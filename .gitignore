@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Native builds
+build/
+cmake-build-*/
+target/
+*.o
+*.a
+*.so
+compile_commands.json
+
+# Local environments and generated data
+.venv/
+.venv_*/
+data/*
+!data/.gitkeep
+*.npz
+*.npy
+*.pkl
+*.mp4
+*.avi
+*.gif
+
+# Logs
+logs/
+*.log
+
+# External dependency checkouts should be referenced, not vendored.
+external/*
+!external/README.md
+
+
+# SONIC runtime generated/heavy artifacts
+sonic_runtime/**/.git/
+sonic_runtime/**/build/
+sonic_runtime/**/build.stale.*/
+sonic_runtime/**/target/
+sonic_runtime/**/.venv/
+sonic_runtime/**/__pycache__/
+sonic_runtime/**/*.onnx
+sonic_runtime/**/*.engine
+sonic_runtime/**/*.plan
+sonic_runtime/**/*.usd
+sonic_runtime/**/*.usda
+sonic_runtime/**/logs/
+sonic_runtime/**/exp_*/
+sonic_runtime/**/session_*/
+
+
+# TensorRT generated engines
+*.trt
+*.trt.*
+sonic_runtime/**/*.trt

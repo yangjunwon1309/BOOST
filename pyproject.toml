@@ -1,0 +1,16 @@
+[project]
+name = "path-g1"
+version = "0.1.0"
+description = "PATH state-machine, cuRobo planning, and EE-QP integration for Unitree G1"
+requires-python = ">=3.10"
+dependencies = [
+  "msgpack",
+  "numpy",
+  "pyyaml",
+  "pyzmq",
+  "scipy",
+]
+
+[tool.ruff]
+line-length = 100
+

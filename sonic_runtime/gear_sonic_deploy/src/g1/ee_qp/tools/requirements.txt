@@ -1,0 +1,8 @@
+numpy>=2.0
+pytorch-kinematics @ git+https://github.com/UM-ARM-Lab/pytorch_kinematics.git@295e225fcb54c2142786ecacd5f6c52e1c038782
+pin==4.0.0
+pin-pink==4.2.0
+qpsolvers==4.12.0
+proxsuite==0.7.3
+cmeel-simde==0.8.2
+mujoco==3.10.0

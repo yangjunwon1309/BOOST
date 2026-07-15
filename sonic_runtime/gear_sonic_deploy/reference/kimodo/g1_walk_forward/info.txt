@@ -1,0 +1,8 @@
+Motion Information: g1_walk_forward
+==================================================
+
+Source: Kimodo-G1 model output
+Coord: Kimodo Z-up (col order x,z,y) -> SONIC Z-up
+Timesteps (50Hz): 150
+Joints: 29 (IsaacLab order, relative to default_angles)
+Bodies: 14

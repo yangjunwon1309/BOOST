@@ -1,0 +1,9 @@
+Motion Information: g1_pick_2_seed
+==================================================
+
+Source: Kimodo-G1 npz
+Coord: Kimodo Y-up -> SONIC Z-up (x,z,y swap)
+Joint angles: rest_pose^-1 @ local_rot_mats, primary axis extraction
+Timesteps (50Hz): 200
+Joints: 29 (IsaacLab order, relative to default_angles)
+Bodies: 14

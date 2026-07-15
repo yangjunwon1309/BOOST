@@ -1,0 +1,106 @@
+<?xml version="1.0" ?>
+<robot name="car">
+	<link name="base"/>
+	<link name="link_0">
+		<visual name="out_frame">
+			<origin xyz="0 0 0"/>
+			<geometry>
+				<mesh filename="texture_dae/car_board.dae" scale="1.0996936170828284 1.0996936170828284 1.0996936170828284"/>
+			</geometry>
+		</visual>
+		<collision>
+			<origin xyz="0 0 0"/>
+			<geometry>
+				<mesh filename="texture_dae/car_board.dae" scale="1.0996936170828284 1.0996936170828284 1.0996936170828284"/>
+			</geometry>
+		</collision>
+	</link>
+	<joint name="joint_0" type="fixed">
+		<origin rpy="0 0 -1.570796326794897" xyz="0 0 0"/>
+		<child link="link_0"/>
+		<parent link="base"/>
+	</joint>
+	<link name="link_1">
+		<inertial>
+			<origin xyz="0.6945 -0.4994 -0.0081"/>
+			<mass value="35.0"/>
+			<inertia
+				ixx="4.214"
+				ixy="0.0"
+				ixz="0.0"
+				iyy="9.231"
+				iyz="0.0"
+				izz="6.237"/>
+		</inertial>
+		<visual name="surf_board">
+			<origin xyz="1.0737739406004048 -0.5477275064157311 0"/>
+			<geometry>
+				<mesh filename="texture_dae/car_door.dae" scale="1.0996936170828284 1.0996936170828284 1.0996936170828284"/>
+			</geometry>
+		</visual>
+		<collision>
+			<origin xyz="1.0737739406004048 -0.5477275064157311 0"/>
+			<geometry>
+				<mesh filename="texture_dae/car_door.dae" scale="1.0996936170828284 1.0996936170828284 1.0996936170828284"/>
+			</geometry>
+		</collision>
+	</link>
+	<joint name="joint_1" type="revolute">
+		<origin xyz="-1.0737739406004048 0.5477275064157311 0"/>
+		<axis xyz="0 0 -1"/>
+		<child link="link_1"/>
+		<parent link="link_0"/>
+		<limit lower="0" upper="1.151917306"/>
+	</joint>
+	<link name="link_2">
+		<visual name="handle_lock">
+			<origin xyz="0 0 0"/>
+			<geometry>
+				<mesh filename="texture_dae/handle_lock.dae" scale="0.8421896393360485 0.8421896393360485 0.8421896393360485"/>
+			</geometry>
+		</visual>
+		<collision>
+			<origin xyz="0 0 0"/>
+			<geometry>
+				<mesh filename="texture_dae/handle_lock.dae" scale="0.8421896393360485 0.8421896393360485 0.8421896393360485"/>
+			</geometry>
+		</collision>
+	</link>
+	<joint name="joint_2" type="fixed">
+		<origin xyz="1.0637739406004048 -0.5477275064157311 0.005"/>
+		<child link="link_2"/>
+		<parent link="link_1"/>
+	</joint>
+	<link name="link_3">
+		<inertial>
+			<origin xyz="0.08322048 -0.02248480 0.00052384"/>
+			<mass value="0.3"/>
+			<inertia
+				ixx="0.000064204"
+				ixy="0.0"
+				ixz="0.0"
+				iyy="0.001026367"
+				iyz="0.0"
+				izz="0.001037837"/>
+		</inertial>
+		<visual name="handle">
+			<origin xyz="0 0 0"/>
+			<geometry>
+				<mesh filename="texture_dae/handle.dae" scale="0.8421896393360485 0.8421896393360485 0.8421896393360485"/>
+			</geometry>
+		</visual>
+		<collision>
+			<origin xyz="0 0 0"/>
+			<geometry>
+				<mesh filename="texture_dae/handle.dae" scale="0.8421896393360485 0.8421896393360485 0.8421896393360485"/>
+			</geometry>
+		</collision>
+	</link>
+	<joint name="joint_3" type="revolute">
+		<origin xyz="0 0 0"/>
+		<child link="link_3"/>
+		<parent link="link_2"/>
+		<axis xyz="0 0 -1"/>
+		<limit lower="0" upper="0.17453"/>
+	</joint>
+</robot>

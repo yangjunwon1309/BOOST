@@ -6,5 +6,7 @@ source "$PATH_G1_ROOT/configs/runtime/local.env"
 source "$PATH_GROOT_ROOT/.venv_sim/bin/activate"
 
 cd "$PATH_G1_ROOT"
-exec python path_streaming/pico_manager_thread_server.py --manager "$@"
-
+exec python path_streaming/pico_manager_thread_server.py \
+  --manager \
+  --port "${PATH_PICO_INTERNAL_PORT:-5559}" \
+  "$@"

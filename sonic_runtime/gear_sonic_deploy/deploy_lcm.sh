@@ -58,6 +58,18 @@ show_usage() {
     echo "  --use-upper-ik              SONIC lower body + IK waist/arms teleop"
     echo "  --use-hand-ik               SONIC lower body + waist, IK arms/hands teleop"
     echo "  --use-hand-ik-origin        Legacy 50 Hz arms/hands IK override (no 500 Hz IK thread)"
+    echo "  --use-ee-qp                 Enable PATH EE-QP correction"
+    echo "  --ee-qp-config PATH         EE-QP config YAML (default: src/g1/ee_qp/config/ee_qp.yaml)"
+    echo "  --path-use-dynamic-reference"
+    echo "                               Read PATH state-machine QP references over ZMQ"
+    echo "  --path-reference-host HOST  PATH QP reference host (default: 127.0.0.1)"
+    echo "  --path-reference-port PORT  PATH QP reference port (default: 5560)"
+    echo "  --path-reference-topic TOPIC"
+    echo "                               PATH QP reference topic (default: path_qp_reference)"
+    echo "  --path-reference-lookahead-ms MS"
+    echo "                               PATH reference lookahead in ms (default: 10)"
+    echo "  --path-reference-heartbeat-timeout-ms MS"
+    echo "                               PATH reference heartbeat timeout in ms (default: 500)"
     echo "  --desk-pose                 INIT ramps to a hands-on-desk ready pose (arms bent) instead of default_angles"
     echo ""
     echo "Examples:"
@@ -106,6 +118,14 @@ DUMMY_STATE=false
 USE_UPPER_IK=false
 USE_HAND_IK=false
 USE_HAND_IK_ORIGIN=false
+USE_EE_QP=false
+EE_QP_CONFIG="src/g1/ee_qp/config/ee_qp.yaml"
+PATH_USE_DYNAMIC_REFERENCE=false
+PATH_REFERENCE_HOST="127.0.0.1"
+PATH_REFERENCE_PORT=5560
+PATH_REFERENCE_TOPIC="path_qp_reference"
+PATH_REFERENCE_LOOKAHEAD_MS=10
+PATH_REFERENCE_HEARTBEAT_TIMEOUT_MS=500
 DESK_POSE=false
 
 # ============================================================================
@@ -164,6 +184,28 @@ while [[ $# -gt 0 ]]; do
             USE_HAND_IK=true; shift ;;
         --use-hand-ik-origin)
             USE_HAND_IK_ORIGIN=true; shift ;;
+        --use-ee-qp)
+            USE_EE_QP=true; shift ;;
+        --ee-qp-config)
+            [[ -z "$2" ]] && { echo -e "${RED}Error: $1 requires an argument${NC}" >&2; exit 1; }
+            EE_QP_CONFIG="$2"; shift 2 ;;
+        --path-use-dynamic-reference)
+            PATH_USE_DYNAMIC_REFERENCE=true; shift ;;
+        --path-reference-host)
+            [[ -z "$2" ]] && { echo -e "${RED}Error: $1 requires an argument${NC}" >&2; exit 1; }
+            PATH_REFERENCE_HOST="$2"; shift 2 ;;
+        --path-reference-port)
+            [[ -z "$2" ]] && { echo -e "${RED}Error: $1 requires an argument${NC}" >&2; exit 1; }
+            PATH_REFERENCE_PORT="$2"; shift 2 ;;
+        --path-reference-topic)
+            [[ -z "$2" ]] && { echo -e "${RED}Error: $1 requires an argument${NC}" >&2; exit 1; }
+            PATH_REFERENCE_TOPIC="$2"; shift 2 ;;
+        --path-reference-lookahead-ms)
+            [[ -z "$2" ]] && { echo -e "${RED}Error: $1 requires an argument${NC}" >&2; exit 1; }
+            PATH_REFERENCE_LOOKAHEAD_MS="$2"; shift 2 ;;
+        --path-reference-heartbeat-timeout-ms)
+            [[ -z "$2" ]] && { echo -e "${RED}Error: $1 requires an argument${NC}" >&2; exit 1; }
+            PATH_REFERENCE_HEARTBEAT_TIMEOUT_MS="$2"; shift 2 ;;
         --desk-pose)
             DESK_POSE=true; shift ;;
         sim|real)
@@ -180,8 +222,9 @@ IK_MODE_COUNT=0
 [[ "$USE_UPPER_IK" == true ]] && IK_MODE_COUNT=$((IK_MODE_COUNT + 1))
 [[ "$USE_HAND_IK" == true ]] && IK_MODE_COUNT=$((IK_MODE_COUNT + 1))
 [[ "$USE_HAND_IK_ORIGIN" == true ]] && IK_MODE_COUNT=$((IK_MODE_COUNT + 1))
+[[ "$USE_EE_QP" == true ]] && IK_MODE_COUNT=$((IK_MODE_COUNT + 1))
 if [[ "$IK_MODE_COUNT" -gt 1 ]]; then
-    echo -e "${RED}Error: --use-upper-ik, --use-hand-ik, and --use-hand-ik-origin cannot be used together${NC}" >&2
+    echo -e "${RED}Error: --use-upper-ik, --use-hand-ik, --use-hand-ik-origin, and --use-ee-qp cannot be used together${NC}" >&2
     exit 1
 fi
 
@@ -367,6 +410,16 @@ elif [[ "$USE_HAND_IK" == true ]]; then
 echo -e "  IK Mode:             ${GREEN}arms/hands only (lower body + waist from SONIC)${NC}"
 elif [[ "$USE_HAND_IK_ORIGIN" == true ]]; then
 echo -e "  IK Mode:             ${GREEN}legacy 50 Hz arms/hands only (lower body + waist from SONIC)${NC}"
+elif [[ "$USE_EE_QP" == true ]]; then
+echo -e "  IK/QP Mode:          ${GREEN}PATH EE-QP correction${NC}"
+echo -e "  EE-QP Config:        ${GREEN}$EE_QP_CONFIG${NC}"
+if [[ "$PATH_USE_DYNAMIC_REFERENCE" == true ]]; then
+echo -e "  PATH QP Reference:   ${GREEN}tcp://$PATH_REFERENCE_HOST:$PATH_REFERENCE_PORT/$PATH_REFERENCE_TOPIC${NC}"
+echo -e "  PATH Lookahead:      ${GREEN}${PATH_REFERENCE_LOOKAHEAD_MS} ms${NC}"
+echo -e "  PATH Heartbeat:      ${GREEN}${PATH_REFERENCE_HEARTBEAT_TIMEOUT_MS} ms${NC}"
+else
+echo -e "  PATH QP Reference:   ${YELLOW}OFF${NC}"
+fi
 else
 echo -e "  IK Mode:             ${GREEN}OFF${NC}"
 fi
@@ -398,6 +451,16 @@ echo -e "${BLUE}    --use-hand-ik${NC}"
 fi
 if [[ "$USE_HAND_IK_ORIGIN" == true ]]; then
 echo -e "${BLUE}    --use-hand-ik-origin${NC}"
+fi
+if [[ "$USE_EE_QP" == true ]]; then
+echo -e "${BLUE}    --use-ee-qp --ee-qp-config $EE_QP_CONFIG \\${NC}"
+if [[ "$PATH_USE_DYNAMIC_REFERENCE" == true ]]; then
+echo -e "${BLUE}    --path-use-dynamic-reference \\${NC}"
+echo -e "${BLUE}    --path-reference-host $PATH_REFERENCE_HOST --path-reference-port $PATH_REFERENCE_PORT \\${NC}"
+echo -e "${BLUE}    --path-reference-topic $PATH_REFERENCE_TOPIC \\${NC}"
+echo -e "${BLUE}    --path-reference-lookahead-ms $PATH_REFERENCE_LOOKAHEAD_MS \\${NC}"
+echo -e "${BLUE}    --path-reference-heartbeat-timeout-ms $PATH_REFERENCE_HEARTBEAT_TIMEOUT_MS${NC}"
+fi
 fi
 echo ""
 echo -e "${CYAN}═══════════════════════════════════════════════════════════════════════${NC}"
@@ -486,6 +549,21 @@ elif [[ "$USE_HAND_IK_ORIGIN" == true ]]; then
     IK_ARG="--use-hand-ik-origin"
 fi
 
+EE_QP_ARGS=()
+if [[ "$USE_EE_QP" == true ]]; then
+    EE_QP_ARGS+=(--use-ee-qp --ee-qp-config "$EE_QP_CONFIG")
+    if [[ "$PATH_USE_DYNAMIC_REFERENCE" == true ]]; then
+        EE_QP_ARGS+=(
+            --path-use-dynamic-reference
+            --path-reference-host "$PATH_REFERENCE_HOST"
+            --path-reference-port "$PATH_REFERENCE_PORT"
+            --path-reference-topic "$PATH_REFERENCE_TOPIC"
+            --path-reference-lookahead-ms "$PATH_REFERENCE_LOOKAHEAD_MS"
+            --path-reference-heartbeat-timeout-ms "$PATH_REFERENCE_HEARTBEAT_TIMEOUT_MS"
+        )
+    fi
+fi
+
 DESK_POSE_ARG=""
 if [[ "$DESK_POSE" == true ]]; then
     DESK_POSE_ARG="--desk-pose"
@@ -502,6 +580,7 @@ just run g1_deploy_onnx_ref_lcm "dummy_iface" "$CHECKPOINT_DECODER" "$MOTION_DAT
     --lcm-action-channel "$LCM_ACTION_CHANNEL" \
     --lcm-state-channel "$LCM_STATE_CHANNEL" \
     --planner-fp16 \
+    "${EE_QP_ARGS[@]}" \
     $DUMMY_ARG \
     $IK_ARG \
     $DESK_POSE_ARG

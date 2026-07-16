@@ -313,6 +313,7 @@ class G1Deploy {
     std::shared_ptr<::g1::ee_qp::RobotFkAdapter> ee_qp_kinematics_;
     std::unique_ptr<::g1::ee_qp::BufferedEeReferenceProvider> ee_qp_buffered_reference_provider_;
     std::unique_ptr<::g1::ee_qp::BsplineEeReferenceProvider> ee_qp_bspline_reference_provider_;
+    std::unique_ptr<::g1::ee_qp::DynamicEeReferenceProvider> ee_qp_dynamic_reference_provider_;
     ::g1::ee_qp::EeReferenceProvider* ee_qp_reference_provider_ = nullptr;
     std::atomic<bool> gmr_reference_running_{false};
     std::thread gmr_reference_thread_;
@@ -2170,6 +2171,9 @@ class G1Deploy {
       if (source == "gmr") return ::g1::ee_qp::ReferenceSource::kGmr;
       if (source == "curobo") return ::g1::ee_qp::ReferenceSource::kCurobo;
       if (source == "replay") return ::g1::ee_qp::ReferenceSource::kReplay;
+      if (source == "damped_return" || source == "damped") {
+        return ::g1::ee_qp::ReferenceSource::kDampedReturn;
+      }
       return ::g1::ee_qp::ReferenceSource::kUnknown;
     }
 
@@ -2408,6 +2412,202 @@ class G1Deploy {
       });
     }
 
+    void StartPathReferenceSubscriber(
+        const std::string& host, int port, const std::string& topic) {
+      gmr_reference_running_.store(true);
+      gmr_reference_thread_ = std::thread([this, host, port, topic]() {
+        try {
+          zmq::context_t context(1);
+          zmq::socket_t socket(context, ZMQ_SUB);
+          socket.set(zmq::sockopt::conflate, 1);
+          socket.set(zmq::sockopt::rcvtimeo, 100);
+          socket.set(zmq::sockopt::linger, 0);
+          socket.set(zmq::sockopt::subscribe, topic);
+          const std::string endpoint =
+              "tcp://" + host + ":" + std::to_string(port);
+          socket.connect(endpoint);
+          std::cout << "[EE-QP/PATH] Waiting for dynamic references at "
+                    << endpoint << "/" << topic << std::endl;
+
+          std::uint64_t received_count = 0;
+          while (gmr_reference_running_.load()) {
+            zmq::message_t message;
+            const auto received = socket.recv(message, zmq::recv_flags::none);
+            if (!received || message.size() <= topic.size() ||
+                std::memcmp(message.data(), topic.data(), topic.size()) != 0) {
+              continue;
+            }
+
+            const char* payload = static_cast<const char*>(message.data()) + topic.size();
+            const std::size_t payload_size = message.size() - topic.size();
+            auto unpacked = msgpack::unpack(payload, payload_size);
+            std::map<std::string, msgpack::object> fields;
+            unpacked.get().convert(fields);
+
+            std::string reference_type;
+            const auto type_it = fields.find("reference_type");
+            if (type_it != fields.end()) type_it->second.convert(reference_type);
+            if (reference_type.empty()) {
+              if (fields.find("control_points") != fields.end()) reference_type = "bspline";
+              else if (fields.find("q_ref") != fields.end() || fields.find("q_mujoco") != fields.end()) reference_type = "sample";
+              else reference_type = "none";
+            }
+
+            ::g1::ee_qp::ReferenceSource source = ::g1::ee_qp::ReferenceSource::kUnknown;
+            const auto source_it = fields.find("source");
+            if (source_it != fields.end()) {
+              std::string source_string;
+              source_it->second.convert(source_string);
+              source = ParseReferenceSource(source_string);
+            }
+
+            ::g1::ee_qp::ControlMode control_mode = ::g1::ee_qp::ControlMode::kUnknown;
+            const auto mode_it = fields.find("control_mode");
+            if (mode_it != fields.end()) {
+              std::string mode;
+              mode_it->second.convert(mode);
+              control_mode = ParseControlMode(mode);
+            } else {
+              const auto state_it = fields.find("state");
+              if (state_it != fields.end()) {
+                std::string state;
+                state_it->second.convert(state);
+                if (state == "teleop" || state == "intention") control_mode = ::g1::ee_qp::ControlMode::kTeleop;
+                else if (state == "auto_planning") control_mode = ::g1::ee_qp::ControlMode::kPlanExec;
+                else if (state == "damped_return") control_mode = ::g1::ee_qp::ControlMode::kBlendBack;
+                else control_mode = ParseControlMode(state);
+              }
+            }
+
+            bool feasible = true;
+            const auto feasible_it = fields.find("feasible");
+            if (feasible_it != fields.end()) feasible_it->second.convert(feasible);
+
+            std::uint64_t plan_id = 0;
+            const auto plan_id_it = fields.find("plan_id");
+            if (plan_id_it != fields.end()) plan_id_it->second.convert(plan_id);
+
+            double phase = 0.0;
+            const auto phase_it = fields.find("phase");
+            if (phase_it != fields.end()) phase_it->second.convert(phase);
+
+            std::int64_t received_us = SteadyNowUs();
+            const auto timestamp_it = fields.find("timestamp_us");
+            if (timestamp_it != fields.end()) {
+              std::int64_t source_timestamp_us = 0;
+              timestamp_it->second.convert(source_timestamp_us);
+              if (source_timestamp_us > 0 && source_timestamp_us <= received_us) {
+                received_us = source_timestamp_us;
+              }
+            }
+
+            if (!ee_qp_dynamic_reference_provider_) continue;
+            if (reference_type == "sample") {
+              ::g1::ee_qp::EeReference reference;
+              reference.source = source == ::g1::ee_qp::ReferenceSource::kUnknown
+                  ? ::g1::ee_qp::ReferenceSource::kGmr
+                  : source;
+              reference.control_mode = control_mode == ::g1::ee_qp::ControlMode::kUnknown
+                  ? ::g1::ee_qp::ControlMode::kTeleop
+                  : control_mode;
+              reference.feasible = feasible;
+              reference.plan_id = plan_id;
+              reference.phase = phase;
+              reference.timestamp_us = received_us;
+              reference.reference_pelvis_orientation = Eigen::Quaterniond::Identity();
+
+              auto q_it = fields.find("q_ref");
+              if (q_it == fields.end()) q_it = fields.find("q_mujoco");
+              if (q_it == fields.end()) {
+                if (!reference.feasible) {
+                  reference.valid = true;
+                  ee_qp_dynamic_reference_provider_->UpdateSample(reference);
+                }
+                continue;
+              }
+
+              std::vector<double> q_values;
+              q_it->second.convert(q_values);
+              if (q_values.size() != ::g1::ee_qp::kNumJoints) continue;
+              ::g1::ee_qp::JointVector q_ref = ::g1::ee_qp::JointVector::Zero();
+              for (int i = 0; i < ::g1::ee_qp::kNumJoints; ++i) q_ref[i] = q_values[i];
+              ::g1::ee_qp::WristKinematics wrist;
+              if (!ee_qp_kinematics_->Evaluate(q_ref, Eigen::Quaterniond::Identity(), wrist)) {
+                continue;
+              }
+              reference.left_wrist_in_reference_pelvis = wrist.left_position_world;
+              reference.right_wrist_in_reference_pelvis = wrist.right_position_world;
+              reference.q_ref = q_ref;
+              reference.valid = true;
+              ee_qp_dynamic_reference_provider_->UpdateSample(reference);
+            } else if (reference_type == "bspline") {
+              double control_dt_sec = 0.02;
+              const auto dt_it = fields.find("control_dt_sec");
+              if (dt_it != fields.end()) {
+                dt_it->second.convert(control_dt_sec);
+              } else {
+                const auto legacy_dt_it = fields.find("dt");
+                if (legacy_dt_it != fields.end()) legacy_dt_it->second.convert(control_dt_sec);
+              }
+
+              std::int64_t t_start_us = received_us;
+              const auto t_start_it = fields.find("t_start_us");
+              if (t_start_it != fields.end()) t_start_it->second.convert(t_start_us);
+
+              std::vector<::g1::ee_qp::JointVector> control_points;
+              const auto cps_it = fields.find("control_points");
+              if (cps_it != fields.end()) {
+                std::vector<std::vector<double>> rows;
+                cps_it->second.convert(rows);
+                control_points.reserve(rows.size());
+                for (const auto& row : rows) {
+                  if (row.size() != ::g1::ee_qp::kNumJoints) continue;
+                  ::g1::ee_qp::JointVector q = ::g1::ee_qp::JointVector::Zero();
+                  for (int i = 0; i < ::g1::ee_qp::kNumJoints; ++i) q[i] = row[i];
+                  control_points.push_back(q);
+                }
+              }
+              if (feasible && control_points.size() < 4) continue;
+              ee_qp_dynamic_reference_provider_->UpdatePlan(
+                  control_points,
+                  control_dt_sec,
+                  t_start_us,
+                  received_us,
+                  plan_id,
+                  feasible,
+                  control_mode == ::g1::ee_qp::ControlMode::kUnknown
+                      ? ::g1::ee_qp::ControlMode::kPlanExec
+                      : control_mode,
+                  source == ::g1::ee_qp::ReferenceSource::kUnknown
+                      ? ::g1::ee_qp::ReferenceSource::kCurobo
+                      : source);
+            } else if (!feasible) {
+              ::g1::ee_qp::EeReference reference;
+              reference.source = source;
+              reference.control_mode = control_mode;
+              reference.feasible = false;
+              reference.plan_id = plan_id;
+              reference.timestamp_us = received_us;
+              reference.valid = true;
+              ee_qp_dynamic_reference_provider_->UpdateSample(reference);
+            }
+
+            if (++received_count % 50 == 0) {
+              std::cout << "[EE-QP/PATH] received " << received_count
+                        << " dynamic references, type=" << reference_type
+                        << ", plan_id=" << plan_id
+                        << ", feasible=" << feasible << std::endl;
+            }
+          }
+        } catch (const std::exception& exc) {
+          std::cerr << "[EE-QP/PATH] dynamic reference subscriber stopped: "
+                    << exc.what() << std::endl;
+          gmr_reference_running_.store(false);
+        }
+      });
+    }
+
+
 
   public:
     OperatorState operator_state;
@@ -2447,6 +2647,10 @@ class G1Deploy {
       bool debug_hand_ik = false,
       bool use_ee_qp = false,
       std::string ee_qp_config_path = "src/g1/ee_qp/config/ee_qp.yaml",
+      bool path_use_dynamic_reference = false,
+      std::string path_reference_host = "127.0.0.1",
+      int path_reference_port = 5560,
+      std::string path_reference_topic = "path_qp_reference",
       bool path_use_bspline_reference = false,
       std::string path_bspline_host = "127.0.0.1",
       int path_bspline_port = 5560,
@@ -2513,7 +2717,22 @@ class G1Deploy {
         ee_qp_kinematics_ = std::make_shared<::g1::ee_qp::RobotFkAdapter>(
             "g1/g1_29dof.xml");
         auto config = ::g1::ee_qp::LoadEeQpConfig(ee_qp_config_path);
-        if (path_use_bspline_reference) {
+        if (path_use_dynamic_reference) {
+          const auto heartbeat_timeout_us =
+              static_cast<std::int64_t>(path_reference_heartbeat_timeout_ms * 1000.0);
+          ee_qp_dynamic_reference_provider_ =
+              std::make_unique<::g1::ee_qp::DynamicEeReferenceProvider>(
+                  config.reference_timeout_us, heartbeat_timeout_us, ee_qp_kinematics_);
+          ee_qp_dynamic_reference_provider_->SetLookaheadUs(
+              static_cast<std::int64_t>(path_reference_lookahead_ms * 1000.0));
+          ee_qp_reference_provider_ = ee_qp_dynamic_reference_provider_.get();
+          StartPathReferenceSubscriber(
+              path_reference_host, path_reference_port, path_reference_topic);
+          std::cout << "[G1Deploy/PATH] EE QP dynamic reference enabled at "
+                    << path_reference_host << ":" << path_reference_port << "/"
+                    << path_reference_topic << ", lookahead="
+                    << path_reference_lookahead_ms << "ms" << std::endl;
+        } else if (path_use_bspline_reference) {
           const auto heartbeat_timeout_us =
               static_cast<std::int64_t>(path_reference_heartbeat_timeout_ms * 1000.0);
           ee_qp_bspline_reference_provider_ =
@@ -4743,7 +4962,11 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --debug-hand-ik: print IK wrist targets and solved arm q periodically" << std::endl;
     std::cout << "  --use-ee-qp: enable base-local arms-only wrist position QP correction" << std::endl;
     std::cout << "  --ee-qp-config <path>: EE QP YAML config path" << std::endl;
-    std::cout << "  --path-use-bspline-reference: use PATH/cuRobo B-spline q_ref instead of sampled GMR reference" << std::endl;
+    std::cout << "  --path-use-dynamic-reference: use PATH state-machine reference schema for EE QP" << std::endl;
+    std::cout << "  --path-reference-host <host>: PATH dynamic reference host (default: 127.0.0.1)" << std::endl;
+    std::cout << "  --path-reference-port <port>: PATH dynamic reference port (default: 5560)" << std::endl;
+    std::cout << "  --path-reference-topic <topic>: PATH dynamic reference topic prefix (default: path_qp_reference)" << std::endl;
+    std::cout << "  --path-use-bspline-reference: legacy direct PATH/cuRobo B-spline q_ref instead of sampled GMR reference" << std::endl;
     std::cout << "  --path-bspline-host <host>: PATH B-spline reference host (default: 127.0.0.1)" << std::endl;
     std::cout << "  --path-bspline-port <port>: PATH B-spline reference port (default: 5560)" << std::endl;
     std::cout << "  --path-bspline-topic <topic>: PATH B-spline topic prefix (default: curobo_bspline)" << std::endl;
@@ -4801,6 +5024,10 @@ int main(int argc, char const* argv[]) {
   bool debugHandIK = false;
   bool useEeQp = false;
   std::string eeQpConfig = "src/g1/ee_qp/config/ee_qp.yaml";
+  bool pathUseDynamicReference = false;
+  std::string pathReferenceHost = "127.0.0.1";
+  int pathReferencePort = 5560;
+  std::string pathReferenceTopic = "path_qp_reference";
   bool pathUseBsplineReference = false;
   std::string pathBsplineHost = "127.0.0.1";
   int pathBsplinePort = 5560;
@@ -5006,6 +5233,18 @@ int main(int argc, char const* argv[]) {
         exit(1);
       }
       eeQpConfig = argv[++i];
+    } else if (std::string(argv[i]) == "--path-use-dynamic-reference") {
+      pathUseDynamicReference = true;
+      std::cout << "[INFO] PATH dynamic state-machine reference enabled for EE QP" << std::endl;
+    } else if (std::string(argv[i]) == "--path-reference-host") {
+      if (i + 1 < argc) { pathReferenceHost = argv[++i]; }
+      else { std::cerr << "Error: --path-reference-host requires a host" << std::endl; exit(1); }
+    } else if (std::string(argv[i]) == "--path-reference-port") {
+      if (i + 1 < argc) { pathReferencePort = std::stoi(argv[++i]); }
+      else { std::cerr << "Error: --path-reference-port requires a port" << std::endl; exit(1); }
+    } else if (std::string(argv[i]) == "--path-reference-topic") {
+      if (i + 1 < argc) { pathReferenceTopic = argv[++i]; }
+      else { std::cerr << "Error: --path-reference-topic requires a topic" << std::endl; exit(1); }
     } else if (std::string(argv[i]) == "--path-use-bspline-reference") {
       pathUseBsplineReference = true;
       std::cout << "[INFO] PATH B-spline reference enabled for EE QP" << std::endl;
@@ -5126,6 +5365,10 @@ int main(int argc, char const* argv[]) {
     debugHandIK,
     useEeQp,
     eeQpConfig,
+    pathUseDynamicReference,
+    pathReferenceHost,
+    pathReferencePort,
+    pathReferenceTopic,
     pathUseBsplineReference,
     pathBsplineHost,
     pathBsplinePort,

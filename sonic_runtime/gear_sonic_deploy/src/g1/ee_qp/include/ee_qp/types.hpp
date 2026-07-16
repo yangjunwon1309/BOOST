@@ -53,6 +53,7 @@ enum class ReferenceSource : std::uint8_t {
   kGmr,
   kCurobo,
   kReplay,
+  kDampedReturn,
 };
 
 enum class ControlMode : std::uint8_t {
@@ -88,6 +89,7 @@ inline const char* ReferenceSourceName(ReferenceSource source) {
     case ReferenceSource::kGmr: return "gmr";
     case ReferenceSource::kCurobo: return "curobo";
     case ReferenceSource::kReplay: return "replay";
+    case ReferenceSource::kDampedReturn: return "damped_return";
   }
   return "unknown";
 }

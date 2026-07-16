@@ -50,7 +50,18 @@ ee_qp_args=()
 if [[ "${EE_QP_ENABLED:-1}" == "1" ]]; then
   ee_qp_args+=(--use-ee-qp)
   echo "EE-QP enabled (set EE_QP_ENABLED=0 for the SONIC-only baseline)."
-  if [[ "${PATH_BSPLINE_ENABLED:-0}" == "1" ]]; then
+  if [[ "${PATH_DYNAMIC_REFERENCE_ENABLED:-1}" == "1" ]]; then
+    ee_qp_args+=(
+      --path-use-dynamic-reference
+      --path-reference-host "${PATH_REFERENCE_HOST:-127.0.0.1}"
+      --path-reference-port "${PATH_REFERENCE_PORT:-5560}"
+      --path-reference-topic "${PATH_REFERENCE_TOPIC:-path_qp_reference}"
+      --path-reference-lookahead-ms "${PATH_REFERENCE_LOOKAHEAD_MS:-10}"
+      --path-reference-heartbeat-timeout-ms "${PATH_REFERENCE_HEARTBEAT_TIMEOUT_MS:-500}"
+    )
+    echo "PATH state-machine QP reference enabled:"
+    echo "  tcp://${PATH_REFERENCE_HOST:-127.0.0.1}:${PATH_REFERENCE_PORT:-5560}/${PATH_REFERENCE_TOPIC:-path_qp_reference}"
+  elif [[ "${PATH_BSPLINE_ENABLED:-0}" == "1" ]]; then
     ee_qp_args+=(
       --path-use-bspline-reference
       --path-bspline-host "${PATH_BSPLINE_HOST:-127.0.0.1}"
@@ -59,12 +70,12 @@ if [[ "${EE_QP_ENABLED:-1}" == "1" ]]; then
       --path-reference-lookahead-ms "${PATH_REFERENCE_LOOKAHEAD_MS:-10}"
       --path-reference-heartbeat-timeout-ms "${PATH_REFERENCE_HEARTBEAT_TIMEOUT_MS:-500}"
     )
-    echo "PATH B-spline QP reference enabled:"
+    echo "Legacy direct PATH B-spline QP reference enabled:"
     echo "  tcp://${PATH_BSPLINE_HOST:-127.0.0.1}:${PATH_BSPLINE_PORT:-5560}/${PATH_BSPLINE_TOPIC:-curobo_bspline}"
   fi
 else
-  if [[ "${PATH_BSPLINE_ENABLED:-0}" == "1" ]]; then
-    echo "PATH_BSPLINE_ENABLED=1 was ignored because EE_QP_ENABLED=0." >&2
+  if [[ "${PATH_DYNAMIC_REFERENCE_ENABLED:-1}" == "1" || "${PATH_BSPLINE_ENABLED:-0}" == "1" ]]; then
+    echo "PATH QP reference settings were ignored because EE_QP_ENABLED=0." >&2
   fi
   echo "EE-QP disabled: running the SONIC-only baseline."
 fi

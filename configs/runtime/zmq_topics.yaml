@@ -1,15 +1,31 @@
+pico_internal:
+  bind: "tcp://*:5559"
+  connect: "tcp://127.0.0.1:5559"
+  topics: ["pose", "command", "planner", "manager_state"]
+gmr_ref:
+  bind: "tcp://*:5558"
+  connect: "tcp://127.0.0.1:5558"
+  topic: "gmr_ref"
 pose:
   endpoint: "tcp://127.0.0.1:5556"
   topic: "pose"
 sonic_debug:
   endpoint: "tcp://127.0.0.1:5557"
   topic: "g1_debug"
-curobo_bspline:
+path_qp_reference:
   bind: "tcp://*:5560"
   connect: "tcp://127.0.0.1:5560"
-  topic: "curobo_bspline"
+  topic: "path_qp_reference"
+curobo_plan:
+  bind: "tcp://*:5562"
+  connect: "tcp://127.0.0.1:5562"
+  topic: "curobo_plan"
 path_goal:
   bind: "tcp://*:5561"
   connect: "tcp://127.0.0.1:5561"
   topic: "path_goal"
+path_state_command:
+  bind: "tcp://*:5563"
+  connect: "tcp://127.0.0.1:5563"
+  topic: "path_state_command"
 

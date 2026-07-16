@@ -64,6 +64,11 @@
 #include <algorithm>
 #include <numeric>
 #include <atomic>
+#include <map>
+#include <thread>
+
+#include <msgpack.hpp>
+#include <zmq.hpp>
 
 // LCM — DDS 대체 (검증된 ActionSender / RobotStateReceiver 사용)
 #include "g1_lcm_action_sender.hpp"
@@ -141,6 +146,11 @@
 // Upper body IK solver (optional: --use-upper-ik)
 #include "../include/upper_body_ik_solver.hpp"
 #include "../include/upper_body_ik_origin_solver.hpp"
+
+// End-effector QP corrector (optional: --use-ee-qp)
+#include "ee_qp/ee_qp_corrector.hpp"
+#include "ee_qp/ee_reference_provider.hpp"
+#include "ee_qp/robot_fk_adapter.hpp"
 
 // DDS namespace 제거 — LCM 버전에서는 불필요
 // LowState_ / IMUState_ using 선언 제거 — RobotStateReceiver가 대체
@@ -298,6 +308,7 @@ class G1Deploy {
     DataBuffer<std::array<float, g1_lcm::kNumMotors>> sonic_action_buffer_;
     DataBuffer<IMUState_> imu_torso_buffer_;
     DataBuffer<HeadingState> heading_state_buffer_;
+    DataBuffer<::g1::ee_qp::EeQpTelemetry> ee_qp_telemetry_buffer_;
     DataBuffer<MovementState> movement_state_buffer_;
     
     // =========================================================================
@@ -335,6 +346,15 @@ class G1Deploy {
     bool use_upper_body_ik_ = false;
     bool use_hand_ik_ = false;
     bool use_hand_ik_origin_ = false;
+    bool use_ee_qp_ = false;
+    uint64_t ee_qp_debug_counter_ = 0;
+    std::unique_ptr<::g1::ee_qp::EeQpCorrector> ee_qp_corrector_;
+    std::shared_ptr<::g1::ee_qp::RobotFkAdapter> ee_qp_kinematics_;
+    std::unique_ptr<::g1::ee_qp::BufferedEeReferenceProvider> ee_qp_buffered_reference_provider_;
+    std::unique_ptr<::g1::ee_qp::DynamicEeReferenceProvider> ee_qp_dynamic_reference_provider_;
+    ::g1::ee_qp::EeReferenceProvider* ee_qp_reference_provider_ = nullptr;
+    std::atomic<bool> gmr_reference_running_{false};
+    std::thread gmr_reference_thread_;
     std::unique_ptr<UpperBodyIKSolver> upper_body_ik_;
     std::unique_ptr<UpperBodyIKOriginSolver> hand_ik_origin_;
     static constexpr std::array<int, UpperBodyIKSolver::kNumIkJoints> kUpperBodyIkHwIndices = {
@@ -2182,6 +2202,156 @@ class G1Deploy {
       return false;
     }
 
+    static std::int64_t SteadyNowUs() {
+      return std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    static ::g1::ee_qp::ReferenceSource ParseReferenceSource(const std::string& source) {
+      if (source == "gmr") return ::g1::ee_qp::ReferenceSource::kGmr;
+      if (source == "curobo") return ::g1::ee_qp::ReferenceSource::kCurobo;
+      if (source == "replay") return ::g1::ee_qp::ReferenceSource::kReplay;
+      if (source == "damped_return" || source == "damped") return ::g1::ee_qp::ReferenceSource::kDampedReturn;
+      return ::g1::ee_qp::ReferenceSource::kUnknown;
+    }
+
+    static ::g1::ee_qp::ControlMode ParseControlMode(const std::string& mode) {
+      if (mode == "teleop") return ::g1::ee_qp::ControlMode::kTeleop;
+      if (mode == "plan_pending") return ::g1::ee_qp::ControlMode::kPlanPending;
+      if (mode == "plan_exec") return ::g1::ee_qp::ControlMode::kPlanExec;
+      if (mode == "blend_back") return ::g1::ee_qp::ControlMode::kBlendBack;
+      if (mode == "idle") return ::g1::ee_qp::ControlMode::kIdle;
+      return ::g1::ee_qp::ControlMode::kUnknown;
+    }
+
+    void StartPathReferenceSubscriber(const std::string& host, int port, const std::string& topic) {
+      gmr_reference_running_.store(true);
+      gmr_reference_thread_ = std::thread([this, host, port, topic]() {
+        try {
+          zmq::context_t context(1);
+          zmq::socket_t socket(context, ZMQ_SUB);
+          socket.set(zmq::sockopt::conflate, 1);
+          socket.set(zmq::sockopt::rcvtimeo, 100);
+          socket.set(zmq::sockopt::linger, 0);
+          socket.set(zmq::sockopt::subscribe, topic);
+          const std::string endpoint = "tcp://" + host + ":" + std::to_string(port);
+          socket.connect(endpoint);
+          std::cout << "[EE-QP/PATH-LCM] Waiting for dynamic references at " << endpoint << "/" << topic << std::endl;
+          std::uint64_t received_count = 0;
+          while (gmr_reference_running_.load()) {
+            zmq::message_t message;
+            const auto received = socket.recv(message, zmq::recv_flags::none);
+            if (!received || message.size() <= topic.size() ||
+                std::memcmp(message.data(), topic.data(), topic.size()) != 0) continue;
+            const char* payload = static_cast<const char*>(message.data()) + topic.size();
+            const std::size_t payload_size = message.size() - topic.size();
+            auto unpacked = msgpack::unpack(payload, payload_size);
+            std::map<std::string, msgpack::object> fields;
+            unpacked.get().convert(fields);
+
+            std::string reference_type;
+            if (auto it = fields.find("reference_type"); it != fields.end()) it->second.convert(reference_type);
+            if (reference_type.empty()) {
+              if (fields.find("control_points") != fields.end()) reference_type = "bspline";
+              else if (fields.find("q_ref") != fields.end() || fields.find("q_mujoco") != fields.end()) reference_type = "sample";
+              else reference_type = "none";
+            }
+
+            ::g1::ee_qp::ReferenceSource source = ::g1::ee_qp::ReferenceSource::kUnknown;
+            if (auto it = fields.find("source"); it != fields.end()) { std::string v; it->second.convert(v); source = ParseReferenceSource(v); }
+            ::g1::ee_qp::ControlMode control_mode = ::g1::ee_qp::ControlMode::kUnknown;
+            if (auto it = fields.find("control_mode"); it != fields.end()) { std::string v; it->second.convert(v); control_mode = ParseControlMode(v); }
+            else if (auto it = fields.find("state"); it != fields.end()) {
+              std::string state; it->second.convert(state);
+              if (state == "teleop" || state == "intention") control_mode = ::g1::ee_qp::ControlMode::kTeleop;
+              else if (state == "auto_planning") control_mode = ::g1::ee_qp::ControlMode::kPlanExec;
+              else if (state == "damped_return") control_mode = ::g1::ee_qp::ControlMode::kBlendBack;
+              else control_mode = ParseControlMode(state);
+            }
+            bool feasible = true;
+            if (auto it = fields.find("feasible"); it != fields.end()) it->second.convert(feasible);
+            std::uint64_t plan_id = 0;
+            if (auto it = fields.find("plan_id"); it != fields.end()) it->second.convert(plan_id);
+            double phase = 0.0;
+            if (auto it = fields.find("phase"); it != fields.end()) it->second.convert(phase);
+            std::int64_t received_us = SteadyNowUs();
+            if (auto it = fields.find("timestamp_us"); it != fields.end()) {
+              std::int64_t source_timestamp_us = 0; it->second.convert(source_timestamp_us);
+              if (source_timestamp_us > 0 && source_timestamp_us <= received_us) received_us = source_timestamp_us;
+            }
+
+            if (!ee_qp_dynamic_reference_provider_) continue;
+            if (reference_type == "sample") {
+              ::g1::ee_qp::EeReference reference;
+              reference.source = source == ::g1::ee_qp::ReferenceSource::kUnknown ? ::g1::ee_qp::ReferenceSource::kGmr : source;
+              reference.control_mode = control_mode == ::g1::ee_qp::ControlMode::kUnknown ? ::g1::ee_qp::ControlMode::kTeleop : control_mode;
+              reference.feasible = feasible;
+              reference.plan_id = plan_id;
+              reference.phase = phase;
+              reference.timestamp_us = received_us;
+              reference.reference_pelvis_orientation = Eigen::Quaterniond::Identity();
+              auto q_it = fields.find("q_ref");
+              if (q_it == fields.end()) q_it = fields.find("q_mujoco");
+              if (q_it == fields.end()) {
+                if (!reference.feasible) { reference.valid = true; ee_qp_dynamic_reference_provider_->UpdateSample(reference); }
+                continue;
+              }
+              std::vector<double> q_values; q_it->second.convert(q_values);
+              if (q_values.size() != ::g1::ee_qp::kNumJoints) continue;
+              ::g1::ee_qp::JointVector q_ref = ::g1::ee_qp::JointVector::Zero();
+              for (int i = 0; i < ::g1::ee_qp::kNumJoints; ++i) q_ref[i] = q_values[i];
+              ::g1::ee_qp::WristKinematics wrist;
+              if (!ee_qp_kinematics_->Evaluate(q_ref, Eigen::Quaterniond::Identity(), wrist)) continue;
+              reference.left_wrist_in_reference_pelvis = wrist.left_position_world;
+              reference.right_wrist_in_reference_pelvis = wrist.right_position_world;
+              reference.q_ref = q_ref;
+              reference.valid = true;
+              ee_qp_dynamic_reference_provider_->UpdateSample(reference);
+            } else if (reference_type == "bspline") {
+              double control_dt_sec = 0.02;
+              if (auto it = fields.find("control_dt_sec"); it != fields.end()) it->second.convert(control_dt_sec);
+              std::int64_t t_start_us = received_us;
+              if (auto it = fields.find("t_start_us"); it != fields.end()) it->second.convert(t_start_us);
+              std::vector<::g1::ee_qp::JointVector> control_points;
+              if (auto it = fields.find("control_points"); it != fields.end()) {
+                std::vector<std::vector<double>> rows; it->second.convert(rows);
+                for (const auto& row : rows) {
+                  if (row.size() != ::g1::ee_qp::kNumJoints) continue;
+                  ::g1::ee_qp::JointVector q = ::g1::ee_qp::JointVector::Zero();
+                  for (int i = 0; i < ::g1::ee_qp::kNumJoints; ++i) q[i] = row[i];
+                  control_points.push_back(q);
+                }
+              }
+              if (feasible && control_points.size() < 4) continue;
+              ee_qp_dynamic_reference_provider_->UpdatePlan(
+                  control_points, control_dt_sec, t_start_us, received_us,
+                  plan_id, feasible,
+                  control_mode == ::g1::ee_qp::ControlMode::kUnknown ? ::g1::ee_qp::ControlMode::kPlanExec : control_mode,
+                  source == ::g1::ee_qp::ReferenceSource::kUnknown ? ::g1::ee_qp::ReferenceSource::kCurobo : source);
+            } else if (!feasible) {
+              ::g1::ee_qp::EeReference reference;
+              reference.source = source;
+              reference.control_mode = control_mode;
+              reference.feasible = false;
+              reference.plan_id = plan_id;
+              reference.timestamp_us = received_us;
+              reference.valid = true;
+              ee_qp_dynamic_reference_provider_->UpdateSample(reference);
+            }
+            if (++received_count % 50 == 0) {
+              std::cout << "[EE-QP/PATH-LCM] received " << received_count
+                        << " dynamic references, type=" << reference_type
+                        << ", plan_id=" << plan_id << ", feasible=" << feasible << std::endl;
+            }
+          }
+        } catch (const std::exception& exc) {
+          std::cerr << "[EE-QP/PATH-LCM] dynamic reference subscriber stopped: " << exc.what() << std::endl;
+          gmr_reference_running_.store(false);
+        }
+      });
+    }
+
+
 
 
   public:
@@ -2225,7 +2395,15 @@ class G1Deploy {
       bool use_upper_body_ik = false,
       bool use_hand_ik = false,
       bool use_hand_ik_origin = false,
-      bool use_desk_pose = false)
+      bool use_desk_pose = false,
+      bool use_ee_qp = false,
+      std::string ee_qp_config_path = "src/g1/ee_qp/config/ee_qp.yaml",
+      bool path_use_dynamic_reference = false,
+      std::string path_reference_host = "127.0.0.1",
+      int path_reference_port = 5560,
+      std::string path_reference_topic = "path_qp_reference",
+      double path_reference_lookahead_ms = 10.0,
+      double path_reference_heartbeat_timeout_ms = 500.0)
       : time_(0.0),
         publish_dt_(0.002),
         control_dt_(0.02),
@@ -2289,10 +2467,12 @@ class G1Deploy {
       use_hand_ik_ = use_hand_ik;
       use_hand_ik_origin_ = use_hand_ik_origin;
       const int ik_mode_count =
-        (use_upper_body_ik_ ? 1 : 0) + (use_hand_ik_ ? 1 : 0) + (use_hand_ik_origin_ ? 1 : 0);
+        (use_upper_body_ik_ ? 1 : 0) + (use_hand_ik_ ? 1 : 0) +
+        (use_hand_ik_origin_ ? 1 : 0) + (use_ee_qp ? 1 : 0);
       if (ik_mode_count > 1) {
-        throw std::runtime_error("--use-upper-ik, --use-hand-ik, and --use-hand-ik-origin cannot be used together");
+        throw std::runtime_error("--use-ee-qp and upper-body IK modes cannot be used together");
       }
+      use_ee_qp_ = use_ee_qp;
       if (use_upper_body_ik_) {
         upper_body_ik_ = std::make_unique<UpperBodyIKSolver>();
         upper_body_ik_->SetMode(UpperBodyIKSolver::Mode::WaistAndArms);
@@ -2307,6 +2487,30 @@ class G1Deploy {
           throw std::runtime_error("Failed to initialize origin hand IK solver");
         }
         std::cout << "[G1Deploy-LCM] IK override ENABLED (" << IkModeDescription() << ")" << std::endl;
+      }
+      if (use_ee_qp_) {
+        ee_qp_kinematics_ = std::make_shared<::g1::ee_qp::RobotFkAdapter>("g1/g1_29dof.xml");
+        auto config = ::g1::ee_qp::LoadEeQpConfig(ee_qp_config_path);
+        if (path_use_dynamic_reference) {
+          const auto heartbeat_timeout_us = static_cast<std::int64_t>(path_reference_heartbeat_timeout_ms * 1000.0);
+          ee_qp_dynamic_reference_provider_ = std::make_unique<::g1::ee_qp::DynamicEeReferenceProvider>(
+              config.reference_timeout_us, heartbeat_timeout_us, ee_qp_kinematics_);
+          ee_qp_dynamic_reference_provider_->SetLookaheadUs(static_cast<std::int64_t>(path_reference_lookahead_ms * 1000.0));
+          ee_qp_reference_provider_ = ee_qp_dynamic_reference_provider_.get();
+          StartPathReferenceSubscriber(path_reference_host, path_reference_port, path_reference_topic);
+          std::cout << "[G1Deploy-LCM/PATH] EE QP dynamic reference enabled at "
+                    << path_reference_host << ":" << path_reference_port << "/" << path_reference_topic
+                    << ", lookahead=" << path_reference_lookahead_ms << "ms" << std::endl;
+        } else {
+          ee_qp_buffered_reference_provider_ = std::make_unique<::g1::ee_qp::BufferedEeReferenceProvider>(config.reference_timeout_us);
+          ee_qp_reference_provider_ = ee_qp_buffered_reference_provider_.get();
+          std::cout << "[G1Deploy-LCM] EE QP enabled without dynamic reference; no reference subscriber is active." << std::endl;
+        }
+        ee_qp_corrector_ = std::make_unique<::g1::ee_qp::EeQpCorrector>(config, ee_qp_kinematics_);
+        ::g1::ee_qp::EeQpTelemetry telemetry;
+        telemetry.enabled = true;
+        ee_qp_telemetry_buffer_.SetData(telemetry);
+        std::cout << "[G1Deploy-LCM] EE QP correction ENABLED, config=" << ee_qp_config_path << std::endl;
       }
 
       // =========================================================================
@@ -2692,7 +2896,9 @@ class G1Deploy {
 #endif
 
       if (create_zmq) {
-        auto zmq_handler = std::make_unique<ZMQOutputHandler>(*state_logger_, zmq_out_port, zmq_out_topic);
+        auto zmq_handler = std::make_unique<ZMQOutputHandler>(
+            *state_logger_, zmq_out_port, zmq_out_topic,
+            use_ee_qp_ ? &ee_qp_telemetry_buffer_ : nullptr);
         std::cout << "Initialized ZMQ output interface" << std::endl;
         // Publish robot config so subscribers can receive it before control loop starts
         zmq_handler->publish_config();
@@ -2737,6 +2943,8 @@ class G1Deploy {
 
     ~G1Deploy()
     {
+      gmr_reference_running_.store(false);
+      if (gmr_reference_thread_.joinable()) gmr_reference_thread_.join();
       // CUDA resources are now cleaned up by the PolicyEngine and planner classes automatically
     }
 
@@ -2857,6 +3065,84 @@ class G1Deploy {
       return use_hand_ik_
         ? "SONIC lower body + waist, IK arms/hands"
         : "SONIC lower body, IK waist + arms/hands";
+    }
+
+
+    bool ApplyEeQpCorrection(MotorCommand& command, std::array<float, g1_lcm::kNumMotors>& action) {
+      if (!use_ee_qp_ || !ee_qp_corrector_ || !ee_qp_reference_provider_) return false;
+      const auto low_state = used_low_state_data_.data;
+      if (!low_state) return false;
+      const auto now_us = SteadyNowUs();
+      const auto reference = ee_qp_reference_provider_->Latest(now_us);
+      ::g1::ee_qp::EeQpInput input;
+      for (int hw = 0; hw < G1_NUM_MOTOR; ++hw) {
+        input.q_measured[hw] = low_state->motor_state()[hw].q();
+        input.dq_measured[hw] = low_state->motor_state()[hw].dq();
+        input.q_sonic[hw] = command.q_target[hw];
+      }
+      input.measured_pelvis_orientation = Eigen::Quaterniond::Identity();
+      if (reference) input.reference = *reference;
+      input.now_us = now_us;
+      input.dt = control_dt_;
+      const auto result = ee_qp_corrector_->Compute(input);
+      ::g1::ee_qp::EeQpTelemetry telemetry;
+      telemetry.enabled = true;
+      telemetry.valid = result.valid;
+      telemetry.q_corrected = result.q_corrected;
+      telemetry.delta_q = result.delta_q;
+      telemetry.joint_tracking_error = result.q_corrected - input.q_measured;
+      telemetry.error_before_m = result.error_before;
+      telemetry.predicted_error_after_m = result.predicted_error_after;
+      telemetry.nonlinear_error_after_m = result.nonlinear_error_after;
+      telemetry.reference_joint_error_before_rad = result.reference_joint_error_before;
+      telemetry.predicted_reference_joint_error_after_rad = result.predicted_reference_joint_error_after;
+      telemetry.arm_only_error_before_m = result.arm_only_error_before;
+      telemetry.waist_only_error_before_m = result.waist_only_error_before;
+      telemetry.lower_only_error_before_m = result.lower_only_error_before;
+      telemetry.upper_only_error_before_m = result.upper_only_error_before;
+      telemetry.joint_tracking_rmse_rad = std::sqrt(telemetry.joint_tracking_error.squaredNorm() / G1_NUM_MOTOR);
+      telemetry.joint_tracking_max_abs_rad = telemetry.joint_tracking_error.cwiseAbs().maxCoeff();
+      double arm_tracking_squared_norm = 0.0;
+      double arm_tracking_max_abs = 0.0;
+      for (const int hw : ::g1::ee_qp::kArmHardwareIndices) {
+        const double lag = result.q_corrected[hw] - input.q_measured[hw];
+        arm_tracking_squared_norm += lag * lag;
+        arm_tracking_max_abs = std::max(arm_tracking_max_abs, std::abs(lag));
+      }
+      telemetry.pd_tracking_lag_rmse_rad = std::sqrt(arm_tracking_squared_norm / ::g1::ee_qp::kNumArmJoints);
+      telemetry.pd_tracking_lag_max_abs_rad = arm_tracking_max_abs;
+      telemetry.solve_time_ms = result.solve_time_ms;
+      telemetry.reference_age_ms = result.reference_age_ms;
+      telemetry.correction_bound_saturation_fraction = result.correction_bound_saturation_fraction;
+      telemetry.rate_bound_saturation_fraction = result.rate_bound_saturation_fraction;
+      telemetry.correction_bound_saturation_mask = result.correction_bound_saturation_mask;
+      telemetry.rate_bound_saturation_mask = result.rate_bound_saturation_mask;
+      telemetry.backtracking_alpha = result.backtracking_alpha;
+      telemetry.fallback_reason = result.fallback_reason;
+      telemetry.reference_source = result.reference_source;
+      telemetry.control_mode = result.control_mode;
+      telemetry.plan_id = result.plan_id;
+      telemetry.plan_phase = result.plan_phase;
+      telemetry.reference_feasible = result.reference_feasible;
+      telemetry.fallback_active = result.fallback_active;
+      telemetry.candidate_rejected = result.candidate_rejected;
+      ee_qp_telemetry_buffer_.SetData(telemetry);
+      for (int hw = 0; hw < G1_NUM_MOTOR; ++hw) {
+        command.q_target[hw] = static_cast<float>(result.q_corrected[hw]);
+        const int action_idx = isaaclab_to_mujoco[hw];
+        action[action_idx] = QTargetToRawAction(hw, command.q_target[hw]);
+        last_action[action_idx] = static_cast<double>(action[action_idx]);
+      }
+      if (++ee_qp_debug_counter_ % 50 == 0) {
+        std::cout << "[EE-QP/LCM] error=" << result.error_before
+                  << " predicted=" << result.predicted_error_after
+                  << " nonlinear=" << result.nonlinear_error_after
+                  << " ref_joint=" << result.reference_joint_error_before
+                  << " predicted_ref_joint=" << result.predicted_reference_joint_error_after
+                  << " plan=" << result.plan_id
+                  << " solve_ms=" << result.solve_time_ms << std::endl;
+      }
+      return result.valid || result.fallback_active;
     }
 
     void PreservePreviousUpperBodyActions(
@@ -3484,7 +3770,9 @@ class G1Deploy {
       sonic_action_buffer_.SetData(sonic_action);
 
       std::array<float, g1_lcm::kNumMotors> final_action = sonic_action;
-      if (use_hand_ik_origin_) {
+      if (use_ee_qp_) {
+        ApplyEeQpCorrection(motor_command_tmp, final_action);
+      } else if (use_hand_ik_origin_) {
         ApplyHandIKOrigin(motor_command_tmp, final_action);
       } else if (UseAnyUpperIK() && has_vr_3point_data_) {
         PreservePreviousUpperBodyActions(final_action);
@@ -4533,6 +4821,14 @@ int main(int argc, char const* argv[]) {
   bool useHandIK = false;
   bool useHandIKOrigin = false;
   bool useDeskPose = false;
+  bool useEeQp = false;
+  std::string eeQpConfig = "src/g1/ee_qp/config/ee_qp.yaml";
+  bool pathUseDynamicReference = false;
+  std::string pathReferenceHost = "127.0.0.1";
+  int pathReferencePort = 5560;
+  std::string pathReferenceTopic = "path_qp_reference";
+  double pathReferenceLookaheadMs = 10.0;
+  double pathReferenceHeartbeatTimeoutMs = 500.0;
 
   for (int i = 4; i < argc; i++) {
     if (std::string(argv[i]) == "--disable-crc-check") {
@@ -4553,6 +4849,30 @@ int main(int argc, char const* argv[]) {
     } else if (std::string(argv[i]) == "--desk-pose") {
       useDeskPose = true;
       std::cout << "[INFO] Desk pose enabled: INIT ramps to hands-on-desk ready pose" << std::endl;
+    } else if (std::string(argv[i]) == "--use-ee-qp") {
+      useEeQp = true;
+      std::cout << "[INFO] Base-local EE QP correction enabled" << std::endl;
+    } else if (std::string(argv[i]) == "--ee-qp-config") {
+      if (i + 1 >= argc) { std::cerr << "Error: --ee-qp-config requires a path argument" << std::endl; exit(1); }
+      eeQpConfig = argv[++i];
+    } else if (std::string(argv[i]) == "--path-use-dynamic-reference") {
+      pathUseDynamicReference = true;
+      std::cout << "[INFO] PATH dynamic state-machine reference enabled for EE QP" << std::endl;
+    } else if (std::string(argv[i]) == "--path-reference-host") {
+      if (i + 1 < argc) { pathReferenceHost = argv[++i]; }
+      else { std::cerr << "Error: --path-reference-host requires a host" << std::endl; exit(1); }
+    } else if (std::string(argv[i]) == "--path-reference-port") {
+      if (i + 1 < argc) { pathReferencePort = std::stoi(argv[++i]); }
+      else { std::cerr << "Error: --path-reference-port requires a port" << std::endl; exit(1); }
+    } else if (std::string(argv[i]) == "--path-reference-topic") {
+      if (i + 1 < argc) { pathReferenceTopic = argv[++i]; }
+      else { std::cerr << "Error: --path-reference-topic requires a topic" << std::endl; exit(1); }
+    } else if (std::string(argv[i]) == "--path-reference-lookahead-ms") {
+      if (i + 1 < argc) { pathReferenceLookaheadMs = std::stod(argv[++i]); }
+      else { std::cerr << "Error: --path-reference-lookahead-ms requires a value" << std::endl; exit(1); }
+    } else if (std::string(argv[i]) == "--path-reference-heartbeat-timeout-ms") {
+      if (i + 1 < argc) { pathReferenceHeartbeatTimeoutMs = std::stod(argv[++i]); }
+      else { std::cerr << "Error: --path-reference-heartbeat-timeout-ms requires a value" << std::endl; exit(1); }
     } else if (std::string(argv[i]) == "--lcm-url") {
       if (i + 1 < argc) {
         lcm_url = argv[++i];
@@ -4797,9 +5117,10 @@ int main(int argc, char const* argv[]) {
   }
 
   const int ikModeCount =
-    (useUpperBodyIK ? 1 : 0) + (useHandIK ? 1 : 0) + (useHandIKOrigin ? 1 : 0);
+    (useUpperBodyIK ? 1 : 0) + (useHandIK ? 1 : 0) +
+    (useHandIKOrigin ? 1 : 0) + (useEeQp ? 1 : 0);
   if (ikModeCount > 1) {
-    std::cerr << "Error: --use-upper-ik, --use-hand-ik, and --use-hand-ik-origin cannot be used together" << std::endl;
+    std::cerr << "Error: --use-ee-qp and upper-body IK modes cannot be used together" << std::endl;
     exit(1);
   }
 
@@ -4841,7 +5162,15 @@ int main(int argc, char const* argv[]) {
     useUpperBodyIK,
     useHandIK,
     useHandIKOrigin,
-    useDeskPose
+    useDeskPose,
+    useEeQp,
+    eeQpConfig,
+    pathUseDynamicReference,
+    pathReferenceHost,
+    pathReferencePort,
+    pathReferenceTopic,
+    pathReferenceLookaheadMs,
+    pathReferenceHeartbeatTimeoutMs
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
   

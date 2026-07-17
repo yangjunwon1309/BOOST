@@ -2224,6 +2224,45 @@ class G1Deploy {
       return ::g1::ee_qp::ControlMode::kUnknown;
     }
 
+    static void ApplyTerminalTargetFields(
+        const std::map<std::string, msgpack::object>& fields,
+        ::g1::ee_qp::EeReference& reference) {
+      auto position_it = fields.find("terminal_target_position");
+      if (position_it == fields.end()) position_it = fields.find("static_target_position");
+      if (position_it == fields.end()) return;
+      std::vector<double> position;
+      position_it->second.convert(position);
+      if (position.size() != 3) return;
+      Eigen::Vector3d target(position[0], position[1], position[2]);
+      if (!target.allFinite()) return;
+
+      auto radius_it = fields.find("terminal_capture_radius_m");
+      if (radius_it == fields.end()) radius_it = fields.find("static_target_radius_m");
+      if (radius_it != fields.end()) {
+        double radius = reference.terminal_capture_radius_m;
+        radius_it->second.convert(radius);
+        if (std::isfinite(radius) && radius > 0.0) reference.terminal_capture_radius_m = radius;
+      }
+
+      std::string link = "left_wrist_yaw_link";
+      auto link_it = fields.find("terminal_target_link");
+      if (link_it == fields.end()) link_it = fields.find("static_target_link");
+      if (link_it == fields.end()) link_it = fields.find("target_link");
+      if (link_it != fields.end()) link_it->second.convert(link);
+      if (link.find("right") != std::string::npos) {
+        reference.terminal_right_wrist_in_reference_pelvis = target;
+        reference.has_terminal_right_wrist_target = true;
+      } else if (link.find("both") != std::string::npos) {
+        reference.terminal_left_wrist_in_reference_pelvis = target;
+        reference.terminal_right_wrist_in_reference_pelvis = target;
+        reference.has_terminal_left_wrist_target = true;
+        reference.has_terminal_right_wrist_target = true;
+      } else {
+        reference.terminal_left_wrist_in_reference_pelvis = target;
+        reference.has_terminal_left_wrist_target = true;
+      }
+    }
+
     void StartPathReferenceSubscriber(const std::string& host, int port, const std::string& topic) {
       gmr_reference_running_.store(true);
       gmr_reference_thread_ = std::thread([this, host, port, topic]() {
@@ -2305,6 +2344,7 @@ class G1Deploy {
               reference.left_wrist_in_reference_pelvis = wrist.left_position_world;
               reference.right_wrist_in_reference_pelvis = wrist.right_position_world;
               reference.q_ref = q_ref;
+              ApplyTerminalTargetFields(fields, reference);
               reference.valid = true;
               ee_qp_dynamic_reference_provider_->UpdateSample(reference);
             } else if (reference_type == "bspline") {
@@ -3088,6 +3128,7 @@ class G1Deploy {
       ::g1::ee_qp::EeQpTelemetry telemetry;
       telemetry.enabled = true;
       telemetry.valid = result.valid;
+      telemetry.q_ref = input.reference.q_ref;
       telemetry.q_corrected = result.q_corrected;
       telemetry.delta_q = result.delta_q;
       telemetry.joint_tracking_error = result.q_corrected - input.q_measured;
@@ -3113,6 +3154,9 @@ class G1Deploy {
       telemetry.pd_tracking_lag_max_abs_rad = arm_tracking_max_abs;
       telemetry.solve_time_ms = result.solve_time_ms;
       telemetry.reference_age_ms = result.reference_age_ms;
+      telemetry.terminal_target_position = result.terminal_target_position;
+      telemetry.terminal_target_distance_m = result.terminal_target_distance_m;
+      telemetry.terminal_capture_radius_m = result.terminal_capture_radius_m;
       telemetry.correction_bound_saturation_fraction = result.correction_bound_saturation_fraction;
       telemetry.rate_bound_saturation_fraction = result.rate_bound_saturation_fraction;
       telemetry.correction_bound_saturation_mask = result.correction_bound_saturation_mask;
@@ -3126,6 +3170,8 @@ class G1Deploy {
       telemetry.reference_feasible = result.reference_feasible;
       telemetry.fallback_active = result.fallback_active;
       telemetry.candidate_rejected = result.candidate_rejected;
+      telemetry.terminal_target_active = result.terminal_target_active;
+      telemetry.terminal_target_side = result.terminal_target_side;
       ee_qp_telemetry_buffer_.SetData(telemetry);
       for (int hw = 0; hw < G1_NUM_MOTOR; ++hw) {
         command.q_target[hw] = static_cast<float>(result.q_corrected[hw]);

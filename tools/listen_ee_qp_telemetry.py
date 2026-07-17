@@ -294,6 +294,18 @@ def summarize(samples: list[dict[str, Any]], elapsed: float, top_joints: int) ->
     waist_err = numeric(samples, "ee_qp_waist_only_error_before_m")
     lower_err = numeric(samples, "ee_qp_lower_only_error_before_m")
     upper_err = numeric(samples, "ee_qp_upper_only_error_before_m")
+    terminal_dist = numeric(samples, "ee_qp_terminal_target_distance_m")
+    terminal_radius = numeric(samples, "ee_qp_terminal_capture_radius_m")
+    terminal_sides = Counter(
+        int(sample.get("ee_qp_terminal_target_side", 0))
+        for sample in samples
+        if isinstance(sample.get("ee_qp_terminal_target_side", 0), (int, float))
+    )
+    terminal_side_names = {0: "none", 1: "left", 2: "right", 3: "both"}
+    terminal_side = terminal_side_names.get(
+        terminal_sides.most_common(1)[0][0] if terminal_sides else 0,
+        "unknown",
+    )
 
     return (
         f"[{elapsed:5.1f}s] n={len(samples):3d} "
@@ -310,6 +322,9 @@ def summarize(samples: list[dict[str, Any]], elapsed: float, top_joints: int) ->
         f"err_split={100.0 * mean(arm_err):.1f}/{100.0 * mean(waist_err):.1f}/"
         f"{100.0 * mean(lower_err):.1f}/{100.0 * mean(upper_err):.1f}cm"
         f"(arm/waist/lower/upper) | "
+        f"terminal={100.0 * ratio(samples, 'ee_qp_terminal_target_active'):4.1f}% "
+        f"{terminal_side} d={100.0 * mean(terminal_dist):.1f}cm "
+        f"r={100.0 * mean(terminal_radius):.1f}cm | "
         f"base=tilt {mean(base_tilt):.3f}/{max(base_tilt, default=math.nan):.3f}rad "
         f"ang {mean(base_ang):.3f}/{max(base_ang, default=math.nan):.3f}rad/s "
         f"qerr {mean(base_qerr):.3f}/{max(base_qerr, default=math.nan):.3f}rad "
@@ -329,10 +344,10 @@ def main() -> None:
     parser.add_argument("--topic", default="g1_debug")
     parser.add_argument("--interval", type=float, default=0.5)
     parser.add_argument("--top-joints", type=int, default=3)
-    parser.add_argument("--waist-max-delta-rad", type=float, default=0.02)
-    parser.add_argument("--arm-max-delta-rad", type=float, default=0.05)
-    parser.add_argument("--waist-max-rate-step-rad", type=float, default=0.004)
-    parser.add_argument("--arm-max-rate-step-rad", type=float, default=0.01)
+    parser.add_argument("--waist-max-delta-rad", type=float, default=0.005)
+    parser.add_argument("--arm-max-delta-rad", type=float, default=10.0)
+    parser.add_argument("--waist-max-rate-step-rad", type=float, default=0.0004)
+    parser.add_argument("--arm-max-rate-step-rad", type=float, default=0.012)
     parser.add_argument("--saturation-tolerance-rad", type=float, default=1e-4)
     args = parser.parse_args()
     if args.interval <= 0.0:

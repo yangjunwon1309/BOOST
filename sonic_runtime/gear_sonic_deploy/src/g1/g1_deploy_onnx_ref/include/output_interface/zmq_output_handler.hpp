@@ -292,7 +292,7 @@ private:
         // Visualisation fields: output_data_map_.size() (typically 11)
         int num_state_fields = has_heading_state ? 20 : 18;
         int num_viz_fields = static_cast<int>(output_data_map_.size());
-        constexpr int kEeQpFields = 35;
+        constexpr int kEeQpFields = 41;
         pk.pack_map(num_state_fields + num_viz_fields + (ee_qp ? kEeQpFields : 0));
 
         // ---- State-logger fields ----
@@ -464,6 +464,19 @@ private:
             pk.pack(ee_qp->plan_phase);
             pk.pack("ee_qp_reference_feasible");
             pk.pack(ee_qp->reference_feasible);
+            pk.pack("ee_qp_terminal_target_active");
+            pk.pack(ee_qp->terminal_target_active);
+            pk.pack("ee_qp_terminal_target_side");
+            pk.pack(ee_qp->terminal_target_side);
+            pk.pack("ee_qp_terminal_target_distance_m");
+            pk.pack(ee_qp->terminal_target_distance_m);
+            pk.pack("ee_qp_terminal_capture_radius_m");
+            pk.pack(ee_qp->terminal_capture_radius_m);
+            pk.pack("ee_qp_terminal_target_position");
+            pk.pack_array(3);
+            for (int i = 0; i < 3; ++i) {
+                pk.pack(ee_qp->terminal_target_position[i]);
+            }
             pk.pack("ee_qp_fallback_active");
             pk.pack(ee_qp->fallback_active);
             pk.pack("ee_qp_candidate_rejected");
@@ -476,6 +489,9 @@ private:
             pk.pack(ee_qp->pd_tracking_lag_rmse_rad);
             pk.pack("ee_qp_pd_tracking_lag_max_abs_rad");
             pk.pack(ee_qp->pd_tracking_lag_max_abs_rad);
+            pk.pack("ee_qp_q_ref");
+            pk.pack_array(::g1::ee_qp::kNumJoints);
+            for (const auto value : ee_qp->q_ref) pk.pack(value);
             pk.pack("ee_qp_q_corrected");
             pk.pack_array(::g1::ee_qp::kNumJoints);
             for (const auto value : ee_qp->q_corrected) pk.pack(value);

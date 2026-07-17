@@ -6,7 +6,7 @@ task:
   # waist_yaw, waist_roll, waist_pitch,
   # left shoulder pitch/roll/yaw, left elbow, left wrist roll/pitch/yaw,
   # right shoulder pitch/roll/yaw, right elbow, right wrist roll/pitch/yaw.
-  joint_tracking_weight: [1.2, 1.5, 1.5,
+  joint_tracking_weight: [0.0, 0.0, 0.0,
                           0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8,
                           0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8]
   joint_tolerance_rad: [0.10, 0.08, 0.08,
@@ -21,12 +21,14 @@ reference:
   topic: gmr_ref
 startup_ramp_sec: 1.5
 max_solve_time_ms: 2.0
-max_delta_rad: [0.02, 0.01, 0.01,
-                0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05,
-                0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05]
-max_velocity_rad_s: [0.20, 0.15, 0.15,
-                     0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50,
-                     0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50]
+# Waist is effectively locked out of QP correction; arms stay wide and are
+# limited primarily by max_velocity_rad_s for gradual convergence.
+max_delta_rad: [0.005, 0.003, 0.003,
+                10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0,
+                10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0]
+max_velocity_rad_s: [0.020, 0.012, 0.012,
+                     0.60, 0.60, 0.60, 0.60, 0.60, 0.60, 0.60,
+                     0.60, 0.60, 0.60, 0.60, 0.60, 0.60, 0.60]
 nonlinear_validation:
   enabled: true
   min_improvement_m: 0.0

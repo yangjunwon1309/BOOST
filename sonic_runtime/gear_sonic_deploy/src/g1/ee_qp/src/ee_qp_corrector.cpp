@@ -14,6 +14,10 @@ namespace g1::ee_qp {
 namespace {
 
 bool AllFinite(const EeQpInput& input) {
+  const bool terminal_left_ok = !input.reference.has_terminal_left_wrist_target ||
+      input.reference.terminal_left_wrist_in_reference_pelvis.allFinite();
+  const bool terminal_right_ok = !input.reference.has_terminal_right_wrist_target ||
+      input.reference.terminal_right_wrist_in_reference_pelvis.allFinite();
   return input.q_measured.allFinite() && input.dq_measured.allFinite() &&
          input.q_sonic.allFinite() &&
          input.measured_pelvis_orientation.coeffs().allFinite() &&
@@ -21,6 +25,8 @@ bool AllFinite(const EeQpInput& input) {
          input.reference.right_wrist_in_reference_pelvis.allFinite() &&
          input.reference.reference_pelvis_orientation.coeffs().allFinite() &&
          input.reference.q_ref.allFinite() &&
+         terminal_left_ok && terminal_right_ok &&
+         std::isfinite(input.reference.terminal_capture_radius_m) &&
          std::isfinite(input.dt) && input.dt > 0.0;
 }
 
@@ -177,6 +183,35 @@ class EeQpCorrector::Impl {
         input.reference.right_wrist_in_reference_pelvis;
 
     TaskVector current = MakeTaskVector(wrist);
+    result.terminal_capture_radius_m =
+        std::max(0.0, input.reference.terminal_capture_radius_m);
+    if (input.reference.has_terminal_left_wrist_target) {
+      const Eigen::Vector3d terminal =
+          reference_root * input.reference.terminal_left_wrist_in_reference_pelvis;
+      const double distance = (terminal - current.head<3>()).norm();
+      result.terminal_target_distance_m = distance;
+      result.terminal_target_position = terminal;
+      if (distance <= result.terminal_capture_radius_m) {
+        target.head<3>() = terminal;
+        result.terminal_target_active = true;
+        result.terminal_target_side |= 1;
+      }
+    }
+    if (input.reference.has_terminal_right_wrist_target) {
+      const Eigen::Vector3d terminal =
+          reference_root * input.reference.terminal_right_wrist_in_reference_pelvis;
+      const double distance = (terminal - current.tail<3>()).norm();
+      if (result.terminal_target_distance_m < 0.0 ||
+          distance < result.terminal_target_distance_m) {
+        result.terminal_target_distance_m = distance;
+        result.terminal_target_position = terminal;
+      }
+      if (distance <= result.terminal_capture_radius_m) {
+        target.tail<3>() = terminal;
+        result.terminal_target_active = true;
+        result.terminal_target_side |= 2;
+      }
+    }
     const TaskVector error = target - current;
     result.error_before = error.norm();
     result.arm_only_error_before = DecomposedError(
@@ -205,25 +240,26 @@ class EeQpCorrector::Impl {
     const ActiveVector normalized_joint_weight =
         config_.joint_tracking_weight.array() /
         config_.joint_tolerance_rad.array().square();
+    const ActiveVector sonic_active = ExtractActive(input.q_sonic);
+    const ActiveVector correction_lower =
+        (config_.joint_lower - sonic_active).cwiseMax(-config_.max_delta_rad);
+    const ActiveVector correction_upper =
+        (config_.joint_upper - sonic_active).cwiseMin(config_.max_delta_rad);
+    const ActiveVector projected_previous_delta =
+        previous_delta_.cwiseMax(correction_lower).cwiseMin(correction_upper);
 
     Eigen::MatrixXd hessian = weighted_jacobian.transpose() * weighted_jacobian;
     hessian.diagonal().array() +=
         normalized_joint_weight.array() + config_.previous_delta_weight;
     Eigen::VectorXd gradient = -weighted_jacobian.transpose() * weighted_error -
         normalized_joint_weight.asDiagonal() * reference_delta -
-        config_.previous_delta_weight * previous_delta_;
-
-    const ActiveVector sonic_active = ExtractActive(input.q_sonic);
-    const ActiveVector correction_lower =
-        (config_.joint_lower - sonic_active).cwiseMax(-config_.max_delta_rad);
-    const ActiveVector correction_upper =
-        (config_.joint_upper - sonic_active).cwiseMin(config_.max_delta_rad);
+        config_.previous_delta_weight * projected_previous_delta;
     ActiveVector lower = correction_lower;
     ActiveVector upper = correction_upper;
 
     const ActiveVector max_rate_step = config_.max_velocity_rad_s * input.dt;
-    const ActiveVector rate_lower = previous_delta_ - max_rate_step;
-    const ActiveVector rate_upper = previous_delta_ + max_rate_step;
+    const ActiveVector rate_lower = projected_previous_delta - max_rate_step;
+    const ActiveVector rate_upper = projected_previous_delta + max_rate_step;
     lower = lower.cwiseMax(rate_lower);
     upper = upper.cwiseMin(rate_upper);
     if ((lower.array() > upper.array()).any()) {
@@ -260,6 +296,11 @@ class EeQpCorrector::Impl {
       EeQpResult fallback = Fallback(input, solve_failure);
       fallback.solve_time_ms = result.solve_time_ms;
       fallback.error_before = result.error_before;
+      fallback.terminal_target_active = result.terminal_target_active;
+      fallback.terminal_target_side = result.terminal_target_side;
+      fallback.terminal_target_position = result.terminal_target_position;
+      fallback.terminal_target_distance_m = result.terminal_target_distance_m;
+      fallback.terminal_capture_radius_m = result.terminal_capture_radius_m;
       return fallback;
     }
 
@@ -340,6 +381,11 @@ class EeQpCorrector::Impl {
           result.correction_bound_saturation_mask;
       fallback.rate_bound_saturation_mask =
           result.rate_bound_saturation_mask;
+      fallback.terminal_target_active = result.terminal_target_active;
+      fallback.terminal_target_side = result.terminal_target_side;
+      fallback.terminal_target_position = result.terminal_target_position;
+      fallback.terminal_target_distance_m = result.terminal_target_distance_m;
+      fallback.terminal_capture_radius_m = result.terminal_capture_radius_m;
       fallback.candidate_rejected = true;
       return fallback;
     }

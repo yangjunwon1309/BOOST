@@ -35,6 +35,7 @@ def qp_sample_reference(
     plan_id: int = 0,
     phase: float = 0.0,
     timestamp_us: int | None = None,
+    **metadata,
 ) -> dict:
     if state not in PATH_STATES:
         raise ValueError(f"unknown PATH state: {state}")
@@ -49,6 +50,7 @@ def qp_sample_reference(
         "phase": float(phase),
         "timestamp_us": int(timestamp_us if timestamp_us is not None else now_us()),
         "q_ref": _list29(q_ref),
+        **metadata,
     }
 
 

@@ -76,6 +76,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--state-zmq-topic", default="g1_debug")
     parser.add_argument("--publish-hz", type=float, default=5.0)
     parser.add_argument("--duration-sec", type=float, default=2.0)
+    parser.add_argument("--min-duration-sec", type=float, default=0.75)
+    parser.add_argument("--max-duration-sec", type=float, default=5.0)
+    parser.add_argument(
+        "--final-hold-sec",
+        type=float,
+        default=0.75,
+        help="Append repeated final control points so the active plan holds its endpoint.",
+    )
+    parser.add_argument(
+        "--plan-clear-grace-sec",
+        type=float,
+        default=0.25,
+        help="Clear the active plan this long after duration_sec + final_hold_sec.",
+    )
     parser.add_argument("--control-dt-sec", type=float, default=0.05)
     parser.add_argument(
         "--min-replan-interval-sec",
@@ -104,13 +118,23 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=[0.45, 0.35, 0.30],
         metavar=("X", "Y", "Z"),
-        help="Reject EE targets above this base-local xyz bound.",
+        help="Clamp/reject EE targets above this base-local xyz bound.",
+    )
+    parser.add_argument(
+        "--reject-outside-workspace",
+        action="store_true",
+        help="Reject workspace violations instead of clamping the target.",
     )
     parser.add_argument(
         "--max-goal-offset-m",
         type=float,
         default=0.10,
-        help="If the goal includes current_position, reject offsets larger than this.",
+        help="If the goal includes current_position, clamp/reject offsets larger than this.",
+    )
+    parser.add_argument(
+        "--reject-large-goal-offset",
+        action="store_true",
+        help="Reject target-current offsets larger than --max-goal-offset-m instead of clamping.",
     )
     parser.add_argument(
         "--no-retime-plan",
@@ -176,25 +200,68 @@ def normalize_quaternion_wxyz(values: list[float]) -> list[float]:
     return (quat / norm).tolist()
 
 
-def validate_goal(goal: dict, args: argparse.Namespace) -> tuple[bool, str, np.ndarray, list[float]]:
+def validate_goal(goal: dict, args: argparse.Namespace) -> tuple[bool, str, np.ndarray, list[float], dict]:
     position = np.asarray(goal.get("position", [np.nan, np.nan, np.nan]), dtype=np.float64).reshape(3)
+    meta: dict = {
+        "requested_target_position": position.tolist(),
+        "target_clamped": False,
+        "target_clamp_reasons": [],
+    }
     if not np.isfinite(position).all():
-        return False, "nonfinite_target_position", position, [1.0, 0.0, 0.0, 0.0]
+        return False, "nonfinite_target_position", position, [1.0, 0.0, 0.0, 0.0], meta
     lower = np.asarray(args.workspace_min, dtype=np.float64)
     upper = np.asarray(args.workspace_max, dtype=np.float64)
     if np.any(position < lower) or np.any(position > upper):
-        return False, f"target_outside_workspace min={lower.tolist()} max={upper.tolist()}", position, [1.0, 0.0, 0.0, 0.0]
+        if args.reject_outside_workspace:
+            return (
+                False,
+                f"target_outside_workspace min={lower.tolist()} max={upper.tolist()}",
+                position,
+                [1.0, 0.0, 0.0, 0.0],
+                meta,
+            )
+        position = np.minimum(np.maximum(position, lower), upper)
+        meta["target_clamped"] = True
+        meta["target_clamp_reasons"].append("workspace")
     if "current_position" in goal:
         current = np.asarray(goal["current_position"], dtype=np.float64).reshape(3)
         if np.isfinite(current).all():
             offset = float(np.linalg.norm(position - current))
             if offset > args.max_goal_offset_m:
-                return False, f"target_offset_too_large {offset:.3f}m>{args.max_goal_offset_m:.3f}m", position, [1.0, 0.0, 0.0, 0.0]
+                if args.reject_large_goal_offset:
+                    return (
+                        False,
+                        f"target_offset_too_large {offset:.3f}m>{args.max_goal_offset_m:.3f}m",
+                        position,
+                        [1.0, 0.0, 0.0, 0.0],
+                        meta,
+                    )
+                direction = (position - current) / max(offset, 1.0e-9)
+                position = current + direction * args.max_goal_offset_m
+                meta["target_clamped"] = True
+                meta["target_clamp_reasons"].append("offset")
     try:
         quaternion = normalize_quaternion_wxyz(list(goal.get("quaternion", [1.0, 0.0, 0.0, 0.0])))
     except Exception as exc:
-        return False, str(exc), position, [1.0, 0.0, 0.0, 0.0]
-    return True, "ok", position, quaternion
+        return False, str(exc), position, [1.0, 0.0, 0.0, 0.0], meta
+    meta["target_position"] = position.tolist()
+    reason = "ok"
+    if meta["target_clamped"]:
+        reason = "clamped:" + ",".join(meta["target_clamp_reasons"])
+    return True, reason, position, quaternion, meta
+
+
+def goal_duration(goal: dict, args: argparse.Namespace) -> tuple[float, dict]:
+    requested = float(goal.get("duration_sec", args.duration_sec))
+    if not np.isfinite(requested) or requested <= 0.0:
+        requested = float(args.duration_sec)
+    lo = max(1.0e-3, float(args.min_duration_sec))
+    hi = max(lo, float(args.max_duration_sec))
+    duration = float(np.clip(requested, lo, hi))
+    return duration, {
+        "requested_duration_sec": requested,
+        "duration_clamped": bool(abs(duration - requested) > 1.0e-9),
+    }
 
 
 def q_seed_from_goal(goal: dict, fallback: np.ndarray) -> tuple[np.ndarray, str]:
@@ -483,7 +550,13 @@ class CuroboTrajectoryPlanner:
         return True, points.tolist(), control_dt, meta
 
 
-def make_clamped_bspline(q_start: np.ndarray, q_goal: np.ndarray, duration_sec: float, dt_sec: float) -> list[list[float]]:
+def make_clamped_bspline(
+    q_start: np.ndarray,
+    q_goal: np.ndarray,
+    duration_sec: float,
+    dt_sec: float,
+    final_hold_sec: float = 0.0,
+) -> list[list[float]]:
     q_start = np.asarray(q_start, dtype=np.float64).reshape(29)
     q_goal = np.asarray(q_goal, dtype=np.float64).reshape(29)
     segments = max(4, int(round(duration_sec / max(dt_sec, 1.0e-6))))
@@ -493,15 +566,22 @@ def make_clamped_bspline(q_start: np.ndarray, q_goal: np.ndarray, duration_sec: 
         alpha = float((j + 1) / (n_internal + 1))
         rows.append((1.0 - alpha) * q_start + alpha * q_goal)
     rows.extend([q_goal.copy() for _ in range(4)])
+    hold_steps = max(0, int(np.ceil(max(0.0, final_hold_sec) / max(dt_sec, 1.0e-6))))
+    rows.extend([q_goal.copy() for _ in range(hold_steps)])
     return [row.tolist() for row in rows]
 
 
-def retime_points_as_clamped_bspline(points: list[list[float]] | np.ndarray, duration_sec: float, dt_sec: float) -> list[list[float]]:
+def retime_points_as_clamped_bspline(
+    points: list[list[float]] | np.ndarray,
+    duration_sec: float,
+    dt_sec: float,
+    final_hold_sec: float = 0.0,
+) -> list[list[float]]:
     pts = np.asarray(points, dtype=np.float64)
     if pts.ndim != 2 or pts.shape[1] != 29 or pts.shape[0] < 1:
         raise ValueError(f"cannot retime invalid plan points shape={pts.shape}")
     if pts.shape[0] == 1:
-        return make_clamped_bspline(pts[0], pts[0], duration_sec, dt_sec)
+        return make_clamped_bspline(pts[0], pts[0], duration_sec, dt_sec, final_hold_sec)
     segments = max(4, int(round(duration_sec / max(dt_sec, 1.0e-6))))
     n_internal = max(0, segments - 4)
     rows = [pts[0].copy() for _ in range(4)]
@@ -513,6 +593,8 @@ def retime_points_as_clamped_bspline(points: list[list[float]] | np.ndarray, dur
         frac = source - lo
         rows.append((1.0 - frac) * pts[lo] + frac * pts[hi])
     rows.extend([pts[-1].copy() for _ in range(4)])
+    hold_steps = max(0, int(np.ceil(max(0.0, final_hold_sec) / max(dt_sec, 1.0e-6))))
+    rows.extend([pts[-1].copy() for _ in range(hold_steps)])
     return [row.tolist() for row in rows]
 
 
@@ -553,6 +635,7 @@ def main() -> int:
     planner: CuroboIkPlanner | CuroboTrajectoryPlanner | None = None
     q_current = np.zeros(29, dtype=np.float64)
     latest_payload: dict | None = None
+    latest_payload_expires_at = -1.0
     plan_id = 0
     accepted_plan_id = 0
     last_goal: dict | None = None
@@ -572,9 +655,17 @@ def main() -> int:
                 goal = unpack_topic_message(raw, args.goal_topic)
                 plan_id += 1
                 target_link = str(goal.get("target_link", "left_wrist_yaw_link"))
-                valid_goal, reason, position_arr, quaternion = validate_goal(goal, args)
+                force_replan = bool(goal.get("force_replan", False))
+                goal_uid = str(goal.get("goal_uid", ""))
+                valid_goal, reason, position_arr, quaternion, goal_meta = validate_goal(goal, args)
+                plan_duration_sec, duration_meta = goal_duration(goal, args)
+                final_hold_sec = max(0.0, float(goal.get("final_hold_sec", args.final_hold_sec)))
                 now_us = time.monotonic_ns() // 1000
-                if is_duplicate_goal(
+                last_goal_uid = str(last_goal.get("goal_uid", "")) if last_goal is not None else ""
+                if goal_uid and goal_uid == last_goal_uid:
+                    log(f"ignored repeated goal message plan_id={plan_id} uid={goal_uid[:8]}")
+                    continue
+                if (not force_replan) and is_duplicate_goal(
                     goal,
                     last_goal,
                     now,
@@ -598,17 +689,22 @@ def main() -> int:
                         "timestamp_us": now_us,
                         "t_start_us": now_us,
                         "control_dt_sec": float(args.control_dt_sec),
-                        "duration_sec": float(args.duration_sec),
+                        "duration_sec": float(plan_duration_sec),
+                        "final_hold_sec": float(final_hold_sec),
                         "target_link": target_link,
                         "target_position": position_arr.tolist(),
                         "control_points": [],
+                        **goal_meta,
+                        **duration_meta,
                     }
+                    latest_payload_expires_at = now + float(args.plan_clear_grace_sec)
                     continue
 
                 if (
                     latest_payload is not None
                     and latest_payload.get("feasible", False)
                     and not args.allow_replan_during_execution
+                    and not force_replan
                     and now - last_accepted_time < args.min_replan_interval_sec
                 ):
                     log(
@@ -617,7 +713,7 @@ def main() -> int:
                     )
                     continue
 
-                if now - last_failure_time < args.infeasible_cooldown_sec:
+                if (not force_replan) and now - last_failure_time < args.infeasible_cooldown_sec:
                     log(
                         f"ignored goal plan_id={plan_id}: infeasible cooldown "
                         f"{args.infeasible_cooldown_sec:.2f}s"
@@ -634,7 +730,11 @@ def main() -> int:
                     q_goal[18] += 0.20
                     feasible = True
                     control_points = make_clamped_bspline(
-                        q_plan_start, q_goal, args.duration_sec, args.control_dt_sec
+                        q_plan_start,
+                        q_goal,
+                        plan_duration_sec,
+                        args.control_dt_sec,
+                        final_hold_sec,
                     )
                     control_dt_sec = args.control_dt_sec
                 else:
@@ -651,11 +751,21 @@ def main() -> int:
                     else:
                         feasible, q_goal = planner.solve(position, quaternion)
                         control_points = make_clamped_bspline(
-                            q_plan_start, q_goal, args.duration_sec, args.control_dt_sec
+                            q_plan_start,
+                            q_goal,
+                            plan_duration_sec,
+                            args.control_dt_sec,
+                            final_hold_sec,
                         )
                         control_dt_sec = args.control_dt_sec
                         meta = {"trajectory_source": "ik_endpoint_clamped_bspline"}
-                meta = {**meta, "q_start_source": q_plan_start_source}
+                meta = {
+                    **meta,
+                    **goal_meta,
+                    **duration_meta,
+                    "q_start_source": q_plan_start_source,
+                    "final_hold_sec": float(final_hold_sec),
+                }
 
                 if feasible:
                     consecutive_failures = 0
@@ -665,7 +775,10 @@ def main() -> int:
                     native_dt_sec = float(control_dt_sec)
                     if not args.no_retime_plan:
                         control_points = retime_points_as_clamped_bspline(
-                            control_points, args.duration_sec, args.control_dt_sec
+                            control_points,
+                            plan_duration_sec,
+                            args.control_dt_sec,
+                            final_hold_sec,
                         )
                         control_dt_sec = args.control_dt_sec
                         meta = {
@@ -696,12 +809,14 @@ def main() -> int:
                         "timestamp_us": now_us,
                         "t_start_us": now_us,
                         "control_dt_sec": float(args.control_dt_sec),
-                        "duration_sec": float(args.duration_sec),
+                        "duration_sec": float(plan_duration_sec),
+                        "final_hold_sec": float(final_hold_sec),
                         "target_link": target_link,
                         "target_position": position,
                         "control_points": [],
                         **meta,
                     }
+                    latest_payload_expires_at = now + float(args.plan_clear_grace_sec)
                     log(
                         f"plan_id={plan_id} feasible=False reason=planner_infeasible "
                         f"consecutive_failures={consecutive_failures}"
@@ -716,23 +831,60 @@ def main() -> int:
                     "timestamp_us": now_us,
                     "t_start_us": now_us,
                     "control_dt_sec": float(control_dt_sec),
-                    "duration_sec": float(args.duration_sec),
+                    "duration_sec": float(plan_duration_sec),
+                    "final_hold_sec": float(final_hold_sec),
+                    "total_duration_sec": float(plan_duration_sec + final_hold_sec),
                     "target_link": target_link,
                     "target_position": position,
                     "target_quaternion": quaternion,
                     "q_start_source": q_plan_start_source,
-                    "planning_frames": max(1, int(round(args.duration_sec / max(control_dt_sec, 1.0e-6)))),
+                    "planning_frames": max(1, int(round(plan_duration_sec / max(control_dt_sec, 1.0e-6)))),
+                    "total_frames": max(1, int(round((plan_duration_sec + final_hold_sec) / max(control_dt_sec, 1.0e-6)))),
                     "control_points": control_points,
                     **meta,
                 }
+                latest_payload_expires_at = (
+                    now
+                    + float(plan_duration_sec)
+                    + float(final_hold_sec)
+                    + float(args.plan_clear_grace_sec)
+                )
                 log(
                     f"plan_id={accepted_plan_id} feasible=True target={np.round(position_arr, 4).tolist()} "
                     f"cps={len(control_points)} dt={control_dt_sec:.3f}s "
-                    f"duration={args.duration_sec:.2f}s retimed={not args.no_retime_plan} "
-                    f"q_start={q_plan_start_source}"
+                    f"duration={plan_duration_sec:.2f}s hold={final_hold_sec:.2f}s "
+                    f"retimed={not args.no_retime_plan} q_start={q_plan_start_source} "
+                    f"goal={reason}"
                 )
             except zmq.Again:
                 pass
+
+            if (
+                latest_payload is not None
+                and latest_payload.get("feasible", False)
+                and latest_payload_expires_at > 0.0
+                and now >= latest_payload_expires_at
+            ):
+                expired_plan_id = int(latest_payload.get("plan_id", accepted_plan_id))
+                log(f"clearing expired plan id={expired_plan_id}")
+                now_us = time.monotonic_ns() // 1000
+                latest_payload = {
+                    "source": "curobo",
+                    "control_mode": "plan_pending",
+                    "feasible": False,
+                    "failure_reason": "plan_expired",
+                    "plan_id": expired_plan_id,
+                    "timestamp_us": now_us,
+                    "t_start_us": now_us,
+                    "control_dt_sec": float(args.control_dt_sec),
+                    "duration_sec": 0.0,
+                    "final_hold_sec": 0.0,
+                    "total_duration_sec": 0.0,
+                    "target_link": "",
+                    "target_position": [0.0, 0.0, 0.0],
+                    "control_points": [],
+                }
+                latest_payload_expires_at = -1.0
 
             if latest_payload is not None and now >= next_pub:
                 latest_payload["timestamp_us"] = time.monotonic_ns() // 1000

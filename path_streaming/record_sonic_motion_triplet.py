@@ -4,6 +4,7 @@ This is a motion-only recorder for MuJoCo/SONIC or real-G1 teleop sessions.
 It always subscribes to:
   - PICO manager `pose` packets over ZMQ (PICO input → SONIC, port 5556)
   - SONIC policy command (`last_action` etc.) over ZMQ (`g1_debug`, port 5557)
+  - Optional PATH cuRobo plan heartbeat (`curobo_plan`, port 5562)
 
 For the *measured G1 joint state*, the source is selectable:
   --g1-source zmq  (default): same `g1_debug` ZMQ topic (MuJoCo sim or real G1
@@ -230,6 +231,7 @@ def compose_frame(
     state_data: dict[str, Any],
     sonic_data: dict[str, Any],
     manager_data: Optional[dict[str, Any]],
+    path_plan_data: Optional[dict[str, Any]] = None,
 ) -> dict[str, np.ndarray]:
     """Compose one raw synchronized sample without changing joint conventions."""
     frame: dict[str, np.ndarray] = {
@@ -245,6 +247,8 @@ def compose_frame(
     frame.update(flatten_prefixed("sonic", sonic_data))
     if manager_data is not None:
         frame.update(flatten_prefixed("manager", manager_data))
+    if path_plan_data is not None:
+        frame.update(flatten_prefixed("path_plan", path_plan_data))
     return frame
 
 
@@ -381,6 +385,37 @@ def append_selected(history: dict[str, list[np.ndarray]], frame: dict[str, np.nd
         "pose_joint_pos",
         "pose_vr_position",
         "pose_vr_orientation",
+        "pose_left_trigger",
+        "pose_right_trigger",
+        "pose_left_grip",
+        "pose_right_grip",
+        "pose_left_hand_joints",
+        "pose_right_hand_joints",
+        "manager_state",
+        "path_plan_source",
+        "path_plan_control_mode",
+        "path_plan_feasible",
+        "path_plan_failure_reason",
+        "path_plan_plan_id",
+        "path_plan_timestamp_us",
+        "path_plan_t_start_us",
+        "path_plan_control_dt_sec",
+        "path_plan_duration_sec",
+        "path_plan_final_hold_sec",
+        "path_plan_total_duration_sec",
+        "path_plan_target_link",
+        "path_plan_target_position",
+        "path_plan_requested_target_position",
+        "path_plan_target_clamped",
+        "path_plan_target_clamp_reasons",
+        "path_plan_requested_duration_sec",
+        "path_plan_duration_clamped",
+        "path_plan_planning_frames",
+        "path_plan_total_frames",
+        "path_plan_position_error_mm",
+        "path_plan_rotation_error",
+        "path_plan_solve_time_ms",
+        "path_plan_trajectory_source",
         "state_last_action",
         "state_body_q",
         "state_body_q_measured",
@@ -407,6 +442,11 @@ def append_selected(history: dict[str, list[np.ndarray]], frame: dict[str, np.nd
         "state_ee_qp_plan_id",
         "state_ee_qp_plan_phase",
         "state_ee_qp_reference_feasible",
+        "state_ee_qp_terminal_target_active",
+        "state_ee_qp_terminal_target_side",
+        "state_ee_qp_terminal_target_distance_m",
+        "state_ee_qp_terminal_capture_radius_m",
+        "state_ee_qp_terminal_target_position",
         "state_ee_qp_arm_only_error_before_m",
         "state_ee_qp_waist_only_error_before_m",
         "state_ee_qp_lower_only_error_before_m",
@@ -428,11 +468,34 @@ def append_selected(history: dict[str, list[np.ndarray]], frame: dict[str, np.nd
         "state_ee_qp_q_corrected",
         "state_ee_qp_delta_q",
         "state_ee_qp_joint_tracking_error",
+        "state_ee_qp_target_position",
+        "state_ee_qp_target_link",
+        "state_ee_qp_left_wrist_error_before_m",
+        "state_ee_qp_right_wrist_error_before_m",
+        "state_ee_qp_left_wrist_error_after_m",
+        "state_ee_qp_right_wrist_error_after_m",
         "sonic_last_action",
         "sonic_body_q_target",
         "sonic_body_q",
         "sonic_body_dq",
         "sonic_base_quat",
+        "sonic_ee_qp_enabled",
+        "sonic_ee_qp_valid",
+        "sonic_ee_qp_error_before_m",
+        "sonic_ee_qp_nonlinear_error_after_m",
+        "sonic_ee_qp_reference_source",
+        "sonic_ee_qp_control_mode",
+        "sonic_ee_qp_plan_id",
+        "sonic_ee_qp_plan_phase",
+        "sonic_ee_qp_reference_feasible",
+        "sonic_ee_qp_terminal_target_active",
+        "sonic_ee_qp_terminal_target_side",
+        "sonic_ee_qp_terminal_target_distance_m",
+        "sonic_ee_qp_terminal_capture_radius_m",
+        "sonic_ee_qp_terminal_target_position",
+        "sonic_ee_qp_fallback_reason",
+        "sonic_ee_qp_fallback_active",
+        "sonic_ee_qp_candidate_rejected",
         "image_path",
     ]
     for key in selected_keys:
@@ -544,6 +607,12 @@ def write_manifest(path: Path, args: argparse.Namespace) -> None:
             "topic": args.state_topic,
             "action_key": args.sonic_action_key,
         },
+        "path_plan_source": None if args.disable_path_plan else {
+            "transport": "zmq",
+            "host": args.path_plan_host,
+            "port": args.path_plan_port,
+            "topic": args.path_plan_topic,
+        },
         "image_source": {
             "transport": "lcm",
             "lcm_url": args.lcm_url,
@@ -572,6 +641,8 @@ def write_manifest(path: Path, args: argparse.Namespace) -> None:
                                     "command (ZMQ path only).",
             "sonic_*": "Raw SONIC g1_debug fields. sonic_last_action is stored "
                         "without joint reordering or offset conversion.",
+            "path_plan_*": "Latest PATH cuRobo plan heartbeat metadata, if the "
+                            "planner server is running.",
             "image_path": "Relative path to saved JPEG frame under frames/ "
                            "(only if --record-image; camera transport is always LCM).",
         },
@@ -622,6 +693,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Record state/image frames even when SONIC g1_debug ZMQ is absent. "
              "A zero 29-DoF sonic_last_action placeholder is saved.",
+    )
+
+    parser.add_argument("--path-plan-host", default="localhost")
+    parser.add_argument("--path-plan-port", type=int, default=5562)
+    parser.add_argument("--path-plan-topic", default="curobo_plan")
+    parser.add_argument(
+        "--disable-path-plan",
+        action="store_true",
+        help="Do not subscribe to PATH cuRobo plan metadata.",
     )
 
     # LCM 공통 (state=lcm 또는 image 사용 시)
@@ -694,6 +774,16 @@ def main() -> None:
         [args.state_topic], conflate=True,
     )
 
+    path_plan_sock: zmq.Socket | None = None
+    if not args.disable_path_plan:
+        path_plan_sock = make_subscriber(
+            ctx,
+            args.path_plan_host,
+            args.path_plan_port,
+            [args.path_plan_topic],
+            conflate=True,
+        )
+
     # G1 measured state: zmq debug payload 또는 LCM direct state
     lcm_receiver: Optional[LcmReceiver] = None
     if args.g1_source == "lcm":
@@ -715,11 +805,14 @@ def main() -> None:
     poller = zmq.Poller()
     poller.register(pose_sock, zmq.POLLIN)
     poller.register(state_sock, zmq.POLLIN)
+    if path_plan_sock is not None:
+        poller.register(path_plan_sock, zmq.POLLIN)
 
     latest_pose: LatestMessage | None = None
     latest_state: LatestMessage | None = None
     latest_sonic: LatestMessage | None = None
     latest_manager: LatestMessage | None = None
+    latest_path_plan: LatestMessage | None = None
     writer = FrameWriter()
     writer.start()
     frame_idx = 0
@@ -735,6 +828,11 @@ def main() -> None:
         print(f"[recorder] g1 state (lcm) {args.lcm_url} / {args.lcm_state_channel}")
     print(f"[recorder] sonic debug/action (zmq) tcp://{args.state_host}:"
           f"{args.state_port}/{args.state_topic} key={args.sonic_action_key}")
+    if path_plan_sock is not None:
+        print(
+            f"[recorder] path plan (zmq) tcp://{args.path_plan_host}:"
+            f"{args.path_plan_port}/{args.path_plan_topic}"
+        )
     if args.record_image:
         print(f"[recorder] image (lcm) {args.lcm_url} / {args.lcm_camera_channel}")
     print("[recorder] Ctrl+C to stop and write session_selected.npz")
@@ -784,6 +882,19 @@ def main() -> None:
                 lcm_msg = lcm_receiver.get_state()
                 if lcm_msg is not None:
                     latest_state = lcm_msg
+
+            if path_plan_sock is not None and path_plan_sock in events:
+                try:
+                    raw = path_plan_sock.recv(zmq.NOBLOCK)
+                    latest_path_plan = LatestMessage(
+                        unpack_msgpack_topic(raw, args.path_plan_topic),
+                        now_wall,
+                        now_mono,
+                    )
+                except zmq.Again:
+                    pass
+                except Exception as exc:
+                    print(f"[recorder] skipped malformed PATH plan message: {exc}")
 
             if now_mono < next_sample:
                 continue
@@ -875,6 +986,7 @@ def main() -> None:
                 state_data=latest_state.data,
                 sonic_data=latest_sonic.data,
                 manager_data=latest_manager.data if latest_manager is not None else None,
+                path_plan_data=latest_path_plan.data if latest_path_plan is not None else None,
             )
 
             jpeg_bytes: Optional[bytes] = None
@@ -941,6 +1053,8 @@ def main() -> None:
         print(f"[recorder] total frames: {frame_idx}")
         pose_sock.close()
         state_sock.close()
+        if path_plan_sock is not None:
+            path_plan_sock.close()
         if lcm_receiver is not None:
             lcm_receiver.stop()
         if image_only_lcm is not None:

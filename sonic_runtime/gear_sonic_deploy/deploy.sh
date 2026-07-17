@@ -369,7 +369,12 @@ while [[ $# -gt 0 ]]; do
             PATH_EXTRA_ARGS+=" --path-use-bspline-reference"
             shift
             ;;
-        --path-bspline-host|--path-bspline-port|--path-bspline-topic|--path-reference-lookahead-ms|--path-reference-heartbeat-timeout-ms)
+        --path-use-dynamic-reference)
+            DEPLOY_BINARY="g1_deploy_onnx_ref_PATH"
+            PATH_EXTRA_ARGS+=" --path-use-dynamic-reference"
+            shift
+            ;;
+        --path-reference-host|--path-reference-port|--path-reference-topic|--path-bspline-host|--path-bspline-port|--path-bspline-topic|--path-reference-lookahead-ms|--path-reference-heartbeat-timeout-ms)
             if [[ -z "${2:-}" ]]; then
                 echo -e "${RED}Error: $1 requires an argument${NC}" >&2
                 exit 1

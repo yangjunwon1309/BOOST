@@ -60,6 +60,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--human-height", type=float, default=None)
     parser.add_argument("--source-rate-hz", type=float, default=50.0)
     parser.add_argument("--output-rate-hz", type=float, default=100.0)
+    parser.add_argument(
+        "--pose-timeout-sec",
+        type=float,
+        default=1.0,
+        help="Reset warm-start state after this long without pose messages.",
+    )
+    parser.add_argument(
+        "--frame-rewind-reset-threshold",
+        type=int,
+        default=5,
+        help="Treat a frame-index rewind of at least this many frames as a new stream.",
+    )
     return parser.parse_args()
 
 
@@ -153,17 +165,21 @@ def main() -> None:
     rest_joints = rest_output.joints[0].detach().cpu().numpy()
     parents = np.asarray(body_model.parents, dtype=np.int64)
     joint_names = list(JOINT_NAMES)
-    retargeter = GeneralMotionRetargeting(
-        actual_human_height=args.human_height,
-        src_human="smplx",
-        tgt_robot="unitree_g1",
-        verbose=False,
-    )
+    def make_retargeter() -> GeneralMotionRetargeting:
+        return GeneralMotionRetargeting(
+            actual_human_height=args.human_height,
+            src_human="smplx",
+            tgt_robot="unitree_g1",
+            verbose=False,
+        )
+
+    retargeter = make_retargeter()
 
     context = zmq.Context()
     pose_socket = context.socket(zmq.SUB)
     pose_socket.setsockopt(zmq.CONFLATE, 1)
     pose_socket.setsockopt(zmq.SUBSCRIBE, args.pose_topic.encode())
+    pose_socket.setsockopt(zmq.RCVTIMEO, max(1, int(args.pose_timeout_sec * 1000.0)))
     pose_socket.connect(f"tcp://{args.pose_host}:{args.pose_port}")
 
     output_socket = context.socket(zmq.PUB)
@@ -188,13 +204,57 @@ def main() -> None:
     previous_human_frame = None
     previous_frame_index = -1
     output_period = 1.0 / args.output_rate_hz
+    last_pose_wall = time.monotonic()
+    stream_active = False
+    reset_count = 0
+
+    def reset_stream_state(reason: str, *, recreate_retargeter: bool) -> None:
+        nonlocal retargeter
+        nonlocal last_frame, previous_human_frame, previous_frame_index
+        nonlocal stream_started, stream_active, reset_count
+        last_frame = -1
+        previous_human_frame = None
+        previous_frame_index = -1
+        stream_started = None
+        stream_active = False
+        reset_count += 1
+        if recreate_retargeter:
+            retargeter = make_retargeter()
+        print(
+            f"[GMR-EE] stream reset #{reset_count}: {reason}"
+            f"{' (retargeter recreated)' if recreate_retargeter else ''}"
+        )
 
     try:
         while True:
-            raw = pose_socket.recv()
+            try:
+                raw = pose_socket.recv()
+            except zmq.Again:
+                silence_sec = time.monotonic() - last_pose_wall
+                if stream_active and silence_sec >= args.pose_timeout_sec:
+                    reset_stream_state(
+                        f"pose timeout after {silence_sec:.2f}s",
+                        recreate_retargeter=True,
+                    )
+                continue
             try:
                 pose = unpack_pose(raw, args.pose_topic)
+                last_pose_wall = time.monotonic()
                 frame_index = int(np.asarray(pose["frame_index"]).reshape(-1)[-1])
+                if frame_index <= last_frame:
+                    rewind = last_frame - frame_index
+                    if rewind >= args.frame_rewind_reset_threshold:
+                        reset_stream_state(
+                            f"frame index rewind {last_frame}->{frame_index}",
+                            recreate_retargeter=True,
+                        )
+                    else:
+                        continue
+
+                if not stream_active:
+                    print(f"[GMR-EE] stream resumed at frame={frame_index}")
+                    stream_active = True
+
                 if frame_index <= last_frame:
                     continue
 

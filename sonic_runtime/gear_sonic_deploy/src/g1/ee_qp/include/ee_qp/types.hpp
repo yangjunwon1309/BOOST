@@ -111,11 +111,16 @@ struct EeReference {
   Eigen::Vector3d right_wrist_in_reference_pelvis = Eigen::Vector3d::Zero();
   Eigen::Quaterniond reference_pelvis_orientation = Eigen::Quaterniond::Identity();
   JointVector q_ref = JointVector::Zero();
+  Eigen::Vector3d terminal_left_wrist_in_reference_pelvis = Eigen::Vector3d::Zero();
+  Eigen::Vector3d terminal_right_wrist_in_reference_pelvis = Eigen::Vector3d::Zero();
+  double terminal_capture_radius_m = 0.07;
   std::int64_t timestamp_us = 0;
   std::uint64_t plan_id = 0;
   double phase = 0.0;
   ReferenceSource source = ReferenceSource::kUnknown;
   ControlMode control_mode = ControlMode::kUnknown;
+  bool has_terminal_left_wrist_target = false;
+  bool has_terminal_right_wrist_target = false;
   bool feasible = true;
   bool valid = false;
 };
@@ -144,6 +149,9 @@ struct EeQpResult {
   double upper_only_error_before = 0.0;
   double solve_time_ms = 0.0;
   double reference_age_ms = -1.0;
+  Eigen::Vector3d terminal_target_position = Eigen::Vector3d::Zero();
+  double terminal_target_distance_m = -1.0;
+  double terminal_capture_radius_m = 0.0;
   double correction_bound_saturation_fraction = 0.0;
   double rate_bound_saturation_fraction = 0.0;
   ActiveVector correction_bound_saturation_mask = ActiveVector::Zero();
@@ -157,10 +165,13 @@ struct EeQpResult {
   bool fallback_active = false;
   bool candidate_rejected = false;
   bool reference_feasible = false;
+  bool terminal_target_active = false;
+  int terminal_target_side = 0;  // 0 none, 1 left, 2 right, 3 both.
   bool valid = false;
 };
 
 struct EeQpTelemetry {
+  JointVector q_ref = JointVector::Zero();
   JointVector q_corrected = JointVector::Zero();
   JointVector delta_q = JointVector::Zero();
   JointVector joint_tracking_error = JointVector::Zero();
@@ -179,6 +190,9 @@ struct EeQpTelemetry {
   double pd_tracking_lag_max_abs_rad = 0.0;
   double solve_time_ms = 0.0;
   double reference_age_ms = -1.0;
+  Eigen::Vector3d terminal_target_position = Eigen::Vector3d::Zero();
+  double terminal_target_distance_m = -1.0;
+  double terminal_capture_radius_m = 0.0;
   double correction_bound_saturation_fraction = 0.0;
   double rate_bound_saturation_fraction = 0.0;
   ActiveVector correction_bound_saturation_mask = ActiveVector::Zero();
@@ -193,6 +207,8 @@ struct EeQpTelemetry {
   bool fallback_active = false;
   bool candidate_rejected = false;
   bool reference_feasible = false;
+  bool terminal_target_active = false;
+  int terminal_target_side = 0;
   bool valid = false;
 };
 

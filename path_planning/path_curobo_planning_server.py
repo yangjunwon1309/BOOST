@@ -75,6 +75,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--state-zmq-port", type=int, default=5557)
     parser.add_argument("--state-zmq-topic", default="g1_debug")
     parser.add_argument("--publish-hz", type=float, default=5.0)
+    parser.add_argument(
+        "--stream-replan-hz",
+        type=float,
+        default=1.0,
+        help=(
+            "Maximum IK/trajectory replan rate for goals marked "
+            "streaming_goal=true. The goal stream itself may run faster."
+        ),
+    )
     parser.add_argument("--duration-sec", type=float, default=2.0)
     parser.add_argument("--min-duration-sec", type=float, default=0.75)
     parser.add_argument("--max-duration-sec", type=float, default=5.0)
@@ -147,6 +156,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--particle-iters", type=int, default=40)
     parser.add_argument("--lbfgs-iters", type=int, default=40)
     parser.add_argument("--interpolation-dt", type=float, default=0.025)
+    parser.add_argument(
+        "--ik-position-tolerance-mm",
+        type=float,
+        default=20.0,
+        help="Reject endpoint IK solutions with final EE position error above this tolerance.",
+    )
     parser.add_argument("--use-cuda-graph", action="store_true")
     parser.add_argument("--self-collision", action="store_true")
     parser.add_argument(
@@ -154,6 +169,39 @@ def parse_args() -> argparse.Namespace:
         choices=["trajopt", "ik"],
         default="trajopt",
         help="Use cuRobo trajectory optimizer or endpoint IK. IK is kept only as a fallback.",
+    )
+    parser.add_argument(
+        "--endpoint-trajectory-source",
+        choices=["auto", "curobo_cspace", "min_jerk_bspline", "clamped_bspline"],
+        default="auto",
+        help=(
+            "Trajectory source after endpoint IK. auto keeps the previous behavior "
+            "(trajopt -> curobo_cspace, ik -> clamped_bspline)."
+        ),
+    )
+    parser.add_argument(
+        "--max-joint-velocity-rad-s",
+        type=float,
+        default=0.60,
+        help="Joint velocity limit used by the internal min-jerk B-spline test path.",
+    )
+    parser.add_argument(
+        "--max-joint-acceleration-rad-s2",
+        type=float,
+        default=2.0,
+        help="Joint acceleration limit used by the internal min-jerk B-spline test path.",
+    )
+    parser.add_argument(
+        "--max-joint-jerk-rad-s3",
+        type=float,
+        default=20.0,
+        help="Joint jerk limit used by the internal min-jerk B-spline test path.",
+    )
+    parser.add_argument(
+        "--allow-duration-extension",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Let the min-jerk test path extend duration to satisfy velocity/accel/jerk limits.",
     )
     parser.add_argument(
         "--mock-without-curobo",
@@ -274,6 +322,16 @@ def q_seed_from_goal(goal: dict, fallback: np.ndarray) -> tuple[np.ndarray, str]
     return np.asarray(fallback, dtype=np.float64).reshape(29).copy(), "state_stream"
 
 
+def target_q_seed_from_goal(goal: dict, fallback: np.ndarray) -> tuple[np.ndarray, str]:
+    for key in ("target_q_seed", "target_q_ref", "target_seed_q"):
+        if key not in goal:
+            continue
+        q = np.asarray(goal[key], dtype=np.float64).reshape(-1)
+        if q.shape[0] >= 29 and np.isfinite(q[:29]).all():
+            return q[:29].copy(), key
+    return np.asarray(fallback, dtype=np.float64).reshape(29).copy(), "plan_start"
+
+
 def is_duplicate_goal(
     goal: dict,
     last_goal: dict | None,
@@ -302,22 +360,54 @@ def load_robot_config(robot: str, target_link: str):
     kinematics["load_tool_frames_with_mesh"] = False
 
     cspace_joint_names = kinematics["cspace"]["joint_names"]
-    active = {j for j in cspace_joint_names if j.startswith("base_j_")}
-    active.update(["waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint"])
     side = "left" if target_link.startswith("left_") else "right"
-    active.update(
-        [
-            f"{side}_shoulder_pitch_joint",
-            f"{side}_shoulder_roll_joint",
-            f"{side}_shoulder_yaw_joint",
-            f"{side}_elbow_joint",
-            f"{side}_wrist_roll_joint",
-            f"{side}_wrist_pitch_joint",
-            f"{side}_wrist_yaw_joint",
-        ]
-    )
+    active = {
+        f"{side}_shoulder_pitch_joint",
+        f"{side}_shoulder_roll_joint",
+        f"{side}_shoulder_yaw_joint",
+        f"{side}_elbow_joint",
+        f"{side}_wrist_roll_joint",
+        f"{side}_wrist_pitch_joint",
+        f"{side}_wrist_yaw_joint",
+    }
+    unknown_active = sorted(active.difference(cspace_joint_names))
+    if unknown_active:
+        raise ValueError(f"active arm joints missing in {robot}: {unknown_active}")
     kinematics["lock_joints"] = {name: 0.0 for name in cspace_joint_names if name not in active}
     return robot_data
+
+
+def active_q_from_29(q_29: np.ndarray, joint_names: list[str]) -> np.ndarray:
+    """Map G1 29DoF hardware q into the cuRobo active cspace order."""
+    q_29 = np.asarray(q_29, dtype=np.float64).reshape(29)
+    active = []
+    for name in joint_names:
+        hw_index = JOINT_NAME_TO_HW_INDEX.get(name)
+        active.append(q_29[hw_index] if hw_index is not None else 0.0)
+    return np.asarray(active, dtype=np.float32)
+
+
+def active_points_to_q29(
+    points: np.ndarray,
+    q_reference: np.ndarray,
+    joint_names: list[str],
+) -> np.ndarray:
+    """Map active cuRobo cspace rows back into 29DoF hardware order."""
+    points = np.asarray(points, dtype=np.float64)
+    q_reference = np.asarray(q_reference, dtype=np.float64).reshape(29)
+    if points.shape[-1] == 29:
+        return points.copy()
+    if points.shape[-1] >= 35:
+        return points[..., -29:].copy()
+    rows = []
+    for point in points.reshape(-1, points.shape[-1]):
+        q29 = q_reference.copy()
+        for value, name in zip(point, joint_names):
+            hw_index = JOINT_NAME_TO_HW_INDEX.get(name)
+            if hw_index is not None:
+                q29[hw_index] = float(value)
+        rows.append(q29)
+    return np.stack(rows, axis=0)
 
 
 class CuroboIkPlanner:
@@ -330,6 +420,14 @@ class CuroboIkPlanner:
         self.torch = torch
         self.target_link = target_link
         robot_config = load_robot_config(args.robot, target_link)
+        lbfgs_iters = int(args.lbfgs_iters)
+        if lbfgs_iters % 20 != 0:
+            adjusted = ((lbfgs_iters + 19) // 20) * 20
+            log(
+                f"IK lbfgs_iters={lbfgs_iters} is not a multiple of 20; "
+                f"using {adjusted}"
+            )
+            lbfgs_iters = adjusted
         cfg = InverseKinematicsCfg.create(
             robot=robot_config,
             num_seeds=args.num_seeds,
@@ -338,21 +436,43 @@ class CuroboIkPlanner:
             use_cuda_graph=args.use_cuda_graph,
             override_optimizer_num_iters={
                 "particle": args.particle_iters,
-                "lbfgs": args.lbfgs_iters,
+                "lbfgs": lbfgs_iters,
             },
         )
         self.ik = InverseKinematics(cfg)
-        self.current_state = None
+        self.joint_names = list(self.ik.joint_names)
         log(
             f"IK ready: target={target_link}, dof={self.ik.kinematics.get_dof()}, "
             f"seeds={args.num_seeds}"
         )
+        log(f"IK active joints={self.joint_names}")
 
-    def solve(self, position_xyz: list[float], quaternion_wxyz: list[float]) -> tuple[bool, np.ndarray]:
+    def tool_position(self, q_29: np.ndarray) -> np.ndarray:
+        from curobo.types import JointState
+
+        q_active = active_q_from_29(q_29, self.joint_names)
+        current_state = JointState.from_position(
+            self.torch.as_tensor(q_active.reshape(1, -1), device="cuda", dtype=self.torch.float32),
+            joint_names=self.joint_names,
+        )
+        fk = self.ik.kinematics.compute_kinematics(current_state)
+        pose = fk.tool_poses.get_link_pose(self.target_link, make_contiguous=True)
+        return pose.position.detach().cpu().numpy().reshape(-1, 3)[0].astype(np.float64)
+
+    def solve(
+        self,
+        q_current: np.ndarray,
+        position_xyz: list[float],
+        quaternion_wxyz: list[float],
+        position_tolerance_mm: float,
+    ) -> tuple[bool, np.ndarray, dict]:
         from curobo.types import GoalToolPose, JointState, Pose
 
-        q0 = self.torch.zeros(1, self.ik.kinematics.get_dof(), device="cuda", dtype=self.torch.float32)
-        self.current_state = JointState.from_position(q0, joint_names=self.ik.joint_names)
+        q_active = active_q_from_29(q_current, self.joint_names)
+        current_state = JointState.from_position(
+            self.torch.as_tensor(q_active.reshape(1, -1), device="cuda", dtype=self.torch.float32),
+            joint_names=self.joint_names,
+        )
         position = self.torch.tensor([position_xyz], device="cuda", dtype=self.torch.float32)
         quaternion = self.torch.tensor([quaternion_wxyz], device="cuda", dtype=self.torch.float32)
         pose = Pose(
@@ -368,20 +488,42 @@ class CuroboIkPlanner:
         )
         self.torch.cuda.synchronize()
         t0 = time.perf_counter()
-        result = self.ik.solve_pose(goal, current_state=self.current_state)
+        result = self.ik.solve_pose(goal, current_state=current_state)
         self.torch.cuda.synchronize()
         solve_ms = (time.perf_counter() - t0) * 1000.0
-        success = bool(result.success.item())
-        if not success:
-            log(f"IK infeasible/failed solve_ms={solve_ms:.2f}")
-            return False, np.zeros(29, dtype=np.float64)
-        q_full = result.js_solution.position[0, 0].detach().cpu().numpy().astype(np.float64)
-        q_29 = q_full[-29:] if q_full.shape[0] >= 29 else np.pad(q_full, (0, 29 - q_full.shape[0]))
-        log(
-            f"IK success solve_ms={solve_ms:.2f}, "
-            f"pos_err_mm={float(result.position_error.item()) * 1000.0:.3f}"
+        success = bool(result is not None and result.success is not None and result.success.any().item())
+        pos_error_mm = (
+            float(result.position_error.reshape(-1)[0].detach().cpu().item()) * 1000.0
+            if result is not None and result.position_error is not None
+            else float("inf")
         )
-        return True, q_29
+        rot_error = (
+            float(result.rotation_error.reshape(-1)[0].detach().cpu().item())
+            if result is not None and result.rotation_error is not None
+            else float("inf")
+        )
+        meta = {
+            "ik_solve_time_ms": solve_ms,
+            "ik_position_error_mm": pos_error_mm,
+            "ik_rotation_error": rot_error,
+        }
+        if (not success) or pos_error_mm > float(position_tolerance_mm):
+            reason = "failed" if not success else f"pos_error>{position_tolerance_mm:.1f}mm"
+            log(f"Endpoint IK infeasible ({reason}) solve_ms={solve_ms:.2f}, pos_err_mm={pos_error_mm:.3f}")
+            return False, np.asarray(q_current, dtype=np.float64).reshape(29).copy(), meta
+        q_active_solution = result.js_solution.position[0, 0].detach().cpu().numpy().astype(np.float64)
+        q_29 = active_points_to_q29(q_active_solution.reshape(1, -1), q_current, self.joint_names)[0]
+        q_delta = q_29 - np.asarray(q_current, dtype=np.float64).reshape(29)
+        active_hw = [JOINT_NAME_TO_HW_INDEX[name] for name in self.joint_names if name in JOINT_NAME_TO_HW_INDEX]
+        meta["ik_active_delta_rmse_rad"] = (
+            float(np.sqrt(np.mean(np.square(q_delta[active_hw])))) if active_hw else 0.0
+        )
+        meta["q_goal"] = q_29.tolist()
+        log(
+            f"Endpoint IK success solve_ms={solve_ms:.2f}, pos_err_mm={pos_error_mm:.3f}, "
+            f"active_delta_rmse={meta['ik_active_delta_rmse_rad']:.4f}rad"
+        )
+        return True, q_29, meta
 
 
 class CuroboTrajectoryPlanner:
@@ -417,36 +559,7 @@ class CuroboTrajectoryPlanner:
             f"TrajOpt ready: target={target_link}, dof={self.trajopt.kinematics.get_dof()}, "
             f"seeds={args.num_seeds}, interpolation_dt={args.interpolation_dt:g}"
         )
-
-    def _active_q_from_29(self, q_29: np.ndarray) -> np.ndarray:
-        """Map G1 29DoF hardware q into cuRobo active cspace order."""
-        # cuRobo's G1 retarget config has six virtual base joints followed by
-        # the 29 hardware joints in the same order used by SONIC/G1.
-        full35 = np.zeros(35, dtype=np.float32)
-        full35[-29:] = np.asarray(q_29, dtype=np.float32).reshape(29)
-        active = []
-        for name in self.joint_names:
-            if name.startswith("base_j_"):
-                active.append(0.0)
-            else:
-                hw_index = JOINT_NAME_TO_HW_INDEX.get(name)
-                active.append(q_29[hw_index] if hw_index is not None else 0.0)
-        return np.asarray(active, dtype=np.float32)
-
-    @staticmethod
-    def _to_q29_from_full_or_active(q: np.ndarray) -> np.ndarray:
-        q = np.asarray(q, dtype=np.float64).reshape(-1)
-        if q.shape[0] >= 35:
-            return q[-29:].copy()
-        if q.shape[0] == 29:
-            return q.copy()
-        out = np.zeros(29, dtype=np.float64)
-        # Active set is usually base + waist + one arm. Fill from the tail as a
-        # conservative fallback; the dense full trajectory path should normally
-        # be available and preferred when knot is not full DoF.
-        n = min(q.shape[0], 29)
-        out[:n] = q[:n]
-        return out
+        log(f"TrajOpt active joints={self.joint_names}")
 
     def _active_points_to_q29(
         self,
@@ -454,25 +567,12 @@ class CuroboTrajectoryPlanner:
         q_reference: np.ndarray,
         joint_names: list[str] | None = None,
     ) -> np.ndarray:
-        points = np.asarray(points, dtype=np.float64)
-        q_reference = np.asarray(q_reference, dtype=np.float64).reshape(29)
-        if points.shape[-1] in (29, 35):
-            return np.stack([self._to_q29_from_full_or_active(row) for row in points], axis=0)
-        names = list(joint_names or self.joint_names)
-        rows = []
-        for point in points:
-            q29 = q_reference.copy()
-            for value, name in zip(point, names):
-                hw_index = JOINT_NAME_TO_HW_INDEX.get(name)
-                if hw_index is not None:
-                    q29[hw_index] = float(value)
-            rows.append(q29)
-        return np.stack(rows, axis=0)
+        return active_points_to_q29(points, q_reference, list(joint_names or self.joint_names))
 
     def solve(self, q_current: np.ndarray, position_xyz: list[float], quaternion_wxyz: list[float]):
         from curobo.types import GoalToolPose, JointState, Pose
 
-        q_active = self._active_q_from_29(q_current)
+        q_active = active_q_from_29(q_current, self.joint_names)
         current_state = JointState.from_position(
             self.torch.as_tensor(q_active.reshape(1, -1), device="cuda", dtype=self.torch.float32),
             joint_names=self.joint_names,
@@ -549,6 +649,74 @@ class CuroboTrajectoryPlanner:
         }
         return True, points.tolist(), control_dt, meta
 
+    def solve_cspace(self, q_current: np.ndarray, q_goal: np.ndarray):
+        from curobo.types import JointState
+
+        q_active = active_q_from_29(q_current, self.joint_names)
+        q_goal_active = active_q_from_29(q_goal, self.joint_names)
+        current_state = JointState.from_position(
+            self.torch.as_tensor(q_active.reshape(1, -1), device="cuda", dtype=self.torch.float32),
+            joint_names=self.joint_names,
+        )
+        goal_state = JointState.from_position(
+            self.torch.as_tensor(q_goal_active.reshape(1, -1), device="cuda", dtype=self.torch.float32),
+            joint_names=self.joint_names,
+        )
+        self.torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        result = self.trajopt.solve_cspace(
+            goal_state=goal_state,
+            current_state=current_state,
+            return_seeds=1,
+        )
+        self.torch.cuda.synchronize()
+        solve_ms = (time.perf_counter() - t0) * 1000.0
+        success = bool(result is not None and result.success is not None and result.success.any().item())
+        if not success:
+            log(f"C-space TrajOpt infeasible/failed solve_ms={solve_ms:.2f}")
+            return False, [], 0.0, {"trajopt_solve_time_ms": solve_ms, "trajectory_source": "curobo_cspace_failed"}
+
+        source = "curobo_cspace_knot"
+        knot = getattr(result.js_solution, "knot", None)
+        knot_dt = getattr(result.js_solution, "knot_dt", None)
+        control_dt = float(knot_dt.reshape(-1)[0].detach().cpu().item()) if knot_dt is not None else 0.05
+        points: np.ndarray | None = None
+        if knot is not None:
+            knot_np = knot.detach().cpu().numpy()
+            candidate = np.asarray(knot_np[0, 0] if knot_np.ndim == 4 else knot_np.reshape(-1, knot_np.shape[-1]))
+            points = self._active_points_to_q29(candidate, q_current, self.joint_names)
+
+        if points is None:
+            source = "curobo_cspace_interpolated"
+            dense = result.get_interpolated_plan()
+            dense_np = dense.position.detach().cpu().numpy()
+            candidate = np.asarray(dense_np[0, 0] if dense_np.ndim == 4 else dense_np.reshape(-1, dense_np.shape[-1]))
+            dense_names = list(getattr(dense, "joint_names", None) or self.joint_names)
+            points = self._active_points_to_q29(candidate, q_current, dense_names)
+            control_dt = float(getattr(self.trajopt.config, "interpolation_dt", 0.025))
+
+        pos_error_mm = (
+            float(result.position_error.reshape(-1)[0].detach().cpu().item()) * 1000.0
+            if result.position_error is not None
+            else -1.0
+        )
+        rot_error = (
+            float(result.rotation_error.reshape(-1)[0].detach().cpu().item())
+            if result.rotation_error is not None
+            else -1.0
+        )
+        log(
+            f"C-space TrajOpt success solve_ms={solve_ms:.2f}, source={source}, "
+            f"points={points.shape}, dt={control_dt:.4f}, pos_err_mm={pos_error_mm:.3f}"
+        )
+        meta = {
+            "trajopt_solve_time_ms": solve_ms,
+            "position_error_mm": pos_error_mm,
+            "rotation_error": rot_error,
+            "trajectory_source": source,
+        }
+        return True, points.tolist(), control_dt, meta
+
 
 def make_clamped_bspline(
     q_start: np.ndarray,
@@ -569,6 +737,108 @@ def make_clamped_bspline(
     hold_steps = max(0, int(np.ceil(max(0.0, final_hold_sec) / max(dt_sec, 1.0e-6))))
     rows.extend([q_goal.copy() for _ in range(hold_steps)])
     return [row.tolist() for row in rows]
+
+
+def min_jerk_profile(alpha: float) -> float:
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+    return 10.0 * alpha**3 - 15.0 * alpha**4 + 6.0 * alpha**5
+
+
+def min_jerk_required_duration(
+    q_start: np.ndarray,
+    q_goal: np.ndarray,
+    requested_duration_sec: float,
+    max_velocity_rad_s: float,
+    max_acceleration_rad_s2: float,
+    max_jerk_rad_s3: float,
+) -> tuple[float, dict]:
+    """Return a conservative duration for q=q0+dq*(10a^3-15a^4+6a^5).
+
+    For the normalized min-jerk profile h(a), max |h'| = 1.875,
+    max |h''| = 10/sqrt(3), and max |h'''| = 60. These constants give a
+    cheap feasibility check for the requested joint-space motion duration.
+    """
+    q_start = np.asarray(q_start, dtype=np.float64).reshape(29)
+    q_goal = np.asarray(q_goal, dtype=np.float64).reshape(29)
+    max_abs_delta = float(np.max(np.abs(q_goal - q_start)))
+    requested = max(1.0e-3, float(requested_duration_sec))
+    required = requested
+    limits: dict = {
+        "min_jerk_max_abs_delta_rad": max_abs_delta,
+        "min_jerk_requested_duration_sec": requested,
+        "min_jerk_required_by_velocity_sec": 0.0,
+        "min_jerk_required_by_acceleration_sec": 0.0,
+        "min_jerk_required_by_jerk_sec": 0.0,
+        "min_jerk_vmax_rad_s": float(max_velocity_rad_s),
+        "min_jerk_amax_rad_s2": float(max_acceleration_rad_s2),
+        "min_jerk_jmax_rad_s3": float(max_jerk_rad_s3),
+    }
+    if max_abs_delta <= 1.0e-12:
+        limits["min_jerk_required_duration_sec"] = required
+        return required, limits
+    if np.isfinite(max_velocity_rad_s) and max_velocity_rad_s > 0.0:
+        t_vel = max_abs_delta * 1.875 / float(max_velocity_rad_s)
+        limits["min_jerk_required_by_velocity_sec"] = float(t_vel)
+        required = max(required, t_vel)
+    if np.isfinite(max_acceleration_rad_s2) and max_acceleration_rad_s2 > 0.0:
+        t_acc = np.sqrt(max_abs_delta * (10.0 / np.sqrt(3.0)) / float(max_acceleration_rad_s2))
+        limits["min_jerk_required_by_acceleration_sec"] = float(t_acc)
+        required = max(required, t_acc)
+    if np.isfinite(max_jerk_rad_s3) and max_jerk_rad_s3 > 0.0:
+        t_jerk = np.cbrt(max_abs_delta * 60.0 / float(max_jerk_rad_s3))
+        limits["min_jerk_required_by_jerk_sec"] = float(t_jerk)
+        required = max(required, t_jerk)
+    limits["min_jerk_required_duration_sec"] = float(required)
+    return float(required), limits
+
+
+def make_min_jerk_bspline(
+    q_start: np.ndarray,
+    q_goal: np.ndarray,
+    duration_sec: float,
+    dt_sec: float,
+    final_hold_sec: float = 0.0,
+    max_velocity_rad_s: float = 0.60,
+    max_acceleration_rad_s2: float = 2.0,
+    max_jerk_rad_s3: float = 20.0,
+    allow_duration_extension: bool = True,
+) -> tuple[list[list[float]], float, dict]:
+    q_start = np.asarray(q_start, dtype=np.float64).reshape(29)
+    q_goal = np.asarray(q_goal, dtype=np.float64).reshape(29)
+    requested_duration = max(1.0e-3, float(duration_sec))
+    required_duration, meta = min_jerk_required_duration(
+        q_start,
+        q_goal,
+        requested_duration,
+        max_velocity_rad_s,
+        max_acceleration_rad_s2,
+        max_jerk_rad_s3,
+    )
+    effective_duration = required_duration if allow_duration_extension else requested_duration
+    effective_duration = max(1.0e-3, float(effective_duration))
+    dt = max(1.0e-4, float(dt_sec))
+    segments = max(4, int(np.ceil(effective_duration / dt)))
+    control_dt = effective_duration / float(segments)
+    n_internal = max(0, segments - 4)
+
+    rows = [q_start.copy() for _ in range(4)]
+    delta = q_goal - q_start
+    for j in range(n_internal):
+        alpha = float((j + 1) / (n_internal + 1))
+        rows.append(q_start + delta * min_jerk_profile(alpha))
+    rows.extend([q_goal.copy() for _ in range(4)])
+    hold_steps = max(0, int(np.ceil(max(0.0, final_hold_sec) / max(control_dt, 1.0e-6))))
+    rows.extend([q_goal.copy() for _ in range(hold_steps)])
+
+    meta = {
+        **meta,
+        "trajectory_source": "endpoint_ik_min_jerk_bspline",
+        "min_jerk_duration_sec": float(effective_duration),
+        "min_jerk_control_dt_sec": float(control_dt),
+        "min_jerk_duration_extended": bool(effective_duration > requested_duration + 1.0e-9),
+        "skip_retime": True,
+    }
+    return [row.tolist() for row in rows], control_dt, meta
 
 
 def retime_points_as_clamped_bspline(
@@ -611,6 +881,7 @@ def main() -> int:
     context = zmq.Context()
     goal_socket = context.socket(zmq.SUB)
     goal_socket.setsockopt(zmq.SUBSCRIBE, args.goal_topic.encode())
+    goal_socket.setsockopt(zmq.CONFLATE, 1)
     goal_socket.setsockopt(zmq.RCVTIMEO, 1)
     goal_socket.bind(f"tcp://{args.goal_bind_host}:{args.goal_port}")
 
@@ -632,7 +903,8 @@ def main() -> int:
         f"{args.state_zmq_host}:{args.state_zmq_port}/{args.state_zmq_topic}"
     )
 
-    planner: CuroboIkPlanner | CuroboTrajectoryPlanner | None = None
+    ik_planner: CuroboIkPlanner | None = None
+    traj_planner: CuroboTrajectoryPlanner | None = None
     q_current = np.zeros(29, dtype=np.float64)
     latest_payload: dict | None = None
     latest_payload_expires_at = -1.0
@@ -642,6 +914,7 @@ def main() -> int:
     last_goal_time = -1.0e9
     last_accepted_time = -1.0e9
     last_failure_time = -1.0e9
+    last_stream_replan_time = -1.0e9
     consecutive_failures = 0
     publish_period = 1.0 / max(args.publish_hz, 1e-6)
     next_pub = 0.0
@@ -655,18 +928,67 @@ def main() -> int:
                 goal = unpack_topic_message(raw, args.goal_topic)
                 plan_id += 1
                 target_link = str(goal.get("target_link", "left_wrist_yaw_link"))
+                streaming_goal = bool(goal.get("streaming_goal", False))
+                if streaming_goal:
+                    stream_replan_period = 1.0 / max(float(args.stream_replan_hz), 1.0e-6)
+                    if now - last_stream_replan_time < stream_replan_period:
+                        continue
+                    last_stream_replan_time = now
                 force_replan = bool(goal.get("force_replan", False))
                 goal_uid = str(goal.get("goal_uid", ""))
-                valid_goal, reason, position_arr, quaternion, goal_meta = validate_goal(goal, args)
                 plan_duration_sec, duration_meta = goal_duration(goal, args)
                 final_hold_sec = max(0.0, float(goal.get("final_hold_sec", args.final_hold_sec)))
-                now_us = time.monotonic_ns() // 1000
+                goal_received_us = time.monotonic_ns() // 1000
+                q_plan_start, q_plan_start_source = q_seed_from_goal(goal, q_current)
+
+                goal_for_planning = copy.deepcopy(goal)
+                terminal_target_position = np.asarray(
+                    goal.get(
+                        "terminal_target_position",
+                        goal.get("position", [np.nan, np.nan, np.nan]),
+                    ),
+                    dtype=np.float64,
+                ).reshape(3)
+                position_mode = str(goal.get("position_mode", "absolute"))
+                if position_mode == "planner_seed_offset":
+                    target_q_seed, target_seed_source = target_q_seed_from_goal(goal, q_plan_start)
+                    target_offset = np.asarray(
+                        goal.get("target_offset", goal.get("offset", [0.0, 0.0, 0.0])),
+                        dtype=np.float64,
+                    ).reshape(3)
+                    if args.mock_without_curobo:
+                        current_for_target = np.asarray(
+                            goal.get("current_position", [0.0, 0.0, 0.0]),
+                            dtype=np.float64,
+                        ).reshape(3)
+                    else:
+                        if ik_planner is None or ik_planner.target_link != target_link:
+                            ik_planner = CuroboIkPlanner(args, target_link)
+                        current_for_target = ik_planner.tool_position(target_q_seed)
+                    resolved_position = current_for_target + target_offset
+                    goal_for_planning["current_position"] = current_for_target.tolist()
+                    goal_for_planning["position"] = resolved_position.tolist()
+                    goal_for_planning["planner_target_current_position"] = current_for_target.tolist()
+                    goal_for_planning["planner_target_offset"] = target_offset.tolist()
+                    goal_for_planning["planner_target_seed_source"] = target_seed_source
+
+                valid_goal, reason, position_arr, quaternion, goal_meta = validate_goal(goal_for_planning, args)
+                goal_meta["position_mode"] = position_mode
+                for key in (
+                    "planner_target_current_position",
+                    "planner_target_offset",
+                    "planner_target_seed_source",
+                ):
+                    if key in goal_for_planning:
+                        goal_meta[key] = goal_for_planning[key]
+                if np.isfinite(terminal_target_position).all():
+                    goal_meta["terminal_target_position"] = terminal_target_position.tolist()
                 last_goal_uid = str(last_goal.get("goal_uid", "")) if last_goal is not None else ""
-                if goal_uid and goal_uid == last_goal_uid:
+                if (not streaming_goal) and goal_uid and goal_uid == last_goal_uid:
                     log(f"ignored repeated goal message plan_id={plan_id} uid={goal_uid[:8]}")
                     continue
-                if (not force_replan) and is_duplicate_goal(
-                    goal,
+                if (not streaming_goal) and (not force_replan) and is_duplicate_goal(
+                    goal_for_planning,
                     last_goal,
                     now,
                     last_goal_time,
@@ -675,7 +997,7 @@ def main() -> int:
                 ):
                     log(f"ignored duplicate goal plan_id={plan_id} target={target_link}")
                     continue
-                last_goal = copy.deepcopy(goal)
+                last_goal = copy.deepcopy(goal_for_planning)
                 last_goal_time = now
 
                 if not valid_goal:
@@ -686,13 +1008,14 @@ def main() -> int:
                         "feasible": False,
                         "failure_reason": reason,
                         "plan_id": accepted_plan_id,
-                        "timestamp_us": now_us,
-                        "t_start_us": now_us,
+                        "timestamp_us": goal_received_us,
+                        "t_start_us": goal_received_us,
                         "control_dt_sec": float(args.control_dt_sec),
                         "duration_sec": float(plan_duration_sec),
                         "final_hold_sec": float(final_hold_sec),
                         "target_link": target_link,
                         "target_position": position_arr.tolist(),
+                        "goal_uid": goal_uid,
                         "control_points": [],
                         **goal_meta,
                         **duration_meta,
@@ -705,6 +1028,7 @@ def main() -> int:
                     and latest_payload.get("feasible", False)
                     and not args.allow_replan_during_execution
                     and not force_replan
+                    and not streaming_goal
                     and now - last_accepted_time < args.min_replan_interval_sec
                 ):
                     log(
@@ -713,7 +1037,11 @@ def main() -> int:
                     )
                     continue
 
-                if (not force_replan) and now - last_failure_time < args.infeasible_cooldown_sec:
+                if (
+                    (not force_replan)
+                    and (not streaming_goal)
+                    and now - last_failure_time < args.infeasible_cooldown_sec
+                ):
                     log(
                         f"ignored goal plan_id={plan_id}: infeasible cooldown "
                         f"{args.infeasible_cooldown_sec:.2f}s"
@@ -721,7 +1049,6 @@ def main() -> int:
                     continue
 
                 position = position_arr.tolist()
-                q_plan_start, q_plan_start_source = q_seed_from_goal(goal, q_current)
 
                 meta = {}
                 if args.mock_without_curobo:
@@ -738,18 +1065,73 @@ def main() -> int:
                     )
                     control_dt_sec = args.control_dt_sec
                 else:
-                    if planner is None or planner.target_link != target_link:
-                        planner = (
-                            CuroboTrajectoryPlanner(args, target_link)
-                            if args.solver == "trajopt"
-                            else CuroboIkPlanner(args, target_link)
+                    if ik_planner is None or ik_planner.target_link != target_link:
+                        ik_planner = CuroboIkPlanner(args, target_link)
+                    ik_feasible, q_goal, ik_meta = ik_planner.solve(
+                        q_plan_start,
+                        position,
+                        quaternion,
+                        args.ik_position_tolerance_mm,
                     )
-                    if isinstance(planner, CuroboTrajectoryPlanner):
-                        feasible, control_points, control_dt_sec, meta = planner.solve(
-                            q_plan_start, position, quaternion
+                    if not ik_feasible:
+                        feasible = False
+                        control_points = []
+                        control_dt_sec = args.control_dt_sec
+                        meta = {
+                            **ik_meta,
+                            "trajectory_source": "endpoint_ik_failed",
+                            "failure_reason": "endpoint_ik_infeasible",
+                        }
+                    trajectory_source = str(args.endpoint_trajectory_source)
+                    if trajectory_source == "auto":
+                        trajectory_source = (
+                            "curobo_cspace" if args.solver == "trajopt" else "clamped_bspline"
+                        )
+                    if (not ik_feasible):
+                        pass
+                    elif trajectory_source == "curobo_cspace":
+                        if traj_planner is None or traj_planner.target_link != target_link:
+                            traj_planner = CuroboTrajectoryPlanner(args, target_link)
+                        feasible, control_points, control_dt_sec, plan_meta = traj_planner.solve_cspace(
+                            q_plan_start, q_goal
+                        )
+                        meta = {
+                            **ik_meta,
+                            **plan_meta,
+                        }
+                    elif trajectory_source == "min_jerk_bspline":
+                        feasible = True
+                        control_points, control_dt_sec, plan_meta = make_min_jerk_bspline(
+                            q_plan_start,
+                            q_goal,
+                            plan_duration_sec,
+                            args.control_dt_sec,
+                            final_hold_sec,
+                            args.max_joint_velocity_rad_s,
+                            args.max_joint_acceleration_rad_s2,
+                            args.max_joint_jerk_rad_s3,
+                            args.allow_duration_extension,
+                        )
+                        plan_duration_sec = float(plan_meta.get("min_jerk_duration_sec", plan_duration_sec))
+                        duration_meta = {
+                            **duration_meta,
+                            "duration_extended_for_min_jerk": bool(
+                                plan_meta.get("min_jerk_duration_extended", False)
+                            ),
+                        }
+                        meta = {
+                            **ik_meta,
+                            **plan_meta,
+                        }
+                        log(
+                            "Min-jerk B-spline "
+                            f"duration={plan_duration_sec:.2f}s "
+                            f"required={plan_meta.get('min_jerk_required_duration_sec', plan_duration_sec):.2f}s "
+                            f"max_delta={plan_meta.get('min_jerk_max_abs_delta_rad', 0.0):.3f}rad "
+                            f"dt={control_dt_sec:.4f}s"
                         )
                     else:
-                        feasible, q_goal = planner.solve(position, quaternion)
+                        feasible = True
                         control_points = make_clamped_bspline(
                             q_plan_start,
                             q_goal,
@@ -758,7 +1140,12 @@ def main() -> int:
                             final_hold_sec,
                         )
                         control_dt_sec = args.control_dt_sec
-                        meta = {"trajectory_source": "ik_endpoint_clamped_bspline"}
+                        meta = {
+                            **ik_meta,
+                            "trajectory_source": "endpoint_ik_clamped_bspline",
+                        }
+                plan_ready_monotonic = time.monotonic()
+                plan_ready_us = time.monotonic_ns() // 1000
                 meta = {
                     **meta,
                     **goal_meta,
@@ -770,10 +1157,11 @@ def main() -> int:
                 if feasible:
                     consecutive_failures = 0
                     accepted_plan_id = plan_id
-                    last_accepted_time = now
+                    last_accepted_time = plan_ready_monotonic
                     native_points = len(control_points)
                     native_dt_sec = float(control_dt_sec)
-                    if not args.no_retime_plan:
+                    skip_retime = bool(meta.pop("skip_retime", False))
+                    if not args.no_retime_plan and not skip_retime:
                         control_points = retime_points_as_clamped_bspline(
                             control_points,
                             plan_duration_sec,
@@ -787,38 +1175,50 @@ def main() -> int:
                             "native_control_points": native_points,
                             "native_control_dt_sec": native_dt_sec,
                         }
+                    elif skip_retime:
+                        meta = {
+                            **meta,
+                            "retimed": False,
+                            "retime_skipped_reason": "trajectory_source_requires_native_timing",
+                            "native_control_points": native_points,
+                            "native_control_dt_sec": native_dt_sec,
+                        }
                     else:
                         meta = {**meta, "retimed": False}
                 else:
                     consecutive_failures += 1
-                    last_failure_time = now
+                    last_failure_time = plan_ready_monotonic
                     if consecutive_failures >= args.max_consecutive_failures:
                         log(
                             f"resetting planner after {consecutive_failures} consecutive failures"
                         )
-                        planner = None
+                        ik_planner = None
+                        traj_planner = None
                         consecutive_failures = 0
 
                 if not feasible:
+                    failure_reason = str(meta.get("failure_reason", "planner_infeasible"))
                     latest_payload = {
                         "source": "curobo",
                         "control_mode": "plan_pending",
                         "feasible": False,
-                        "failure_reason": "planner_infeasible",
+                        "failure_reason": failure_reason,
                         "plan_id": accepted_plan_id,
-                        "timestamp_us": now_us,
-                        "t_start_us": now_us,
+                        "timestamp_us": plan_ready_us,
+                        "t_start_us": plan_ready_us,
                         "control_dt_sec": float(args.control_dt_sec),
                         "duration_sec": float(plan_duration_sec),
                         "final_hold_sec": float(final_hold_sec),
                         "target_link": target_link,
                         "target_position": position,
+                        "terminal_target_position": goal_meta.get("terminal_target_position", position),
+                        "goal_uid": goal_uid,
                         "control_points": [],
                         **meta,
                     }
-                    latest_payload_expires_at = now + float(args.plan_clear_grace_sec)
+                    latest_payload_expires_at = plan_ready_monotonic + float(args.plan_clear_grace_sec)
                     log(
-                        f"plan_id={plan_id} feasible=False reason=planner_infeasible "
+                        f"plan_id={plan_id} feasible=False reason={failure_reason} "
                         f"consecutive_failures={consecutive_failures}"
                     )
                     continue
@@ -828,14 +1228,16 @@ def main() -> int:
                     "control_mode": "plan_exec",
                     "feasible": True,
                     "plan_id": accepted_plan_id,
-                    "timestamp_us": now_us,
-                    "t_start_us": now_us,
+                    "timestamp_us": plan_ready_us,
+                    "t_start_us": plan_ready_us,
                     "control_dt_sec": float(control_dt_sec),
                     "duration_sec": float(plan_duration_sec),
                     "final_hold_sec": float(final_hold_sec),
                     "total_duration_sec": float(plan_duration_sec + final_hold_sec),
                     "target_link": target_link,
                     "target_position": position,
+                    "terminal_target_position": goal_meta.get("terminal_target_position", position),
+                    "goal_uid": goal_uid,
                     "target_quaternion": quaternion,
                     "q_start_source": q_plan_start_source,
                     "planning_frames": max(1, int(round(plan_duration_sec / max(control_dt_sec, 1.0e-6)))),
@@ -844,7 +1246,7 @@ def main() -> int:
                     **meta,
                 }
                 latest_payload_expires_at = (
-                    now
+                    plan_ready_monotonic
                     + float(plan_duration_sec)
                     + float(final_hold_sec)
                     + float(args.plan_clear_grace_sec)
@@ -853,7 +1255,7 @@ def main() -> int:
                     f"plan_id={accepted_plan_id} feasible=True target={np.round(position_arr, 4).tolist()} "
                     f"cps={len(control_points)} dt={control_dt_sec:.3f}s "
                     f"duration={plan_duration_sec:.2f}s hold={final_hold_sec:.2f}s "
-                    f"retimed={not args.no_retime_plan} q_start={q_plan_start_source} "
+                    f"retimed={bool(meta.get('retimed', False))} q_start={q_plan_start_source} "
                     f"goal={reason}"
                 )
             except zmq.Again:

@@ -68,6 +68,7 @@
 #include <atomic>
 #include <thread>
 #include <map>
+#include <optional>
 
 // DDS
 #include <unitree/robot/channel/channel_publisher.hpp>
@@ -309,6 +310,7 @@ class G1Deploy {
     std::unique_ptr<UpperBodyIKOriginSolver> hand_ik_origin_;
     bool use_ee_qp_ = false;
     uint64_t ee_qp_debug_counter_ = 0;
+    uint64_t path_direct_override_debug_counter_ = 0;
     std::unique_ptr<::g1::ee_qp::EeQpCorrector> ee_qp_corrector_;
     std::shared_ptr<::g1::ee_qp::RobotFkAdapter> ee_qp_kinematics_;
     std::unique_ptr<::g1::ee_qp::BufferedEeReferenceProvider> ee_qp_buffered_reference_provider_;
@@ -2174,7 +2176,17 @@ class G1Deploy {
       if (source == "damped_return" || source == "damped") {
         return ::g1::ee_qp::ReferenceSource::kDampedReturn;
       }
+      if (source == "cartesian_servo") return ::g1::ee_qp::ReferenceSource::kCartesianServo;
       return ::g1::ee_qp::ReferenceSource::kUnknown;
+    }
+
+    static ::g1::ee_qp::ReferenceType ParseReferenceType(
+        const std::string& type) {
+      if (type == "sample") return ::g1::ee_qp::ReferenceType::kSample;
+      if (type == "bspline") return ::g1::ee_qp::ReferenceType::kBspline;
+      if (type == "cartesian_target") return ::g1::ee_qp::ReferenceType::kCartesianTarget;
+      if (type == "none") return ::g1::ee_qp::ReferenceType::kNone;
+      return ::g1::ee_qp::ReferenceType::kUnknown;
     }
 
     static ::g1::ee_qp::ControlMode ParseControlMode(
@@ -2497,9 +2509,12 @@ class G1Deploy {
             if (type_it != fields.end()) type_it->second.convert(reference_type);
             if (reference_type.empty()) {
               if (fields.find("control_points") != fields.end()) reference_type = "bspline";
+              else if (fields.find("terminal_target_position") != fields.end() ||
+                       fields.find("static_target_position") != fields.end()) reference_type = "cartesian_target";
               else if (fields.find("q_ref") != fields.end() || fields.find("q_mujoco") != fields.end()) reference_type = "sample";
               else reference_type = "none";
             }
+            const auto parsed_reference_type = ParseReferenceType(reference_type);
 
             ::g1::ee_qp::ReferenceSource source = ::g1::ee_qp::ReferenceSource::kUnknown;
             const auto source_it = fields.find("source");
@@ -2552,6 +2567,7 @@ class G1Deploy {
             if (!ee_qp_dynamic_reference_provider_) continue;
             if (reference_type == "sample") {
               ::g1::ee_qp::EeReference reference;
+              reference.reference_type = ::g1::ee_qp::ReferenceType::kSample;
               reference.source = source == ::g1::ee_qp::ReferenceSource::kUnknown
                   ? ::g1::ee_qp::ReferenceSource::kGmr
                   : source;
@@ -2587,6 +2603,39 @@ class G1Deploy {
               reference.right_wrist_in_reference_pelvis = wrist.right_position_world;
               reference.q_ref = q_ref;
               ApplyTerminalTargetFields(fields, reference);
+              reference.valid = true;
+              ee_qp_dynamic_reference_provider_->UpdateSample(reference);
+            } else if (reference_type == "cartesian_target") {
+              ::g1::ee_qp::EeReference reference;
+              reference.reference_type = ::g1::ee_qp::ReferenceType::kCartesianTarget;
+              reference.source = source == ::g1::ee_qp::ReferenceSource::kUnknown
+                  ? ::g1::ee_qp::ReferenceSource::kCartesianServo
+                  : source;
+              reference.control_mode = control_mode == ::g1::ee_qp::ControlMode::kUnknown
+                  ? ::g1::ee_qp::ControlMode::kPlanExec
+                  : control_mode;
+              reference.feasible = feasible;
+              reference.plan_id = plan_id;
+              reference.phase = phase;
+              reference.timestamp_us = received_us;
+              reference.reference_pelvis_orientation = Eigen::Quaterniond::Identity();
+
+              auto q_it = fields.find("q_ref");
+              if (q_it == fields.end()) q_it = fields.find("q_mujoco");
+              if (q_it != fields.end()) {
+                std::vector<double> q_values;
+                q_it->second.convert(q_values);
+                if (q_values.size() == ::g1::ee_qp::kNumJoints) {
+                  for (int i = 0; i < ::g1::ee_qp::kNumJoints; ++i) {
+                    reference.q_ref[i] = q_values[i];
+                  }
+                }
+              }
+              ApplyTerminalTargetFields(fields, reference);
+              if (!reference.has_terminal_left_wrist_target &&
+                  !reference.has_terminal_right_wrist_target) {
+                continue;
+              }
               reference.valid = true;
               ee_qp_dynamic_reference_provider_->UpdateSample(reference);
             } else if (reference_type == "bspline") {
@@ -2632,6 +2681,7 @@ class G1Deploy {
                       : source);
             } else if (!feasible) {
               ::g1::ee_qp::EeReference reference;
+              reference.reference_type = parsed_reference_type;
               reference.source = source;
               reference.control_mode = control_mode;
               reference.feasible = false;
@@ -3386,7 +3436,41 @@ class G1Deploy {
       return true;
     }
 
-    bool ApplyEeQpCorrection(MotorCommand& command) {
+    bool ShouldApplyPathDirectUpperOverride(
+        const ::g1::ee_qp::EeReference& reference) const {
+      return reference.valid &&
+             reference.feasible &&
+             reference.control_mode == ::g1::ee_qp::ControlMode::kPlanExec &&
+             reference.source == ::g1::ee_qp::ReferenceSource::kCurobo;
+    }
+
+    bool ApplyPathDirectUpperOverride(
+        MotorCommand& command,
+        const ::g1::ee_qp::EeReference& reference) {
+      if (!ShouldApplyPathDirectUpperOverride(reference)) {
+        return false;
+      }
+
+      for (const int hw : ::g1::ee_qp::kArmHardwareIndices) {
+        command.q_target[hw] = static_cast<float>(reference.q_ref[hw]);
+        command.dq_target[hw] = 0.0f;
+      }
+
+      if (++path_direct_override_debug_counter_ % 50 == 0) {
+        std::cout << "[PATH-direct] arm PD target override"
+                  << " plan=" << reference.plan_id
+                  << " phase=" << reference.phase
+                  << " left_shoulder_pitch=" << reference.q_ref[15]
+                  << " right_shoulder_pitch=" << reference.q_ref[22]
+                  << std::endl;
+      }
+      return true;
+    }
+
+    bool ApplyEeQpCorrection(
+        MotorCommand& command,
+        const std::optional<::g1::ee_qp::EeReference>& preloaded_reference =
+            std::nullopt) {
       if (!use_ee_qp_ || !ee_qp_corrector_ || !ee_qp_reference_provider_) {
         return false;
       }
@@ -3395,7 +3479,9 @@ class G1Deploy {
       if (!low_state) return false;
 
       const auto now_us = SteadyNowUs();
-      const auto reference = ee_qp_reference_provider_->Latest(now_us);
+      const auto reference = preloaded_reference.has_value()
+          ? preloaded_reference
+          : ee_qp_reference_provider_->Latest(now_us);
 
       ::g1::ee_qp::EeQpInput input;
       for (int hw = 0; hw < G1_NUM_MOTOR; ++hw) {
@@ -3445,6 +3531,9 @@ class G1Deploy {
       telemetry.pd_tracking_lag_max_abs_rad = arm_tracking_max_abs;
       telemetry.solve_time_ms = result.solve_time_ms;
       telemetry.reference_age_ms = result.reference_age_ms;
+      telemetry.left_wrist_position = result.left_wrist_position;
+      telemetry.right_wrist_position = result.right_wrist_position;
+      telemetry.active_wrist_position = result.active_wrist_position;
       telemetry.terminal_target_position = result.terminal_target_position;
       telemetry.terminal_target_distance_m = result.terminal_target_distance_m;
       telemetry.terminal_capture_radius_m = result.terminal_capture_radius_m;
@@ -3461,6 +3550,7 @@ class G1Deploy {
       telemetry.control_mode = result.control_mode;
       telemetry.plan_id = result.plan_id;
       telemetry.plan_phase = result.plan_phase;
+      telemetry.reference_type = result.reference_type;
       telemetry.reference_feasible = result.reference_feasible;
       telemetry.fallback_active = result.fallback_active;
       telemetry.candidate_rejected = result.candidate_rejected;
@@ -4002,8 +4092,15 @@ class G1Deploy {
         motor_command_tmp.dq_target.at(i) = 0.0;
       }
       sonic_motor_command_buffer_.SetData(motor_command_tmp);
+      std::optional<::g1::ee_qp::EeReference> path_reference;
+      if (use_ee_qp_ && ee_qp_reference_provider_) {
+        path_reference = ee_qp_reference_provider_->Latest(SteadyNowUs());
+        if (path_reference) {
+          ApplyPathDirectUpperOverride(motor_command_tmp, *path_reference);
+        }
+      }
       if (use_ee_qp_) {
-        ApplyEeQpCorrection(motor_command_tmp);
+        ApplyEeQpCorrection(motor_command_tmp, path_reference);
       } else if (use_hand_ik_origin_) {
         ApplyHandIKOrigin(motor_command_tmp);
       } else if (UseAnyUpperIK() && has_vr_3point_data_) {

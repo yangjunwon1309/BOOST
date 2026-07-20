@@ -97,39 +97,34 @@ def load_robot_config(robot: str, target_link: str, all_tool_frames: bool):
     kinematics["tool_frames"] = [target_link]
     kinematics["load_tool_frames_with_mesh"] = False
     cspace_joint_names = kinematics["cspace"]["joint_names"]
-    active_joint_names = set(j for j in cspace_joint_names if j.startswith("base_j_"))
-    active_joint_names.update(
-        ["waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint"]
-    )
     if target_link.startswith("left_"):
-        active_joint_names.update(
-            [
-                "left_shoulder_pitch_joint",
-                "left_shoulder_roll_joint",
-                "left_shoulder_yaw_joint",
-                "left_elbow_joint",
-                "left_wrist_roll_joint",
-                "left_wrist_pitch_joint",
-                "left_wrist_yaw_joint",
-            ]
-        )
+        active_joint_names = {
+            "left_shoulder_pitch_joint",
+            "left_shoulder_roll_joint",
+            "left_shoulder_yaw_joint",
+            "left_elbow_joint",
+            "left_wrist_roll_joint",
+            "left_wrist_pitch_joint",
+            "left_wrist_yaw_joint",
+        }
     elif target_link.startswith("right_"):
-        active_joint_names.update(
-            [
-                "right_shoulder_pitch_joint",
-                "right_shoulder_roll_joint",
-                "right_shoulder_yaw_joint",
-                "right_elbow_joint",
-                "right_wrist_roll_joint",
-                "right_wrist_pitch_joint",
-                "right_wrist_yaw_joint",
-            ]
-        )
+        active_joint_names = {
+            "right_shoulder_pitch_joint",
+            "right_shoulder_roll_joint",
+            "right_shoulder_yaw_joint",
+            "right_elbow_joint",
+            "right_wrist_roll_joint",
+            "right_wrist_pitch_joint",
+            "right_wrist_yaw_joint",
+        }
     else:
         raise ValueError(
             "single-tool mock only knows how to lock joints for left/right arm targets; "
             f"got {target_link}"
         )
+    unknown_active = sorted(active_joint_names.difference(cspace_joint_names))
+    if unknown_active:
+        raise ValueError(f"active arm joints missing in {robot}: {unknown_active}")
     kinematics["lock_joints"] = {
         joint_name: 0.0
         for joint_name in cspace_joint_names

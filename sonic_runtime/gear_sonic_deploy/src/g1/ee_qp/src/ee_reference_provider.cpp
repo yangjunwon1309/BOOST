@@ -99,6 +99,7 @@ std::optional<EeReference> BsplineEeReferenceProvider::Latest(
 
   EeReference reference;
   reference.source = ReferenceSource::kCurobo;
+  reference.reference_type = ReferenceType::kBspline;
   reference.control_mode = plan.control_mode;
   reference.feasible = plan.feasible;
   reference.plan_id = plan.plan_id;
@@ -220,6 +221,7 @@ std::optional<EeReference> DynamicEeReferenceProvider::Latest(
 
   EeReference reference;
   reference.source = plan.source;
+  reference.reference_type = ReferenceType::kBspline;
   reference.control_mode = plan.control_mode;
   reference.feasible = plan.feasible;
   reference.plan_id = plan.plan_id;

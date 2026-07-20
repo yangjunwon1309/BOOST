@@ -9,9 +9,10 @@ SCHEMA_QP_REFERENCE_V1 = "path.qp_reference.v1"
 QP_REFERENCE_TOPIC = "path_qp_reference"
 CUROBO_PLAN_TOPIC = "curobo_plan"
 PATH_GOAL_TOPIC = "path_goal"
+STATIC_EE_TARGET_TOPIC = "path_static_ee_target"
 
 PATH_STATES = {"teleop", "intention", "auto_planning", "damped_return", "idle"}
-REFERENCE_TYPES = {"none", "sample", "bspline"}
+REFERENCE_TYPES = {"none", "sample", "bspline", "cartesian_target"}
 
 
 def now_us() -> int:
@@ -84,6 +85,44 @@ def qp_bspline_reference(
         "t_start_us": int(t_start_us),
         "control_dt_sec": float(control_dt_sec),
         "control_points": rows,
+        **metadata,
+    }
+
+
+def qp_cartesian_target_reference(
+    *,
+    target_link: str,
+    target_position: Sequence[float] | np.ndarray,
+    q_ref: Sequence[float] | np.ndarray,
+    state: str = "auto_planning",
+    source: str = "cartesian_servo",
+    control_mode: str = "plan_exec",
+    feasible: bool = True,
+    plan_id: int = 0,
+    phase: float = 0.0,
+    timestamp_us: int | None = None,
+    terminal_capture_radius_m: float = 0.0,
+    **metadata,
+) -> dict:
+    if state not in PATH_STATES:
+        raise ValueError(f"unknown PATH state: {state}")
+    pos = np.asarray(target_position, dtype=np.float64).reshape(-1)
+    if pos.shape[0] != 3:
+        raise ValueError(f"target_position must contain 3 values, got {pos.shape[0]}")
+    return {
+        "schema": SCHEMA_QP_REFERENCE_V1,
+        "reference_type": "cartesian_target",
+        "state": state,
+        "source": source,
+        "control_mode": control_mode,
+        "feasible": bool(feasible),
+        "plan_id": int(plan_id),
+        "phase": float(phase),
+        "timestamp_us": int(timestamp_us if timestamp_us is not None else now_us()),
+        "q_ref": _list29(q_ref),
+        "terminal_target_link": str(target_link),
+        "terminal_target_position": pos.tolist(),
+        "terminal_capture_radius_m": float(terminal_capture_radius_m),
         **metadata,
     }
 

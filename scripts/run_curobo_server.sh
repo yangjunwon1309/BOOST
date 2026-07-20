@@ -16,14 +16,26 @@ fi
 if [[ "${PATH_CUROBO_ALLOW_REPLAN_DURING_EXECUTION:-0}" == "1" ]]; then
   extra_args+=(--allow-replan-during-execution)
 fi
+if [[ "${PATH_CUROBO_USE_CUDA_GRAPH:-0}" == "1" ]]; then
+  extra_args+=(--use-cuda-graph)
+fi
+if [[ "${PATH_CUROBO_ALLOW_DURATION_EXTENSION:-1}" == "0" ]]; then
+  extra_args+=(--no-allow-duration-extension)
+fi
 
 python -u path_planning/path_curobo_planning_server.py \
   --curobo-root "$PATH_CUROBO_ROOT" \
   --solver "${PATH_CUROBO_SOLVER:-trajopt}" \
+  --endpoint-trajectory-source "${PATH_CUROBO_ENDPOINT_TRAJECTORY_SOURCE:-auto}" \
   --robot "${PATH_CUROBO_ROBOT:-unitree_g1_29dof_retarget.yml}" \
   --num-seeds "${PATH_CUROBO_NUM_SEEDS:-4}" \
   --lbfgs-iters "${PATH_CUROBO_LBFGS_ITERS:-25}" \
+  --ik-position-tolerance-mm "${PATH_CUROBO_IK_POSITION_TOLERANCE_MM:-20.0}" \
+  --max-joint-velocity-rad-s "${PATH_CUROBO_MAX_JOINT_VELOCITY_RAD_S:-0.60}" \
+  --max-joint-acceleration-rad-s2 "${PATH_CUROBO_MAX_JOINT_ACCELERATION_RAD_S2:-2.0}" \
+  --max-joint-jerk-rad-s3 "${PATH_CUROBO_MAX_JOINT_JERK_RAD_S3:-20.0}" \
   --publish-hz "${PATH_CUROBO_PUBLISH_HZ:-5}" \
+  --stream-replan-hz "${PATH_CUROBO_STREAM_REPLAN_HZ:-1}" \
   --duration-sec "${PATH_CUROBO_DURATION_SEC:-2.0}" \
   --min-duration-sec "${PATH_CUROBO_MIN_DURATION_SEC:-0.75}" \
   --max-duration-sec "${PATH_CUROBO_MAX_DURATION_SEC:-5.0}" \
@@ -40,6 +52,5 @@ python -u path_planning/path_curobo_planning_server.py \
   --output-topic "${PATH_PLAN_TOPIC:-curobo_plan}" \
   --goal-port "${PATH_GOAL_PORT:-5561}" \
   --goal-topic "${PATH_GOAL_TOPIC:-path_goal}" \
-  --use-cuda-graph \
   "${extra_args[@]}" \
   "$@"

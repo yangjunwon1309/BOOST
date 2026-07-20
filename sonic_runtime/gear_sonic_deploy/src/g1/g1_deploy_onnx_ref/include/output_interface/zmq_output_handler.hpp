@@ -292,7 +292,7 @@ private:
         // Visualisation fields: output_data_map_.size() (typically 11)
         int num_state_fields = has_heading_state ? 20 : 18;
         int num_viz_fields = static_cast<int>(output_data_map_.size());
-        constexpr int kEeQpFields = 41;
+        constexpr int kEeQpFields = 48;
         pk.pack_map(num_state_fields + num_viz_fields + (ee_qp ? kEeQpFields : 0));
 
         // ---- State-logger fields ----
@@ -436,6 +436,21 @@ private:
             pk.pack(ee_qp->solve_time_ms);
             pk.pack("ee_qp_reference_age_ms");
             pk.pack(ee_qp->reference_age_ms);
+            pk.pack("ee_qp_left_wrist_position");
+            pk.pack_array(3);
+            for (int i = 0; i < 3; ++i) {
+                pk.pack(ee_qp->left_wrist_position[i]);
+            }
+            pk.pack("ee_qp_right_wrist_position");
+            pk.pack_array(3);
+            for (int i = 0; i < 3; ++i) {
+                pk.pack(ee_qp->right_wrist_position[i]);
+            }
+            pk.pack("ee_qp_active_wrist_position");
+            pk.pack_array(3);
+            for (int i = 0; i < 3; ++i) {
+                pk.pack(ee_qp->active_wrist_position[i]);
+            }
             pk.pack("ee_qp_correction_bound_saturation_fraction");
             pk.pack(ee_qp->correction_bound_saturation_fraction);
             pk.pack("ee_qp_rate_bound_saturation_fraction");
@@ -458,6 +473,16 @@ private:
             pk.pack(::g1::ee_qp::ReferenceSourceName(ee_qp->reference_source));
             pk.pack("ee_qp_control_mode");
             pk.pack(::g1::ee_qp::ControlModeName(ee_qp->control_mode));
+            pk.pack("ee_qp_reference_type");
+            pk.pack(::g1::ee_qp::ReferenceTypeName(ee_qp->reference_type));
+            pk.pack("ee_qp_servo_error_before_m");
+            pk.pack(ee_qp->reference_type == ::g1::ee_qp::ReferenceType::kCartesianTarget
+                        ? ee_qp->error_before_m
+                        : -1.0);
+            pk.pack("ee_qp_servo_error_after_m");
+            pk.pack(ee_qp->reference_type == ::g1::ee_qp::ReferenceType::kCartesianTarget
+                        ? ee_qp->nonlinear_error_after_m
+                        : -1.0);
             pk.pack("ee_qp_plan_id");
             pk.pack(ee_qp->plan_id);
             pk.pack("ee_qp_plan_phase");
@@ -468,6 +493,16 @@ private:
             pk.pack(ee_qp->terminal_target_active);
             pk.pack("ee_qp_terminal_target_side");
             pk.pack(ee_qp->terminal_target_side);
+            pk.pack("ee_qp_terminal_target_link");
+            if (ee_qp->terminal_target_side == 1) {
+                pk.pack("left_wrist_yaw_link");
+            } else if (ee_qp->terminal_target_side == 2) {
+                pk.pack("right_wrist_yaw_link");
+            } else if (ee_qp->terminal_target_side == 3) {
+                pk.pack("both_wrist_yaw_link");
+            } else {
+                pk.pack("none");
+            }
             pk.pack("ee_qp_terminal_target_distance_m");
             pk.pack(ee_qp->terminal_target_distance_m);
             pk.pack("ee_qp_terminal_capture_radius_m");

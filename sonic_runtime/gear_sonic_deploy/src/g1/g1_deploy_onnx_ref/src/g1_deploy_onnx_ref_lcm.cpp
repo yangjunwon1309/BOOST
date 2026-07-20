@@ -2212,7 +2212,16 @@ class G1Deploy {
       if (source == "curobo") return ::g1::ee_qp::ReferenceSource::kCurobo;
       if (source == "replay") return ::g1::ee_qp::ReferenceSource::kReplay;
       if (source == "damped_return" || source == "damped") return ::g1::ee_qp::ReferenceSource::kDampedReturn;
+      if (source == "cartesian_servo") return ::g1::ee_qp::ReferenceSource::kCartesianServo;
       return ::g1::ee_qp::ReferenceSource::kUnknown;
+    }
+
+    static ::g1::ee_qp::ReferenceType ParseReferenceType(const std::string& type) {
+      if (type == "sample") return ::g1::ee_qp::ReferenceType::kSample;
+      if (type == "bspline") return ::g1::ee_qp::ReferenceType::kBspline;
+      if (type == "cartesian_target") return ::g1::ee_qp::ReferenceType::kCartesianTarget;
+      if (type == "none") return ::g1::ee_qp::ReferenceType::kNone;
+      return ::g1::ee_qp::ReferenceType::kUnknown;
     }
 
     static ::g1::ee_qp::ControlMode ParseControlMode(const std::string& mode) {
@@ -2292,9 +2301,12 @@ class G1Deploy {
             if (auto it = fields.find("reference_type"); it != fields.end()) it->second.convert(reference_type);
             if (reference_type.empty()) {
               if (fields.find("control_points") != fields.end()) reference_type = "bspline";
+              else if (fields.find("terminal_target_position") != fields.end() ||
+                       fields.find("static_target_position") != fields.end()) reference_type = "cartesian_target";
               else if (fields.find("q_ref") != fields.end() || fields.find("q_mujoco") != fields.end()) reference_type = "sample";
               else reference_type = "none";
             }
+            const auto parsed_reference_type = ParseReferenceType(reference_type);
 
             ::g1::ee_qp::ReferenceSource source = ::g1::ee_qp::ReferenceSource::kUnknown;
             if (auto it = fields.find("source"); it != fields.end()) { std::string v; it->second.convert(v); source = ParseReferenceSource(v); }
@@ -2322,6 +2334,7 @@ class G1Deploy {
             if (!ee_qp_dynamic_reference_provider_) continue;
             if (reference_type == "sample") {
               ::g1::ee_qp::EeReference reference;
+              reference.reference_type = ::g1::ee_qp::ReferenceType::kSample;
               reference.source = source == ::g1::ee_qp::ReferenceSource::kUnknown ? ::g1::ee_qp::ReferenceSource::kGmr : source;
               reference.control_mode = control_mode == ::g1::ee_qp::ControlMode::kUnknown ? ::g1::ee_qp::ControlMode::kTeleop : control_mode;
               reference.feasible = feasible;
@@ -2347,6 +2360,40 @@ class G1Deploy {
               ApplyTerminalTargetFields(fields, reference);
               reference.valid = true;
               ee_qp_dynamic_reference_provider_->UpdateSample(reference);
+            } else if (reference_type == "cartesian_target") {
+              ::g1::ee_qp::EeReference reference;
+              reference.reference_type = ::g1::ee_qp::ReferenceType::kCartesianTarget;
+              reference.source = source == ::g1::ee_qp::ReferenceSource::kUnknown
+                  ? ::g1::ee_qp::ReferenceSource::kCartesianServo
+                  : source;
+              reference.control_mode = control_mode == ::g1::ee_qp::ControlMode::kUnknown
+                  ? ::g1::ee_qp::ControlMode::kPlanExec
+                  : control_mode;
+              reference.feasible = feasible;
+              reference.plan_id = plan_id;
+              reference.phase = phase;
+              reference.timestamp_us = received_us;
+              reference.reference_pelvis_orientation = Eigen::Quaterniond::Identity();
+
+              auto q_it = fields.find("q_ref");
+              if (q_it == fields.end()) q_it = fields.find("q_mujoco");
+              if (q_it != fields.end()) {
+                std::vector<double> q_values;
+                q_it->second.convert(q_values);
+                if (q_values.size() == ::g1::ee_qp::kNumJoints) {
+                  for (int i = 0; i < ::g1::ee_qp::kNumJoints; ++i) {
+                    reference.q_ref[i] = q_values[i];
+                  }
+                }
+              }
+
+              ApplyTerminalTargetFields(fields, reference);
+              if (!reference.has_terminal_left_wrist_target &&
+                  !reference.has_terminal_right_wrist_target) {
+                continue;
+              }
+              reference.valid = true;
+              ee_qp_dynamic_reference_provider_->UpdateSample(reference);
             } else if (reference_type == "bspline") {
               double control_dt_sec = 0.02;
               if (auto it = fields.find("control_dt_sec"); it != fields.end()) it->second.convert(control_dt_sec);
@@ -2370,6 +2417,7 @@ class G1Deploy {
                   source == ::g1::ee_qp::ReferenceSource::kUnknown ? ::g1::ee_qp::ReferenceSource::kCurobo : source);
             } else if (!feasible) {
               ::g1::ee_qp::EeReference reference;
+              reference.reference_type = parsed_reference_type;
               reference.source = source;
               reference.control_mode = control_mode;
               reference.feasible = false;
@@ -3167,6 +3215,7 @@ class G1Deploy {
       telemetry.control_mode = result.control_mode;
       telemetry.plan_id = result.plan_id;
       telemetry.plan_phase = result.plan_phase;
+      telemetry.reference_type = result.reference_type;
       telemetry.reference_feasible = result.reference_feasible;
       telemetry.fallback_active = result.fallback_active;
       telemetry.candidate_rejected = result.candidate_rejected;

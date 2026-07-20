@@ -261,8 +261,12 @@ def summarize(samples: list[dict[str, Any]], elapsed: float, top_joints: int) ->
     source_counts = Counter(
         str(sample.get("ee_qp_reference_source", "unknown")) for sample in samples
     )
+    type_counts = Counter(
+        str(sample.get("ee_qp_reference_type", "unknown")) for sample in samples
+    )
     mode_text = mode_counts.most_common(1)[0][0] if mode_counts else "unknown"
     source_text = source_counts.most_common(1)[0][0] if source_counts else "unknown"
+    type_text = type_counts.most_common(1)[0][0] if type_counts else "unknown"
     plan_ids = [
         int(value)
         for value in numeric(samples, "ee_qp_plan_id")
@@ -306,10 +310,20 @@ def summarize(samples: list[dict[str, Any]], elapsed: float, top_joints: int) ->
         terminal_sides.most_common(1)[0][0] if terminal_sides else 0,
         "unknown",
     )
+    terminal_link_counts = Counter(
+        str(sample.get("ee_qp_terminal_target_link", terminal_side))
+        for sample in samples
+    )
+    terminal_link = terminal_link_counts.most_common(1)[0][0] \
+        if terminal_link_counts else terminal_side
+    servo_before = numeric(samples, "ee_qp_servo_error_before_m")
+    servo_after = numeric(samples, "ee_qp_servo_error_after_m")
+    servo_before = [value for value in servo_before if value >= 0.0]
+    servo_after = [value for value in servo_after if value >= 0.0]
 
     return (
         f"[{elapsed:5.1f}s] n={len(samples):3d} "
-        f"mode={mode_text}/{source_text} plan={max(plan_ids, default=0)} "
+        f"mode={mode_text}/{source_text}/{type_text} plan={max(plan_ids, default=0)} "
         f"phase={mean(plan_phase):.2f} "
         f"ref_ok={100.0 * ratio(samples, 'ee_qp_reference_feasible'):4.1f}% | "
         f"ref_age={mean(reference_age):5.1f}/{max(reference_age, default=math.nan):5.1f}ms(avg/max) | "
@@ -323,8 +337,9 @@ def summarize(samples: list[dict[str, Any]], elapsed: float, top_joints: int) ->
         f"{100.0 * mean(lower_err):.1f}/{100.0 * mean(upper_err):.1f}cm"
         f"(arm/waist/lower/upper) | "
         f"terminal={100.0 * ratio(samples, 'ee_qp_terminal_target_active'):4.1f}% "
-        f"{terminal_side} d={100.0 * mean(terminal_dist):.1f}cm "
-        f"r={100.0 * mean(terminal_radius):.1f}cm | "
+        f"{terminal_link} d={100.0 * mean(terminal_dist):.1f}cm "
+        f"r={100.0 * mean(terminal_radius):.1f}cm "
+        f"servo={100.0 * mean(servo_before):.1f}->{100.0 * mean(servo_after):.1f}cm | "
         f"base=tilt {mean(base_tilt):.3f}/{max(base_tilt, default=math.nan):.3f}rad "
         f"ang {mean(base_ang):.3f}/{max(base_ang, default=math.nan):.3f}rad/s "
         f"qerr {mean(base_qerr):.3f}/{max(base_qerr, default=math.nan):.3f}rad "

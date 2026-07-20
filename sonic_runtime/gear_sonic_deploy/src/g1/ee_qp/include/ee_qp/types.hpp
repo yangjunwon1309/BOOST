@@ -54,6 +54,7 @@ enum class ReferenceSource : std::uint8_t {
   kCurobo,
   kReplay,
   kDampedReturn,
+  kCartesianServo,
 };
 
 enum class ControlMode : std::uint8_t {
@@ -63,6 +64,14 @@ enum class ControlMode : std::uint8_t {
   kPlanExec,
   kBlendBack,
   kIdle,
+};
+
+enum class ReferenceType : std::uint8_t {
+  kUnknown = 0,
+  kSample,
+  kBspline,
+  kCartesianTarget,
+  kNone,
 };
 
 inline const char* FallbackReasonName(EeQpFallbackReason reason) {
@@ -90,6 +99,7 @@ inline const char* ReferenceSourceName(ReferenceSource source) {
     case ReferenceSource::kCurobo: return "curobo";
     case ReferenceSource::kReplay: return "replay";
     case ReferenceSource::kDampedReturn: return "damped_return";
+    case ReferenceSource::kCartesianServo: return "cartesian_servo";
   }
   return "unknown";
 }
@@ -106,6 +116,17 @@ inline const char* ControlModeName(ControlMode mode) {
   return "unknown";
 }
 
+inline const char* ReferenceTypeName(ReferenceType type) {
+  switch (type) {
+    case ReferenceType::kUnknown: return "unknown";
+    case ReferenceType::kSample: return "sample";
+    case ReferenceType::kBspline: return "bspline";
+    case ReferenceType::kCartesianTarget: return "cartesian_target";
+    case ReferenceType::kNone: return "none";
+  }
+  return "unknown";
+}
+
 struct EeReference {
   Eigen::Vector3d left_wrist_in_reference_pelvis = Eigen::Vector3d::Zero();
   Eigen::Vector3d right_wrist_in_reference_pelvis = Eigen::Vector3d::Zero();
@@ -117,6 +138,7 @@ struct EeReference {
   std::int64_t timestamp_us = 0;
   std::uint64_t plan_id = 0;
   double phase = 0.0;
+  ReferenceType reference_type = ReferenceType::kUnknown;
   ReferenceSource source = ReferenceSource::kUnknown;
   ControlMode control_mode = ControlMode::kUnknown;
   bool has_terminal_left_wrist_target = false;
@@ -149,6 +171,9 @@ struct EeQpResult {
   double upper_only_error_before = 0.0;
   double solve_time_ms = 0.0;
   double reference_age_ms = -1.0;
+  Eigen::Vector3d left_wrist_position = Eigen::Vector3d::Zero();
+  Eigen::Vector3d right_wrist_position = Eigen::Vector3d::Zero();
+  Eigen::Vector3d active_wrist_position = Eigen::Vector3d::Zero();
   Eigen::Vector3d terminal_target_position = Eigen::Vector3d::Zero();
   double terminal_target_distance_m = -1.0;
   double terminal_capture_radius_m = 0.0;
@@ -162,6 +187,7 @@ struct EeQpResult {
   ControlMode control_mode = ControlMode::kUnknown;
   std::uint64_t plan_id = 0;
   double plan_phase = 0.0;
+  ReferenceType reference_type = ReferenceType::kUnknown;
   bool fallback_active = false;
   bool candidate_rejected = false;
   bool reference_feasible = false;
@@ -190,6 +216,9 @@ struct EeQpTelemetry {
   double pd_tracking_lag_max_abs_rad = 0.0;
   double solve_time_ms = 0.0;
   double reference_age_ms = -1.0;
+  Eigen::Vector3d left_wrist_position = Eigen::Vector3d::Zero();
+  Eigen::Vector3d right_wrist_position = Eigen::Vector3d::Zero();
+  Eigen::Vector3d active_wrist_position = Eigen::Vector3d::Zero();
   Eigen::Vector3d terminal_target_position = Eigen::Vector3d::Zero();
   double terminal_target_distance_m = -1.0;
   double terminal_capture_radius_m = 0.0;
@@ -203,6 +232,7 @@ struct EeQpTelemetry {
   ControlMode control_mode = ControlMode::kUnknown;
   std::uint64_t plan_id = 0;
   double plan_phase = 0.0;
+  ReferenceType reference_type = ReferenceType::kUnknown;
   bool enabled = false;
   bool fallback_active = false;
   bool candidate_rejected = false;

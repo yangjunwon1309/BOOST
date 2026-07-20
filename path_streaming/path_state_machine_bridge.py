@@ -56,8 +56,10 @@ from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
 from path_core.messaging.path_schema import (
     CUROBO_PLAN_TOPIC,
     QP_REFERENCE_TOPIC,
+    STATIC_EE_TARGET_TOPIC,
     now_us,
     qp_bspline_reference,
+    qp_cartesian_target_reference,
     qp_none_reference,
     qp_sample_reference,
 )
@@ -78,6 +80,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gmr-topic", default="gmr_ref")
     parser.add_argument("--plan-endpoint", default="tcp://127.0.0.1:5562")
     parser.add_argument("--plan-topic", default=CUROBO_PLAN_TOPIC)
+    parser.add_argument("--static-target-bind", default="tcp://*:5564")
+    parser.add_argument("--static-target-topic", default=STATIC_EE_TARGET_TOPIC)
+    parser.add_argument("--static-target-timeout-sec", type=float, default=0.25)
     parser.add_argument("--robot-state-endpoint", default="tcp://127.0.0.1:5557")
     parser.add_argument("--robot-state-topic", default="g1_debug")
     parser.add_argument(
@@ -113,16 +118,51 @@ def parse_args() -> argparse.Namespace:
         help="Advance the measured-state-aligned B-spline phase by this prediction horizon.",
     )
     parser.add_argument(
+        "--phase-tracking-mode",
+        choices=("fixed_rate", "state_aligned", "wall_time"),
+        default="fixed_rate",
+        help=(
+            "How auto_planning advances along the cuRobo B-spline. "
+            "fixed_rate streams the spline at the bridge FPS independent of tracking error; "
+            "state_aligned projects measured q onto the spline; wall_time uses message t_start_us."
+        ),
+    )
+    parser.add_argument(
         "--terminal-capture-radius-m",
         type=float,
         default=0.07,
         help="QP switches to the static terminal EE target once measured wrist is within this radius.",
     )
+    parser.add_argument("--outer-waist-enabled", action="store_true",
+                        help="Enable slow hierarchical waist yaw setpoint for static Cartesian EE servo.")
+    parser.add_argument("--outer-waist-update-hz", type=float, default=1.0)
+    parser.add_argument("--outer-waist-enable-error-m", type=float, default=0.045)
+    parser.add_argument("--outer-waist-enable-dwell-sec", type=float, default=0.50)
+    parser.add_argument("--outer-waist-freeze-error-m", type=float, default=0.025)
+    parser.add_argument("--outer-waist-yaw-bound-rad", type=float, default=0.15)
+    parser.add_argument("--outer-waist-roll-bound-rad", type=float, default=0.02)
+    parser.add_argument("--outer-waist-pitch-bound-rad", type=float, default=0.03)
+    parser.add_argument("--outer-waist-yaw-velocity-rad-s", type=float, default=0.06)
+    parser.add_argument("--outer-waist-roll-velocity-rad-s", type=float, default=0.01)
+    parser.add_argument("--outer-waist-pitch-velocity-rad-s", type=float, default=0.015)
+    parser.add_argument("--outer-waist-yaw-samples", type=int, default=31)
+    parser.add_argument("--outer-waist-current-weight", type=float, default=0.08)
+    parser.add_argument("--outer-waist-neutral-weight", type=float, default=0.18)
     parser.add_argument(
         "--plan-complete-radius-m",
         type=float,
         default=0.07,
-        help="Clear active auto plan after duration_sec once measured EE is within this target distance.",
+        help="Target distance used by optional auto-clear logging/behavior.",
+    )
+    parser.add_argument(
+        "--auto-clear-on-target-reached",
+        action="store_true",
+        help="Clear active auto plan after duration_sec once measured EE is within --plan-complete-radius-m.",
+    )
+    parser.add_argument(
+        "--clear-plan-after-total-duration",
+        action="store_true",
+        help="Clear active auto plan after duration_sec + final_hold_sec. By default the final knot is held.",
     )
     parser.add_argument(
         "--no-keyboard",
@@ -328,8 +368,16 @@ def upper_from_q29(q: np.ndarray) -> np.ndarray:
     return np.asarray(q, dtype=np.float64).reshape(29)[UPPER_BODY_PLANNER_INDICES].astype(np.float32)
 
 
-def send_planner_command(socket: zmq.Socket, q29: np.ndarray, height: float) -> None:
-    upper = upper_from_q29(q29)
+def send_planner_command(
+    socket: zmq.Socket,
+    q29: np.ndarray,
+    height: float,
+    neutralize_waist: bool = False,
+) -> None:
+    q_for_command = np.asarray(q29, dtype=np.float64).reshape(29).copy()
+    if neutralize_waist:
+        q_for_command[12:15] = 0.0
+    upper = upper_from_q29(q_for_command)
     socket.send(
         build_planner_message(
             0,
@@ -364,7 +412,7 @@ def latest_q_from_gmr(payload: dict | None) -> np.ndarray | None:
 def latest_q_from_robot_state(payload: dict | None) -> np.ndarray | None:
     if not payload:
         return None
-    for key in ("body_q_measured", "body_q", "q_measured", "state_body_q"):
+    for key in ("body_q", "q_measured", "state_body_q", "body_q_measured"):
         q = payload.get(key)
         if q is None:
             continue
@@ -372,6 +420,230 @@ def latest_q_from_robot_state(payload: dict | None) -> np.ndarray | None:
         if arr.shape[0] >= 29 and np.isfinite(arr[:29]).all():
             return arr[:29].copy()
     return None
+
+
+def target_side_from_link(target_link: str) -> str:
+    if target_link.startswith("right_") or "right" in target_link:
+        return "right"
+    if target_link.startswith("left_") or "left" in target_link:
+        return "left"
+    return ""
+
+
+def hold_inactive_arm_for_single_target(
+    q_command: np.ndarray,
+    q_hold: np.ndarray | None,
+    target_side: str,
+) -> np.ndarray:
+    output = np.asarray(q_command, dtype=np.float64).reshape(29).copy()
+    if q_hold is None:
+        return output
+    hold = np.asarray(q_hold, dtype=np.float64).reshape(29)
+    if target_side == "left":
+        output[22:29] = hold[22:29]
+    elif target_side == "right":
+        output[15:22] = hold[15:22]
+    return output
+
+
+def target_arm_prior_from_ik(
+    q_base: np.ndarray,
+    q_ik: np.ndarray | None,
+    target_side: str,
+) -> np.ndarray:
+    output = np.asarray(q_base, dtype=np.float64).reshape(29).copy()
+    if q_ik is None:
+        return output
+    ik = np.asarray(q_ik, dtype=np.float64).reshape(29)
+    if target_side == "left":
+        output[15:22] = ik[15:22]
+    elif target_side == "right":
+        output[22:29] = ik[22:29]
+    return output
+
+
+class OuterWaistPlanner:
+    """Slow yaw-only waist posture selector for static Cartesian servo."""
+
+    def __init__(self, args: argparse.Namespace):
+        self.args = args
+        self.enabled = bool(args.outer_waist_enabled)
+        self.start = np.zeros(3, dtype=np.float64)
+        self.ref = np.zeros(3, dtype=np.float64)
+        self.desired = np.zeros(3, dtype=np.float64)
+        self.hold_plan_id = -1
+        self.hold_side = ""
+        self.high_error_sec = 0.0
+        self.last_select_us = 0
+        self.active = False
+        self.last_reason = "disabled"
+        self.last_score = float("nan")
+
+    def reset(self, q_seed: np.ndarray, plan_id: int, target_side: str) -> None:
+        waist = np.asarray(q_seed, dtype=np.float64).reshape(29)[12:15].copy()
+        self.start = waist
+        self.ref = waist
+        self.desired = waist
+        self.hold_plan_id = int(plan_id)
+        self.hold_side = target_side
+        self.high_error_sec = 0.0
+        self.last_select_us = 0
+        self.active = False
+        self.last_reason = "reset"
+        self.last_score = float("nan")
+
+    def maybe_reset(self, q_seed: np.ndarray, plan_id: int, target_side: str) -> None:
+        if self.hold_plan_id != int(plan_id) or self.hold_side != target_side:
+            self.reset(q_seed, plan_id, target_side)
+
+    def _bounded_target(self, candidate_yaw: float) -> np.ndarray:
+        target = self.start.copy()
+        target[0] = float(np.clip(
+            candidate_yaw,
+            self.start[0] - self.args.outer_waist_yaw_bound_rad,
+            self.start[0] + self.args.outer_waist_yaw_bound_rad,
+        ))
+        target[1] = float(np.clip(
+            self.start[1],
+            self.start[1] - self.args.outer_waist_roll_bound_rad,
+            self.start[1] + self.args.outer_waist_roll_bound_rad,
+        ))
+        target[2] = float(np.clip(
+            self.start[2],
+            self.start[2] - self.args.outer_waist_pitch_bound_rad,
+            self.start[2] + self.args.outer_waist_pitch_bound_rad,
+        ))
+        return target
+
+    def _select_desired_yaw(
+        self,
+        wrist_fk: MujocoWristFk,
+        q_base: np.ndarray,
+        q_posture: np.ndarray,
+        target_link: str,
+        target_position: np.ndarray,
+    ) -> None:
+        n = max(3, int(self.args.outer_waist_yaw_samples))
+        lo = self.start[0] - self.args.outer_waist_yaw_bound_rad
+        hi = self.start[0] + self.args.outer_waist_yaw_bound_rad
+        candidates = np.linspace(lo, hi, n, dtype=np.float64)
+        best_score = float("inf")
+        best = self.desired.copy()
+        current_yaw = float(self.ref[0])
+        neutral_yaw = float(self.start[0])
+        for yaw in candidates:
+            q = np.asarray(q_posture, dtype=np.float64).reshape(29).copy()
+            q[12:15] = self._bounded_target(float(yaw))
+            try:
+                wrist = wrist_fk.wrist_position(q, target_link)
+            except Exception:
+                continue
+            err = float(np.linalg.norm(wrist - target_position))
+            score = (
+                err * err
+                + self.args.outer_waist_current_weight * (float(yaw) - current_yaw) ** 2
+                + self.args.outer_waist_neutral_weight * (float(yaw) - neutral_yaw) ** 2
+            )
+            if score < best_score:
+                best_score = score
+                best = self._bounded_target(float(yaw))
+        if np.isfinite(best_score):
+            self.desired = best
+            self.last_score = best_score
+            self.last_reason = "selected"
+        else:
+            self.last_reason = "select_failed"
+
+    def update(
+        self,
+        dt: float,
+        tick_us: int,
+        terminal_error_m: float,
+        wrist_fk: MujocoWristFk | None,
+        q_command: np.ndarray,
+        q_posture: np.ndarray,
+        target_link: str,
+        target_position: np.ndarray,
+    ) -> np.ndarray:
+        if not self.enabled:
+            self.last_reason = "disabled"
+            return np.asarray(q_command, dtype=np.float64).reshape(29)
+        output = np.asarray(q_command, dtype=np.float64).reshape(29).copy()
+        if not np.isfinite(terminal_error_m):
+            self.last_reason = "no_error"
+            output[12:15] = self.ref
+            return output
+        if terminal_error_m > self.args.outer_waist_enable_error_m:
+            self.high_error_sec += max(0.0, float(dt))
+        else:
+            self.high_error_sec = 0.0
+        if terminal_error_m < self.args.outer_waist_freeze_error_m:
+            self.active = False
+            self.last_reason = "freeze_near_target"
+        elif self.high_error_sec >= self.args.outer_waist_enable_dwell_sec:
+            self.active = True
+
+        update_interval_us = int(1.0e6 / max(self.args.outer_waist_update_hz, 1.0e-6))
+        if (
+            self.active
+            and wrist_fk is not None
+            and (tick_us - self.last_select_us) >= update_interval_us
+        ):
+            self._select_desired_yaw(
+                wrist_fk=wrist_fk,
+                q_base=output,
+                q_posture=q_posture,
+                target_link=target_link,
+                target_position=target_position,
+            )
+            self.last_select_us = tick_us
+
+        velocity = np.array([
+            self.args.outer_waist_yaw_velocity_rad_s,
+            self.args.outer_waist_roll_velocity_rad_s,
+            self.args.outer_waist_pitch_velocity_rad_s,
+        ], dtype=np.float64)
+        step = np.clip(self.desired - self.ref, -velocity * dt, velocity * dt)
+        self.ref = self._bounded_target(self.ref[0] + step[0])
+        # Keep roll/pitch effectively fixed at the latched start posture for
+        # now. Their bounds/velocities are present for later expansion.
+        self.ref[1:] = self.start[1:]
+        output[12:15] = self.ref
+        return output
+
+    def status(self) -> str:
+        return (
+            f"outer_waist={'on' if self.enabled else 'off'}"
+            f"/{'active' if self.active else 'frozen'} "
+            f"yaw={self.ref[0]:+.3f}->{self.desired[0]:+.3f} "
+            f"err_hold={self.high_error_sec:.2f}s reason={self.last_reason}"
+        )
+
+
+def q_ik_prior_from_plan(
+    plan: dict | None,
+    target: dict | None,
+    target_link: str,
+    tick_us: int,
+    plan_timeout_sec: float,
+) -> tuple[np.ndarray | None, str]:
+    if not plan or not target or not bool(plan.get("feasible", False)):
+        return None, "none"
+    if (tick_us - int(plan.get("timestamp_us", 0))) > plan_timeout_sec * 1.0e6:
+        return None, "stale"
+    if str(plan.get("target_link", "")) != str(target_link):
+        return None, "link_mismatch"
+    target_uid = str(target.get("goal_uid", ""))
+    plan_uid = str(plan.get("goal_uid", ""))
+    if target_uid and plan_uid and target_uid != plan_uid:
+        return None, "uid_mismatch"
+    q_goal = plan.get("q_goal", plan.get("q_ik_ref", plan.get("ik_q_goal")))
+    if q_goal is None:
+        return None, "missing_q_goal"
+    q = np.asarray(q_goal, dtype=np.float64).reshape(-1)
+    if q.shape[0] < 29 or not np.isfinite(q[:29]).all():
+        return None, "invalid_q_goal"
+    return q[:29].copy(), f"curobo_ik_plan_{int(plan.get('plan_id', 0))}"
 
 
 def main() -> int:
@@ -395,6 +667,12 @@ def main() -> int:
     plan_sub.setsockopt(zmq.CONFLATE, 1)
     plan_sub.setsockopt(zmq.RCVTIMEO, 1)
     plan_sub.connect(args.plan_endpoint)
+
+    static_target_sub = ctx.socket(zmq.SUB)
+    static_target_sub.setsockopt(zmq.SUBSCRIBE, args.static_target_topic.encode())
+    static_target_sub.setsockopt(zmq.CONFLATE, 1)
+    static_target_sub.setsockopt(zmq.RCVTIMEO, 1)
+    static_target_sub.bind(args.static_target_bind)
 
     robot_state = ctx.socket(zmq.SUB)
     robot_state.setsockopt(zmq.SUBSCRIBE, args.robot_state_topic.encode())
@@ -421,6 +699,7 @@ def main() -> int:
     log(f"Pico input SUB {args.pico_endpoint}/pose,command,planner,manager_state")
     log(f"GMR input SUB {args.gmr_endpoint}/{args.gmr_topic}")
     log(f"cuRobo plan SUB {args.plan_endpoint}/{args.plan_topic}")
+    log(f"static EE target SUB {args.static_target_bind}/{args.static_target_topic}")
     log(f"robot state SUB {args.robot_state_endpoint}/{args.robot_state_topic}")
     log(f"state command SUB {args.state_command_bind}/{args.state_command_topic}")
     log(f"SONIC output PUB tcp://{args.sonic_bind_host}:{args.sonic_port}")
@@ -431,6 +710,13 @@ def main() -> int:
     latest_gmr_us = 0
     latest_plan: dict | None = None
     latest_plan_us = 0
+    latest_static_target: dict | None = None
+    latest_static_target_us = 0
+    static_target_plan_id = 0
+    latest_static_target_uid = ""
+    static_target_hold_q: np.ndarray | None = None
+    static_target_hold_plan_id = -1
+    static_target_hold_side = ""
     active_plan: dict | None = None
     active_plan_us = 0
     active_plan_s: float | None = None
@@ -447,6 +733,7 @@ def main() -> int:
     completed_plan_ids: set[int] = set()
     period = 1.0 / max(args.fps, 1.0e-6)
     keyboard = KeyboardController(enabled=not args.no_keyboard)
+    outer_waist = OuterWaistPlanner(args)
     wrist_fk: MujocoWristFk | None = None
     try:
         wrist_fk = MujocoWristFk(args.model_xml)
@@ -503,13 +790,14 @@ def main() -> int:
             log(f"{source}: no fresh feasible plan to latch")
             return False
         active_plan = copy.deepcopy(latest_plan)
-        active_plan_us = latest_plan_us
-        active_plan_s = None
+        active_plan_us = tick_us
+        active_plan_s = 0.0
         phase_mode = "latched"
         phase_sync_error_rad = float("nan")
         log(
             f"{source}: latched active plan id={active_plan.get('plan_id', 0)} "
-            f"cps={len(active_plan.get('control_points', []))}"
+            f"cps={len(active_plan.get('control_points', []))} "
+            f"phase_mode={args.phase_tracking_mode}"
         )
         return True
 
@@ -618,11 +906,23 @@ def main() -> int:
 
             try:
                 while True:
-                    latest_plan = unpack_topic(plan_sub.recv(zmq.NOBLOCK), args.plan_topic)
-                    latest_plan_us = tick_us
-                    if not latest_plan.get("feasible", False):
-                        reason = str(latest_plan.get("failure_reason", ""))
-                        incoming_plan_id = int(latest_plan.get("plan_id", 0))
+                    incoming_plan = unpack_topic(plan_sub.recv(zmq.NOBLOCK), args.plan_topic)
+                    incoming_feasible = bool(incoming_plan.get("feasible", False))
+                    incoming_plan_id = int(incoming_plan.get("plan_id", 0))
+                    incoming_cps = len(incoming_plan.get("control_points", []))
+                    if incoming_feasible and incoming_cps >= 4:
+                        latest_plan = incoming_plan
+                        latest_plan_us = tick_us
+                        if current_state == "auto_planning":
+                            active_plan_id = int(active_plan.get("plan_id", 0)) if active_plan else 0
+                            if active_plan is None or incoming_plan_id != active_plan_id:
+                                latch_latest_plan("auto_planning/plan_update", tick_us)
+                    else:
+                        # Infeasible/expired planner heartbeats are status
+                        # messages, not executable references. Do not let them
+                        # overwrite the last feasible plan before the bridge has
+                        # a chance to latch it on an A+X/e transition.
+                        reason = str(incoming_plan.get("failure_reason", ""))
                         if (
                             reason == "plan_expired"
                             and active_plan is not None
@@ -631,9 +931,37 @@ def main() -> int:
                             clear_active_plan("server plan_expired")
                     log(
                         "plan update "
-                        f"id={latest_plan.get('plan_id', 0)} feasible={latest_plan.get('feasible')} "
-                        f"cps={len(latest_plan.get('control_points', []))}"
+                        f"id={incoming_plan_id} feasible={incoming_plan.get('feasible')} "
+                        f"cps={incoming_cps}"
                     )
+            except zmq.Again:
+                pass
+
+            try:
+                while True:
+                    incoming_target = unpack_topic(
+                        static_target_sub.recv(zmq.NOBLOCK), args.static_target_topic)
+                    position = np.asarray(
+                        incoming_target.get("position", incoming_target.get("target_position", [])),
+                        dtype=np.float64,
+                    ).reshape(-1)
+                    if position.shape[0] == 3 and np.isfinite(position).all():
+                        incoming_uid = str(incoming_target.get("goal_uid", ""))
+                        target_link = str(incoming_target.get("target_link", "left_wrist_yaw_link"))
+                        target_side = target_side_from_link(target_link)
+                        is_new_goal = (
+                            not incoming_uid
+                            or incoming_uid != latest_static_target_uid
+                            or target_side != static_target_hold_side
+                        )
+                        latest_static_target = incoming_target
+                        latest_static_target_us = tick_us
+                        if is_new_goal:
+                            latest_static_target_uid = incoming_uid
+                            static_target_plan_id += 1
+                            static_target_hold_q = None
+                            static_target_hold_plan_id = -1
+                            static_target_hold_side = ""
             except zmq.Again:
                 pass
 
@@ -673,6 +1001,10 @@ def main() -> int:
             q_gmr = latest_q_from_gmr(latest_gmr)
             gmr_fresh = q_gmr is not None and (tick_us - latest_gmr_us) <= args.gmr_timeout_sec * 1.0e6
             plan_fresh = latest_plan is not None and (tick_us - latest_plan_us) <= args.plan_timeout_sec * 1.0e6
+            static_target_fresh = (
+                latest_static_target is not None
+                and (tick_us - latest_static_target_us) <= args.static_target_timeout_sec * 1.0e6
+            )
             if active_plan is not None:
                 elapsed_sec = (tick_us - active_plan_us) / 1.0e6
                 move_duration_sec = float(active_plan.get("duration_sec", 0.0))
@@ -680,6 +1012,7 @@ def main() -> int:
                 if move_duration_sec > 0.0 and elapsed_sec >= move_duration_sec:
                     target_distance_m = active_plan_target_distance()
                     if (
+                        args.auto_clear_on_target_reached and
                         np.isfinite(target_distance_m)
                         and target_distance_m <= args.plan_complete_radius_m
                     ):
@@ -687,7 +1020,12 @@ def main() -> int:
                             f"target reached d={100.0 * target_distance_m:.1f}cm "
                             f"<= {100.0 * args.plan_complete_radius_m:.1f}cm"
                         )
-                if active_plan is not None and active_total_sec > 0.0 and elapsed_sec >= active_total_sec + 0.25:
+                if (
+                    active_plan is not None
+                    and args.clear_plan_after_total_duration
+                    and active_total_sec > 0.0
+                    and elapsed_sec >= active_total_sec + 0.25
+                ):
                     clear_active_plan("duration+hold elapsed")
             if current_state == "auto_planning" and active_plan is None and latest_plan_ready(tick_us):
                 latch_latest_plan("auto_planning/pending", tick_us)
@@ -713,9 +1051,103 @@ def main() -> int:
                         timestamp_us=tick_us,
                     )
             elif current_state == "auto_planning":
-                plan = active_plan
-                feasible_plan = bool(plan and plan.get("feasible", False))
-                if feasible_plan:
+                if static_target_fresh:
+                    target_link = str(latest_static_target.get("target_link", "left_wrist_yaw_link"))
+                    target_position = np.asarray(
+                        latest_static_target.get(
+                            "terminal_target_position",
+                            latest_static_target.get("position", [0.0, 0.0, 0.0]),
+                        ),
+                        dtype=np.float64,
+                    ).reshape(3)
+                    q_hold = (
+                        latest_robot_q.copy()
+                        if latest_robot_q is not None
+                        else q_gmr.copy()
+                        if q_gmr is not None
+                        else np.zeros(29, dtype=np.float64)
+                    )
+                    target_side = target_side_from_link(target_link)
+                    if (
+                        static_target_hold_q is None
+                        or static_target_hold_plan_id != static_target_plan_id
+                        or static_target_hold_side != target_side
+                    ):
+                        static_target_hold_q = q_hold.copy()
+                        static_target_hold_plan_id = static_target_plan_id
+                        static_target_hold_side = target_side
+                        log(
+                            "latched inactive-arm hold "
+                            f"plan={static_target_plan_id} side={target_side or 'unknown'}"
+                        )
+                    outer_waist.maybe_reset(q_hold, static_target_plan_id, target_side)
+                    q_command = hold_inactive_arm_for_single_target(
+                        q_hold, static_target_hold_q, target_side)
+                    q_ik_prior, q_ik_prior_source = q_ik_prior_from_plan(
+                        latest_plan,
+                        latest_static_target,
+                        target_link,
+                        tick_us,
+                        args.plan_timeout_sec,
+                    )
+                    q_prior = target_arm_prior_from_ik(
+                        q_command,
+                        q_ik_prior,
+                        target_side,
+                    )
+                    q_prior = hold_inactive_arm_for_single_target(
+                        q_prior, static_target_hold_q, target_side)
+                    terminal_error_m = float("nan")
+                    if wrist_fk is not None:
+                        try:
+                            q_for_error = (
+                                latest_robot_q
+                                if latest_robot_q is not None
+                                else q_hold
+                            )
+                            terminal_error_m = float(np.linalg.norm(
+                                wrist_fk.wrist_position(q_for_error, target_link)
+                                - target_position
+                            ))
+                        except Exception:
+                            terminal_error_m = float("nan")
+                    q_command = outer_waist.update(
+                        dt=dt,
+                        tick_us=tick_us,
+                        terminal_error_m=terminal_error_m,
+                        wrist_fk=wrist_fk,
+                        q_command=q_command,
+                        q_posture=q_prior,
+                        target_link=target_link,
+                        target_position=target_position,
+                    )
+                    q_prior[12:15] = q_command[12:15]
+                    q_prior = hold_inactive_arm_for_single_target(
+                        q_prior, static_target_hold_q, target_side)
+                    send_planner_command(sonic, q_command, args.height, neutralize_waist=False)
+                    last_plan_q = q_command.copy()
+                    blended_q = q_prior.copy()
+                    qp_payload = qp_cartesian_target_reference(
+                        target_link=target_link,
+                        target_position=target_position,
+                        q_ref=q_prior,
+                        state="auto_planning",
+                        source="cartesian_servo",
+                        control_mode="plan_exec",
+                        feasible=True,
+                        plan_id=static_target_plan_id,
+                        timestamp_us=tick_us,
+                        terminal_capture_radius_m=float(args.terminal_capture_radius_m),
+                        target_source=str(latest_static_target.get("source", "manual_static_target")),
+                        q_prior_source=q_ik_prior_source,
+                        has_q_ik_prior=q_ik_prior is not None,
+                    )
+                    phase_mode = "cartesian_target"
+                    phase_sync_error_rad = float("nan")
+                else:
+                  plan = active_plan
+                  feasible_plan = bool(plan and plan.get("feasible", False))
+                  if feasible_plan:
                     cps = np.asarray(plan.get("control_points", []), dtype=np.float64)
                     dt_plan = float(plan.get("control_dt_sec", 0.02))
                     t0 = int(plan.get("t_start_us", plan.get("timestamp_us", tick_us)))
@@ -725,7 +1157,16 @@ def main() -> int:
                             and (tick_us - latest_robot_state_us) <= 0.25 * 1.0e6
                         )
                         max_segment = float(cps.shape[0] - 4)
-                        if robot_fresh:
+                        if args.phase_tracking_mode == "fixed_rate":
+                            elapsed_sec = max(0.0, (tick_us - active_plan_us) / 1.0e6)
+                            query_s = (elapsed_sec + max(0.0, args.phase_lookahead_sec)) / max(
+                                dt_plan, 1.0e-6
+                            )
+                            active_plan_s = float(np.clip(query_s, 0.0, max_segment))
+                            q_plan, phase = bspline_eval_s(cps, active_plan_s)
+                            phase_mode = "fixed_rate"
+                            phase_sync_error_rad = float("nan")
+                        elif args.phase_tracking_mode == "state_aligned" and robot_fresh:
                             best_s, phase_sync_error_rad = nearest_bspline_s(
                                 cps,
                                 latest_robot_q,
@@ -743,13 +1184,14 @@ def main() -> int:
                             q_plan, phase = bspline_eval_s(cps, active_plan_s)
                             phase_mode = "state_aligned"
                         else:
-                            q_plan, phase = bspline_eval(cps, dt_plan, t0, tick_us)
+                            wall_t0 = active_plan_us if args.phase_tracking_mode == "wall_time" else t0
+                            q_plan, phase = bspline_eval(cps, dt_plan, wall_t0, tick_us)
                             active_plan_s = phase * max_segment
                             phase_mode = "wall_time"
                             phase_sync_error_rad = float("nan")
                         last_plan_q = q_plan.copy()
                         blended_q = q_plan.copy()
-                        send_planner_command(sonic, q_plan, args.height)
+                        send_planner_command(sonic, q_plan, args.height, neutralize_waist=True)
                         # Publish the same cuRobo spline that produced SONIC's
                         # q_plan. Re-anchor t_start every tick to the
                         # state-aligned phase so the deploy-side QP provider
@@ -770,7 +1212,12 @@ def main() -> int:
                             phase=phase,
                             timestamp_us=tick_us,
                             terminal_target_link=str(plan.get("target_link", "left_wrist_yaw_link")),
-                            terminal_target_position=list(plan.get("target_position", [0.0, 0.0, 0.0])),
+                            terminal_target_position=list(
+                                plan.get(
+                                    "terminal_target_position",
+                                    plan.get("target_position", [0.0, 0.0, 0.0]),
+                                )
+                            ),
                             terminal_capture_radius_m=float(args.terminal_capture_radius_m),
                             phase_mode=phase_mode,
                             phase_sync_error_rad=float(phase_sync_error_rad),
@@ -785,7 +1232,7 @@ def main() -> int:
                             plan_id=int(plan.get("plan_id", 0)) if plan else 0,
                             timestamp_us=tick_us,
                         )
-                else:
+                  else:
                     qp_payload = qp_none_reference(
                         state="auto_planning",
                         source="curobo",
@@ -800,7 +1247,7 @@ def main() -> int:
                         blended_q = last_plan_q.copy() if last_plan_q is not None else q_gmr.copy()
                     alpha = 1.0 - np.exp(-args.damped_return_rate * dt)
                     blended_q = (1.0 - alpha) * blended_q + alpha * q_gmr
-                    send_planner_command(sonic, blended_q, args.height)
+                    send_planner_command(sonic, blended_q, args.height, neutralize_waist=False)
                     qp_payload = qp_sample_reference(
                         blended_q,
                         state="damped_return",
@@ -839,15 +1286,18 @@ def main() -> int:
             if now - last_log > 1.0:
                 log(
                     f"state={current_state} gmr_fresh={gmr_fresh} plan_fresh={plan_fresh} "
+                    f"static_target_fresh={static_target_fresh} "
                     f"active_plan={active_plan.get('plan_id', 0) if active_plan else 0} "
                     f"qp_gate={'on' if qp_reference_enabled else 'off'} "
                     f"qp_type={qp_payload.get('reference_type') if qp_payload else 'none'} "
                     f"source={qp_payload.get('source', 'none') if qp_payload else 'none'} "
+                    f"q_prior={qp_payload.get('q_prior_source', 'n/a') if qp_payload else 'n/a'} "
                     f"control={qp_payload.get('control_mode', 'none') if qp_payload else 'none'} "
                     f"plan={qp_payload.get('plan_id', 0) if qp_payload else 0} "
                     f"phase={float(qp_payload.get('phase', 0.0)) if qp_payload else 0.0:.2f} "
                     f"phase_mode={phase_mode} "
                     f"phase_err={phase_sync_error_rad if np.isfinite(phase_sync_error_rad) else float('nan'):.3f}rad "
+                    f"{outer_waist.status()} "
                     f"feasible={qp_payload.get('feasible') if qp_payload else False}"
                 )
                 last_log = now

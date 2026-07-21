@@ -97,9 +97,16 @@ void LockInactiveArmBounds(
   }
 }
 
-void LockCartesianWaistBounds(
-    const EeReference& reference, ActiveVector& lower, ActiveVector& upper) {
-  if (reference.reference_type != ReferenceType::kCartesianTarget) return;
+bool ShouldLockWaistCorrection(
+    const EeReference& reference, bool lock_waist_correction) {
+  return lock_waist_correction ||
+         reference.reference_type == ReferenceType::kCartesianTarget;
+}
+
+void LockWaistBounds(
+    const EeReference& reference, bool lock_waist_correction,
+    ActiveVector& lower, ActiveVector& upper) {
+  if (!ShouldLockWaistCorrection(reference, lock_waist_correction)) return;
   for (int i = 0; i < 3; ++i) {
     lower[i] = 0.0;
     upper[i] = 0.0;
@@ -114,13 +121,17 @@ void ZeroInactiveArmDelta(const EeReference& reference, ActiveVector& delta) {
   }
 }
 
-void ZeroCartesianWaistDelta(const EeReference& reference, ActiveVector& delta) {
-  if (reference.reference_type != ReferenceType::kCartesianTarget) return;
+void ZeroWaistDelta(
+    const EeReference& reference, bool lock_waist_correction,
+    ActiveVector& delta) {
+  if (!ShouldLockWaistCorrection(reference, lock_waist_correction)) return;
   for (int i = 0; i < 3; ++i) delta[i] = 0.0;
 }
 
-void ZeroLockedDelta(const EeReference& reference, ActiveVector& delta) {
-  ZeroCartesianWaistDelta(reference, delta);
+void ZeroLockedDelta(
+    const EeReference& reference, bool lock_waist_correction,
+    ActiveVector& delta) {
+  ZeroWaistDelta(reference, lock_waist_correction, delta);
   ZeroInactiveArmDelta(reference, delta);
 }
 
@@ -395,7 +406,7 @@ class EeQpCorrector::Impl {
     const ActiveVector rate_upper = projected_previous_delta + max_rate_step;
     lower = lower.cwiseMax(rate_lower);
     upper = upper.cwiseMin(rate_upper);
-    LockCartesianWaistBounds(input.reference, lower, upper);
+    LockWaistBounds(input.reference, config_.lock_waist_correction, lower, upper);
     LockInactiveArmBounds(input.reference, lower, upper);
     if ((lower.array() > upper.array()).any()) {
       return Fallback(input, EeQpFallbackReason::kInfeasibleBounds);
@@ -454,7 +465,7 @@ class EeQpCorrector::Impl {
         qp_.update(hessian, gradient, equality, equality_target, box, lower, upper);
       }
       ActiveVector guess = initial_guess.cwiseMax(lower).cwiseMin(upper);
-      ZeroLockedDelta(input.reference, guess);
+      ZeroLockedDelta(input.reference, config_.lock_waist_correction, guess);
       qp_.solve(guess, proxsuite::nullopt, proxsuite::nullopt);
       result.solve_time_ms += std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - started).count();
@@ -467,12 +478,12 @@ class EeQpCorrector::Impl {
         return EeQpFallbackReason::kNonFiniteSolution;
       }
       solution = qp_.results.x;
-      ZeroLockedDelta(input.reference, solution);
+      ZeroLockedDelta(input.reference, config_.lock_waist_correction, solution);
       return EeQpFallbackReason::kNone;
     };
 
     ActiveVector initial_guess = reference_delta.cwiseMax(lower).cwiseMin(upper);
-    ZeroLockedDelta(input.reference, initial_guess);
+    ZeroLockedDelta(input.reference, config_.lock_waist_correction, initial_guess);
     ActiveVector qp_delta = ActiveVector::Zero();
     EeQpFallbackReason solve_failure =
         solve_total_delta_at(ActiveVector::Zero(), initial_guess, qp_delta);
@@ -508,16 +519,22 @@ class EeQpCorrector::Impl {
       return fallback;
     }
 
-    result.correction_bound_saturation_fraction = SaturationFraction(
-        qp_delta, correction_lower, correction_upper);
-    result.rate_bound_saturation_fraction = SaturationFraction(
-        qp_delta, rate_lower, rate_upper);
     result.correction_bound_saturation_mask = SaturationMask(
         qp_delta, correction_lower, correction_upper);
     result.rate_bound_saturation_mask = SaturationMask(
         qp_delta, rate_lower, rate_upper);
+    ZeroLockedDelta(
+        input.reference, config_.lock_waist_correction,
+        result.correction_bound_saturation_mask);
+    ZeroLockedDelta(
+        input.reference, config_.lock_waist_correction,
+        result.rate_bound_saturation_mask);
+    result.correction_bound_saturation_fraction =
+        result.correction_bound_saturation_mask.sum() / kNumUpperJoints;
+    result.rate_bound_saturation_fraction =
+        result.rate_bound_saturation_mask.sum() / kNumUpperJoints;
     ActiveVector proposed_delta = qp_delta;
-    ZeroLockedDelta(input.reference, proposed_delta);
+    ZeroLockedDelta(input.reference, config_.lock_waist_correction, proposed_delta);
     elapsed_sec_ += input.dt;
     const double ramp = config_.startup_ramp_sec > 0.0
         ? std::clamp(elapsed_sec_ / config_.startup_ramp_sec, 0.0, 1.0)
@@ -534,7 +551,7 @@ class EeQpCorrector::Impl {
         // introduce a new rate-limit jump toward zero.
         ActiveVector candidate_delta =
             previous_delta_ + alpha * (proposed_delta - previous_delta_);
-        ZeroLockedDelta(input.reference, candidate_delta);
+        ZeroLockedDelta(input.reference, config_.lock_waist_correction, candidate_delta);
         JointVector candidate_q = q_linearization;
         JointVector candidate_full_delta = JointVector::Zero();
         InsertActive(candidate_delta, candidate_full_delta);
@@ -598,7 +615,7 @@ class EeQpCorrector::Impl {
       return fallback;
     }
 
-    ZeroLockedDelta(input.reference, accepted_delta);
+    ZeroLockedDelta(input.reference, config_.lock_waist_correction, accepted_delta);
     JointVector full_delta = JointVector::Zero();
     InsertActive(accepted_delta, full_delta);
     result.q_corrected = input.q_sonic + full_delta;
@@ -744,7 +761,7 @@ class EeQpCorrector::Impl {
     } else {
       previous_delta_.setZero();
     }
-    ZeroLockedDelta(input.reference, previous_delta_);
+    ZeroLockedDelta(input.reference, config_.lock_waist_correction, previous_delta_);
 
     JointVector full_delta = JointVector::Zero();
     InsertActive(previous_delta_, full_delta);
@@ -780,6 +797,10 @@ EeQpConfig LoadEeQpConfig(const std::string& yaml_path) {
   if (root["task"]["inactive_arm_hold_tolerance_rad"]) {
     config.inactive_arm_hold_tolerance_rad =
         root["task"]["inactive_arm_hold_tolerance_rad"].as<double>();
+  }
+  if (root["task"]["lock_waist_correction"]) {
+    config.lock_waist_correction =
+        root["task"]["lock_waist_correction"].as<bool>();
   }
   if (const auto schedule = root["task"]["cartesian_servo_schedule"]) {
     if (schedule["enabled"]) {

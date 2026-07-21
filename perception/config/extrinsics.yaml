@@ -1,0 +1,3 @@
+# Row-major transform from the camera optical frame into torso_link.
+# Leave null until the physical camera mount has been calibrated.
+T_torso_cam: null

@@ -1,0 +1,28 @@
+services:
+  verify:
+    image: g1-perception-sam3:thor-jp71
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.thor
+    network_mode: host
+    ipc: host
+    runtime: nvidia
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      HF_HOME: /cache/huggingface
+      TORCH_HOME: /cache/torch
+      TORCHINDUCTOR_CACHE_DIR: /cache/torch/inductor
+      TRITON_CACHE_DIR: /cache/torch/triton
+      CUDA_CACHE_PATH: /cache/torch/cuda
+      HF_TOKEN: ${HF_TOKEN:-}
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    volumes:
+      - .:/workspace/perception
+      - ./.cache/huggingface:/cache/huggingface
+      - ./.cache/torch:/cache/torch
+      - ./models:/models
+      - ./registry_data:/workspace/perception/registry_data
+    command: ["python", "tools/verify_environment.py"]

@@ -1,0 +1,8 @@
+.cache
+models
+registry_data
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.git

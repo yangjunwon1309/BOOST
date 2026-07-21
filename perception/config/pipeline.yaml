@@ -1,0 +1,41 @@
+lcm_url: "udpm://239.255.76.67:7667?ttl=1"
+web_port: 8080
+depth:
+  min_depth_m: 0.15
+  max_depth_m: 3.0
+  sync_tol_ms: 50
+segmentation:
+  concepts: []
+  target_hz: 3.0
+  min_score: 0.5
+  min_area_px: 400
+  miss_ttl: 10
+  # Keep credentials outside this file. The default builder reads the gated
+  # checkpoint through the mounted Hugging Face cache.
+  checkpoint: null
+cloud:
+  workspace_lims: [-1.0, 1.0, -1.0, 1.0, 0.1, 1.5]
+  voxel_size_m: 0.005
+  object_max_points: 8000
+grip:
+  h_th_m: 0.12
+  finger_clearance_m: 0.005
+  grasp_depth_max_m: 0.04
+  gripper_max_width_m: 0.08
+  gripper_axis_convention: "x_closing_z_approach"
+  top_k: 4
+  side_approach_angles_deg: [0, 30, -30]
+reid:
+  model: "dinov2_vits14"
+  local_repo: null
+  checkpoint: null
+  match_th: 0.72
+  hysteresis: 0.08
+  confirm_n: 3
+  gallery_k: 16
+  diversity_th: 0.90
+  use_size_gate: true
+publish:
+  keepalive_hz: 1.0
+  stale_after_s: 1.5
+registry_dir: "registry_data"

@@ -54,6 +54,18 @@ def _as_vec(value: Any, length: int) -> list[float] | None:
     return values[:length]
 
 
+def _as_nonzero_vec(value: Any, length: int, eps: float = 1e-9) -> list[float] | None:
+    values = _as_vec(value, length)
+    if values is None:
+        return None
+    # Older/non-rebuilt real-LCM deploy binaries published default Eigen::Zero()
+    # wrist telemetry. Treat that as missing so the viewer does not report a
+    # bogus target error that disagrees with the QP telemetry.
+    if sum(v * v for v in values) <= eps * eps:
+        return None
+    return values
+
+
 def json_safe(value: Any) -> Any:
     if isinstance(value, dict):
         return {str(k): json_safe(v) for k, v in value.items()}
@@ -179,6 +191,7 @@ class PathWebRecorder:
         self._lock = threading.Lock()
         self._active = False
         self._rows: list[dict[str, Any]] = []
+        self._telemetry_rows: list[dict[str, Any]] = []
         self._start_wall = 0.0
         self._session_dir: Path | None = None
         self._last_saved: dict[str, str] | None = None
@@ -192,6 +205,7 @@ class PathWebRecorder:
         with self._lock:
             self._active = True
             self._rows = []
+            self._telemetry_rows = []
             self._start_wall = time.time()
             self._session_dir = session_dir
             self._last_saved = None
@@ -200,13 +214,16 @@ class PathWebRecorder:
     def stop(self) -> dict[str, Any]:
         with self._lock:
             rows = list(self._rows)
+            telemetry_rows = list(self._telemetry_rows)
             session_dir = self._session_dir
             self._active = False
             self._rows = []
+            self._telemetry_rows = []
         if session_dir is None:
             return {"recording": False, "frames": 0, "saved": False}
         csv_path = session_dir / "path_static_ee_tracking.csv"
         npz_path = session_dir / "path_static_ee_tracking.npz"
+        telemetry_csv_path = session_dir / "path_ee_qp_telemetry.csv"
         if rows:
             fieldnames: list[str] = []
             for row in rows:
@@ -225,10 +242,21 @@ class PathWebRecorder:
                 except (TypeError, ValueError):
                     arrays[key] = np.asarray(values, dtype=object)
             np.savez_compressed(npz_path, **arrays)
+        if telemetry_rows:
+            telemetry_fieldnames: list[str] = []
+            for row in telemetry_rows:
+                for key in row.keys():
+                    if key not in telemetry_fieldnames:
+                        telemetry_fieldnames.append(key)
+            with telemetry_csv_path.open("w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=telemetry_fieldnames)
+                writer.writeheader()
+                writer.writerows(telemetry_rows)
         self._last_saved = {
             "session_dir": str(session_dir),
             "csv": str(csv_path),
             "npz": str(npz_path),
+            "qp_telemetry_csv": str(telemetry_csv_path),
         }
         return {
             "recording": False,
@@ -244,9 +272,13 @@ class PathWebRecorder:
             elapsed = time.time() - self._start_wall
             index = len(self._rows)
         row = flatten_record_payload(payload, index=index, elapsed_sec=elapsed)
+        telemetry_row = flatten_qp_telemetry_payload(
+            payload, index=index, elapsed_sec=elapsed
+        )
         with self._lock:
             if self._active:
                 self._rows.append(row)
+                self._telemetry_rows.append(telemetry_row)
 
     def status(self) -> dict[str, Any]:
         with self._lock:
@@ -301,6 +333,61 @@ def _put_vec(row: dict[str, Any], prefix: str, values: list[float] | None) -> No
         row[f"{prefix}_{i:02d}"] = float(value)
 
 
+def _put_any_for_csv(row: dict[str, Any], key: str, value: Any) -> None:
+    if value is None:
+        return
+    if isinstance(value, np.ndarray):
+        value = value.tolist()
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, (bool, np.bool_)):
+        row[key] = int(bool(value))
+        return
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        row[key] = float(value)
+        return
+    if isinstance(value, str):
+        row[key] = value
+        return
+    if isinstance(value, (list, tuple)):
+        if all(isinstance(item, (int, float, np.integer, np.floating, bool, np.bool_)) for item in value):
+            for i, item in enumerate(value):
+                row[f"{key}_{i:02d}"] = float(item)
+        else:
+            row[key] = json.dumps(json_safe(value), separators=(",", ":"))
+        return
+    if isinstance(value, dict):
+        row[key] = json.dumps(json_safe(value), separators=(",", ":"))
+        return
+    row[key] = str(value)
+
+
+def flatten_qp_telemetry_payload(
+    payload: dict[str, Any], index: int, elapsed_sec: float
+) -> dict[str, Any]:
+    state_msg = payload.get("_state_msg")
+    if not isinstance(state_msg, dict):
+        state_msg = {}
+    row: dict[str, Any] = {
+        "frame": index,
+        "elapsed_sec": elapsed_sec,
+        "monotonic_us": time.monotonic_ns() // 1000,
+        "state_age_ms": payload.get("state_age_ms", math.nan),
+        "gmr_age_ms": payload.get("gmr_age_ms", math.nan),
+    }
+    # Keep the same raw telemetry that tools/listen_ee_qp_telemetry.py
+    # summarizes, but write vectors as numbered CSV columns for easy plotting.
+    for key in sorted(state_msg.keys()):
+        if (
+            key.startswith("ee_qp_")
+            or key.startswith("base_")
+            or key.startswith("body_torso_")
+            or key in {"body_torso_ang_vel"}
+        ):
+            _put_any_for_csv(row, key, state_msg.get(key))
+    return row
+
+
 def flatten_record_payload(payload: dict[str, Any], index: int, elapsed_sec: float) -> dict[str, Any]:
     row: dict[str, Any] = {
         "frame": index,
@@ -327,7 +414,12 @@ def flatten_record_payload(payload: dict[str, Any], index: int, elapsed_sec: flo
         "active_target_error_m": payload.get("active_target_error_m", math.nan),
     }
     _put_vec(row, "body_q_measured", payload.get("q"))
-    _put_vec(row, "bspline_q_ref", payload.get("q_qp_ref"))
+    gmr_q_ref = payload.get("q_ref")
+    qp_q_ref = payload.get("q_qp_ref")
+    # Always keep the raw GMR reference. When QP is toggled off, ee_qp_q_ref is
+    # absent, so keep bspline_q_ref backward-compatible by falling back to GMR.
+    _put_vec(row, "gmr_q_ref", gmr_q_ref)
+    _put_vec(row, "bspline_q_ref", qp_q_ref if qp_q_ref is not None else gmr_q_ref)
     _put_vec(row, "pd_q_corrected", payload.get("q_corrected"))
     _put_vec(row, "sonic_last_action", payload.get("last_action"))
     _put_vec(row, "terminal_target_position", payload.get("ee_qp_terminal_target_position"))
@@ -803,7 +895,9 @@ recordBtn.onclick = async () => {
   const status = await (await fetch("/api/record/status")).json();
   if (status.recording) {
     const stopped = await (await fetch("/api/record/stop", {method:"POST"})).json();
-    recordStatusEl.textContent = stopped.saved ? `saved ${stopped.frames} frames: ${stopped.csv}` : "record stopped, no frames";
+    recordStatusEl.textContent = stopped.saved
+      ? `saved ${stopped.frames} frames: ${stopped.csv} | qp: ${stopped.qp_telemetry_csv}`
+      : "record stopped, no frames";
   } else {
     const started = await (await fetch("/api/record/start", {method:"POST"})).json();
     recordStatusEl.textContent = `recording to ${started.session_dir}`;
@@ -928,9 +1022,9 @@ async def state_ws(ws: WebSocket) -> None:
             qp_corrected = _as_float_list(state_msg.get("ee_qp_q_corrected"))
             last_action = _as_float_list(state_msg.get("last_action"))
             terminal_position = _as_vec(state_msg.get("ee_qp_terminal_target_position"), 3)
-            ee_qp_left_wrist_position = _as_vec(state_msg.get("ee_qp_left_wrist_position"), 3)
-            ee_qp_right_wrist_position = _as_vec(state_msg.get("ee_qp_right_wrist_position"), 3)
-            ee_qp_active_wrist_position = _as_vec(state_msg.get("ee_qp_active_wrist_position"), 3)
+            ee_qp_left_wrist_position = _as_nonzero_vec(state_msg.get("ee_qp_left_wrist_position"), 3)
+            ee_qp_right_wrist_position = _as_nonzero_vec(state_msg.get("ee_qp_right_wrist_position"), 3)
+            ee_qp_active_wrist_position = _as_nonzero_vec(state_msg.get("ee_qp_active_wrist_position"), 3)
             terminal_distance = state_msg.get("ee_qp_terminal_target_distance_m", math.nan)
             try:
                 terminal_distance_float = float(terminal_distance)
@@ -979,6 +1073,12 @@ async def state_ws(ws: WebSocket) -> None:
                     active_target_error_m = min(left_target_error_m, right_target_error_m)
                 elif math.isfinite(left_target_error_m) or math.isfinite(right_target_error_m):
                     active_target_error_m = min(left_target_error_m, right_target_error_m)
+            if terminal_position is not None and math.isfinite(terminal_distance_float):
+                active_target_error_m = terminal_distance_float
+                if target_side_int == 1:
+                    left_target_error_m = terminal_distance_float
+                elif target_side_int == 2:
+                    right_target_error_m = terminal_distance_float
             payload = {
                 "q": q_measured,
                 "q_ref": gmr.get("q"),
@@ -1028,7 +1128,9 @@ async def state_ws(ws: WebSocket) -> None:
                 "ee_qp_servo_error_after_m": state_msg.get("ee_qp_servo_error_after_m"),
             }
             if recorder is not None:
-                recorder.append(payload)
+                record_payload = dict(payload)
+                record_payload["_state_msg"] = state_msg
+                recorder.append(record_payload)
             await ws.send_text(json.dumps(json_safe(payload), allow_nan=False))
             await asyncio.sleep(1.0 / 30.0)
     except WebSocketDisconnect:

@@ -9,7 +9,7 @@ ee_qp_args=()
 if [[ "${EE_QP_ENABLED:-1}" == "1" ]]; then
   ee_qp_args+=(
     --use-ee-qp
-    --ee-qp-config "${EE_QP_CONFIG:-src/g1/ee_qp/config/ee_qp.yaml}"
+    --ee-qp-config "${EE_QP_CONFIG:-src/g1/ee_qp/config/ee_qp_real.yaml}"
   )
   if [[ "${PATH_DYNAMIC_REFERENCE_ENABLED:-1}" == "1" ]]; then
     ee_qp_args+=(

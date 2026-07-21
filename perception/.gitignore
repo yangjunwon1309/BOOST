@@ -1,0 +1,8 @@
+.cache/
+models/*
+!models/.gitkeep
+registry_data/*
+!registry_data/.gitkeep
+__pycache__/
+*.py[cod]
+.pytest_cache/

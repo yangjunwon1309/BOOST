@@ -59,7 +59,7 @@ show_usage() {
     echo "  --use-hand-ik               SONIC lower body + waist, IK arms/hands teleop"
     echo "  --use-hand-ik-origin        Legacy 50 Hz arms/hands IK override (no 500 Hz IK thread)"
     echo "  --use-ee-qp                 Enable PATH EE-QP correction"
-    echo "  --ee-qp-config PATH         EE-QP config YAML (default: src/g1/ee_qp/config/ee_qp.yaml)"
+    echo "  --ee-qp-config PATH         EE-QP config YAML (default: src/g1/ee_qp/config/ee_qp_real.yaml)"
     echo "  --path-use-dynamic-reference"
     echo "                               Read PATH state-machine QP references over ZMQ"
     echo "  --path-reference-host HOST  PATH QP reference host (default: 127.0.0.1)"
@@ -119,7 +119,7 @@ USE_UPPER_IK=false
 USE_HAND_IK=false
 USE_HAND_IK_ORIGIN=false
 USE_EE_QP=false
-EE_QP_CONFIG="src/g1/ee_qp/config/ee_qp.yaml"
+EE_QP_CONFIG="src/g1/ee_qp/config/ee_qp_real.yaml"
 PATH_USE_DYNAMIC_REFERENCE=false
 PATH_REFERENCE_HOST="127.0.0.1"
 PATH_REFERENCE_PORT=5560

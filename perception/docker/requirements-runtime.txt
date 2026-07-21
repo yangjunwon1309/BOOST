@@ -1,0 +1,14 @@
+# SAM3 itself is installed from its pinned upstream source revision.
+# PyTorch and torchvision intentionally come from the NVIDIA Thor base image.
+numpy>=1.26,<2
+scipy>=1.13,<2
+Pillow>=10,<13
+PyYAML>=6,<7
+fastapi>=0.115,<1
+uvicorn[standard]>=0.34,<1
+websockets>=14,<17
+lcm>=1.5,<2
+opencv-python-headless>=4.10,<5
+huggingface-hub>=0.29,<2
+# NVIDIA's bundled triton-kernels package declares this runtime dependency.
+pytest>=8,<10

@@ -3202,6 +3202,9 @@ class G1Deploy {
       telemetry.pd_tracking_lag_max_abs_rad = arm_tracking_max_abs;
       telemetry.solve_time_ms = result.solve_time_ms;
       telemetry.reference_age_ms = result.reference_age_ms;
+      telemetry.left_wrist_position = result.left_wrist_position;
+      telemetry.right_wrist_position = result.right_wrist_position;
+      telemetry.active_wrist_position = result.active_wrist_position;
       telemetry.terminal_target_position = result.terminal_target_position;
       telemetry.terminal_target_distance_m = result.terminal_target_distance_m;
       telemetry.terminal_capture_radius_m = result.terminal_capture_radius_m;

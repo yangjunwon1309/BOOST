@@ -1,0 +1,10 @@
+# Replace null values with D435i COLOR-stream intrinsics from
+# `rs-enumerate-devices -c`. Depth must already be aligned to color.
+frame_id: "d435_color_optical"
+width: 640
+height: 480
+fx: null
+fy: null
+cx: null
+cy: null
+depth_scale_um: 1000

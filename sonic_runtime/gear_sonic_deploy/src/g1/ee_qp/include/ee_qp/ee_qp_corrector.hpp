@@ -21,6 +21,7 @@ struct EeQpConfig {
   ActiveVector joint_tolerance_rad = ActiveVector::Constant(0.15);
   double inactive_arm_hold_weight = 3.0;
   double inactive_arm_hold_tolerance_rad = 0.08;
+  bool lock_waist_correction = false;
   bool cartesian_servo_schedule_enabled = true;
   double cartesian_far_distance_m = 0.10;
   double cartesian_mid_distance_m = 0.05;

@@ -9,6 +9,7 @@ import json
 import os
 import platform
 import subprocess
+import shutil
 import sys
 from pathlib import Path
 
@@ -25,6 +26,7 @@ def main() -> int:
     import numpy as np
     import torch
     import lcm
+    import tensorrt as trt
 
     pip_check = subprocess.run(
         [sys.executable, "-m", "pip", "check"],
@@ -76,6 +78,8 @@ def main() -> int:
         "yaml",
         "websockets",
         "huggingface_hub",
+        "tensorrt",
+        "modelopt",
         "sam3",
     ):
         packages[name] = module_version(name)
@@ -97,6 +101,12 @@ def main() -> int:
             "build_sam3_image_model": str(inspect.signature(build_sam3_image_model)),
             "build_sam3_video_predictor": str(inspect.signature(build_sam3_video_predictor)),
             "Sam3Processor": str(inspect.signature(Sam3Processor)),
+        },
+        "tensorrt": {
+            "version": trt.__version__,
+            "trtexec": shutil.which("trtexec"),
+            "engine": str(Path("/models/sam3_trt/sam3_fp16_4out.engine")),
+            "engine_exists": Path("/models/sam3_trt/sam3_fp16_4out.engine").is_file(),
         },
         "checkpoint_state": {
             "hf_token_available": bool(os.getenv("HF_TOKEN")),

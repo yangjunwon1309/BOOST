@@ -46,6 +46,7 @@ enum class EeQpFallbackReason : std::uint8_t {
   kNonFiniteSolution,
   kCandidateRejected,
   kInfeasibleReference,
+  kTeleopWaistGate,
 };
 
 enum class ReferenceSource : std::uint8_t {
@@ -88,6 +89,7 @@ inline const char* FallbackReasonName(EeQpFallbackReason reason) {
     case EeQpFallbackReason::kNonFiniteSolution: return "nonfinite_solution";
     case EeQpFallbackReason::kCandidateRejected: return "candidate_rejected";
     case EeQpFallbackReason::kInfeasibleReference: return "infeasible_reference";
+    case EeQpFallbackReason::kTeleopWaistGate: return "teleop_waist_gate";
   }
   return "unknown";
 }
@@ -134,6 +136,7 @@ struct EeReference {
   JointVector q_ref = JointVector::Zero();
   Eigen::Vector3d terminal_left_wrist_in_reference_pelvis = Eigen::Vector3d::Zero();
   Eigen::Vector3d terminal_right_wrist_in_reference_pelvis = Eigen::Vector3d::Zero();
+  JointVector tau_ff_ref = JointVector::Zero();
   double terminal_capture_radius_m = 0.07;
   std::int64_t timestamp_us = 0;
   std::uint64_t plan_id = 0;
@@ -143,6 +146,12 @@ struct EeReference {
   ControlMode control_mode = ControlMode::kUnknown;
   bool has_terminal_left_wrist_target = false;
   bool has_terminal_right_wrist_target = false;
+  bool has_tau_ff_ref = false;
+  std::int64_t pose_frame_index = -1;
+  std::int64_t gmr_frame_index = -1;
+  std::int64_t gmr_frame_mismatch = 999999;
+  double gmr_prediction_horizon_ms = -1.0;
+  bool gmr_sync_valid = false;
   bool feasible = true;
   bool valid = false;
 };
@@ -188,6 +197,11 @@ struct EeQpResult {
   std::uint64_t plan_id = 0;
   double plan_phase = 0.0;
   ReferenceType reference_type = ReferenceType::kUnknown;
+  std::int64_t pose_frame_index = -1;
+  std::int64_t gmr_frame_index = -1;
+  std::int64_t gmr_frame_mismatch = 999999;
+  double gmr_prediction_horizon_ms = -1.0;
+  bool gmr_sync_valid = false;
   bool fallback_active = false;
   bool candidate_rejected = false;
   bool reference_feasible = false;
@@ -198,6 +212,7 @@ struct EeQpResult {
 
 struct EeQpTelemetry {
   JointVector q_ref = JointVector::Zero();
+  JointVector tau_ff_ref = JointVector::Zero();
   JointVector q_corrected = JointVector::Zero();
   JointVector delta_q = JointVector::Zero();
   JointVector joint_tracking_error = JointVector::Zero();
@@ -233,6 +248,11 @@ struct EeQpTelemetry {
   std::uint64_t plan_id = 0;
   double plan_phase = 0.0;
   ReferenceType reference_type = ReferenceType::kUnknown;
+  std::int64_t pose_frame_index = -1;
+  std::int64_t gmr_frame_index = -1;
+  std::int64_t gmr_frame_mismatch = 999999;
+  double gmr_prediction_horizon_ms = -1.0;
+  bool gmr_sync_valid = false;
   bool enabled = false;
   bool fallback_active = false;
   bool candidate_rejected = false;

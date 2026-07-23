@@ -26,6 +26,12 @@ def _list29(values: Sequence[float] | np.ndarray) -> list[float]:
     return arr.tolist()
 
 
+def _optional_list29(values: Sequence[float] | np.ndarray | None) -> list[float] | None:
+    if values is None:
+        return None
+    return _list29(values)
+
+
 def qp_sample_reference(
     q_ref: Sequence[float] | np.ndarray,
     *,
@@ -36,11 +42,12 @@ def qp_sample_reference(
     plan_id: int = 0,
     phase: float = 0.0,
     timestamp_us: int | None = None,
+    tau_ff_ref: Sequence[float] | np.ndarray | None = None,
     **metadata,
 ) -> dict:
     if state not in PATH_STATES:
         raise ValueError(f"unknown PATH state: {state}")
-    return {
+    payload = {
         "schema": SCHEMA_QP_REFERENCE_V1,
         "reference_type": "sample",
         "state": state,
@@ -53,6 +60,10 @@ def qp_sample_reference(
         "q_ref": _list29(q_ref),
         **metadata,
     }
+    tau = _optional_list29(tau_ff_ref)
+    if tau is not None:
+        payload["tau_ff_ref"] = tau
+    return payload
 
 
 def qp_bspline_reference(
@@ -102,6 +113,7 @@ def qp_cartesian_target_reference(
     phase: float = 0.0,
     timestamp_us: int | None = None,
     terminal_capture_radius_m: float = 0.0,
+    tau_ff_ref: Sequence[float] | np.ndarray | None = None,
     **metadata,
 ) -> dict:
     if state not in PATH_STATES:
@@ -109,7 +121,7 @@ def qp_cartesian_target_reference(
     pos = np.asarray(target_position, dtype=np.float64).reshape(-1)
     if pos.shape[0] != 3:
         raise ValueError(f"target_position must contain 3 values, got {pos.shape[0]}")
-    return {
+    payload = {
         "schema": SCHEMA_QP_REFERENCE_V1,
         "reference_type": "cartesian_target",
         "state": state,
@@ -125,6 +137,10 @@ def qp_cartesian_target_reference(
         "terminal_capture_radius_m": float(terminal_capture_radius_m),
         **metadata,
     }
+    tau = _optional_list29(tau_ff_ref)
+    if tau is not None:
+        payload["tau_ff_ref"] = tau
+    return payload
 
 
 def qp_none_reference(
@@ -135,6 +151,7 @@ def qp_none_reference(
     feasible: bool = False,
     plan_id: int = 0,
     timestamp_us: int | None = None,
+    **metadata,
 ) -> dict:
     return {
         "schema": SCHEMA_QP_REFERENCE_V1,
@@ -145,4 +162,5 @@ def qp_none_reference(
         "feasible": bool(feasible),
         "plan_id": int(plan_id),
         "timestamp_us": int(timestamp_us if timestamp_us is not None else now_us()),
+        **metadata,
     }

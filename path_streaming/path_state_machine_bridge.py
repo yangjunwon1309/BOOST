@@ -13,8 +13,9 @@ Other producers are subordinate inputs:
 
 State behavior:
   teleop/intention:
-    Forward Pico SMPL pose stream to SONIC. Forward Pico command/planner for the
-    normal A+B+X+Y and A+X SONIC interaction. Publish GMR retargeted q_ref to QP.
+    Buffer Pico SMPL pose and GMR q_ref, then release frame-aligned pairs at the
+    bridge clock. Forward Pico command/planner for the normal A+B+X+Y and A+X
+    SONIC interaction.
   auto_planning:
     Suppress Pico pose. Evaluate cuRobo B-spline at the current tick and send it
     as SONIC upper-body/root planner command. Publish the same spline to QP.
@@ -64,6 +65,7 @@ from path_core.messaging.path_schema import (
     qp_sample_reference,
 )
 from path_core.messaging.zmq_bus import pack_topic, unpack_topic
+from path_planning.unitree_arm_nonlinear_ik import UnitreeG1ArmNonlinearIK
 from path_streaming.path_smpl_thread_server import UPPER_BODY_PLANNER_INDICES
 
 VALID_STATES = {"teleop", "intention", "auto_planning", "damped_return"}
@@ -83,6 +85,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--static-target-bind", default="tcp://*:5564")
     parser.add_argument("--static-target-topic", default=STATIC_EE_TARGET_TOPIC)
     parser.add_argument("--static-target-timeout-sec", type=float, default=0.25)
+    parser.add_argument(
+        "--static-target-hold-sec",
+        type=float,
+        default=0.0,
+        help=(
+            "Keep tracking the last valid static EE target for this long after "
+            "messages stop. Values <= 0 hold forever until another state/target "
+            "command replaces it; this is intended for 3-5Hz perception streams."
+        ),
+    )
     parser.add_argument("--robot-state-endpoint", default="tcp://127.0.0.1:5557")
     parser.add_argument("--robot-state-topic", default="g1_debug")
     parser.add_argument(
@@ -103,6 +115,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--command-period-sec", type=float, default=0.25)
     parser.add_argument("--damped-return-rate", type=float, default=3.0)
     parser.add_argument("--gmr-timeout-sec", type=float, default=0.20)
+    parser.add_argument(
+        "--gmr-frame-tolerance",
+        type=int,
+        default=1,
+        help="Only publish GMR QP refs whose frame_index is within this many frames of the forwarded SONIC pose.",
+    )
+    parser.add_argument(
+        "--gmr-max-prediction-horizon-ms",
+        type=float,
+        default=1.0,
+        help="Reject GMR predicted subframes beyond this horizon for teleop/intention QP sync.",
+    )
+    parser.add_argument(
+        "--gmr-frame-buffer-size",
+        type=int,
+        default=240,
+        help="Number of recent GMR frame_index entries retained for frame-synchronous matching.",
+    )
+    parser.add_argument(
+        "--teleop-sync-buffer-min-frames",
+        type=int,
+        default=2,
+        help="Minimum number of incoming pose windows buffered before 50Hz aligned release starts.",
+    )
+    parser.add_argument(
+        "--teleop-sync-drop-unmatched-after-sec",
+        type=float,
+        default=0.25,
+        help="Drop buffered pose frames that do not receive a matching GMR q_ref within this time.",
+    )
     parser.add_argument("--plan-timeout-sec", type=float, default=1.00)
     parser.add_argument(
         "--phase-search-window-sec",
@@ -148,6 +190,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--outer-waist-yaw-samples", type=int, default=31)
     parser.add_argument("--outer-waist-current-weight", type=float, default=0.08)
     parser.add_argument("--outer-waist-neutral-weight", type=float, default=0.18)
+    parser.add_argument(
+        "--arm-nonlinear-ik-enabled",
+        action="store_true",
+        help=(
+            "Use Unitree-style CasADi Opti + IPOPT arm-only nonlinear IK as the "
+            "auto-planning/cartesian-servo q_ref generator. Deploy then directly "
+            "overrides both arms with q_ref and tau_ff_ref."
+        ),
+    )
+    parser.add_argument(
+        "--arm-ik-urdf",
+        type=Path,
+        default=Path("/home/url/00_workspace/xr_teleop/assets/g1/g1_body29_hand14.urdf"),
+    )
+    parser.add_argument(
+        "--arm-ik-model-dir",
+        type=Path,
+        default=Path("/home/url/00_workspace/xr_teleop/assets/g1"),
+    )
+    parser.add_argument("--arm-ik-max-iter", type=int, default=30)
+    parser.add_argument("--arm-ik-ee-offset-m", type=float, default=0.05)
+    parser.add_argument(
+        "--arm-ik-smooth-filter",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep Unitree's short weighted moving average on the IK q solution.",
+    )
+    parser.add_argument(
+        "--arm-ik-hard-lock-inactive-arm",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Set dynamic lower=upper bounds for the non-target arm.",
+    )
     parser.add_argument(
         "--plan-complete-radius-m",
         type=float,
@@ -298,6 +373,35 @@ def command_flags(raw: bytes) -> tuple[bool, bool, bool] | None:
         return start, stop, planner
     except Exception:
         return None
+
+
+def pose_frame_index(raw: bytes) -> int | None:
+    try:
+        fields = parse_packed_fields(raw, "pose")
+        indices = np.asarray(fields.get("frame_index", []), dtype=np.int64).reshape(-1)
+        if indices.size == 0:
+            return None
+        return int(indices[-1])
+    except Exception:
+        return None
+
+
+def gmr_frame_index(payload: dict | None) -> int | None:
+    if not payload:
+        return None
+    try:
+        return int(np.asarray(payload.get("frame_index")).reshape(-1)[-1])
+    except Exception:
+        return None
+
+
+def gmr_prediction_horizon_ms(payload: dict | None) -> float:
+    if not payload:
+        return float("nan")
+    try:
+        return float(payload.get("prediction_horizon_ms", 0.0))
+    except (TypeError, ValueError):
+        return float("nan")
 
 
 def bspline_eval(control_points: np.ndarray, dt: float, t_start_us: int, query_us: int) -> tuple[np.ndarray, float]:
@@ -658,7 +762,7 @@ def main() -> int:
 
     gmr = ctx.socket(zmq.SUB)
     gmr.setsockopt(zmq.SUBSCRIBE, args.gmr_topic.encode())
-    gmr.setsockopt(zmq.CONFLATE, 1)
+    gmr.setsockopt(zmq.RCVHWM, max(20, int(args.gmr_frame_buffer_size)))
     gmr.setsockopt(zmq.RCVTIMEO, 1)
     gmr.connect(args.gmr_endpoint)
 
@@ -704,14 +808,39 @@ def main() -> int:
     log(f"state command SUB {args.state_command_bind}/{args.state_command_topic}")
     log(f"SONIC output PUB tcp://{args.sonic_bind_host}:{args.sonic_port}")
     log(f"QP reference PUB tcp://{args.qp_bind_host}:{args.qp_port}/{args.qp_topic}")
+    arm_nonlinear_ik: UnitreeG1ArmNonlinearIK | None = None
+    if args.arm_nonlinear_ik_enabled:
+        arm_nonlinear_ik = UnitreeG1ArmNonlinearIK(
+            urdf_path=args.arm_ik_urdf,
+            model_dir=args.arm_ik_model_dir,
+            max_iter=args.arm_ik_max_iter,
+            ee_offset_m=args.arm_ik_ee_offset_m,
+            use_smooth_filter=args.arm_ik_smooth_filter,
+        )
+        log(
+            "Unitree-style arm nonlinear IK enabled: "
+            f"urdf={args.arm_ik_urdf}, max_iter={args.arm_ik_max_iter}, "
+            f"hard_lock_inactive={args.arm_ik_hard_lock_inactive_arm}"
+        )
 
     current_state = args.state
-    latest_gmr: dict | None = None
-    latest_gmr_us = 0
+    pose_buffer: dict[int, tuple[bytes, int]] = {}
+    dropped_pose_frames = 0
+    released_pose_frames = 0
+    gmr_buffer: dict[int, list[tuple[dict, int]]] = {}
+    last_gmr_sync_status: dict[str, float | int | bool | str] = {
+        "valid": False,
+        "reason": "no_pose",
+        "pose_frame_index": -1,
+        "gmr_frame_index": -1,
+        "frame_mismatch": 999999,
+        "prediction_horizon_ms": float("nan"),
+    }
     latest_plan: dict | None = None
     latest_plan_us = 0
     latest_static_target: dict | None = None
     latest_static_target_us = 0
+    static_target_revision = 0
     static_target_plan_id = 0
     latest_static_target_uid = ""
     static_target_hold_q: np.ndarray | None = None
@@ -724,6 +853,15 @@ def main() -> int:
     latest_robot_state_us = 0
     phase_mode = "none"
     phase_sync_error_rad = float("nan")
+    last_arm_ik_solve_ms = float("nan")
+    last_arm_ik_error_m = float("nan")
+    last_arm_ik_rot_error_rad = float("nan")
+    last_arm_ik_status = "disabled"
+    arm_ik_cached_revision = -1
+    arm_ik_cached_q_ref: np.ndarray | None = None
+    arm_ik_cached_tau_ff: np.ndarray | None = None
+    arm_ik_cached_feasible = False
+    arm_ik_cached_source = "none"
     blended_q: np.ndarray | None = None
     last_plan_q: np.ndarray | None = None
     qp_reference_enabled = not args.qp_reference_disabled
@@ -767,6 +905,182 @@ def main() -> int:
         current = wrist_fk.wrist_position(latest_robot_q, target_link)
         return float(np.linalg.norm(current - target_position))
 
+    def prune_gmr_buffer(tick_us: int) -> None:
+        max_age_us = max(args.gmr_timeout_sec * 3.0, 0.5) * 1.0e6
+        for frame in list(gmr_buffer.keys()):
+            fresh_items = [
+                (payload, rx_us)
+                for payload, rx_us in gmr_buffer[frame]
+                if tick_us - rx_us <= max_age_us
+            ]
+            if fresh_items:
+                gmr_buffer[frame] = fresh_items[-4:]
+            else:
+                del gmr_buffer[frame]
+        if len(gmr_buffer) > args.gmr_frame_buffer_size:
+            for frame in sorted(gmr_buffer)[: len(gmr_buffer) - args.gmr_frame_buffer_size]:
+                del gmr_buffer[frame]
+
+    def prune_pose_buffer(tick_us: int) -> None:
+        nonlocal dropped_pose_frames
+        max_age_us = max(args.teleop_sync_drop_unmatched_after_sec, 0.05) * 1.0e6
+        for frame in sorted(list(pose_buffer.keys())):
+            _, rx_us = pose_buffer[frame]
+            if tick_us - rx_us <= max_age_us:
+                continue
+            del pose_buffer[frame]
+            dropped_pose_frames += 1
+        max_pose_frames = max(args.gmr_frame_buffer_size, args.teleop_sync_buffer_min_frames + 8)
+        if len(pose_buffer) > max_pose_frames:
+            for frame in sorted(pose_buffer)[: len(pose_buffer) - max_pose_frames]:
+                del pose_buffer[frame]
+                dropped_pose_frames += 1
+
+    def remember_pose(raw: bytes, rx_us: int) -> None:
+        frame = pose_frame_index(raw)
+        if frame is None:
+            return
+        pose_buffer[frame] = (raw, rx_us)
+        prune_pose_buffer(rx_us)
+
+    def remember_gmr_reference(payload: dict, rx_us: int) -> None:
+        frame = gmr_frame_index(payload)
+        if frame is None:
+            return
+        gmr_buffer.setdefault(frame, []).append((payload, rx_us))
+        gmr_buffer[frame] = gmr_buffer[frame][-4:]
+        prune_gmr_buffer(rx_us)
+
+    def find_gmr_for_pose_frame(pose_frame: int, tick_us: int) -> tuple[dict | None, dict]:
+        candidates: list[tuple[int, float, int, dict]] = []
+        for frame, items in gmr_buffer.items():
+            mismatch = int(frame - pose_frame)
+            if abs(mismatch) > args.gmr_frame_tolerance:
+                continue
+            for payload, rx_us in items:
+                if tick_us - rx_us > args.gmr_timeout_sec * 1.0e6:
+                    continue
+                horizon_ms = gmr_prediction_horizon_ms(payload)
+                if not np.isfinite(horizon_ms):
+                    horizon_ms = 0.0
+                if horizon_ms > args.gmr_max_prediction_horizon_ms:
+                    continue
+                candidates.append((abs(mismatch), abs(horizon_ms), -rx_us, payload))
+        if not candidates:
+            nearest_frame = None
+            nearest_mismatch = 999999
+            for frame in gmr_buffer:
+                mismatch = int(frame - pose_frame)
+                if abs(mismatch) < abs(nearest_mismatch):
+                    nearest_frame = frame
+                    nearest_mismatch = mismatch
+            return None, {
+                "valid": False,
+                "reason": "no_matching_gmr_frame",
+                "pose_frame_index": int(pose_frame),
+                "gmr_frame_index": int(nearest_frame) if nearest_frame is not None else -1,
+                "frame_mismatch": int(nearest_mismatch),
+                "prediction_horizon_ms": float("nan"),
+            }
+        candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+        payload = candidates[0][3]
+        frame = gmr_frame_index(payload)
+        horizon_ms = gmr_prediction_horizon_ms(payload)
+        if not np.isfinite(horizon_ms):
+            horizon_ms = 0.0
+        mismatch = int(frame - pose_frame) if frame is not None else 999999
+        return payload, {
+            "valid": True,
+            "reason": "matched",
+            "pose_frame_index": int(pose_frame),
+            "gmr_frame_index": int(frame) if frame is not None else -1,
+            "frame_mismatch": int(mismatch),
+            "prediction_horizon_ms": float(horizon_ms),
+        }
+
+    def pop_synced_pose_gmr(tick_us: int) -> tuple[bytes | None, dict | None, dict]:
+        nonlocal dropped_pose_frames
+        prune_pose_buffer(tick_us)
+        prune_gmr_buffer(tick_us)
+        if len(pose_buffer) < max(1, int(args.teleop_sync_buffer_min_frames)):
+            return None, None, {
+                "valid": False,
+                "reason": "waiting_pose_buffer",
+                "pose_frame_index": -1,
+                "gmr_frame_index": -1,
+                "frame_mismatch": 999999,
+                "prediction_horizon_ms": float("nan"),
+            }
+        for frame in sorted(pose_buffer):
+            raw, _rx_us = pose_buffer[frame]
+            payload, sync = find_gmr_for_pose_frame(frame, tick_us)
+            if payload is None:
+                continue
+            del pose_buffer[frame]
+            for old_frame in sorted(list(pose_buffer.keys())):
+                if old_frame >= frame:
+                    break
+                del pose_buffer[old_frame]
+                dropped_pose_frames += 1
+            return raw, payload, sync
+        oldest_frame = min(pose_buffer) if pose_buffer else -1
+        return None, None, {
+            "valid": False,
+            "reason": "waiting_gmr_match",
+            "pose_frame_index": int(oldest_frame),
+            "gmr_frame_index": -1,
+            "frame_mismatch": 999999,
+            "prediction_horizon_ms": float("nan"),
+        }
+
+    def select_latest_gmr_reference(tick_us: int) -> tuple[dict | None, dict]:
+        prune_gmr_buffer(tick_us)
+        candidates: list[tuple[int, float, int, dict]] = []
+        for frame, items in gmr_buffer.items():
+            for payload, rx_us in items:
+                if tick_us - rx_us > args.gmr_timeout_sec * 1.0e6:
+                    continue
+                horizon_ms = gmr_prediction_horizon_ms(payload)
+                if not np.isfinite(horizon_ms):
+                    horizon_ms = 0.0
+                if horizon_ms > args.gmr_max_prediction_horizon_ms:
+                    continue
+                candidates.append((-int(frame), abs(horizon_ms), -rx_us, payload))
+        if not candidates:
+            return None, {
+                "valid": False,
+                "reason": "no_fresh_gmr",
+                "pose_frame_index": -1,
+                "gmr_frame_index": -1,
+                "frame_mismatch": 999999,
+                "prediction_horizon_ms": float("nan"),
+            }
+        candidates.sort()
+        payload = candidates[0][3]
+        frame = gmr_frame_index(payload)
+        horizon_ms = gmr_prediction_horizon_ms(payload)
+        if not np.isfinite(horizon_ms):
+            horizon_ms = 0.0
+        return payload, {
+            "valid": True,
+            "reason": "latest",
+            "pose_frame_index": -1,
+            "gmr_frame_index": int(frame) if frame is not None else -1,
+            "frame_mismatch": 0,
+            "prediction_horizon_ms": float(horizon_ms),
+        }
+
+    def attach_gmr_sync_metadata(payload: dict, sync: dict) -> dict:
+        payload["pose_frame_index"] = int(sync.get("pose_frame_index", -1))
+        payload["gmr_frame_index"] = int(sync.get("gmr_frame_index", -1))
+        payload["gmr_frame_mismatch"] = int(sync.get("frame_mismatch", 999999))
+        payload["gmr_prediction_horizon_ms"] = float(
+            sync.get("prediction_horizon_ms", float("nan"))
+        )
+        payload["gmr_sync_valid"] = bool(sync.get("valid", False))
+        payload["gmr_sync_reason"] = str(sync.get("reason", "unknown"))
+        return payload
+
     def clear_active_plan(reason: str) -> None:
         nonlocal active_plan, active_plan_us, active_plan_s, phase_mode, phase_sync_error_rad
         plan_id = int(active_plan.get("plan_id", 0)) if active_plan else 0
@@ -809,11 +1123,14 @@ def main() -> int:
         if requested not in VALID_STATES:
             log(f"ignored invalid {source} state command: {requested}")
             return
+        previous_state = current_state
         if requested != current_state:
             log(f"{source} state command: {current_state} -> {requested}")
         else:
             log(f"{source} state command: staying in {requested}")
         current_state = requested
+        if requested != previous_state:
+            pose_buffer.clear()
         if requested in {"teleop", "intention"}:
             active_plan = None
             active_plan_us = 0
@@ -861,6 +1178,7 @@ def main() -> int:
                             if stop:
                                 sonic.send(raw)
                                 current_state = "teleop"
+                                pose_buffer.clear()
                                 continue
 
                             if planner and current_state in {"teleop", "intention"}:
@@ -868,6 +1186,7 @@ def main() -> int:
                                 if plan_ready:
                                     log(f"A+X/planner command: {current_state} -> auto_planning")
                                     current_state = "auto_planning"
+                                    pose_buffer.clear()
                                     latch_latest_plan("A+X/planner", tick_us)
                                     sonic.send(raw)
                                 elif start:
@@ -880,6 +1199,7 @@ def main() -> int:
                             if (not planner) and current_state in {"auto_planning", "damped_return"}:
                                 log(f"A+X/pose command: {current_state} -> teleop")
                                 current_state = "teleop"
+                                pose_buffer.clear()
                                 sonic.send(raw)
                                 continue
 
@@ -888,7 +1208,7 @@ def main() -> int:
                             sonic.send(raw)
                     elif starts(raw, "pose"):
                         if current_state in {"teleop", "intention"}:
-                            sonic.send(raw)
+                            remember_pose(raw, tick_us)
                     elif starts(raw, "planner"):
                         if current_state in {"teleop", "intention"}:
                             sonic.send(raw)
@@ -899,8 +1219,10 @@ def main() -> int:
 
             try:
                 while True:
-                    latest_gmr = unpack_prefixed_msgpack(gmr.recv(zmq.NOBLOCK), args.gmr_topic)
-                    latest_gmr_us = tick_us
+                    remember_gmr_reference(
+                        unpack_prefixed_msgpack(gmr.recv(zmq.NOBLOCK), args.gmr_topic),
+                        tick_us,
+                    )
             except zmq.Again:
                 pass
 
@@ -949,19 +1271,34 @@ def main() -> int:
                         incoming_uid = str(incoming_target.get("goal_uid", ""))
                         target_link = str(incoming_target.get("target_link", "left_wrist_yaw_link"))
                         target_side = target_side_from_link(target_link)
+                        explicit_reset = bool(
+                            incoming_target.get("new_goal", False)
+                            or incoming_target.get("reset_hold", False)
+                        )
                         is_new_goal = (
-                            not incoming_uid
-                            or incoming_uid != latest_static_target_uid
+                            latest_static_target is None
+                            or explicit_reset
+                            or (incoming_uid and incoming_uid != latest_static_target_uid)
                             or target_side != static_target_hold_side
                         )
                         latest_static_target = incoming_target
                         latest_static_target_us = tick_us
+                        static_target_revision += 1
                         if is_new_goal:
                             latest_static_target_uid = incoming_uid
                             static_target_plan_id += 1
                             static_target_hold_q = None
                             static_target_hold_plan_id = -1
                             static_target_hold_side = ""
+                            arm_ik_cached_revision = -1
+                            arm_ik_cached_q_ref = None
+                            arm_ik_cached_tau_ff = None
+                            arm_ik_cached_feasible = False
+                            arm_ik_cached_source = "new_goal"
+                            if current_state != "auto_planning":
+                                apply_state_request(
+                                    "auto_planning", "static EE target", tick_us
+                                )
             except zmq.Again:
                 pass
 
@@ -998,12 +1335,36 @@ def main() -> int:
             elif keyboard_command is not None:
                 apply_state_request(keyboard_command, "keyboard", tick_us)
 
-            q_gmr = latest_q_from_gmr(latest_gmr)
-            gmr_fresh = q_gmr is not None and (tick_us - latest_gmr_us) <= args.gmr_timeout_sec * 1.0e6
+            released_pose_frame = -1
+            pose_to_send: bytes | None = None
+            if current_state in {"teleop", "intention"}:
+                pose_raw, matched_gmr, last_gmr_sync_status = pop_synced_pose_gmr(tick_us)
+                if pose_raw is not None:
+                    pose_to_send = pose_raw
+                    frame = pose_frame_index(pose_raw)
+                    if frame is not None:
+                        released_pose_frame = frame
+                        released_pose_frames += 1
+            else:
+                matched_gmr, last_gmr_sync_status = select_latest_gmr_reference(tick_us)
+            q_gmr = latest_q_from_gmr(matched_gmr)
+            gmr_fresh = q_gmr is not None and bool(last_gmr_sync_status.get("valid", False))
             plan_fresh = latest_plan is not None and (tick_us - latest_plan_us) <= args.plan_timeout_sec * 1.0e6
+            static_target_age_sec = (
+                (tick_us - latest_static_target_us) / 1.0e6
+                if latest_static_target is not None
+                else float("inf")
+            )
             static_target_fresh = (
                 latest_static_target is not None
-                and (tick_us - latest_static_target_us) <= args.static_target_timeout_sec * 1.0e6
+                and static_target_age_sec <= args.static_target_timeout_sec
+            )
+            static_target_usable = (
+                latest_static_target is not None
+                and (
+                    args.static_target_hold_sec <= 0.0
+                    or static_target_age_sec <= args.static_target_hold_sec
+                )
             )
             if active_plan is not None:
                 elapsed_sec = (tick_us - active_plan_us) / 1.0e6
@@ -1051,7 +1412,7 @@ def main() -> int:
                         timestamp_us=tick_us,
                     )
             elif current_state == "auto_planning":
-                if static_target_fresh:
+                if static_target_usable:
                     target_link = str(latest_static_target.get("target_link", "left_wrist_yaw_link"))
                     target_position = np.asarray(
                         latest_static_target.get(
@@ -1068,6 +1429,7 @@ def main() -> int:
                         else np.zeros(29, dtype=np.float64)
                     )
                     target_side = target_side_from_link(target_link)
+                    q_hold[12:15] = 0.0
                     if (
                         static_target_hold_q is None
                         or static_target_hold_plan_id != static_target_plan_id
@@ -1083,6 +1445,7 @@ def main() -> int:
                     outer_waist.maybe_reset(q_hold, static_target_plan_id, target_side)
                     q_command = hold_inactive_arm_for_single_target(
                         q_hold, static_target_hold_q, target_side)
+                    q_command[12:15] = 0.0
                     q_ik_prior, q_ik_prior_source = q_ik_prior_from_plan(
                         latest_plan,
                         latest_static_target,
@@ -1097,6 +1460,62 @@ def main() -> int:
                     )
                     q_prior = hold_inactive_arm_for_single_target(
                         q_prior, static_target_hold_q, target_side)
+                    q_prior[12:15] = 0.0
+                    tau_ff_ref = np.zeros(29, dtype=np.float64)
+                    arm_ik_feasible = True
+                    if arm_nonlinear_ik is not None:
+                        if (
+                            arm_ik_cached_revision != static_target_revision
+                            or arm_ik_cached_q_ref is None
+                            or arm_ik_cached_tau_ff is None
+                        ):
+                            target_quat = np.asarray(
+                                latest_static_target.get(
+                                    "quaternion",
+                                    latest_static_target.get("target_quaternion", [1.0, 0.0, 0.0, 0.0]),
+                                ),
+                                dtype=np.float64,
+                            ).reshape(4)
+                            ik_seed = (
+                                latest_robot_q.copy()
+                                if latest_robot_q is not None
+                                else q_hold.copy()
+                            )
+                            ik_result = arm_nonlinear_ik.solve_single_target(
+                                target_link=target_link,
+                                target_position=target_position,
+                                target_quaternion_wxyz=target_quat,
+                                q_seed29=ik_seed,
+                                q_hold29=static_target_hold_q,
+                                hard_lock_inactive_arm=args.arm_ik_hard_lock_inactive_arm,
+                            )
+                            last_arm_ik_solve_ms = ik_result.solve_time_ms
+                            last_arm_ik_error_m = ik_result.position_error_m
+                            last_arm_ik_rot_error_rad = ik_result.rotation_error_rad
+                            last_arm_ik_status = "ok" if ik_result.success else ik_result.message
+                            arm_ik_cached_revision = static_target_revision
+                            arm_ik_cached_feasible = bool(ik_result.success)
+                            arm_ik_cached_source = (
+                                f"unitree_ipopt_arm_ik:{ik_result.solve_time_ms:.2f}ms/"
+                                f"{100.0 * ik_result.position_error_m:.2f}cm/"
+                                f"{ik_result.rotation_error_rad:.3f}rad"
+                            )
+                            if ik_result.success:
+                                arm_ik_cached_q_ref = hold_inactive_arm_for_single_target(
+                                    ik_result.q_ref.copy(), static_target_hold_q, target_side)
+                                arm_ik_cached_tau_ff = ik_result.tau_ff_ref.copy()
+                            else:
+                                arm_ik_cached_q_ref = hold_inactive_arm_for_single_target(
+                                    q_command, static_target_hold_q, target_side)
+                                arm_ik_cached_tau_ff = np.zeros(29, dtype=np.float64)
+                        elif arm_ik_cached_feasible:
+                            last_arm_ik_status = "cached_ok"
+
+                        arm_ik_feasible = bool(arm_ik_cached_feasible)
+                        q_prior = hold_inactive_arm_for_single_target(
+                            arm_ik_cached_q_ref.copy(), static_target_hold_q, target_side)
+                        tau_ff_ref = arm_ik_cached_tau_ff.copy()
+                        q_ik_prior_source = arm_ik_cached_source
                     terminal_error_m = float("nan")
                     if wrist_fk is not None:
                         try:
@@ -1111,20 +1530,12 @@ def main() -> int:
                             ))
                         except Exception:
                             terminal_error_m = float("nan")
-                    q_command = outer_waist.update(
-                        dt=dt,
-                        tick_us=tick_us,
-                        terminal_error_m=terminal_error_m,
-                        wrist_fk=wrist_fk,
-                        q_command=q_command,
-                        q_posture=q_prior,
-                        target_link=target_link,
-                        target_position=target_position,
-                    )
-                    q_prior[12:15] = q_command[12:15]
+                    q_command[12:15] = 0.0
+                    q_prior[12:15] = 0.0
                     q_prior = hold_inactive_arm_for_single_target(
                         q_prior, static_target_hold_q, target_side)
-                    send_planner_command(sonic, q_command, args.height, neutralize_waist=False)
+                    q_prior[12:15] = 0.0
+                    send_planner_command(sonic, q_command, args.height, neutralize_waist=True)
                     last_plan_q = q_command.copy()
                     blended_q = q_prior.copy()
                     qp_payload = qp_cartesian_target_reference(
@@ -1134,13 +1545,19 @@ def main() -> int:
                         state="auto_planning",
                         source="cartesian_servo",
                         control_mode="plan_exec",
-                        feasible=True,
+                        feasible=arm_ik_feasible,
                         plan_id=static_target_plan_id,
                         timestamp_us=tick_us,
                         terminal_capture_radius_m=float(args.terminal_capture_radius_m),
+                        tau_ff_ref=tau_ff_ref,
                         target_source=str(latest_static_target.get("source", "manual_static_target")),
                         q_prior_source=q_ik_prior_source,
-                        has_q_ik_prior=q_ik_prior is not None,
+                        has_q_ik_prior=(q_ik_prior is not None) or (arm_nonlinear_ik is not None and arm_ik_feasible),
+                        arm_ik_mode="unitree_ipopt" if arm_nonlinear_ik is not None else "external_plan_prior",
+                        arm_ik_solve_ms=float(last_arm_ik_solve_ms),
+                        arm_ik_position_error_m=float(last_arm_ik_error_m),
+                        arm_ik_rotation_error_rad=float(last_arm_ik_rot_error_rad),
+                        arm_ik_status=str(last_arm_ik_status),
                     )
                     phase_mode = "cartesian_target"
                     phase_sync_error_rad = float("nan")
@@ -1276,27 +1693,45 @@ def main() -> int:
                     timestamp_us=tick_us,
                 )
 
+            if qp_payload is not None:
+                attach_gmr_sync_metadata(qp_payload, last_gmr_sync_status)
+
             if current_state in {"auto_planning", "damped_return"} and now >= next_mode_command:
                 send_mode_command(sonic, planner=True)
                 next_mode_command = now + max(0.05, args.command_period_sec)
 
             if qp_payload is not None:
                 qp.send(pack_topic(args.qp_topic, qp_payload))
+            if pose_to_send is not None:
+                sonic.send(pose_to_send)
 
             if now - last_log > 1.0:
                 log(
                     f"state={current_state} gmr_fresh={gmr_fresh} plan_fresh={plan_fresh} "
-                    f"static_target_fresh={static_target_fresh} "
+                    f"static_target={'fresh' if static_target_fresh else 'held' if static_target_usable else 'missing'} "
+                    f"static_age={static_target_age_sec if np.isfinite(static_target_age_sec) else float('nan'):.2f}s "
+                    f"static_rev={static_target_revision} "
                     f"active_plan={active_plan.get('plan_id', 0) if active_plan else 0} "
                     f"qp_gate={'on' if qp_reference_enabled else 'off'} "
                     f"qp_type={qp_payload.get('reference_type') if qp_payload else 'none'} "
                     f"source={qp_payload.get('source', 'none') if qp_payload else 'none'} "
                     f"q_prior={qp_payload.get('q_prior_source', 'n/a') if qp_payload else 'n/a'} "
+                    f"gmr_sync={last_gmr_sync_status.get('reason')} "
+                    f"pose_buf={len(pose_buffer)} gmr_buf={len(gmr_buffer)} "
+                    f"released={released_pose_frame}/{released_pose_frames} "
+                    f"dropped={dropped_pose_frames} "
+                    f"pose_frame={last_gmr_sync_status.get('pose_frame_index')} "
+                    f"gmr_frame={last_gmr_sync_status.get('gmr_frame_index')} "
+                    f"df={last_gmr_sync_status.get('frame_mismatch')} "
+                    f"pred={float(last_gmr_sync_status.get('prediction_horizon_ms', float('nan'))):.1f}ms "
                     f"control={qp_payload.get('control_mode', 'none') if qp_payload else 'none'} "
                     f"plan={qp_payload.get('plan_id', 0) if qp_payload else 0} "
                     f"phase={float(qp_payload.get('phase', 0.0)) if qp_payload else 0.0:.2f} "
                     f"phase_mode={phase_mode} "
                     f"phase_err={phase_sync_error_rad if np.isfinite(phase_sync_error_rad) else float('nan'):.3f}rad "
+                    f"arm_ik={last_arm_ik_status} "
+                    f"ik_err={100.0 * last_arm_ik_error_m if np.isfinite(last_arm_ik_error_m) else float('nan'):.2f}cm "
+                    f"ik_solve={last_arm_ik_solve_ms if np.isfinite(last_arm_ik_solve_ms) else float('nan'):.2f}ms "
                     f"{outer_waist.status()} "
                     f"feasible={qp_payload.get('feasible') if qp_payload else False}"
                 )

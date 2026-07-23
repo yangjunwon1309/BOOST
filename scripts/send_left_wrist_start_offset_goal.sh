@@ -12,6 +12,7 @@ if [[ "${PATH_GOAL_INTERACTIVE:-1}" != "0" ]]; then
     --interactive
     --stream-hz "${PATH_GOAL_STREAM_HZ:-50}"
     --step-cm "${PATH_GOAL_STEP_CM:-1.0}"
+    --orientation-step-deg "${PATH_GOAL_ORIENTATION_STEP_DEG:-2.0}"
   )
 fi
 if [[ "${PATH_GOAL_STREAM_INCLUDE_Q_SEED:-0}" == "1" ]]; then

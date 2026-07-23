@@ -1,5 +1,8 @@
 # G1 SAM3 perception environment (Jetson AGX Thor)
 
+RGB-D transport, mock validation, and G1 interoperability commands are in
+[`RGBD_RUNBOOK.md`](RGBD_RUNBOOK.md).
+
 This directory provides the isolated SAM3-only runtime specified by the G1
 Perception Pipeline v2 document. It deliberately contains no AnyGrasp,
 MinkowskiEngine, Open3D, PyTorch3D, or pycocotools dependency.
@@ -97,14 +100,81 @@ caches. This is required because the host UID may not exist in the NGC image's
 `/etc/passwd`; without it, PyTorch Dynamo can fail in `getpass.getuser()` while
 SAM3 imports torchvision.
 
-Once `seg_web_node.main` is implemented, launch it with:
+Launch the SAM3 RGB-D web node with:
 
 ```bash
-./tools/run_thor.sh python -m seg_web_node.main \
+./tools/run_thor.sh python -m seg_web_node.web_server \
   --config config/pipeline.yaml \
-  --registry-dir registry_data \
+  --prompt "object" \
   --port 8080
 ```
+
+## TensorRT backend
+
+The linked `dataplayer12/SAM3-TensorRT` project is a community implementation,
+not an official Meta SAM3 deployment repository. Its Thor benchmark uses
+TensorRT 10.13.3, CUDA 13.0, MAXN, and a C++ zero-copy path. This deployment
+adapts its full-model ONNX approach to the existing Python RGB-D web pipeline.
+
+The Docker image contains TensorRT and NVIDIA ModelOpt. Build the engine on the
+Thor where it will run; TensorRT plans are specific to the GPU and TensorRT
+version. The first two commands are one-time operations and reuse the mounted
+Hugging Face cache:
+
+```bash
+cd /home/url/PATH-G1/perception
+docker build -t g1-perception-sam3:thor-jp71 -f docker/Dockerfile.thor .
+./tools/run_thor.sh python tools/export_sam3_onnx.py \
+  --output /models/sam3_trt/runtime4/sam3_4out.onnx --device cpu
+./tools/run_thor.sh bash tools/build_sam3_trt.sh \
+  /models/sam3_trt/runtime4/sam3_4out.onnx \
+  /models/sam3_trt/sam3_fp16_4out.engine
+```
+
+TensorRT 10 uses its `--fp16` builder mode. TensorRT 11 uses NVIDIA ModelOpt
+AutoCast to make FP16 types explicit before building the strongly typed engine.
+The export omits the unused `semantic_seg` branch and keeps the four outputs
+required by the instance pipeline. CUDA Graph replay is enabled by default
+after one warm-up enqueue; set `G1_SAM3_CUDA_GRAPH=0` to use direct TensorRT
+enqueue. The web server retains `--backend pytorch` as an immediate fallback.
+
+Run one prompt per inference for the lowest latency:
+
+```bash
+./tools/run_thor.sh python -m seg_web_node.web_server \
+  --config /workspace/perception/config/pipeline.yaml \
+  --backend tensorrt \
+  --concepts object \
+  --allow-unaligned \
+  --host 0.0.0.0 \
+  --port 8080
+```
+
+Each additional comma-separated concept is a separate full TensorRT inference,
+so a seven-concept vocabulary is not expected to have single-prompt latency.
+Use the web prompt control to choose the smallest useful concept set.
+
+Validated on this board in the 120 W profile:
+
+| Path | Same 640x360 image, one `floor` prompt |
+| --- | ---: |
+| Existing PyTorch backend | 522 ms mean |
+| TensorRT Python backend | 303 ms mean, 297 ms p50 |
+| Raw TensorRT engine | 294 ms mean, 293 ms p50 |
+
+The full mock RGB-D/web path produced the expected mask and depth with zero
+decode/pairing errors. To reproduce the reference project's MAXN condition,
+first verify cooling and power-delivery headroom, then run on the host:
+
+```bash
+nvpmodel -q
+sudo nvpmodel -m 0
+sudo jetson_clocks
+```
+
+Mode `0` is MAXN in this Thor's `/etc/nvpmodel.conf`. A mode change can require
+a reboot; follow the message printed by `nvpmodel`. This deployment does not
+change the board power profile automatically.
 
 Before that launch, replace all null camera intrinsics in
 `config/camera_info.yaml` and provide `T_torso_cam` in

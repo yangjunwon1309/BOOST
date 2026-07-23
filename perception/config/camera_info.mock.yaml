@@ -1,0 +1,8 @@
+frame_id: "mock_color_optical"
+width: 640
+height: 360
+fx: 512.0
+fy: 512.0
+cx: 319.5
+cy: 179.5
+depth_scale_um: 1000

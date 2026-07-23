@@ -30,8 +30,10 @@ bool RobotFkAdapter::Evaluate(
   std::array<std::array<double, kNumJoints>, 3> right_full{};
   std::array<double, 3> left_position{};
   std::array<double, 3> right_position{};
-  constexpr std::array<double, 3> left_tracking_point = {0.18, -0.025, 0.0};
-  constexpr std::array<double, 3> right_tracking_point = {0.18, 0.025, 0.0};
+  // Keep this tracking point identical to PATH's Unitree-style arm IK
+  // operational frame (L_ee/R_ee): wrist_yaw_link + 5 cm along local x.
+  constexpr std::array<double, 3> left_tracking_point = {0.05, 0.0, 0.0};
+  constexpr std::array<double, 3> right_tracking_point = {0.05, 0.0, 0.0};
 
   if (!fk_->ComputeBodyPositionJacobian(
           "left_wrist_yaw_link", left_full, left_position,

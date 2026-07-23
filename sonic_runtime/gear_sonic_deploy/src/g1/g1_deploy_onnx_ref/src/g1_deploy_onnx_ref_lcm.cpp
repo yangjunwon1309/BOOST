@@ -2272,6 +2272,42 @@ class G1Deploy {
       }
     }
 
+    static void ApplyGmrSyncFields(
+        const std::map<std::string, msgpack::object>& fields,
+        ::g1::ee_qp::EeReference& reference) {
+      if (auto it = fields.find("pose_frame_index"); it != fields.end()) {
+        it->second.convert(reference.pose_frame_index);
+      }
+      if (auto it = fields.find("gmr_frame_index"); it != fields.end()) {
+        it->second.convert(reference.gmr_frame_index);
+      }
+      if (auto it = fields.find("gmr_frame_mismatch"); it != fields.end()) {
+        it->second.convert(reference.gmr_frame_mismatch);
+      }
+      if (auto it = fields.find("gmr_prediction_horizon_ms"); it != fields.end()) {
+        it->second.convert(reference.gmr_prediction_horizon_ms);
+      }
+      if (auto it = fields.find("gmr_sync_valid"); it != fields.end()) {
+        it->second.convert(reference.gmr_sync_valid);
+      }
+    }
+
+    static void ApplyTauFeedforwardFields(
+        const std::map<std::string, msgpack::object>& fields,
+        ::g1::ee_qp::EeReference& reference) {
+      auto tau_it = fields.find("tau_ff_ref");
+      if (tau_it == fields.end()) tau_it = fields.find("tauff_ref");
+      if (tau_it == fields.end()) tau_it = fields.find("arm_tau_ff_ref");
+      if (tau_it == fields.end()) return;
+      std::vector<double> tau_values;
+      tau_it->second.convert(tau_values);
+      if (tau_values.size() != ::g1::ee_qp::kNumJoints) return;
+      for (int i = 0; i < ::g1::ee_qp::kNumJoints; ++i) {
+        reference.tau_ff_ref[i] = tau_values[i];
+      }
+      reference.has_tau_ff_ref = true;
+    }
+
     void StartPathReferenceSubscriber(const std::string& host, int port, const std::string& topic) {
       gmr_reference_running_.store(true);
       gmr_reference_thread_ = std::thread([this, host, port, topic]() {
@@ -2342,6 +2378,7 @@ class G1Deploy {
               reference.phase = phase;
               reference.timestamp_us = received_us;
               reference.reference_pelvis_orientation = Eigen::Quaterniond::Identity();
+              ApplyGmrSyncFields(fields, reference);
               auto q_it = fields.find("q_ref");
               if (q_it == fields.end()) q_it = fields.find("q_mujoco");
               if (q_it == fields.end()) {
@@ -2357,6 +2394,7 @@ class G1Deploy {
               reference.left_wrist_in_reference_pelvis = wrist.left_position_world;
               reference.right_wrist_in_reference_pelvis = wrist.right_position_world;
               reference.q_ref = q_ref;
+              ApplyTauFeedforwardFields(fields, reference);
               ApplyTerminalTargetFields(fields, reference);
               reference.valid = true;
               ee_qp_dynamic_reference_provider_->UpdateSample(reference);
@@ -2374,6 +2412,7 @@ class G1Deploy {
               reference.phase = phase;
               reference.timestamp_us = received_us;
               reference.reference_pelvis_orientation = Eigen::Quaterniond::Identity();
+              ApplyGmrSyncFields(fields, reference);
 
               auto q_it = fields.find("q_ref");
               if (q_it == fields.end()) q_it = fields.find("q_mujoco");
@@ -2387,6 +2426,7 @@ class G1Deploy {
                 }
               }
 
+              ApplyTauFeedforwardFields(fields, reference);
               ApplyTerminalTargetFields(fields, reference);
               if (!reference.has_terminal_left_wrist_target &&
                   !reference.has_terminal_right_wrist_target) {
@@ -2423,6 +2463,7 @@ class G1Deploy {
               reference.feasible = false;
               reference.plan_id = plan_id;
               reference.timestamp_us = received_us;
+              ApplyGmrSyncFields(fields, reference);
               reference.valid = true;
               ee_qp_dynamic_reference_provider_->UpdateSample(reference);
             }
@@ -3155,6 +3196,132 @@ class G1Deploy {
         : "SONIC lower body, IK waist + arms/hands";
     }
 
+    bool ShouldApplyPathDirectUpperOverride(
+        const ::g1::ee_qp::EeReference& reference) const {
+      if (!reference.valid || !reference.feasible) return false;
+      if (reference.reference_type == ::g1::ee_qp::ReferenceType::kNone ||
+          reference.reference_type == ::g1::ee_qp::ReferenceType::kUnknown) {
+        return false;
+      }
+      switch (reference.source) {
+        case ::g1::ee_qp::ReferenceSource::kGmr:
+        case ::g1::ee_qp::ReferenceSource::kCurobo:
+        case ::g1::ee_qp::ReferenceSource::kReplay:
+        case ::g1::ee_qp::ReferenceSource::kDampedReturn:
+        case ::g1::ee_qp::ReferenceSource::kCartesianServo:
+          return true;
+        case ::g1::ee_qp::ReferenceSource::kUnknown:
+          return false;
+      }
+      return false;
+    }
+
+    bool ApplyPathDirectUpperOverride(
+        MotorCommand& command,
+        std::array<float, g1_lcm::kNumMotors>& action,
+        const ::g1::ee_qp::EeReference& reference) {
+      if (!ShouldApplyPathDirectUpperOverride(reference)) return false;
+
+      for (const int hw : ::g1::ee_qp::kArmHardwareIndices) {
+        command.q_target[hw] = static_cast<float>(reference.q_ref[hw]);
+        command.dq_target[hw] = 0.0f;
+        command.tau_ff[hw] = reference.has_tau_ff_ref
+            ? static_cast<float>(reference.tau_ff_ref[hw])
+            : 0.0f;
+        const int action_idx = isaaclab_to_mujoco[hw];
+        action[action_idx] = ClampUpperBodyRawAction(
+            QTargetToRawAction(hw, command.q_target[hw]));
+        last_action[action_idx] = static_cast<double>(action[action_idx]);
+      }
+      return true;
+    }
+
+    void PublishPathDirectTelemetry(
+        const MotorCommand& command,
+        const ::g1::ee_qp::EeReference& reference) {
+      if (!ee_qp_kinematics_) return;
+      const auto low_state = used_low_state_data_.data;
+      if (!low_state) return;
+      ::g1::ee_qp::JointVector q_measured = ::g1::ee_qp::JointVector::Zero();
+      ::g1::ee_qp::JointVector q_command = ::g1::ee_qp::JointVector::Zero();
+      for (int hw = 0; hw < G1_NUM_MOTOR; ++hw) {
+        q_measured[hw] = low_state->motor_state()[hw].q();
+        q_command[hw] = command.q_target[hw];
+      }
+      ::g1::ee_qp::WristKinematics wrist;
+      if (!ee_qp_kinematics_->Evaluate(
+              q_measured, Eigen::Quaterniond::Identity(), wrist)) {
+        return;
+      }
+
+      ::g1::ee_qp::EeQpTelemetry telemetry;
+      telemetry.enabled = true;
+      telemetry.valid = true;
+      telemetry.q_ref = reference.q_ref;
+      telemetry.tau_ff_ref = reference.tau_ff_ref;
+      telemetry.q_corrected = q_command;
+      telemetry.delta_q = q_command - q_measured;
+      telemetry.joint_tracking_error = q_command - q_measured;
+      telemetry.reference_source = reference.source;
+      telemetry.control_mode = reference.control_mode;
+      telemetry.plan_id = reference.plan_id;
+      telemetry.plan_phase = reference.phase;
+      telemetry.reference_type = reference.reference_type;
+      telemetry.reference_feasible = reference.feasible;
+      telemetry.reference_age_ms =
+          static_cast<double>(SteadyNowUs() - reference.timestamp_us) / 1000.0;
+      telemetry.left_wrist_position = wrist.left_position_world;
+      telemetry.right_wrist_position = wrist.right_position_world;
+      telemetry.active_wrist_position = wrist.right_position_world;
+
+      double best_terminal_distance = -1.0;
+      if (reference.has_terminal_left_wrist_target) {
+        const Eigen::Vector3d target =
+            reference.reference_pelvis_orientation.normalized() *
+            reference.terminal_left_wrist_in_reference_pelvis;
+        best_terminal_distance = (target - wrist.left_position_world).norm();
+        telemetry.terminal_target_position = target;
+        telemetry.terminal_target_side |= 1;
+        telemetry.active_wrist_position = wrist.left_position_world;
+      }
+      if (reference.has_terminal_right_wrist_target) {
+        const Eigen::Vector3d target =
+            reference.reference_pelvis_orientation.normalized() *
+            reference.terminal_right_wrist_in_reference_pelvis;
+        const double d = (target - wrist.right_position_world).norm();
+        if (best_terminal_distance < 0.0 || d < best_terminal_distance) {
+          best_terminal_distance = d;
+          telemetry.terminal_target_position = target;
+          telemetry.active_wrist_position = wrist.right_position_world;
+        }
+        telemetry.terminal_target_side |= 2;
+      }
+      telemetry.terminal_target_active = telemetry.terminal_target_side != 0;
+      telemetry.terminal_target_distance_m = best_terminal_distance;
+      telemetry.terminal_capture_radius_m = reference.terminal_capture_radius_m;
+      telemetry.error_before_m =
+          best_terminal_distance >= 0.0 ? best_terminal_distance : 0.0;
+      telemetry.predicted_error_after_m = telemetry.error_before_m;
+      telemetry.nonlinear_error_after_m = telemetry.error_before_m;
+      telemetry.fallback_reason = ::g1::ee_qp::EeQpFallbackReason::kNone;
+
+      double arm_tracking_squared_norm = 0.0;
+      double arm_tracking_max_abs = 0.0;
+      for (const int hw : ::g1::ee_qp::kArmHardwareIndices) {
+        const double lag = q_command[hw] - q_measured[hw];
+        arm_tracking_squared_norm += lag * lag;
+        arm_tracking_max_abs = std::max(arm_tracking_max_abs, std::abs(lag));
+      }
+      telemetry.pd_tracking_lag_rmse_rad = std::sqrt(
+          arm_tracking_squared_norm / ::g1::ee_qp::kNumArmJoints);
+      telemetry.pd_tracking_lag_max_abs_rad = arm_tracking_max_abs;
+      telemetry.joint_tracking_rmse_rad =
+          std::sqrt(telemetry.joint_tracking_error.squaredNorm() / G1_NUM_MOTOR);
+      telemetry.joint_tracking_max_abs_rad =
+          telemetry.joint_tracking_error.cwiseAbs().maxCoeff();
+      ee_qp_telemetry_buffer_.SetData(telemetry);
+    }
+
 
     bool ApplyEeQpCorrection(MotorCommand& command, std::array<float, g1_lcm::kNumMotors>& action) {
       if (!use_ee_qp_ || !ee_qp_corrector_ || !ee_qp_reference_provider_) return false;
@@ -3177,6 +3344,7 @@ class G1Deploy {
       telemetry.enabled = true;
       telemetry.valid = result.valid;
       telemetry.q_ref = input.reference.q_ref;
+      telemetry.tau_ff_ref = input.reference.tau_ff_ref;
       telemetry.q_corrected = result.q_corrected;
       telemetry.delta_q = result.delta_q;
       telemetry.joint_tracking_error = result.q_corrected - input.q_measured;
@@ -3219,6 +3387,11 @@ class G1Deploy {
       telemetry.plan_id = result.plan_id;
       telemetry.plan_phase = result.plan_phase;
       telemetry.reference_type = result.reference_type;
+      telemetry.pose_frame_index = result.pose_frame_index;
+      telemetry.gmr_frame_index = result.gmr_frame_index;
+      telemetry.gmr_frame_mismatch = result.gmr_frame_mismatch;
+      telemetry.gmr_prediction_horizon_ms = result.gmr_prediction_horizon_ms;
+      telemetry.gmr_sync_valid = result.gmr_sync_valid;
       telemetry.reference_feasible = result.reference_feasible;
       telemetry.fallback_active = result.fallback_active;
       telemetry.candidate_rejected = result.candidate_rejected;
@@ -3868,7 +4041,19 @@ class G1Deploy {
       sonic_action_buffer_.SetData(sonic_action);
 
       std::array<float, g1_lcm::kNumMotors> final_action = sonic_action;
-      if (use_ee_qp_) {
+      std::optional<::g1::ee_qp::EeReference> path_reference;
+      bool path_direct_override_applied = false;
+      if (use_ee_qp_ && ee_qp_reference_provider_) {
+        path_reference = ee_qp_reference_provider_->Latest(SteadyNowUs());
+        if (path_reference) {
+          path_direct_override_applied =
+              ApplyPathDirectUpperOverride(
+                  motor_command_tmp, final_action, *path_reference);
+        }
+      }
+      if (path_direct_override_applied && path_reference) {
+        PublishPathDirectTelemetry(motor_command_tmp, *path_reference);
+      } else if (use_ee_qp_ && !ee_qp_dynamic_reference_provider_) {
         ApplyEeQpCorrection(motor_command_tmp, final_action);
       } else if (use_hand_ik_origin_) {
         ApplyHandIKOrigin(motor_command_tmp, final_action);

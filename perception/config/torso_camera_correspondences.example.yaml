@@ -1,0 +1,17 @@
+# Replace these placeholders with at least six well-spread points observed in
+# the D435 color optical frame and independently measured in torso_link.
+# Row i in both arrays must refer to exactly the same physical target point.
+camera_points_m:
+  - [0.0, 0.0, 0.0]
+  - [0.0, 0.0, 0.0]
+  - [0.0, 0.0, 0.0]
+  - [0.0, 0.0, 0.0]
+  - [0.0, 0.0, 0.0]
+  - [0.0, 0.0, 0.0]
+torso_points_m:
+  - [0.0, 0.0, 0.0]
+  - [0.0, 0.0, 0.0]
+  - [0.0, 0.0, 0.0]
+  - [0.0, 0.0, 0.0]
+  - [0.0, 0.0, 0.0]
+  - [0.0, 0.0, 0.0]

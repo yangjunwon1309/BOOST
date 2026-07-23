@@ -82,6 +82,17 @@ bool RightOnlyCartesianTarget(const EeReference& reference) {
          !reference.has_terminal_left_wrist_target;
 }
 
+bool IsTeleopGmrSample(const EeReference& reference) {
+  return reference.reference_type == ReferenceType::kSample &&
+         reference.source == ReferenceSource::kGmr &&
+         reference.control_mode == ControlMode::kTeleop;
+}
+
+double LinearRamp(double value, double start, double end) {
+  if (end <= start) return value >= end ? 1.0 : 0.0;
+  return std::clamp((value - start) / (end - start), 0.0, 1.0);
+}
+
 void LockInactiveArmBounds(
     const EeReference& reference, ActiveVector& lower, ActiveVector& upper) {
   if (LeftOnlyCartesianTarget(reference)) {
@@ -258,18 +269,10 @@ class EeQpCorrector::Impl {
       return Fallback(input, EeQpFallbackReason::kStaleReference);
     }
 
-    // Corrections are commanded relative to q_sonic, but FK/Jacobian are
-    // linearized at a one-step measured-state prediction. This keeps the QP
-    // objective close to the state where the next command will actually land.
-    constexpr double kPredictionHorizonSec = 0.01;
-    constexpr double kMaxPredictionStepRad = 0.04;
-    JointVector q_linearization = input.q_measured;
-    for (int hw = 0; hw < kNumJoints; ++hw) {
-      const double step = std::clamp(
-          input.dq_measured[hw] * kPredictionHorizonSec,
-          -kMaxPredictionStepRad, kMaxPredictionStepRad);
-      q_linearization[hw] += step;
-    }
+    // The QP correction is added to q_sonic, so FK/Jacobian must be
+    // linearized at q_sonic as well. The measured-vs-target offset in PD
+    // control is a torque-producing command signal, not pure tracking lag.
+    JointVector q_linearization = input.q_sonic;
     WristKinematics wrist;
     if (!kinematics_->Evaluate(
             q_linearization, input.measured_pelvis_orientation.normalized(), wrist) ||
@@ -289,6 +292,12 @@ class EeQpCorrector::Impl {
     result.plan_phase = input.reference.phase;
     result.reference_type = input.reference.reference_type;
     result.reference_feasible = input.reference.feasible;
+    result.pose_frame_index = input.reference.pose_frame_index;
+    result.gmr_frame_index = input.reference.gmr_frame_index;
+    result.gmr_frame_mismatch = input.reference.gmr_frame_mismatch;
+    result.gmr_prediction_horizon_ms =
+        input.reference.gmr_prediction_horizon_ms;
+    result.gmr_sync_valid = input.reference.gmr_sync_valid;
     const Eigen::Quaterniond reference_root =
         input.reference.reference_pelvis_orientation.normalized();
     const bool cartesian_target_mode =
@@ -350,12 +359,64 @@ class EeQpCorrector::Impl {
     result.upper_only_error_before = DecomposedError(
         input.reference.q_ref, q_linearization, target, reference_root,
         kUpperHardwareIndices);
+    const JointVector& reference_prior = input.reference.q_ref;
+    const ActiveVector reference_delta =
+        ExtractActive(reference_prior) - ExtractActive(input.q_sonic);
+    result.reference_joint_error_before = reference_delta.norm();
+
+    auto measured_fallback = [&](EeQpFallbackReason reason) {
+      EeQpResult fallback = Fallback(input, reason);
+      fallback.error_before = result.error_before;
+      fallback.predicted_error_after = result.predicted_error_after;
+      fallback.nonlinear_error_after = result.nonlinear_error_after;
+      fallback.left_wrist_position = result.left_wrist_position;
+      fallback.right_wrist_position = result.right_wrist_position;
+      fallback.active_wrist_position = result.active_wrist_position;
+      fallback.terminal_target_active = result.terminal_target_active;
+      fallback.terminal_target_side = result.terminal_target_side;
+      fallback.terminal_target_position = result.terminal_target_position;
+      fallback.terminal_target_distance_m = result.terminal_target_distance_m;
+      fallback.terminal_capture_radius_m = result.terminal_capture_radius_m;
+      fallback.reference_joint_error_before =
+          result.reference_joint_error_before;
+      fallback.arm_only_error_before = result.arm_only_error_before;
+      fallback.waist_only_error_before = result.waist_only_error_before;
+      fallback.lower_only_error_before = result.lower_only_error_before;
+      fallback.upper_only_error_before = result.upper_only_error_before;
+      return fallback;
+    };
+
+    const bool teleop_gmr_sample = IsTeleopGmrSample(input.reference);
+    const bool use_teleop_profile =
+        teleop_gmr_sample && config_.teleop_gmr_profile_enabled;
+    if (teleop_gmr_sample &&
+        config_.teleop_gmr_schedule_enabled &&
+        config_.teleop_gmr_hard_fallback_enabled &&
+        result.waist_only_error_before >=
+            config_.teleop_gmr_waist_disable_error_m) {
+      return measured_fallback(EeQpFallbackReason::kTeleopWaistGate);
+    }
 
     const CartesianServoSchedule cartesian_schedule =
         SelectCartesianServoSchedule(input.reference, result.terminal_target_distance_m);
     Eigen::Vector3d scheduled_position_weight = config_.position_weight;
     ActiveVector scheduled_joint_tracking_weight = config_.joint_tracking_weight;
     ActiveVector scheduled_max_velocity_rad_s = config_.max_velocity_rad_s;
+    ActiveVector scheduled_max_delta_rad = config_.max_delta_rad;
+    double scheduled_previous_delta_weight = config_.previous_delta_weight;
+    bool scheduled_lock_waist_correction = config_.lock_waist_correction;
+    if (use_teleop_profile) {
+      scheduled_joint_tracking_weight =
+          config_.teleop_gmr_joint_tracking_weight;
+      scheduled_max_velocity_rad_s =
+          config_.teleop_gmr_max_velocity_rad_s;
+      scheduled_max_delta_rad =
+          config_.teleop_gmr_max_delta_rad;
+      scheduled_previous_delta_weight =
+          config_.teleop_gmr_previous_delta_weight;
+      scheduled_lock_waist_correction =
+          config_.teleop_gmr_lock_waist_correction;
+    }
     if (cartesian_schedule.active) {
       scheduled_position_weight *= cartesian_schedule.position_scale;
       ForEachTargetArmIndex(input.reference, [&](int i) {
@@ -363,6 +424,23 @@ class EeQpCorrector::Impl {
         scheduled_max_velocity_rad_s[i] =
             cartesian_schedule.active_arm_velocity_rad_s;
       });
+    } else if (teleop_gmr_sample && config_.teleop_gmr_schedule_enabled) {
+      const double gate = LinearRamp(
+          result.waist_only_error_before,
+          config_.teleop_gmr_waist_soft_error_m,
+          config_.teleop_gmr_waist_disable_error_m);
+      const double position_scale =
+          1.0 + gate * (config_.teleop_gmr_min_position_weight_scale - 1.0);
+      const double joint_scale =
+          1.0 + gate * (config_.teleop_gmr_max_joint_weight_scale - 1.0);
+      const double delta_scale =
+          1.0 + gate * (config_.teleop_gmr_min_max_delta_scale - 1.0);
+      const double velocity_scale =
+          1.0 + gate * (config_.teleop_gmr_min_max_velocity_scale - 1.0);
+      scheduled_position_weight *= position_scale;
+      scheduled_joint_tracking_weight *= joint_scale;
+      scheduled_max_delta_rad *= delta_scale;
+      scheduled_max_velocity_rad_s *= velocity_scale;
     }
 
     TaskVector task_weights;
@@ -370,10 +448,6 @@ class EeQpCorrector::Impl {
         scheduled_position_weight.cwiseSqrt() / config_.position_tolerance_m;
     task_weights.head<3>() = normalized_position_weights;
     task_weights.tail<3>() = normalized_position_weights;
-    const JointVector& reference_prior = input.reference.q_ref;
-    const ActiveVector reference_delta =
-        ExtractActive(reference_prior) - ExtractActive(input.q_sonic);
-    result.reference_joint_error_before = reference_delta.norm();
     const ActiveVector normalized_joint_weight =
         scheduled_joint_tracking_weight.array() /
         config_.joint_tolerance_rad.array().square();
@@ -392,9 +466,9 @@ class EeQpCorrector::Impl {
     }
     const ActiveVector sonic_active = ExtractActive(input.q_sonic);
     const ActiveVector correction_lower =
-        (config_.joint_lower - sonic_active).cwiseMax(-config_.max_delta_rad);
+        (config_.joint_lower - sonic_active).cwiseMax(-scheduled_max_delta_rad);
     const ActiveVector correction_upper =
-        (config_.joint_upper - sonic_active).cwiseMin(config_.max_delta_rad);
+        (config_.joint_upper - sonic_active).cwiseMin(scheduled_max_delta_rad);
     const ActiveVector projected_previous_delta =
         previous_delta_.cwiseMax(correction_lower).cwiseMin(correction_upper);
 
@@ -406,10 +480,12 @@ class EeQpCorrector::Impl {
     const ActiveVector rate_upper = projected_previous_delta + max_rate_step;
     lower = lower.cwiseMax(rate_lower);
     upper = upper.cwiseMin(rate_upper);
-    LockWaistBounds(input.reference, config_.lock_waist_correction, lower, upper);
+    LockWaistBounds(input.reference, scheduled_lock_waist_correction, lower, upper);
     LockInactiveArmBounds(input.reference, lower, upper);
     if ((lower.array() > upper.array()).any()) {
-      return Fallback(input, EeQpFallbackReason::kInfeasibleBounds);
+      return FallbackWithLock(
+          input, EeQpFallbackReason::kInfeasibleBounds,
+          scheduled_lock_waist_correction, scheduled_max_delta_rad);
     }
 
     Eigen::MatrixXd equality(0, kNumUpperJoints);
@@ -451,11 +527,11 @@ class EeQpCorrector::Impl {
           weighted_jacobian.transpose() * weighted_jacobian;
       hessian.diagonal().array() +=
           normalized_joint_weight.array() + inactive_arm_hold_weight.array() +
-          config_.previous_delta_weight;
+          scheduled_previous_delta_weight;
       Eigen::VectorXd gradient =
           -weighted_jacobian.transpose() * weighted_error -
           normalized_joint_weight.asDiagonal() * reference_delta -
-          config_.previous_delta_weight * projected_previous_delta;
+          scheduled_previous_delta_weight * projected_previous_delta;
 
       const auto started = std::chrono::steady_clock::now();
       if (!initialized_) {
@@ -465,7 +541,7 @@ class EeQpCorrector::Impl {
         qp_.update(hessian, gradient, equality, equality_target, box, lower, upper);
       }
       ActiveVector guess = initial_guess.cwiseMax(lower).cwiseMin(upper);
-      ZeroLockedDelta(input.reference, config_.lock_waist_correction, guess);
+      ZeroLockedDelta(input.reference, scheduled_lock_waist_correction, guess);
       qp_.solve(guess, proxsuite::nullopt, proxsuite::nullopt);
       result.solve_time_ms += std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - started).count();
@@ -478,12 +554,12 @@ class EeQpCorrector::Impl {
         return EeQpFallbackReason::kNonFiniteSolution;
       }
       solution = qp_.results.x;
-      ZeroLockedDelta(input.reference, config_.lock_waist_correction, solution);
+      ZeroLockedDelta(input.reference, scheduled_lock_waist_correction, solution);
       return EeQpFallbackReason::kNone;
     };
 
     ActiveVector initial_guess = reference_delta.cwiseMax(lower).cwiseMin(upper);
-    ZeroLockedDelta(input.reference, config_.lock_waist_correction, initial_guess);
+    ZeroLockedDelta(input.reference, scheduled_lock_waist_correction, initial_guess);
     ActiveVector qp_delta = ActiveVector::Zero();
     EeQpFallbackReason solve_failure =
         solve_total_delta_at(ActiveVector::Zero(), initial_guess, qp_delta);
@@ -505,7 +581,10 @@ class EeQpCorrector::Impl {
       solve_failure = EeQpFallbackReason::kSolveTimeout;
     }
     if (solve_failure != EeQpFallbackReason::kNone) {
-      EeQpResult fallback = Fallback(input, solve_failure);
+      EeQpResult fallback =
+          FallbackWithLock(
+              input, solve_failure, scheduled_lock_waist_correction,
+              scheduled_max_delta_rad);
       fallback.solve_time_ms = result.solve_time_ms;
       fallback.error_before = result.error_before;
       fallback.left_wrist_position = result.left_wrist_position;
@@ -524,17 +603,17 @@ class EeQpCorrector::Impl {
     result.rate_bound_saturation_mask = SaturationMask(
         qp_delta, rate_lower, rate_upper);
     ZeroLockedDelta(
-        input.reference, config_.lock_waist_correction,
+        input.reference, scheduled_lock_waist_correction,
         result.correction_bound_saturation_mask);
     ZeroLockedDelta(
-        input.reference, config_.lock_waist_correction,
+        input.reference, scheduled_lock_waist_correction,
         result.rate_bound_saturation_mask);
     result.correction_bound_saturation_fraction =
         result.correction_bound_saturation_mask.sum() / kNumUpperJoints;
     result.rate_bound_saturation_fraction =
         result.rate_bound_saturation_mask.sum() / kNumUpperJoints;
     ActiveVector proposed_delta = qp_delta;
-    ZeroLockedDelta(input.reference, config_.lock_waist_correction, proposed_delta);
+    ZeroLockedDelta(input.reference, scheduled_lock_waist_correction, proposed_delta);
     elapsed_sec_ += input.dt;
     const double ramp = config_.startup_ramp_sec > 0.0
         ? std::clamp(elapsed_sec_ / config_.startup_ramp_sec, 0.0, 1.0)
@@ -551,7 +630,7 @@ class EeQpCorrector::Impl {
         // introduce a new rate-limit jump toward zero.
         ActiveVector candidate_delta =
             previous_delta_ + alpha * (proposed_delta - previous_delta_);
-        ZeroLockedDelta(input.reference, config_.lock_waist_correction, candidate_delta);
+        ZeroLockedDelta(input.reference, scheduled_lock_waist_correction, candidate_delta);
         JointVector candidate_q = q_linearization;
         JointVector candidate_full_delta = JointVector::Zero();
         InsertActive(candidate_delta, candidate_full_delta);
@@ -589,7 +668,9 @@ class EeQpCorrector::Impl {
 
     if (!accepted) {
       EeQpResult fallback =
-          Fallback(input, EeQpFallbackReason::kCandidateRejected);
+          FallbackWithLock(
+              input, EeQpFallbackReason::kCandidateRejected,
+              scheduled_lock_waist_correction, scheduled_max_delta_rad);
       fallback.error_before = result.error_before;
       fallback.predicted_error_after = result.predicted_error_after;
       fallback.nonlinear_error_after = result.nonlinear_error_after;
@@ -615,7 +696,7 @@ class EeQpCorrector::Impl {
       return fallback;
     }
 
-    ZeroLockedDelta(input.reference, config_.lock_waist_correction, accepted_delta);
+    ZeroLockedDelta(input.reference, scheduled_lock_waist_correction, accepted_delta);
     JointVector full_delta = JointVector::Zero();
     InsertActive(accepted_delta, full_delta);
     result.q_corrected = input.q_sonic + full_delta;
@@ -715,6 +796,14 @@ class EeQpCorrector::Impl {
 
   EeQpResult Fallback(
       const EeQpInput& input, EeQpFallbackReason reason) {
+    return FallbackWithLock(
+        input, reason, config_.lock_waist_correction, config_.max_delta_rad);
+  }
+
+  EeQpResult FallbackWithLock(
+      const EeQpInput& input, EeQpFallbackReason reason,
+      bool lock_waist_correction,
+      const ActiveVector& max_delta_rad) {
     EeQpResult result;
     result.q_corrected = input.q_sonic;
     result.fallback_active = true;
@@ -730,6 +819,12 @@ class EeQpCorrector::Impl {
     result.plan_phase = input.reference.phase;
     result.reference_type = input.reference.reference_type;
     result.reference_feasible = input.reference.feasible;
+    result.pose_frame_index = input.reference.pose_frame_index;
+    result.gmr_frame_index = input.reference.gmr_frame_index;
+    result.gmr_frame_mismatch = input.reference.gmr_frame_mismatch;
+    result.gmr_prediction_horizon_ms =
+        input.reference.gmr_prediction_horizon_ms;
+    result.gmr_sync_valid = input.reference.gmr_sync_valid;
 
     switch (config_.invalid_fallback_mode) {
       case InvalidFallbackMode::kSonic:
@@ -750,9 +845,9 @@ class EeQpCorrector::Impl {
     if (input.q_sonic.allFinite()) {
       const ActiveVector sonic_active = ExtractActive(input.q_sonic);
       const ActiveVector lower = (config_.joint_lower - sonic_active)
-          .cwiseMax(-config_.max_delta_rad);
+          .cwiseMax(-max_delta_rad);
       const ActiveVector upper = (config_.joint_upper - sonic_active)
-          .cwiseMin(config_.max_delta_rad);
+          .cwiseMin(max_delta_rad);
       if ((lower.array() <= upper.array()).all()) {
         previous_delta_ = previous_delta_.cwiseMax(lower).cwiseMin(upper);
       } else {
@@ -761,7 +856,7 @@ class EeQpCorrector::Impl {
     } else {
       previous_delta_.setZero();
     }
-    ZeroLockedDelta(input.reference, config_.lock_waist_correction, previous_delta_);
+    ZeroLockedDelta(input.reference, lock_waist_correction, previous_delta_);
 
     JointVector full_delta = JointVector::Zero();
     InsertActive(previous_delta_, full_delta);
@@ -851,6 +946,60 @@ EeQpConfig LoadEeQpConfig(const std::string& yaml_path) {
           velocities["near"].as<double>();
       config.cartesian_active_arm_max_velocity_close_rad_s =
           velocities["close"].as<double>();
+    }
+  }
+  if (const auto schedule = root["task"]["teleop_gmr_schedule"]) {
+    if (schedule["enabled"]) {
+      config.teleop_gmr_schedule_enabled = schedule["enabled"].as<bool>();
+    }
+    if (schedule["waist_soft_error_m"]) {
+      config.teleop_gmr_waist_soft_error_m =
+          schedule["waist_soft_error_m"].as<double>();
+    }
+    if (schedule["waist_disable_error_m"]) {
+      config.teleop_gmr_waist_disable_error_m =
+          schedule["waist_disable_error_m"].as<double>();
+    }
+    if (schedule["min_position_weight_scale"]) {
+      config.teleop_gmr_min_position_weight_scale =
+          schedule["min_position_weight_scale"].as<double>();
+    }
+    if (schedule["max_joint_weight_scale"]) {
+      config.teleop_gmr_max_joint_weight_scale =
+          schedule["max_joint_weight_scale"].as<double>();
+    }
+    if (schedule["min_max_delta_scale"]) {
+      config.teleop_gmr_min_max_delta_scale =
+          schedule["min_max_delta_scale"].as<double>();
+    }
+    if (schedule["min_max_velocity_scale"]) {
+      config.teleop_gmr_min_max_velocity_scale =
+          schedule["min_max_velocity_scale"].as<double>();
+    }
+    if (schedule["hard_fallback_enabled"]) {
+      config.teleop_gmr_hard_fallback_enabled =
+          schedule["hard_fallback_enabled"].as<bool>();
+    }
+  }
+  if (const auto profile = root["task"]["teleop_gmr_profile"]) {
+    if (profile["enabled"]) {
+      config.teleop_gmr_profile_enabled = profile["enabled"].as<bool>();
+    }
+    config.teleop_gmr_joint_tracking_weight = ReadActiveVector(
+        profile, "joint_tracking_weight",
+        config.teleop_gmr_joint_tracking_weight);
+    config.teleop_gmr_max_delta_rad = ReadActiveVector(
+        profile, "max_delta_rad", config.teleop_gmr_max_delta_rad);
+    config.teleop_gmr_max_velocity_rad_s = ReadActiveVector(
+        profile, "max_velocity_rad_s",
+        config.teleop_gmr_max_velocity_rad_s);
+    if (profile["previous_delta_weight"]) {
+      config.teleop_gmr_previous_delta_weight =
+          profile["previous_delta_weight"].as<double>();
+    }
+    if (profile["lock_waist_correction"]) {
+      config.teleop_gmr_lock_waist_correction =
+          profile["lock_waist_correction"].as<bool>();
     }
   }
   config.previous_delta_weight = root["previous_delta_weight"].as<double>();

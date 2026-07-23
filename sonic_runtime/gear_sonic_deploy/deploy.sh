@@ -691,7 +691,12 @@ if [[ "$confirm" =~ ^[Yy]$ ]] || [[ -z "$confirm" ]]; then
         read -r -a EXTRA_ARG_ARRAY <<< "$EXTRA_ARGS"
         DEPLOY_ARGS+=("${EXTRA_ARG_ARRAY[@]}")
     fi
-    just run "$DEPLOY_BINARY" "${DEPLOY_ARGS[@]}"
+    RUN_PREFIX=()
+    if [[ -n "${PATH_SONIC_CPUSET:-}" ]]; then
+        RUN_PREFIX=(taskset -c "$PATH_SONIC_CPUSET")
+        echo "CPU affinity: SONIC -> ${PATH_SONIC_CPUSET}"
+    fi
+    "${RUN_PREFIX[@]}" just run "$DEPLOY_BINARY" "${DEPLOY_ARGS[@]}"
 else
     echo ""
     echo -e "${YELLOW}Deployment cancelled.${NC}"

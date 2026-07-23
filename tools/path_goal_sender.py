@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import math
 import os
 import select
 import sys
@@ -139,7 +140,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Continuously stream the target pose and let the terminal keys "
-            "w/a/s/d/q/e adjust it in robot-local xyz."
+            "w/a/s/d/q/e adjust robot-local xyz, o/p adjust local EE roll, "
+            "and k/l adjust local EE yaw."
         ),
     )
     parser.add_argument("--stream-hz", type=float, default=50.0)
@@ -148,6 +150,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.0,
         help="Interactive key step size in centimeters.",
+    )
+    parser.add_argument(
+        "--orientation-step-deg",
+        type=float,
+        default=2.0,
+        help="Interactive o/p roll and k/l yaw step size in degrees.",
     )
     parser.add_argument(
         "--stream-include-q-seed",
@@ -200,6 +208,14 @@ class TerminalKeys:
         "q": np.array([0.0, 0.0, -1.0], dtype=np.float64),
         "e": np.array([0.0, 0.0, 1.0], dtype=np.float64),
     }
+    KEY_TO_ROLL_SIGN = {
+        "o": 1.0,
+        "p": -1.0,
+    }
+    KEY_TO_YAW_SIGN = {
+        "k": 1.0,
+        "l": -1.0,
+    }
 
     def __init__(self) -> None:
         if not sys.stdin.isatty():
@@ -213,14 +229,29 @@ class TerminalKeys:
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.old_settings)
             self.old_settings = None
 
-    def poll_delta(self) -> np.ndarray | None:
+    def poll_key(self) -> str | None:
         ready, _, _ = select.select([sys.stdin], [], [], 0.0)
         if not ready:
             return None
         key = sys.stdin.read(1)
         if key == "\x03":
             raise KeyboardInterrupt
-        return self.KEY_TO_DELTA.get(key.lower())
+        return key.lower()
+
+    def key_delta(self, key: str | None) -> np.ndarray | None:
+        if key is None:
+            return None
+        return self.KEY_TO_DELTA.get(key)
+
+    def key_roll_sign(self, key: str | None) -> float | None:
+        if key is None:
+            return None
+        return self.KEY_TO_ROLL_SIGN.get(key)
+
+    def key_yaw_sign(self, key: str | None) -> float | None:
+        if key is None:
+            return None
+        return self.KEY_TO_YAW_SIGN.get(key)
 
 
 def target_link_from_args(args: argparse.Namespace) -> str:
@@ -233,6 +264,43 @@ def offset_from_args(args: argparse.Namespace) -> np.ndarray:
     if args.offset is not None:
         return np.asarray(args.offset, dtype=np.float64).reshape(3)
     return np.array([args.dx, args.dy, args.dz], dtype=np.float64)
+
+
+def normalize_quaternion_wxyz(quaternion: np.ndarray) -> np.ndarray:
+    q = np.asarray(quaternion, dtype=np.float64).reshape(4)
+    norm = float(np.linalg.norm(q))
+    if norm <= 1.0e-12 or not np.isfinite(q).all():
+        raise ValueError(f"invalid quaternion: {q.tolist()}")
+    q = q / norm
+    if q[0] < 0.0:
+        q = -q
+    return q
+
+
+def quat_multiply_wxyz(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    aw, ax, ay, az = normalize_quaternion_wxyz(a)
+    bw, bx, by, bz = normalize_quaternion_wxyz(b)
+    return normalize_quaternion_wxyz(
+        np.array(
+            [
+                aw * bw - ax * bx - ay * by - az * bz,
+                aw * bx + ax * bw + ay * bz - az * by,
+                aw * by - ax * bz + ay * bw + az * bx,
+                aw * bz + ax * by - ay * bx + az * bw,
+            ],
+            dtype=np.float64,
+        )
+    )
+
+
+def local_x_roll_quaternion(delta_rad: float) -> np.ndarray:
+    half = 0.5 * float(delta_rad)
+    return np.array([math.cos(half), math.sin(half), 0.0, 0.0], dtype=np.float64)
+
+
+def local_z_yaw_quaternion(delta_rad: float) -> np.ndarray:
+    half = 0.5 * float(delta_rad)
+    return np.array([math.cos(half), 0.0, 0.0, math.sin(half)], dtype=np.float64)
 
 
 def unpack_prefixed(raw: bytes, topic: str) -> dict:
@@ -413,13 +481,16 @@ def wrist_position_from_q(model_xml: Path, target_link: str, q29: np.ndarray, ro
         raise ValueError(f"body not found in MuJoCo model: {target_link}")
     pelvis_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "pelvis")
     pelvis = data.xpos[pelvis_id].copy() if pelvis_id >= 0 else np.zeros(3)
-    return data.xpos[body_id].copy() - pelvis
+    ee_offset = np.array([0.05, 0.0, 0.0], dtype=np.float64)
+    body_xmat = data.xmat[body_id].reshape(3, 3).copy()
+    return data.xpos[body_id].copy() + body_xmat @ ee_offset - pelvis
 
 
 def make_goal_payload(
     args: argparse.Namespace,
     target_link: str,
     target: np.ndarray,
+    quaternion: np.ndarray,
     current_position: np.ndarray | None,
     q_seed: np.ndarray | None,
     offset: np.ndarray,
@@ -435,7 +506,7 @@ def make_goal_payload(
         "target_link": target_link,
         "side": args.side,
         "position": np.asarray(target, dtype=np.float64).reshape(3).tolist(),
-        "quaternion": [float(x) for x in args.quaternion],
+        "quaternion": normalize_quaternion_wxyz(quaternion).tolist(),
         "source": (
             "interactive_state_offset"
             if streaming_goal and args.from_state
@@ -481,6 +552,7 @@ def interactive_stream(
     planner_socket: zmq.Socket | None,
     target_link: str,
     target: np.ndarray,
+    quaternion: np.ndarray,
     current_position: np.ndarray | None,
     q_seed: np.ndarray | None,
     offset: np.ndarray,
@@ -491,15 +563,21 @@ def interactive_stream(
     period = 1.0 / max(float(args.stream_hz), 1.0e-6)
     next_print = 0.0
     target = np.asarray(target, dtype=np.float64).reshape(3).copy()
+    quaternion = normalize_quaternion_wxyz(quaternion)
     offset = np.asarray(offset, dtype=np.float64).reshape(3).copy()
     stream_goal_uid = uuid.uuid4().hex
+    roll_step = math.radians(float(args.orientation_step_deg))
     print(
         "[PATH-goal] interactive streaming started: "
-        "w=+x, s=-x, a=+y, d=-y, q=-z, e=+z, Ctrl+C=stop"
+        "w=+x, s=-x, a=+y, d=-y, q=-z, e=+z, "
+        "o=+roll/CCW, p=-roll/CW, k=+yaw/CCW, l=-yaw/CW, Ctrl+C=stop"
     )
     try:
         while True:
-            delta = keys.poll_delta()
+            key = keys.poll_key()
+            delta = keys.key_delta(key)
+            roll_sign = keys.key_roll_sign(key)
+            yaw_sign = keys.key_yaw_sign(key)
             workspace_info = None
             if delta is not None:
                 candidate_target = target + step * delta
@@ -515,12 +593,21 @@ def interactive_stream(
                     offset = target - current_position
                 else:
                     offset += step * delta
+            elif roll_sign is not None:
+                quaternion = quat_multiply_wxyz(
+                    quaternion, local_x_roll_quaternion(roll_sign * roll_step)
+                )
+            elif yaw_sign is not None:
+                quaternion = quat_multiply_wxyz(
+                    quaternion, local_z_yaw_quaternion(yaw_sign * roll_step)
+                )
             else:
                 target, workspace_info = apply_workspace_guard(args, target, target_link)
             payload = make_goal_payload(
                 args,
                 target_link,
                 target,
+                quaternion,
                 current_position,
                 q_seed,
                 offset,
@@ -537,8 +624,10 @@ def interactive_stream(
                 print(
                     f"[PATH-goal] streaming target~={np.round(target, 4).tolist()} "
                     f"offset={np.round(offset, 4).tolist()} "
+                    f"quat={np.round(quaternion, 4).tolist()} "
                     f"workspace={payload.get('workspace_reason', 'n/a')} "
-                    f"link={target_link} step={args.step_cm:.2f}cm hz={args.stream_hz:.1f}",
+                    f"link={target_link} step={args.step_cm:.2f}cm "
+                    f"roll_step={args.orientation_step_deg:.1f}deg hz={args.stream_hz:.1f}",
                     flush=True,
                 )
                 next_print = now + max(0.1, float(args.print_period_sec))
@@ -553,6 +642,7 @@ def main() -> int:
         raise SystemExit("Use only one of --from-gmr or --from-state.")
     target_link = target_link_from_args(args)
     offset = offset_from_args(args)
+    quaternion = normalize_quaternion_wxyz(np.asarray(args.quaternion, dtype=np.float64))
     q_seed = np.asarray(args.q_seed, dtype=np.float64).reshape(29) if args.q_seed is not None else None
     current_position = (
         np.asarray(args.current_position, dtype=np.float64).reshape(3)
@@ -605,6 +695,7 @@ def main() -> int:
             planner_socket,
             target_link,
             target,
+            quaternion,
             current_position,
             q_seed,
             offset,
@@ -619,6 +710,7 @@ def main() -> int:
         args,
         target_link,
         target,
+        quaternion,
         current_position,
         q_seed,
         offset,

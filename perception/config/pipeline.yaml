@@ -5,14 +5,26 @@ depth:
   max_depth_m: 3.0
   sync_tol_ms: 50
 segmentation:
-  concepts: []
-  target_hz: 3.0
+  # `tensorrt` requires the board-local engine below. Use `--backend pytorch`
+  # for an explicit diagnostic fallback.
+  backend: tensorrt
+  # SAM3 is prompt-driven; these concepts form the default robot-scene
+  # vocabulary. The web page can replace them at runtime with a comma-separated
+  # list. "object" is a broad fallback, not a guaranteed panoptic mode.
+  # The full TensorRT graph runs once per concept. Keep the default to one
+  # broad prompt for minimum latency; add specific prompts from the web UI.
+  concepts: [object]
+  target_hz: 3.5
   min_score: 0.5
   min_area_px: 400
   miss_ttl: 10
   # Keep credentials outside this file. The default builder reads the gated
   # checkpoint through the mounted Hugging Face cache.
   checkpoint: null
+  tensorrt:
+    engine: /models/sam3_trt/sam3_fp16_4out.engine
+    model_id: facebook/sam3
+    mask_threshold: 0.5
 cloud:
   workspace_lims: [-1.0, 1.0, -1.0, 1.0, 0.1, 1.5]
   voxel_size_m: 0.005
@@ -38,4 +50,43 @@ reid:
 publish:
   keepalive_hz: 1.0
   stale_after_s: 1.5
+ee_target:
+  # The server still requires the explicit --enable-ee-publishing CLI flag and
+  # starts tracking only after an object is selected and Send is pressed.
+  # Tracking republishes the latest center until Stop is pressed or the selected
+  # object disappears for tracking_lost_grace_frames consecutive SAM3 frames.
+  # Test mode: accept any finite segmented center without range or timing gates.
+  bypass_checks: true
+  camera_info: config/camera_info.yaml
+  extrinsics: config/extrinsics.yaml
+  # identity uses a fixed camera->goal transform and ignores pelvis->torso IMU/FK
+  # rotation. This is the most stable mode while the RGB-D extrinsics are still
+  # only approximate. Alternatives: joint_fk, dual_imu.
+  torso_estimator: identity
+  robot_state_max_delta_ms: 40.0
+  max_imu_fk_disagreement_deg: 12.0
+  max_waist_speed_rad_s: 0.15
+  side: left
+  target_link: left_wrist_yaw_link
+  quaternion_wxyz: [1.0, 0.0, 0.0, 0.0]
+  # Added after transforming the segmented center into pelvis_identity_fk.
+  position_offset_goal_m: [0.0, 0.0, 0.0]
+  duration_sec: 2.0
+  final_hold_sec: 1.0
+  auto_publish_hz: 5.0
+  tracking_lost_grace_frames: 3
+  tracking_max_jump_m: 0.25
+  max_frame_age_sec: 1.5
+  min_depth_points: 100
+  goal_endpoint: tcp://127.0.0.1:5564
+  goal_topic: path_static_ee_target
+  send_planner_goal: true
+  planner_endpoint: tcp://127.0.0.1:5561
+  planner_topic: path_goal
+  workspace:
+    x: [-0.15, 0.45]
+    left_y: [0.03, 0.50]
+    right_y: [-0.50, -0.03]
+    z: [-0.30, 0.35]
+    radius_m: 0.62
 registry_dir: "registry_data"

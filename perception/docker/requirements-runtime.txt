@@ -8,7 +8,16 @@ fastapi>=0.115,<1
 uvicorn[standard]>=0.34,<1
 websockets>=14,<17
 lcm>=1.5,<2
+msgpack>=1.0,<2
+pyzmq>=26,<28
 opencv-python-headless>=4.10,<5
 huggingface-hub>=0.29,<2
+# Pinned to the SAM3-TensorRT reference export implementation. Keep this exact
+# until the ONNX graph and engine have been revalidated against a newer release.
+transformers==5.0.0rc1
+accelerate>=1.1,<2
+# TensorRT 11 removed trtexec's implicit --fp16 mode.  Its supported migration
+# path is ModelOpt AutoCast, so keep the ONNX extras in the runtime/build image.
+nvidia-modelopt[onnx]==0.44.0
 # NVIDIA's bundled triton-kernels package declares this runtime dependency.
 pytest>=8,<10

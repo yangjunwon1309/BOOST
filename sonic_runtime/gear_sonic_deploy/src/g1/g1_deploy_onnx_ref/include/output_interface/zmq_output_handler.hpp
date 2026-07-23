@@ -292,7 +292,7 @@ private:
         // Visualisation fields: output_data_map_.size() (typically 11)
         int num_state_fields = has_heading_state ? 20 : 18;
         int num_viz_fields = static_cast<int>(output_data_map_.size());
-        constexpr int kEeQpFields = 48;
+        constexpr int kEeQpFields = 54;
         pk.pack_map(num_state_fields + num_viz_fields + (ee_qp ? kEeQpFields : 0));
 
         // ---- State-logger fields ----
@@ -475,6 +475,16 @@ private:
             pk.pack(::g1::ee_qp::ControlModeName(ee_qp->control_mode));
             pk.pack("ee_qp_reference_type");
             pk.pack(::g1::ee_qp::ReferenceTypeName(ee_qp->reference_type));
+            pk.pack("ee_qp_pose_frame_index");
+            pk.pack(ee_qp->pose_frame_index);
+            pk.pack("ee_qp_gmr_frame_index");
+            pk.pack(ee_qp->gmr_frame_index);
+            pk.pack("ee_qp_gmr_frame_mismatch");
+            pk.pack(ee_qp->gmr_frame_mismatch);
+            pk.pack("ee_qp_gmr_prediction_horizon_ms");
+            pk.pack(ee_qp->gmr_prediction_horizon_ms);
+            pk.pack("ee_qp_gmr_sync_valid");
+            pk.pack(ee_qp->gmr_sync_valid);
             pk.pack("ee_qp_servo_error_before_m");
             pk.pack(ee_qp->reference_type == ::g1::ee_qp::ReferenceType::kCartesianTarget
                         ? ee_qp->error_before_m
@@ -527,6 +537,9 @@ private:
             pk.pack("ee_qp_q_ref");
             pk.pack_array(::g1::ee_qp::kNumJoints);
             for (const auto value : ee_qp->q_ref) pk.pack(value);
+            pk.pack("ee_qp_tau_ff_ref");
+            pk.pack_array(::g1::ee_qp::kNumJoints);
+            for (const auto value : ee_qp->tau_ff_ref) pk.pack(value);
             pk.pack("ee_qp_q_corrected");
             pk.pack_array(::g1::ee_qp::kNumJoints);
             for (const auto value : ee_qp->q_corrected) pk.pack(value);

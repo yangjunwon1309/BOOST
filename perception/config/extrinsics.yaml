@@ -1,3 +1,22 @@
-# Row-major transform from the camera optical frame into torso_link.
-# Leave null until the physical camera mount has been calibrated.
+# URDF-derived G1 29-DoF head-camera transform for bring-up without a measured
+# extrinsic. Source:
+#   /home/url/00_workspace/xr_teleop/assets/g1/g1_body29_hand14.urdf
+# with waist yaw/roll/pitch set to zero, combined with the official Isaac Lab
+# ROS optical-frame quaternion (wxyz) [0.5, -0.5, 0.5, -0.5].
+# Replace this approximation with a measured extrinsic when one is available.
+extrinsics_source: g1_body29_hand14_urdf_waist_zero
 T_torso_cam: null
+
+# Row-major camera optical -> PATH goal-frame transform:
+#   p_goal = T_goal_cam @ p_camera
+# PATH's absolute wrist target uses `pelvis_identity_fk`, not torso_link. This
+# may only be a static matrix when the camera mount is rigid to that goal frame
+# (for example, with the waist locked). Otherwise update it from robot FK.
+T_goal_cam:
+  # camera optical -> pelvis_identity_fk at zero waist:
+  #   t_pelvis_camera = [0.053660, 0.017530, 0.483870] m
+  #   torso -> d435 pitch = +0.830776724 rad (47.60 deg; looks downward)
+  - [ 0.0, -0.73845534,  0.67430239, 0.053660]
+  - [-1.0,  0.0,         0.0,        0.017530]
+  - [ 0.0, -0.67430239, -0.73845534, 0.483870]
+  - [ 0.0,  0.0,         0.0,        1.0]

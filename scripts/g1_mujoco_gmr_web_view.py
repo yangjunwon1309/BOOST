@@ -291,6 +291,8 @@ class PathWebRecorder:
 
 
 class MujocoWristFk:
+    ee_offset_m = 0.05
+
     def __init__(self, model_xml: Path) -> None:
         import mujoco
 
@@ -322,7 +324,9 @@ class MujocoWristFk:
         self.data.qpos[7:36] = q[:29]
         self.mujoco.mj_forward(self.model, self.data)
         pelvis = self.data.xpos[self.pelvis_id].copy() if self.pelvis_id >= 0 else np.zeros(3)
-        pos = self.data.xpos[body_id].copy() - pelvis
+        body_pos = self.data.xpos[body_id].copy()
+        body_xmat = self.data.xmat[body_id].reshape(3, 3).copy()
+        pos = body_pos + body_xmat @ np.array([self.ee_offset_m, 0.0, 0.0]) - pelvis
         return pos.astype(float).tolist()
 
 
@@ -409,6 +413,13 @@ def flatten_record_payload(payload: dict[str, Any], index: int, elapsed_sec: flo
         "ee_qp_terminal_capture_radius_m": payload.get("ee_qp_terminal_capture_radius_m", math.nan),
         "ee_qp_servo_error_before_m": payload.get("ee_qp_servo_error_before_m", math.nan),
         "ee_qp_servo_error_after_m": payload.get("ee_qp_servo_error_after_m", math.nan),
+        "gmr_frame": payload.get("gmr_frame", -1),
+        "gmr_prediction_horizon_ms": payload.get("gmr_prediction_horizon_ms", math.nan),
+        "ee_qp_pose_frame_index": payload.get("ee_qp_pose_frame_index", -1),
+        "ee_qp_gmr_frame_index": payload.get("ee_qp_gmr_frame_index", -1),
+        "ee_qp_gmr_frame_mismatch": payload.get("ee_qp_gmr_frame_mismatch", math.nan),
+        "ee_qp_gmr_prediction_horizon_ms": payload.get("ee_qp_gmr_prediction_horizon_ms", math.nan),
+        "ee_qp_gmr_sync_valid": int(bool(payload.get("ee_qp_gmr_sync_valid", False))),
         "left_target_error_m": payload.get("left_target_error_m", math.nan),
         "right_target_error_m": payload.get("right_target_error_m", math.nan),
         "active_target_error_m": payload.get("active_target_error_m", math.nan),
@@ -821,7 +832,12 @@ function drawFrame(data) {
   const ref = qRef ? computeFK(qRef) : null;
   const qpRef = qQpRef ? computeFK(qQpRef) : null;
   const corrected = qCorrected ? computeFK(qCorrected) : null;
-  if (ref) drawSkeleton(ref, "#16a34a", 2.0, 3.0, true);
+  const syncKnown = data.ee_qp_gmr_sync_valid !== null &&
+    typeof data.ee_qp_gmr_sync_valid !== "undefined";
+  const syncValid = !syncKnown || data.ee_qp_gmr_sync_valid === true ||
+    data.ee_qp_gmr_sync_valid === 1;
+  const refColor = syncValid ? "#16a34a" : "#9ca3af";
+  if (ref) drawSkeleton(ref, refColor, 2.0, 3.0, true);
   if (qpRef) drawSkeleton(qpRef, "#f97316", 1.9, 2.8, true);
   if (corrected) drawSkeleton(corrected, "#7c3aed", 1.7, 2.5, true);
   drawSkeleton(cur, "#2563eb", 2.4, 3.4, false);
@@ -875,7 +891,7 @@ function drawFrame(data) {
   }
   ctx.fillStyle = "#111827";
   ctx.font = "16px ui-monospace, monospace";
-  ctx.fillText("upper body only, QP internal wrist FK when available", 24, 34);
+  ctx.fillText("upper body only, MuJoCo pelvis-local FK", 24, 34);
   ctx.font = "13px ui-monospace, monospace";
   ctx.fillText(`left wrist GMR/QP: ${Number.isFinite(lErr) ? (lErr*100).toFixed(2) : "n/a"} / ${Number.isFinite(lQpErr) ? (lQpErr*100).toFixed(2) : "n/a"} cm`, 24, 58);
   ctx.fillText(`right wrist GMR/QP: ${Number.isFinite(rErr) ? (rErr*100).toFixed(2) : "n/a"} / ${Number.isFinite(rQpErr) ? (rQpErr*100).toFixed(2) : "n/a"} cm`, 24, 78);
@@ -922,6 +938,7 @@ GMR reference: ${data.gmr_count} msgs
   q key: ${data.gmr_q_key || "missing"}
   age: ${fmtAge(data.gmr_age_ms)}
   frame: ${data.gmr_frame ?? "n/a"}
+  prediction horizon: ${Number.isFinite(data.gmr_prediction_horizon_ms) ? data.gmr_prediction_horizon_ms.toFixed(1) : "n/a"} ms
   mode/source: ${data.gmr_control_mode ?? "n/a"} / ${data.gmr_source ?? "n/a"}
 
 QP active reference:
@@ -930,6 +947,7 @@ QP active reference:
   type: ${data.ee_qp_reference_type ?? "n/a"}
   plan: ${data.ee_qp_plan_id ?? "n/a"} phase=${Number.isFinite(data.ee_qp_plan_phase) ? data.ee_qp_plan_phase.toFixed(3) : "n/a"}
   valid/fallback: ${data.ee_qp_valid ?? "n/a"} / ${data.ee_qp_fallback_reason ?? "n/a"}
+  sync: ${data.ee_qp_gmr_sync_valid ?? "n/a"} pose=${data.ee_qp_pose_frame_index ?? "n/a"} gmr=${data.ee_qp_gmr_frame_index ?? "n/a"} df=${data.ee_qp_gmr_frame_mismatch ?? "n/a"} pred=${Number.isFinite(data.ee_qp_gmr_prediction_horizon_ms) ? data.ee_qp_gmr_prediction_horizon_ms.toFixed(1) : "n/a"} ms
   terminal active/link: ${data.ee_qp_terminal_target_active ?? "n/a"} / ${data.ee_qp_terminal_target_link ?? "n/a"}
   QP input target: ${Array.isArray(data.qp_input_target_position) ? data.qp_input_target_position.map(v=>v.toFixed(3)).join(", ") : "n/a"}
   QP input frame: ${data.qp_input_coordinate_frame ?? "n/a"}
@@ -980,9 +998,16 @@ async def health() -> dict[str, Any]:
         "state_age_ms": state.get("age_ms"),
         "qp_ref_q_key": "ee_qp_q_ref" if _as_float_list(state_msg.get("ee_qp_q_ref")) is not None else None,
         "qp_corrected_q_key": "ee_qp_q_corrected" if _as_float_list(state_msg.get("ee_qp_q_corrected")) is not None else None,
+        "ee_qp_pose_frame_index": state_msg.get("ee_qp_pose_frame_index"),
+        "ee_qp_gmr_frame_index": state_msg.get("ee_qp_gmr_frame_index"),
+        "ee_qp_gmr_frame_mismatch": state_msg.get("ee_qp_gmr_frame_mismatch"),
+        "ee_qp_gmr_prediction_horizon_ms": state_msg.get("ee_qp_gmr_prediction_horizon_ms"),
+        "ee_qp_gmr_sync_valid": state_msg.get("ee_qp_gmr_sync_valid"),
         "gmr_count": gmr.get("count", 0),
         "gmr_q_key": gmr.get("q_key"),
         "gmr_age_ms": gmr.get("age_ms"),
+        "gmr_frame": (gmr.get("message") or {}).get("frame_index"),
+        "gmr_prediction_horizon_ms": (gmr.get("message") or {}).get("prediction_horizon_ms"),
         "record": recorder.status() if recorder is not None else {},
     }
 
@@ -1055,16 +1080,14 @@ async def state_ws(ws: WebSocket) -> None:
             if wrist_fk is not None and q_measured is not None:
                 left_wrist_position = wrist_fk.wrist_position(q_measured, "left_wrist_yaw_link")
                 right_wrist_position = wrist_fk.wrist_position(q_measured, "right_wrist_yaw_link")
-            if ee_qp_left_wrist_position is not None:
-                left_wrist_position = ee_qp_left_wrist_position
-            if ee_qp_right_wrist_position is not None:
-                right_wrist_position = ee_qp_right_wrist_position
             if terminal_position is not None:
                 target_np = np.asarray(terminal_position, dtype=np.float64)
-                if left_wrist_position is not None:
-                    left_target_error_m = float(np.linalg.norm(np.asarray(left_wrist_position) - target_np))
-                if right_wrist_position is not None:
-                    right_target_error_m = float(np.linalg.norm(np.asarray(right_wrist_position) - target_np))
+                left_for_target = ee_qp_left_wrist_position or left_wrist_position
+                right_for_target = ee_qp_right_wrist_position or right_wrist_position
+                if left_for_target is not None:
+                    left_target_error_m = float(np.linalg.norm(np.asarray(left_for_target) - target_np))
+                if right_for_target is not None:
+                    right_target_error_m = float(np.linalg.norm(np.asarray(right_for_target) - target_np))
                 if target_side_int == 1:
                     active_target_error_m = left_target_error_m
                 elif target_side_int == 2:
@@ -1073,7 +1096,11 @@ async def state_ws(ws: WebSocket) -> None:
                     active_target_error_m = min(left_target_error_m, right_target_error_m)
                 elif math.isfinite(left_target_error_m) or math.isfinite(right_target_error_m):
                     active_target_error_m = min(left_target_error_m, right_target_error_m)
-            if terminal_position is not None and math.isfinite(terminal_distance_float):
+            if (
+                terminal_position is not None
+                and math.isfinite(terminal_distance_float)
+                and not math.isfinite(active_target_error_m)
+            ):
                 active_target_error_m = terminal_distance_float
                 if target_side_int == 1:
                     left_target_error_m = terminal_distance_float
@@ -1102,6 +1129,7 @@ async def state_ws(ws: WebSocket) -> None:
                 "state_count": state.get("count", 0),
                 "gmr_count": gmr.get("count", 0),
                 "gmr_frame": gmr_msg.get("frame_index"),
+                "gmr_prediction_horizon_ms": gmr_msg.get("prediction_horizon_ms"),
                 "gmr_source": gmr_msg.get("source"),
                 "gmr_control_mode": gmr_msg.get("control_mode"),
                 "ee_qp_valid": state_msg.get("ee_qp_valid"),
@@ -1111,6 +1139,11 @@ async def state_ws(ws: WebSocket) -> None:
                 "ee_qp_control_mode": state_msg.get("ee_qp_control_mode"),
                 "ee_qp_plan_id": state_msg.get("ee_qp_plan_id"),
                 "ee_qp_plan_phase": state_msg.get("ee_qp_plan_phase"),
+                "ee_qp_pose_frame_index": state_msg.get("ee_qp_pose_frame_index"),
+                "ee_qp_gmr_frame_index": state_msg.get("ee_qp_gmr_frame_index"),
+                "ee_qp_gmr_frame_mismatch": state_msg.get("ee_qp_gmr_frame_mismatch"),
+                "ee_qp_gmr_prediction_horizon_ms": state_msg.get("ee_qp_gmr_prediction_horizon_ms"),
+                "ee_qp_gmr_sync_valid": state_msg.get("ee_qp_gmr_sync_valid"),
                 "ee_qp_terminal_target_active": state_msg.get("ee_qp_terminal_target_active"),
                 "ee_qp_terminal_target_side": target_side_int,
                 "ee_qp_terminal_target_link": target_link,

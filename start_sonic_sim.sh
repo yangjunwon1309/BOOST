@@ -10,10 +10,10 @@ export CYCLONEDDS_NETWORK_INTERFACE="${CYCLONEDDS_NETWORK_INTERFACE:-lo}"
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
 
 cd "$PATH_G1_ROOT"
-exec python sonic_runtime/gear_sonic/scripts/run_sim_loop.py \
+exec taskset -c "${PATH_SIM_CPUSET:-4-5}" \
+  python sonic_runtime/gear_sonic/scripts/run_sim_loop.py \
   --enable-offscreen \
   --camera-port "${SONIC_SIM_CAMERA_PORT:-5555}" \
   --env_name "${SONIC_SIM_ENV_NAME:-default}" \
   --enable-image-publish \
   "$@"
-

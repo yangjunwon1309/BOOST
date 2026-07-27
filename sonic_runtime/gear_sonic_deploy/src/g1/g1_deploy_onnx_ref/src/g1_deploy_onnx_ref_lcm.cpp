@@ -2209,6 +2209,10 @@ class G1Deploy {
 
     static ::g1::ee_qp::ReferenceSource ParseReferenceSource(const std::string& source) {
       if (source == "gmr") return ::g1::ee_qp::ReferenceSource::kGmr;
+      if (source == "gmr_arms_only" ||
+          source == "gmr_qp_bimanual_teleop") {
+        return ::g1::ee_qp::ReferenceSource::kGmr;
+      }
       if (source == "curobo") return ::g1::ee_qp::ReferenceSource::kCurobo;
       if (source == "replay") return ::g1::ee_qp::ReferenceSource::kReplay;
       if (source == "damped_return" || source == "damped") return ::g1::ee_qp::ReferenceSource::kDampedReturn;
@@ -2226,6 +2230,7 @@ class G1Deploy {
 
     static ::g1::ee_qp::ControlMode ParseControlMode(const std::string& mode) {
       if (mode == "teleop") return ::g1::ee_qp::ControlMode::kTeleop;
+      if (mode == "teleop_qp_bimanual") return ::g1::ee_qp::ControlMode::kTeleop;
       if (mode == "plan_pending") return ::g1::ee_qp::ControlMode::kPlanPending;
       if (mode == "plan_exec") return ::g1::ee_qp::ControlMode::kPlanExec;
       if (mode == "blend_back") return ::g1::ee_qp::ControlMode::kBlendBack;
@@ -3203,6 +3208,13 @@ class G1Deploy {
           reference.reference_type == ::g1::ee_qp::ReferenceType::kUnknown) {
         return false;
       }
+      // A cartesian_target is a task-space wrist goal. It must go through the
+      // EE-QP correction path instead of directly replaying q_ref, otherwise the
+      // SAM3/shared-control target is ignored while telemetry still looks fresh.
+      if (reference.reference_type ==
+          ::g1::ee_qp::ReferenceType::kCartesianTarget) {
+        return false;
+      }
       switch (reference.source) {
         case ::g1::ee_qp::ReferenceSource::kGmr:
         case ::g1::ee_qp::ReferenceSource::kCurobo:
@@ -3234,6 +3246,37 @@ class G1Deploy {
         last_action[action_idx] = static_cast<double>(action[action_idx]);
       }
       return true;
+    }
+
+    static bool IsPathWaistIdentityPdLocked(
+        const std::optional<::g1::ee_qp::EeReference>& reference) {
+      if (!reference) return false;
+      // PATH owns no waist motion.  Both q/w GMR teleoperation and e-mode
+      // Cartesian shared control must leave the waist PD target at identity;
+      // SONIC retains sole ownership of the lower-body balance policy.
+      const bool gmr_bimanual_teleop =
+          reference->reference_type == ::g1::ee_qp::ReferenceType::kSample &&
+          reference->control_mode == ::g1::ee_qp::ControlMode::kTeleop &&
+          reference->source == ::g1::ee_qp::ReferenceSource::kGmr;
+      const bool path_e_mode_plan_exec =
+          reference->control_mode == ::g1::ee_qp::ControlMode::kPlanExec;
+      // plan_exec also covers a fresh e-mode fallback/null target.  Keeping
+      // this clamp through that transition prevents a one-frame waist command
+      // leak while the arms fall back to their unassisted posture.
+      return gmr_bimanual_teleop || path_e_mode_plan_exec;
+    }
+
+    void ForceWaistIdentityPdTarget(
+        MotorCommand& command,
+        std::array<float, g1_lcm::kNumMotors>& action) {
+      for (const int hw : ::g1::ee_qp::kWaistHardwareIndices) {
+        command.q_target[hw] = 0.0f;
+        command.dq_target[hw] = 0.0f;
+        command.tau_ff[hw] = 0.0f;
+        const int action_idx = isaaclab_to_mujoco[hw];
+        action[action_idx] = QTargetToRawAction(hw, command.q_target[hw]);
+        last_action[action_idx] = static_cast<double>(action[action_idx]);
+      }
     }
 
     void PublishPathDirectTelemetry(
@@ -3323,12 +3366,18 @@ class G1Deploy {
     }
 
 
-    bool ApplyEeQpCorrection(MotorCommand& command, std::array<float, g1_lcm::kNumMotors>& action) {
+    bool ApplyEeQpCorrection(
+        MotorCommand& command,
+        std::array<float, g1_lcm::kNumMotors>& action,
+        const std::optional<::g1::ee_qp::EeReference>& preloaded_reference =
+            std::nullopt) {
       if (!use_ee_qp_ || !ee_qp_corrector_ || !ee_qp_reference_provider_) return false;
       const auto low_state = used_low_state_data_.data;
       if (!low_state) return false;
       const auto now_us = SteadyNowUs();
-      const auto reference = ee_qp_reference_provider_->Latest(now_us);
+      const auto reference = preloaded_reference.has_value()
+          ? preloaded_reference
+          : ee_qp_reference_provider_->Latest(now_us);
       ::g1::ee_qp::EeQpInput input;
       for (int hw = 0; hw < G1_NUM_MOTOR; ++hw) {
         input.q_measured[hw] = low_state->motor_state()[hw].q();
@@ -4053,12 +4102,15 @@ class G1Deploy {
       }
       if (path_direct_override_applied && path_reference) {
         PublishPathDirectTelemetry(motor_command_tmp, *path_reference);
-      } else if (use_ee_qp_ && !ee_qp_dynamic_reference_provider_) {
-        ApplyEeQpCorrection(motor_command_tmp, final_action);
+      } else if (use_ee_qp_) {
+        ApplyEeQpCorrection(motor_command_tmp, final_action, path_reference);
       } else if (use_hand_ik_origin_) {
         ApplyHandIKOrigin(motor_command_tmp, final_action);
       } else if (UseAnyUpperIK() && has_vr_3point_data_) {
         PreservePreviousUpperBodyActions(final_action);
+      }
+      if (IsPathWaistIdentityPdLocked(path_reference)) {
+        ForceWaistIdentityPdTarget(motor_command_tmp, final_action);
       }
 
       motor_command_buffer_.SetData(motor_command_tmp);

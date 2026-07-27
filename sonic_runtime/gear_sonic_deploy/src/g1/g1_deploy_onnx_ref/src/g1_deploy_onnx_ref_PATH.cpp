@@ -2171,6 +2171,10 @@ class G1Deploy {
     static ::g1::ee_qp::ReferenceSource ParseReferenceSource(
         const std::string& source) {
       if (source == "gmr") return ::g1::ee_qp::ReferenceSource::kGmr;
+      if (source == "gmr_arms_only" ||
+          source == "gmr_qp_bimanual_teleop") {
+        return ::g1::ee_qp::ReferenceSource::kGmr;
+      }
       if (source == "curobo") return ::g1::ee_qp::ReferenceSource::kCurobo;
       if (source == "replay") return ::g1::ee_qp::ReferenceSource::kReplay;
       if (source == "damped_return" || source == "damped") {
@@ -2192,6 +2196,7 @@ class G1Deploy {
     static ::g1::ee_qp::ControlMode ParseControlMode(
         const std::string& mode) {
       if (mode == "teleop") return ::g1::ee_qp::ControlMode::kTeleop;
+      if (mode == "teleop_qp_bimanual") return ::g1::ee_qp::ControlMode::kTeleop;
       if (mode == "plan_pending") return ::g1::ee_qp::ControlMode::kPlanPending;
       if (mode == "plan_exec") return ::g1::ee_qp::ControlMode::kPlanExec;
       if (mode == "blend_back") return ::g1::ee_qp::ControlMode::kBlendBack;
@@ -3534,6 +3539,32 @@ class G1Deploy {
       return true;
     }
 
+    static bool IsPathWaistIdentityPdLocked(
+        const std::optional<::g1::ee_qp::EeReference>& reference) {
+      if (!reference) return false;
+      // PATH owns no waist motion.  Both q/w GMR teleoperation and e-mode
+      // Cartesian shared control must leave the waist PD target at identity;
+      // SONIC retains sole ownership of the lower-body balance policy.
+      const bool gmr_bimanual_teleop =
+          reference->reference_type == ::g1::ee_qp::ReferenceType::kSample &&
+          reference->control_mode == ::g1::ee_qp::ControlMode::kTeleop &&
+          reference->source == ::g1::ee_qp::ReferenceSource::kGmr;
+      const bool path_e_mode_plan_exec =
+          reference->control_mode == ::g1::ee_qp::ControlMode::kPlanExec;
+      // plan_exec also covers a fresh e-mode fallback/null target.  Keeping
+      // this clamp through that transition prevents a one-frame waist command
+      // leak while the arms fall back to their unassisted posture.
+      return gmr_bimanual_teleop || path_e_mode_plan_exec;
+    }
+
+    static void ForceWaistIdentityPdTarget(MotorCommand& command) {
+      for (const int hw : ::g1::ee_qp::kWaistHardwareIndices) {
+        command.q_target[hw] = 0.0f;
+        command.dq_target[hw] = 0.0f;
+        command.tau_ff[hw] = 0.0f;
+      }
+    }
+
     void PublishPathDirectTelemetry(
         const MotorCommand& command,
         const ::g1::ee_qp::EeReference& reference) {
@@ -4279,6 +4310,9 @@ class G1Deploy {
         ApplyHandIKOrigin(motor_command_tmp);
       } else if (UseAnyUpperIK() && has_vr_3point_data_) {
         PreservePreviousUpperBodyCommand(motor_command_tmp);
+      }
+      if (IsPathWaistIdentityPdLocked(path_reference)) {
+        ForceWaistIdentityPdTarget(motor_command_tmp);
       }
       motor_command_buffer_.SetData(motor_command_tmp);
       return true;

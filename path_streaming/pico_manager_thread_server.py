@@ -41,6 +41,11 @@ from scipy.spatial.transform import Rotation as R, Rotation as sRot
 import torch
 import zmq
 
+PATH_G1_ROOT = Path(__file__).resolve().parents[1]
+HUMAN_JOINTS_INFO_PATH = (
+    PATH_G1_ROOT / "sonic_runtime" / "gear_sonic" / "data" / "human" / "human_joints_info.pkl"
+)
+
 from gear_sonic.utils.teleop.zmq.zmq_poller import ZMQPoller
 from gear_sonic.trl.utils.rotation_conversion import decompose_rotation_aa
 from gear_sonic.trl.utils.torch_transform import (
@@ -473,6 +478,7 @@ def process_smpl_joints(body_pose, global_orient, transl):
     joints = compute_human_joints(
         body_pose=body_pose[..., :63],
         global_orient=global_orient_new,
+        human_joints_info_path=str(HUMAN_JOINTS_INFO_PATH),
     )  # (*, 24, 3)
 
     # Apply base rotation removal and compute local joints

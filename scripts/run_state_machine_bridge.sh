@@ -13,6 +13,7 @@ python -u path_streaming/path_state_machine_bridge.py \
   $(if [[ "${PATH_TELEOP_GMR_ARMS_ONLY_DEFAULT:-1}" != "0" ]]; then printf '%s' "--teleop-gmr-arms-only-default"; else printf '%s' "--no-teleop-gmr-arms-only-default"; fi) \
   $(if [[ "${PATH_FREEZE_PLANNER_LOWER_BODY:-1}" != "0" ]]; then printf '%s' "--freeze-planner-lower-body"; else printf '%s' "--no-freeze-planner-lower-body"; fi) \
   $(if [[ "${PATH_FREEZE_PLANNER_WAIST:-1}" != "0" ]]; then printf '%s' "--freeze-planner-waist"; else printf '%s' "--no-freeze-planner-waist"; fi) \
+  --pico-hand-timeout-sec "${PATH_PICO_HAND_TIMEOUT_SEC:-0.35}" \
   --phase-tracking-mode "${PATH_PHASE_TRACKING_MODE:-fixed_rate}" \
   --pico-endpoint "${PATH_PICO_INTERNAL_ENDPOINT:-tcp://127.0.0.1:5559}" \
   --gmr-endpoint "${PATH_GMR_REF_ENDPOINT:-tcp://127.0.0.1:5558}" \
@@ -41,6 +42,7 @@ python -u path_streaming/path_state_machine_bridge.py \
   --shared-hand-switch-confirm-n "${PATH_SHARED_HAND_SWITCH_CONFIRM_N:-10}" \
   --shared-orientation-mode "${PATH_SHARED_ORIENTATION_MODE:-gmr_prior}" \
   --shared-waist-mode "${PATH_SHARED_WAIST_MODE:-sonic_passthrough}" \
+  $(if [[ "${PATH_SHARED_LOCK_INACTIVE_ARM_Q_PRIOR:-1}" != "0" ]]; then printf '%s' "--shared-lock-inactive-arm-q-prior"; else printf '%s' "--no-shared-lock-inactive-arm-q-prior"; fi) \
   --sonic-port "${PATH_SONIC_PORT:-5556}" \
   --qp-port "${PATH_REFERENCE_PORT:-5560}" \
   --qp-topic "${PATH_REFERENCE_TOPIC:-path_qp_reference}" \

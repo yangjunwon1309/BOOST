@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 import os
+import socket
 import threading
 import time
 from pathlib import Path
@@ -34,7 +35,11 @@ from .lcm_protocol import (
 from .robot_geometry import RobotStateBuffer, g1_wrist_ee_position, pelvis_to_torso
 from .rgbd_sync import RgbdPair, RgbdSynchronizer, depth_at_rgb_size
 from .sam3_backend import TensorRTSam3Backend, TorchSam3Backend
-from .tasc_belief import BeliefInputObject, HierarchicalTascBelief
+from .tasc_belief import (
+    BeliefInputObject,
+    HierarchicalTascBelief,
+    StableObjectIdTracker,
+)
 from .visualization import render_segmented_rgbd
 
 
@@ -88,6 +93,51 @@ def pin_current_thread_from_env(env_name: str) -> dict[str, Any]:
     }
 
 
+def detect_lan_host() -> str:
+    """Best-effort LAN IP used only for the printed browser URL."""
+    candidates: list[str] = []
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.connect(("8.8.8.8", 80))
+            candidates.append(str(probe.getsockname()[0]))
+        finally:
+            probe.close()
+    except OSError:
+        pass
+    try:
+        hostname = socket.gethostname()
+        _name, _aliases, addresses = socket.gethostbyname_ex(hostname)
+        candidates.extend(addresses)
+    except OSError:
+        pass
+    for candidate in candidates:
+        if candidate and not candidate.startswith("127."):
+            return candidate
+    return "127.0.0.1"
+
+
+def display_host(bind_host: str, advertise_host: str | None) -> str:
+    if advertise_host:
+        return advertise_host
+    if bind_host in ("0.0.0.0", "::", ""):
+        return detect_lan_host()
+    return bind_host
+
+
+def ensure_port_available(host: str, port: int) -> None:
+    family = socket.AF_INET6 if ":" in host and host != "0.0.0.0" else socket.AF_INET
+    with socket.socket(family, socket.SOCK_STREAM) as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            probe.bind((host, int(port)))
+        except OSError as error:
+            raise RuntimeError(
+                f"web port {host}:{port} is not available. "
+                "Use --port <free_port> or stop the existing web server."
+            ) from error
+
+
 HTML = """<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <title>G1 SAM3 RGB-D View</title>
@@ -105,19 +155,18 @@ main{padding:16px;display:grid;grid-template-columns:minmax(0,1fr) 290px;gap:16p
 <header><h1>G1 · SAM3 RGB-D</h1><div class="grow"></div>
 <input id="prompt" placeholder="person, box, tool, robot part"><button onclick="setPrompt()">Apply concepts</button></header>
 <main><div><img id="view" src="/stream.mjpg"></div><aside>
-<div class="card"><b>Continuous left wrist target</b><select id="object"><option value="">No segmented object</option></select>
-<div class="row"><button id="send" onclick="sendTarget()" disabled>Track and send continuously</button><button id="stop" class="danger" onclick="stopTarget()" disabled>Stop</button></div>
-<div id="targetmsg">Select an object and start continuous publishing.</div></div>
+<div class="card"><b>Belief target publisher</b>
+<div class="row"><button id="send" onclick="startBeliefPublishing()">Publish belief result</button><button id="stop" class="danger" onclick="stopBeliefPublishing()" disabled>Stop publishing</button></div>
+<div id="targetmsg">Publishing is stopped. When enabled, the highest-belief contact target is streamed automatically; missing target streams null.</div></div>
 <div class="card"><b>Pipeline status</b><pre id="status">connecting…</pre></div></aside></main>
 <script>
 let state={};
 async function api(url,body){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const data=await r.json();if(!r.ok)throw new Error(data.detail||JSON.stringify(data));return data}
-function renderTarget(s){state=s;const t=s.ee_target||{}, sel=document.getElementById('object'), previous=sel.value;sel.innerHTML='<option value="">Select an object…</option>';for(const o of (s.instances||[])){const p=o.center_goal_m?o.center_goal_m.map(v=>v.toFixed(3)).join(', '):'goal frame unavailable';const op=document.createElement('option');op.value=o.index;op.dataset.label=o.label;op.textContent=`#${o.index} ${o.label} (${o.score.toFixed(2)}) — ${p}`;sel.appendChild(op)}if([...sel.options].some(o=>o.value===previous))sel.value=previous;const tracking=!!t.tracking;document.getElementById('send').disabled=sel.value==='';document.getElementById('stop').disabled=!tracking;const blockers=(t.blockers||[]).join('; ');const active=tracking?`Continuously publishing ${t.tracked_label||'selected object'}${t.missing_frames?` (missing ${t.missing_frames} frames)`:''}`:'';document.getElementById('targetmsg').textContent=active||t.last_result||blockers||'Select an object and start continuous publishing.';}
+function renderTarget(s){state=s;const t=s.ee_target||{};const enabled=!!t.belief_publishing;document.getElementById('send').disabled=enabled;document.getElementById('stop').disabled=!enabled;const blockers=(t.blockers||[]).join('; ');const active=enabled?`Publishing belief result at ${Number(t.publish_hz||0).toFixed(1)} Hz${t.last_published_label?` — ${t.last_published_label}`:''}`:'';document.getElementById('targetmsg').textContent=active||t.last_result||blockers||'Publishing is stopped. Enable it to stream belief target/null fallback.';}
 async function update(){try{const s=await (await fetch('/api/status')).json();document.getElementById('status').textContent=JSON.stringify(s,null,2);renderTarget(s);if(document.activeElement!==document.getElementById('prompt'))document.getElementById('prompt').value=(s.concepts||[]).join(', ');}catch(e){document.getElementById('status').textContent=String(e)}}
 async function setPrompt(){const prompt=document.getElementById('prompt').value.trim();await fetch('/api/prompt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt})});update()}
-async function sendTarget(){const sel=document.getElementById('object'),index=Number(sel.value),label=sel.options[sel.selectedIndex].dataset.label,selected=(state.instances||[]).find(o=>Number(o.index)===index);try{const r=await api('/api/ee-target/send',{object_index:index,frame_timestamp_us:state.last_frame_ts,label,center_goal_m:selected?selected.center_goal_m:null});document.getElementById('targetmsg').textContent=`Tracking ${r.label}: ${r.position_m.map(v=>v.toFixed(3)).join(', ')}`;await update()}catch(e){document.getElementById('targetmsg').textContent=e.message}}
-async function stopTarget(){try{await api('/api/ee-target/stop',{});await update()}catch(e){document.getElementById('targetmsg').textContent=e.message}}
-document.getElementById('object').addEventListener('change',()=>renderTarget(state));
+async function startBeliefPublishing(){try{await api('/api/ee-target/start',{});await update()}catch(e){document.getElementById('targetmsg').textContent=e.message}}
+async function stopBeliefPublishing(){try{await api('/api/ee-target/stop',{});await update()}catch(e){document.getElementById('targetmsg').textContent=e.message}}
 setInterval(update,1000);update();
 </script></body></html>"""
 
@@ -299,7 +348,7 @@ def draw_belief_highlight(
         x0, x1 = np.clip([x0, x1], 0, width - 1)
         y0, y1 = np.clip([y0, y1], 0, height - 1)
         cv2.rectangle(overlay, (x0, y0), (x1, y1), color, 3)
-        confidence = target.get("confidence")
+        confidence = target.get("joint_confidence")
         grip = target.get("grip_index")
         label = "belief"
         if isinstance(confidence, (int, float)):
@@ -385,6 +434,12 @@ class SegmentationRuntime:
         self.workspace = workspace
         self.target_config = target_config
         self.tasc_belief = HierarchicalTascBelief(belief_config)
+        self.tasc_object_tracker = StableObjectIdTracker(
+            max_distance_m=float(belief_config.get("object_track_max_distance_m", 0.25)),
+            missing_ttl_frames=int(
+                belief_config.get("object_track_missing_ttl_frames", 5)
+            ),
+        )
         self.tasc_use_contact_target = bool(belief_config.get("use_contact_target", True))
         self.tasc_pointcloud_max_points = int(
             belief_config.get(
@@ -418,6 +473,10 @@ class SegmentationRuntime:
             target_config.get("tracking_lost_grace_frames", 3)
         )
         self.target_last_stream_publish_monotonic = 0.0
+        self.belief_publishing_enabled = bool(
+            target_config.get("belief_publishing_enabled", False)
+        )
+        self.last_belief_published_label: str | None = None
         self.target_lock = threading.Lock()
         self.target_tracking: dict[str, Any] | None = None
         self.target_tracking_missing_frames = 0
@@ -523,6 +582,7 @@ class SegmentationRuntime:
                 ee_target={
                     "publisher_enabled": self.publisher is not None,
                     "armed": False,
+                    "belief_publishing": self.belief_publishing_enabled,
                     "tracking": tracking is not None,
                     "tracked_label": tracking.get("label") if tracking else None,
                     "tracked_index": tracking.get("last_index") if tracking else None,
@@ -532,6 +592,7 @@ class SegmentationRuntime:
                     "target_link": self.target_link,
                     "bypass_checks": self.target_bypass_checks,
                     "blockers": blockers,
+                    "last_published_label": self.last_belief_published_label,
                     "last_result": self.status.get("ee_target_last_result"),
                 },
             )
@@ -564,13 +625,43 @@ class SegmentationRuntime:
         return blockers
 
     def stop_target_tracking(
-        self, reason: str = "Continuous target stopped."
+        self, reason: str = "Belief target publishing stopped."
     ) -> dict[str, Any]:
+        publisher = None
+        payload = None
         with self.target_lock, self.lock:
+            self.belief_publishing_enabled = False
             self.target_tracking = None
             self.target_tracking_missing_frames = 0
+            self.last_belief_published_label = None
             self.status["ee_target_last_result"] = reason
-            return {"tracking": False}
+            publisher = self.publisher
+            if publisher is not None:
+                payload = self._null_goal_payload_locked(reason)
+        if publisher is not None and payload is not None:
+            publisher.publish(
+                payload,
+                repeat=1,
+                period_sec=1.0 / max(0.1, self.target_auto_publish_hz),
+            )
+        return {"belief_publishing": False, "tracking": False, "sent_null": payload is not None}
+
+    def start_belief_publishing(self) -> dict[str, Any]:
+        with self.target_lock, self.lock:
+            if self.publisher is None:
+                raise ValueError("publisher is disabled; restart with --enable-ee-publishing")
+            self.belief_publishing_enabled = True
+            self.target_tracking = None
+            self.target_tracking_missing_frames = 0
+            self.target_last_stream_publish_monotonic = 0.0
+            self.status["ee_target_last_result"] = (
+                "Belief target publishing enabled; streaming best belief target or null fallback."
+            )
+            return {
+                "belief_publishing": True,
+                "target_link": self.target_link,
+                "publish_hz": self.target_auto_publish_hz,
+            }
 
     def _goal_payload_for_object_locked(
         self,
@@ -613,8 +704,9 @@ class SegmentationRuntime:
                 "center_camera_m": selected.get("center_camera_m"),
                 "center_goal_m": selected.get("center_goal_m"),
                 "target_contact_goal_m": selected.get("target_contact_goal_m"),
+                "tasc_object_id": selected.get("tasc_object_id"),
                 "tasc_selected_grip_index": selected.get("tasc_selected_grip_index"),
-                "tasc_confidence": selected.get("tasc_confidence"),
+                "tasc_joint_confidence": selected.get("tasc_joint_confidence"),
                 "streaming_goal": bool(streaming_goal),
             },
         )
@@ -630,11 +722,137 @@ class SegmentationRuntime:
                 f"{str(selected.get('label', 'object'))}:"
                 f"{int(selected.get('index', 0))}"
             )
+        if selected.get("tasc_object_probability") is not None:
+            payload["confidence"] = float(selected.get("tasc_object_probability"))
+            payload["object_confidence"] = float(selected.get("tasc_object_probability"))
+        if selected.get("tasc_joint_confidence") is not None:
+            payload["joint_confidence"] = float(selected.get("tasc_joint_confidence"))
         return payload, position
+
+    def _null_goal_payload_locked(self, reason: str) -> dict[str, Any]:
+        return {
+            "goal_uid": f"sam3_belief:null:{self.target_link}",
+            "force_replan": False,
+            "streaming_goal": True,
+            "target_valid": False,
+            "target_link": self.target_link,
+            "side": self.target_side,
+            "position": None,
+            "quaternion": list(self.target_quaternion),
+            "source": "sam3_tasc_belief_null",
+            "coordinate_frame": "pelvis_identity_fk",
+            "duration_sec": float(self.target_config.get("duration_sec", 2.0)),
+            "final_hold_sec": float(self.target_config.get("final_hold_sec", 1.0)),
+            "perception": {
+                "frame_timestamp_us": int(self.status.get("last_frame_ts", 0) or 0),
+                "reason": str(reason),
+                "streaming_goal": True,
+                "target_valid": False,
+            },
+        }
+
+    def _belief_payload_locked(self) -> tuple[dict[str, Any], np.ndarray | None, str]:
+        belief = self.status.get("tasc_belief") or {}
+        target = belief.get("target") if isinstance(belief, dict) else None
+        if not isinstance(target, dict):
+            return self._null_goal_payload_locked("belief target unavailable"), None, "null"
+        try:
+            position = np.asarray(target.get("position_goal_m"), dtype=np.float64).reshape(3)
+        except Exception:
+            return self._null_goal_payload_locked("belief target position unavailable"), None, "null"
+        position = position + self.target_offset
+        if not np.isfinite(position).all():
+            return self._null_goal_payload_locked("belief target position is non-finite"), None, "null"
+
+        object_id = str(target.get("object_id", ""))
+        selected = next(
+            (
+                obj for obj in self.status.get("instances", [])
+                if str(obj.get("tasc_object_id", "")) == object_id
+            ),
+            None,
+        )
+        label = str((selected or {}).get("label") or object_id or "belief_target")
+        object_confidence = float(
+            target.get(
+                "object_confidence",
+                (selected or {}).get(
+                    "tasc_object_probability",
+                    target.get("joint_confidence", 1.0),
+                ),
+            )
+        )
+        joint_confidence = float(target.get("joint_confidence", object_confidence))
+        if self.target_bypass_checks:
+            workspace_info = {
+                "workspace_mode": "bypass",
+                "workspace_reason": "validation_disabled_by_config",
+                "workspace_clamped": False,
+                "requested_position": position.tolist(),
+            }
+        else:
+            try:
+                workspace_info = self.workspace.validate(position, self.target_side)
+            except ValueError as error:
+                return self._null_goal_payload_locked(str(error)), None, "null"
+        payload = make_goal_payload(
+            position,
+            side=self.target_side,
+            target_link=self.target_link,
+            quaternion=self.target_quaternion,
+            duration_sec=float(self.target_config.get("duration_sec", 2.0)),
+            final_hold_sec=float(self.target_config.get("final_hold_sec", 1.0)),
+            workspace_info=workspace_info,
+            metadata={
+                "frame_timestamp_us": int(self.status.get("last_frame_ts", 0) or 0),
+                "object_index": int((selected or {}).get("index", -1)),
+                "label": label,
+                "score": float((selected or {}).get("score", 0.0)),
+                "center_camera_m": (selected or {}).get("center_camera_m"),
+                "center_goal_m": (selected or {}).get("center_goal_m"),
+                "target_contact_goal_m": target.get("position_goal_m"),
+                "tasc_object_id": object_id,
+                "tasc_selected_grip_index": target.get("grip_index"),
+                "tasc_object_probability": object_confidence,
+                "tasc_joint_confidence": joint_confidence,
+                "streaming_goal": True,
+                "target_valid": True,
+                "belief_selected": True,
+            },
+        )
+        payload["source"] = "sam3_tasc_belief"
+        payload["streaming_goal"] = True
+        payload["target_valid"] = True
+        payload["goal_uid"] = f"sam3_belief:{self.target_link}:{object_id or label}"
+        # Shared-control alpha should answer "which object should we assist?",
+        # not "how certain is the exact grip contact?".  Use p(object) for
+        # alpha and keep p(object)*p(contact|object) as joint_confidence for
+        # target/contact diagnostics.
+        payload["confidence"] = object_confidence
+        payload["object_confidence"] = object_confidence
+        payload["joint_confidence"] = joint_confidence
+        payload["object_id"] = object_id
+        payload["grip_index"] = int(target.get("grip_index", -1))
+        return payload, position, label
 
     def _auto_publish_target_locked(self) -> tuple[GoalPublisher | None, dict[str, Any] | None, np.ndarray | None, str | None]:
         if self.publisher is None:
             return None, None, None, None
+        if self.belief_publishing_enabled:
+            now = time.monotonic()
+            period = 1.0 / max(0.1, self.target_auto_publish_hz)
+            if now - self.target_last_stream_publish_monotonic < period:
+                return None, None, None, None
+            blockers = self._target_blockers_locked()
+            if blockers:
+                payload = self._null_goal_payload_locked("; ".join(blockers))
+                self.target_last_stream_publish_monotonic = now
+                self.last_belief_published_label = None
+                return self.publisher, payload, None, "null"
+            payload, position, label = self._belief_payload_locked()
+            self.target_last_stream_publish_monotonic = now
+            self.last_belief_published_label = None if label == "null" else label
+            return self.publisher, payload, position, label
         tracking = self.target_tracking
         if tracking is None:
             return None, None, None, None
@@ -1016,6 +1234,7 @@ class SegmentationRuntime:
                         belief_ray_direction = ray / ray_norm
                 if frame_intrinsics is not None:
                     tasc_inputs: list[BeliefInputObject] = []
+                    pending_tasc_inputs: list[dict[str, Any]] = []
                     try:
                         xyz_camera = deproject(
                             depth,
@@ -1049,14 +1268,14 @@ class SegmentationRuntime:
                                     t_goal_cam,
                                     max_points=self.tasc_pointcloud_max_points,
                                 )
-                                tasc_inputs.append(
-                                    BeliefInputObject(
-                                        object_id=f"{labels[index]}:{index}",
-                                        label=str(labels[index]),
-                                        score=float(scores[index]),
-                                        center_goal_m=point_goal,
-                                        points_goal_m=points_goal,
-                                    )
+                                pending_tasc_inputs.append(
+                                    {
+                                        "index": int(index),
+                                        "label": str(labels[index]),
+                                        "score": float(scores[index]),
+                                        "center_goal_m": point_goal,
+                                        "points_goal_m": points_goal,
+                                    }
                                 )
                             color = tuple(
                                 int(value)
@@ -1069,6 +1288,21 @@ class SegmentationRuntime:
                             )
                     except Exception as error:
                         geometry_runtime_error = f"3-D center unavailable: {error}"
+                    assignments = self.tasc_object_tracker.assign(pending_tasc_inputs)
+                    for item in pending_tasc_inputs:
+                        object_id = assignments.get(int(item["index"]))
+                        if object_id is None:
+                            continue
+                        objects[int(item["index"])]["tasc_object_id"] = object_id
+                        tasc_inputs.append(
+                            BeliefInputObject(
+                                object_id=object_id,
+                                label=str(item["label"]),
+                                score=float(item["score"]),
+                                center_goal_m=item["center_goal_m"],
+                                points_goal_m=item["points_goal_m"],
+                            )
+                        )
                 else:
                     tasc_inputs = []
                     for obj in objects:
@@ -1101,8 +1335,8 @@ class SegmentationRuntime:
                         for item in belief_telemetry.get("objects", [])
                     }
                     for index, obj in enumerate(objects):
-                        object_id = f"{obj.get('label')}:{index}"
-                        belief_obj = by_id.get(object_id)
+                        object_id = obj.get("tasc_object_id")
+                        belief_obj = by_id.get(str(object_id)) if object_id is not None else None
                         if not belief_obj:
                             continue
                         obj["tasc_object_id"] = object_id
@@ -1120,7 +1354,7 @@ class SegmentationRuntime:
                         )
                         target = belief_telemetry.get("target") or {}
                         if target.get("object_id") == object_id:
-                            obj["tasc_confidence"] = target.get("confidence")
+                            obj["tasc_joint_confidence"] = target.get("joint_confidence")
                     if self.tasc_belief.should_log():
                         print(self.tasc_belief.format_log_line(), flush=True)
                         self.tasc_belief.mark_logged()
@@ -1169,10 +1403,21 @@ class SegmentationRuntime:
                         period_sec=1.0 / max(0.1, self.target_auto_publish_hz),
                     )
                     with self.lock:
-                        self.status["ee_target_last_result"] = (
-                            f"Streaming {self.target_link} target "
-                            f"{np.round(auto_position, 4).tolist()} for {auto_label}."
-                        )
+                        if auto_position is None or auto_payload.get("target_valid") is False:
+                            reason = (
+                                (auto_payload.get("perception") or {}).get("reason")
+                                if isinstance(auto_payload, dict)
+                                else None
+                            )
+                            self.status["ee_target_last_result"] = (
+                                "Streaming null belief target"
+                                + (f": {reason}" if reason else ".")
+                            )
+                        else:
+                            self.status["ee_target_last_result"] = (
+                                f"Streaming {self.target_link} belief target "
+                                f"{np.round(auto_position, 4).tolist()} for {auto_label}."
+                            )
             except Exception as error:
                 self._record_error(f"inference failed: {error}")
 
@@ -1215,6 +1460,16 @@ def api_ee_target_send(request: SendTargetRequest):
             request.label,
             request.center_goal_m,
         )
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+
+
+@app.post("/api/ee-target/start")
+def api_ee_target_start():
+    if runtime is None:
+        raise HTTPException(503, "runtime is not initialized")
+    try:
+        return runtime.start_belief_publishing()
     except ValueError as error:
         raise HTTPException(409, str(error)) from error
 
@@ -1280,8 +1535,33 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Exercise target tracking/payload validation without sending ZeroMQ messages.",
     )
-    parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=None)
+    parser.add_argument(
+        "--host",
+        default=os.environ.get(
+            "PATH_SAM3_WEB_BIND_HOST",
+            os.environ.get("PATH_WEB_BIND_HOST", "0.0.0.0"),
+        ),
+    )
+    parser.add_argument(
+        "--advertise-host",
+        default=os.environ.get(
+            "PATH_SAM3_WEB_ADVERTISE_HOST",
+            os.environ.get("PATH_WEB_ADVERTISE_HOST"),
+        ),
+        help=(
+            "Host/IP printed for opening this page from another desktop. "
+            "The server still binds to --host."
+        ),
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=(
+            int(os.environ["PATH_SAM3_WEB_PORT"])
+            if os.environ.get("PATH_SAM3_WEB_PORT")
+            else None
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1289,6 +1569,11 @@ def main() -> int:
     global runtime
     args = parse_args()
     config = yaml.safe_load(args.config.read_text()) if args.config.is_file() else {}
+    web_port = int(args.port or config.get("web_port", 8080))
+    try:
+        ensure_port_available(args.host, web_port)
+    except RuntimeError as error:
+        raise SystemExit(str(error)) from error
     depth_config = config.get("depth", {})
     segmentation_config = config.get("segmentation", {})
     tensorrt_config = dict(segmentation_config.get("tensorrt", {}))
@@ -1361,8 +1646,13 @@ def main() -> int:
     )
     runtime.start()
     runtime.pin_current_thread("web_server", "G1_PERCEPTION_IO_CPUSET")
+    advertised = display_host(args.host, args.advertise_host)
+    print(f"[SAM3-web] serving on {args.host}:{web_port}", flush=True)
+    print(f"[SAM3-web] open local  http://127.0.0.1:{web_port}", flush=True)
+    print(f"[SAM3-web] open remote http://{advertised}:{web_port}", flush=True)
+    print(f"[SAM3-web] status      http://{advertised}:{web_port}/api/status", flush=True)
     try:
-        uvicorn.run(app, host=args.host, port=args.port or config.get("web_port", 8080), log_level="info")
+        uvicorn.run(app, host=args.host, port=web_port, log_level="info")
     finally:
         runtime.stop()
     return 0

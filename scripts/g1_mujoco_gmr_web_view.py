@@ -17,6 +17,7 @@ import csv
 import json
 import math
 import os
+import socket
 from pathlib import Path
 import threading
 import time
@@ -78,6 +79,38 @@ def json_safe(value: Any) -> Any:
     if isinstance(value, float):
         return value if math.isfinite(value) else None
     return value
+
+
+def detect_lan_host() -> str:
+    """Best-effort LAN IP used only for the printed browser URL."""
+    candidates: list[str] = []
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.connect(("8.8.8.8", 80))
+            candidates.append(str(probe.getsockname()[0]))
+        finally:
+            probe.close()
+    except OSError:
+        pass
+    try:
+        hostname = socket.gethostname()
+        _name, _aliases, addresses = socket.gethostbyname_ex(hostname)
+        candidates.extend(addresses)
+    except OSError:
+        pass
+    for candidate in candidates:
+        if candidate and not candidate.startswith("127."):
+            return candidate
+    return "127.0.0.1"
+
+
+def display_host(bind_host: str, advertise_host: str | None) -> str:
+    if advertise_host:
+        return advertise_host
+    if bind_host in ("0.0.0.0", "::", ""):
+        return detect_lan_host()
+    return bind_host
 
 
 def _unpack_topic_msg(raw: bytes, topic: str) -> dict[str, Any] | None:
@@ -1172,7 +1205,15 @@ async def state_ws(ws: WebSocket) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--host", default=os.environ.get("PATH_WEB_BIND_HOST", "0.0.0.0"))
+    parser.add_argument(
+        "--advertise-host",
+        default=os.environ.get("PATH_WEB_ADVERTISE_HOST"),
+        help=(
+            "Host/IP printed for opening this page from another desktop. "
+            "The server still binds to --host."
+        ),
+    )
     parser.add_argument("--port", type=int, default=8090)
     parser.add_argument("--state-endpoint", default="tcp://127.0.0.1:5557")
     parser.add_argument("--state-topic", default="g1_debug")
@@ -1222,8 +1263,11 @@ def main() -> None:
     )
     state_sub.start()
     gmr_sub.start()
-    print(f"[web] open http://127.0.0.1:{args.port}")
-    print(f"[web] health http://127.0.0.1:{args.port}/health")
+    advertised = display_host(args.host, args.advertise_host)
+    print(f"[web] serving on {args.host}:{args.port}")
+    print(f"[web] open local  http://127.0.0.1:{args.port}")
+    print(f"[web] open remote http://{advertised}:{args.port}")
+    print(f"[web] health      http://{advertised}:{args.port}/health")
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
 

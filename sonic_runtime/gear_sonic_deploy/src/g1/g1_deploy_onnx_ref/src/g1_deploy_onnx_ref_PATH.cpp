@@ -3485,6 +3485,14 @@ class G1Deploy {
           reference.reference_type == ::g1::ee_qp::ReferenceType::kUnknown) {
         return false;
       }
+      // A cartesian_target carries a task-space wrist goal and must be consumed
+      // by ApplyEeQpCorrection().  Directly copying q_ref here only replays the
+      // GMR prior, leaves the SAM3 target untracked, and publishes misleading
+      // "QP reason=none / solve_time=0" telemetry.
+      if (reference.reference_type ==
+          ::g1::ee_qp::ReferenceType::kCartesianTarget) {
+        return false;
+      }
       switch (reference.source) {
         case ::g1::ee_qp::ReferenceSource::kGmr:
         case ::g1::ee_qp::ReferenceSource::kCurobo:
@@ -4265,7 +4273,7 @@ class G1Deploy {
       }
       if (path_direct_override_applied && path_reference) {
         PublishPathDirectTelemetry(motor_command_tmp, *path_reference);
-      } else if (use_ee_qp_ && !ee_qp_dynamic_reference_provider_) {
+      } else if (use_ee_qp_) {
         ApplyEeQpCorrection(motor_command_tmp, path_reference);
       } else if (use_hand_ik_origin_) {
         ApplyHandIKOrigin(motor_command_tmp);

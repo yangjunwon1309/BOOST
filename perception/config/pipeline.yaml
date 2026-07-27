@@ -96,8 +96,11 @@ tasc_belief:
   # coordinate frame stay unchanged.
   use_contact_target: true
   object_max_points: 8000
+  object_track_max_distance_m: 0.25
+  object_track_missing_ttl_frames: 5
   log_every_sec: 1.0
   action_apply_time: 0.01
+  feature_ema_alpha: 0.25
   beta: 1.0
   w_sc: 0.95
   max_prob_any_goal: 0.99
@@ -125,5 +128,8 @@ tasc_belief:
     h_th_m: 0.12
     grip_update_hz: 10
     w_geom_prior: 1.0
+    match_max_distance_m: 0.04
+    switch_dwell_frames: 2
+    switch_margin: 0.0
     table_normal: [0.0, 0.0, 1.0]
 registry_dir: "registry_data"

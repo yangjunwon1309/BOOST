@@ -31,9 +31,10 @@ from .lcm_protocol import (
     decode_depth,
     decode_robot_state,
 )
-from .robot_geometry import RobotStateBuffer, pelvis_to_torso
+from .robot_geometry import RobotStateBuffer, g1_wrist_ee_position, pelvis_to_torso
 from .rgbd_sync import RgbdPair, RgbdSynchronizer, depth_at_rgb_size
 from .sam3_backend import TensorRTSam3Backend, TorchSam3Backend
+from .tasc_belief import BeliefInputObject, HierarchicalTascBelief
 from .visualization import render_segmented_rgbd
 
 
@@ -258,6 +259,75 @@ def select_tracking_candidate(
     return selected, "ok"
 
 
+def masked_goal_points(
+    xyz_camera: np.ndarray,
+    mask: np.ndarray,
+    t_goal_cam: np.ndarray,
+    *,
+    max_points: int,
+) -> np.ndarray:
+    valid = mask.astype(bool) & np.isfinite(xyz_camera).all(axis=2)
+    points = xyz_camera[valid]
+    if points.size == 0:
+        return np.empty((0, 3), dtype=np.float64)
+    if points.shape[0] > max_points:
+        step = int(np.ceil(points.shape[0] / max(1, int(max_points))))
+        points = points[::step][:max_points]
+    return transform_points(points, t_goal_cam)
+
+
+def draw_belief_highlight(
+    overlay: np.ndarray,
+    objects: list[dict[str, Any]],
+    belief_telemetry: dict[str, Any],
+) -> None:
+    target = belief_telemetry.get("target") or {}
+    object_id = target.get("object_id")
+    if not object_id:
+        return
+    selected = next(
+        (obj for obj in objects if obj.get("tasc_object_id") == object_id),
+        None,
+    )
+    if selected is None:
+        return
+    height, width = overlay.shape[:2]
+    color = (40, 255, 40)
+    box = selected.get("box_xyxy")
+    if isinstance(box, list) and len(box) == 4:
+        x0, y0, x1, y1 = [int(round(float(value))) for value in box]
+        x0, x1 = np.clip([x0, x1], 0, width - 1)
+        y0, y1 = np.clip([y0, y1], 0, height - 1)
+        cv2.rectangle(overlay, (x0, y0), (x1, y1), color, 3)
+        confidence = target.get("confidence")
+        grip = target.get("grip_index")
+        label = "belief"
+        if isinstance(confidence, (int, float)):
+            label += f" {float(confidence):.2f}"
+        if grip is not None:
+            label += f" grip {int(grip)}"
+        cv2.putText(
+            overlay,
+            label,
+            (x0, min(height - 6, y1 + 18)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.52,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
+    pixel = selected.get("center_pixel_uv")
+    if isinstance(pixel, list) and len(pixel) == 2:
+        cv2.drawMarker(
+            overlay,
+            (int(pixel[0]), int(pixel[1])),
+            color,
+            cv2.MARKER_CROSS,
+            24,
+            3,
+        )
+
+
 class SegmentationRuntime:
     def __init__(
         self,
@@ -285,6 +355,7 @@ class SegmentationRuntime:
         publisher: GoalPublisher | None,
         workspace: Workspace,
         target_config: dict[str, Any],
+        belief_config: dict[str, Any],
     ):
         self.lcm_url = lcm_url
         self.rgb_channel = rgb_channel
@@ -313,6 +384,17 @@ class SegmentationRuntime:
         self.publisher = publisher
         self.workspace = workspace
         self.target_config = target_config
+        self.tasc_belief = HierarchicalTascBelief(belief_config)
+        self.tasc_use_contact_target = bool(belief_config.get("use_contact_target", True))
+        self.tasc_pointcloud_max_points = int(
+            belief_config.get(
+                "object_max_points",
+                belief_config.get("grip", {}).get("max_points", 8000),
+            )
+        )
+        self.tasc_ee_offset_m = float(belief_config.get("ee_offset_m", 0.05))
+        self.tasc_last_eef_position: np.ndarray | None = None
+        self.tasc_last_eef_timestamp_us: int | None = None
         self.target_side = str(target_config.get("side", "left"))
         self.target_link = str(
             target_config.get("target_link", f"{self.target_side}_wrist_yaw_link")
@@ -371,6 +453,7 @@ class SegmentationRuntime:
             "robot_state_delta_ms": None,
             "torso_transform": None,
             "thread_affinity": {},
+            "tasc_belief": self.tasc_belief.last_telemetry,
         }
         self.threads: list[threading.Thread] = []
         self.bus.subscribe(rgb_channel, self._on_rgb)
@@ -495,7 +578,11 @@ class SegmentationRuntime:
         *,
         streaming_goal: bool,
     ) -> tuple[dict[str, Any], np.ndarray]:
-        center = selected.get("center_goal_m")
+        center = (
+            selected.get("target_contact_goal_m")
+            if bool(getattr(self, "tasc_use_contact_target", False))
+            else None
+        ) or selected.get("center_goal_m")
         if center is None:
             raise ValueError("selected object has no valid goal-frame center")
         position = np.asarray(center, dtype=np.float64) + self.target_offset
@@ -524,9 +611,18 @@ class SegmentationRuntime:
                 "label": str(selected["label"]),
                 "score": float(selected["score"]),
                 "center_camera_m": selected.get("center_camera_m"),
+                "center_goal_m": selected.get("center_goal_m"),
+                "target_contact_goal_m": selected.get("target_contact_goal_m"),
+                "tasc_selected_grip_index": selected.get("tasc_selected_grip_index"),
+                "tasc_confidence": selected.get("tasc_confidence"),
                 "streaming_goal": bool(streaming_goal),
             },
         )
+        if (
+            selected.get("target_contact_goal_m") is not None
+            and bool(getattr(self, "tasc_use_contact_target", False))
+        ):
+            payload["source"] = "sam3_tasc_contact"
         if streaming_goal:
             payload["streaming_goal"] = True
             payload["goal_uid"] = (
@@ -843,6 +939,7 @@ class SegmentationRuntime:
                 geometry_runtime_error = None
                 t_goal_cam = self.static_t_goal_cam
                 transform_metadata = None
+                state_for_belief = state_match[0] if state_match else None
                 if self.t_torso_cam is not None:
                     if state_match is None:
                         geometry_runtime_error = "3-D goal unavailable: no timestamp-matched G1 robot state"
@@ -884,7 +981,41 @@ class SegmentationRuntime:
                                     t_goal_cam = None
                             else:
                                 t_goal_cam = None
+                belief_eef_position = None
+                belief_eef_velocity = None
+                belief_ray_origin = None
+                belief_ray_direction = None
+                if state_for_belief is not None:
+                    try:
+                        belief_eef_position = g1_wrist_ee_position(
+                            state_for_belief.q,
+                            self.target_link,
+                            self.tasc_ee_offset_m,
+                        )
+                        previous_position = self.tasc_last_eef_position
+                        previous_timestamp = self.tasc_last_eef_timestamp_us
+                        if previous_position is not None and previous_timestamp is not None:
+                            dt = (state_for_belief.timestamp_us - previous_timestamp) / 1.0e6
+                            if 1.0e-4 <= dt <= 0.5:
+                                belief_eef_velocity = (
+                                    belief_eef_position - previous_position
+                                ) / dt
+                        self.tasc_last_eef_position = belief_eef_position.copy()
+                        self.tasc_last_eef_timestamp_us = state_for_belief.timestamp_us
+                    except Exception as error:
+                        geometry_runtime_error = (
+                            f"{geometry_runtime_error}; " if geometry_runtime_error else ""
+                        ) + f"TASC EE FK unavailable: {error}"
+                if t_goal_cam is not None:
+                    belief_ray_origin = np.asarray(t_goal_cam[:3, 3], dtype=np.float64)
+                    ray = np.asarray(t_goal_cam[:3, :3], dtype=np.float64) @ np.array(
+                        [0.0, 0.0, 1.0], dtype=np.float64
+                    )
+                    ray_norm = float(np.linalg.norm(ray))
+                    if ray_norm > 1.0e-9 and np.isfinite(ray_norm):
+                        belief_ray_direction = ray / ray_norm
                 if frame_intrinsics is not None:
+                    tasc_inputs: list[BeliefInputObject] = []
                     try:
                         xyz_camera = deproject(
                             depth,
@@ -912,6 +1043,21 @@ class SegmentationRuntime:
                             if t_goal_cam is not None:
                                 point_goal = transform_points(point_camera, t_goal_cam)
                                 objects[index]["center_goal_m"] = point_goal.tolist()
+                                points_goal = masked_goal_points(
+                                    xyz_camera,
+                                    mask,
+                                    t_goal_cam,
+                                    max_points=self.tasc_pointcloud_max_points,
+                                )
+                                tasc_inputs.append(
+                                    BeliefInputObject(
+                                        object_id=f"{labels[index]}:{index}",
+                                        label=str(labels[index]),
+                                        score=float(scores[index]),
+                                        center_goal_m=point_goal,
+                                        points_goal_m=points_goal,
+                                    )
+                                )
                             color = tuple(
                                 int(value)
                                 for value in np.asarray(
@@ -924,6 +1070,7 @@ class SegmentationRuntime:
                     except Exception as error:
                         geometry_runtime_error = f"3-D center unavailable: {error}"
                 else:
+                    tasc_inputs = []
                     for obj in objects:
                         obj.update(
                             center_camera_m=None,
@@ -931,6 +1078,55 @@ class SegmentationRuntime:
                             center_pixel_uv=None,
                             valid_depth_points=0,
                         )
+                if self.tasc_belief.config.enabled:
+                    controller_xyzw = np.asarray(
+                        [
+                            self.target_quaternion[1],
+                            self.target_quaternion[2],
+                            self.target_quaternion[3],
+                            self.target_quaternion[0],
+                        ],
+                        dtype=np.float64,
+                    )
+                    belief_telemetry = self.tasc_belief.update(
+                        tasc_inputs,
+                        eef_position_m=belief_eef_position,
+                        user_translation_mps=belief_eef_velocity,
+                        ray_origin_m=belief_ray_origin,
+                        ray_direction=belief_ray_direction,
+                        controller_orientation_xyzw=controller_xyzw,
+                    )
+                    by_id = {
+                        str(item.get("object_id")): item
+                        for item in belief_telemetry.get("objects", [])
+                    }
+                    for index, obj in enumerate(objects):
+                        object_id = f"{obj.get('label')}:{index}"
+                        belief_obj = by_id.get(object_id)
+                        if not belief_obj:
+                            continue
+                        obj["tasc_object_id"] = object_id
+                        obj["tasc_object_probability"] = belief_obj.get(
+                            "object_probability"
+                        )
+                        obj["tasc_selected_grip_index"] = belief_obj.get(
+                            "selected_grip_index"
+                        )
+                        obj["target_contact_goal_m"] = belief_obj.get(
+                            "selected_contact_goal_m"
+                        )
+                        obj["tasc_grip_candidates"] = belief_obj.get(
+                            "grip_candidates", []
+                        )
+                        target = belief_telemetry.get("target") or {}
+                        if target.get("object_id") == object_id:
+                            obj["tasc_confidence"] = target.get("confidence")
+                    if self.tasc_belief.should_log():
+                        print(self.tasc_belief.format_log_line(), flush=True)
+                        self.tasc_belief.mark_logged()
+                    draw_belief_highlight(overlay, objects, belief_telemetry)
+                else:
+                    belief_telemetry = {"enabled": False, "objects": [], "target": None}
                 latency_ms = (time.perf_counter() - started) * 1000.0
                 cv2.putText(
                     overlay,
@@ -959,6 +1155,7 @@ class SegmentationRuntime:
                     )
                     self.status["robot_state_delta_ms"] = state_match[1] if state_match else None
                     self.status["torso_transform"] = transform_metadata
+                    self.status["tasc_belief"] = belief_telemetry
                     self.status["last_error"] = None
                     self.last_processed_monotonic = time.monotonic()
                     auto_publisher, auto_payload, auto_position, auto_label = (
@@ -1096,6 +1293,7 @@ def main() -> int:
     segmentation_config = config.get("segmentation", {})
     tensorrt_config = dict(segmentation_config.get("tensorrt", {}))
     target_config = config.get("ee_target", {})
+    belief_config = config.get("tasc_belief", {})
     concepts = segmentation_config.get("concepts") or []
     checkpoint = args.checkpoint
     if checkpoint is None and segmentation_config.get("checkpoint"):
@@ -1159,6 +1357,7 @@ def main() -> int:
         publisher=publisher,
         workspace=workspace,
         target_config=target_config,
+        belief_config=belief_config,
     )
     runtime.start()
     runtime.pin_current_thread("web_server", "G1_PERCEPTION_IO_CPUSET")

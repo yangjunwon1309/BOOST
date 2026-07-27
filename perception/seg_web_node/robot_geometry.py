@@ -10,11 +10,147 @@ import numpy as np
 from .lcm_protocol import RobotState
 
 
+JOINT_NAMES_URDF = [
+    "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint",
+    "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
+    "right_hip_pitch_joint", "right_hip_roll_joint", "right_hip_yaw_joint",
+    "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint",
+    "waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint",
+    "left_shoulder_pitch_joint", "left_shoulder_roll_joint",
+    "left_shoulder_yaw_joint", "left_elbow_joint", "left_wrist_roll_joint",
+    "left_wrist_pitch_joint", "left_wrist_yaw_joint",
+    "right_shoulder_pitch_joint", "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint", "right_elbow_joint", "right_wrist_roll_joint",
+    "right_wrist_pitch_joint", "right_wrist_yaw_joint",
+]
+
+
+JOINT_DATA = {
+    "left_hip_pitch_joint": ("pelvis", "left_hip_pitch_link", [0, 0.064452, -0.1027], [0, 0, 0], [0, 1, 0]),
+    "left_hip_roll_joint": ("left_hip_pitch_link", "left_hip_roll_link", [0, 0.052, -0.030465], [0, -0.1749, 0], [1, 0, 0]),
+    "left_hip_yaw_joint": ("left_hip_roll_link", "left_hip_yaw_link", [0.025001, 0, -0.12412], [0, 0, 0], [0, 0, 1]),
+    "left_knee_joint": ("left_hip_yaw_link", "left_knee_link", [-0.078273, 0.0021489, -0.17734], [0, 0.1749, 0], [0, 1, 0]),
+    "left_ankle_pitch_joint": ("left_knee_link", "left_ankle_pitch_link", [0, -9.4445e-5, -0.30001], [0, 0, 0], [0, 1, 0]),
+    "left_ankle_roll_joint": ("left_ankle_pitch_link", "left_ankle_roll_link", [0, 0, -0.017558], [0, 0, 0], [1, 0, 0]),
+    "right_hip_pitch_joint": ("pelvis", "right_hip_pitch_link", [0, -0.064452, -0.1027], [0, 0, 0], [0, 1, 0]),
+    "right_hip_roll_joint": ("right_hip_pitch_link", "right_hip_roll_link", [0, -0.052, -0.030465], [0, -0.1749, 0], [1, 0, 0]),
+    "right_hip_yaw_joint": ("right_hip_roll_link", "right_hip_yaw_link", [0.025001, 0, -0.12412], [0, 0, 0], [0, 0, 1]),
+    "right_knee_joint": ("right_hip_yaw_link", "right_knee_link", [-0.078273, -0.0021489, -0.17734], [0, 0.1749, 0], [0, 1, 0]),
+    "right_ankle_pitch_joint": ("right_knee_link", "right_ankle_pitch_link", [0, 9.4445e-5, -0.30001], [0, 0, 0], [0, 1, 0]),
+    "right_ankle_roll_joint": ("right_ankle_pitch_link", "right_ankle_roll_link", [0, 0, -0.017558], [0, 0, 0], [1, 0, 0]),
+    "waist_yaw_joint": ("pelvis", "waist_yaw_link", [0, 0, 0], [0, 0, 0], [0, 0, 1]),
+    "waist_roll_joint": ("waist_yaw_link", "waist_roll_link", [-0.0039635, 0, 0.035], [0, 0, 0], [1, 0, 0]),
+    "waist_pitch_joint": ("waist_roll_link", "torso_link", [0, 0, 0.019], [0, 0, 0], [0, 1, 0]),
+    "left_shoulder_pitch_joint": ("torso_link", "left_shoulder_pitch_link", [0.0039563, 0.10022, 0.23778], [0.27931, 0, 0], [0, 1, 0]),
+    "left_shoulder_roll_joint": ("left_shoulder_pitch_link", "left_shoulder_roll_link", [0, 0.038, -0.013831], [-0.27925, 0, 0], [1, 0, 0]),
+    "left_shoulder_yaw_joint": ("left_shoulder_roll_link", "left_shoulder_yaw_link", [0, 0.00624, -0.1032], [0, 0, 0], [0, 0, 1]),
+    "left_elbow_joint": ("left_shoulder_yaw_link", "left_elbow_link", [0.015783, 0, -0.080518], [0, 0, 0], [0, 1, 0]),
+    "left_wrist_roll_joint": ("left_elbow_link", "left_wrist_roll_link", [0.100, 0.00188791, -0.010], [0, 0, 0], [1, 0, 0]),
+    "left_wrist_pitch_joint": ("left_wrist_roll_link", "left_wrist_pitch_link", [0.038, 0, 0], [0, 0, 0], [0, 1, 0]),
+    "left_wrist_yaw_joint": ("left_wrist_pitch_link", "left_wrist_yaw_link", [0.046, 0, 0], [0, 0, 0], [0, 0, 1]),
+    "right_shoulder_pitch_joint": ("torso_link", "right_shoulder_pitch_link", [0.0039563, -0.10021, 0.23778], [-0.27931, 0, 0], [0, 1, 0]),
+    "right_shoulder_roll_joint": ("right_shoulder_pitch_link", "right_shoulder_roll_link", [0, -0.038, -0.013831], [0.27925, 0, 0], [1, 0, 0]),
+    "right_shoulder_yaw_joint": ("right_shoulder_roll_link", "right_shoulder_yaw_link", [0, -0.00624, -0.1032], [0, 0, 0], [0, 0, 1]),
+    "right_elbow_joint": ("right_shoulder_yaw_link", "right_elbow_link", [0.015783, 0, -0.080518], [0, 0, 0], [0, 1, 0]),
+    "right_wrist_roll_joint": ("right_elbow_link", "right_wrist_roll_link", [0.100, -0.00188791, -0.010], [0, 0, 0], [1, 0, 0]),
+    "right_wrist_pitch_joint": ("right_wrist_roll_link", "right_wrist_pitch_link", [0.038, 0, 0], [0, 0, 0], [0, 1, 0]),
+    "right_wrist_yaw_joint": ("right_wrist_pitch_link", "right_wrist_yaw_link", [0.046, 0, 0], [0, 0, 0], [0, 0, 1]),
+}
+
+
+JOINT_ORDER = [
+    "waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint",
+    "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint",
+    "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
+    "right_hip_pitch_joint", "right_hip_roll_joint", "right_hip_yaw_joint",
+    "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint",
+    "left_shoulder_pitch_joint", "left_shoulder_roll_joint",
+    "left_shoulder_yaw_joint", "left_elbow_joint", "left_wrist_roll_joint",
+    "left_wrist_pitch_joint", "left_wrist_yaw_joint",
+    "right_shoulder_pitch_joint", "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint", "right_elbow_joint", "right_wrist_roll_joint",
+    "right_wrist_pitch_joint", "right_wrist_yaw_joint",
+]
+
+
 def _rot(axis: str, angle: float) -> np.ndarray:
     c, s = math.cos(angle), math.sin(angle)
     if axis == "x": return np.array([[1, 0, 0], [0, c, -s], [0, s, c]], dtype=float)
     if axis == "y": return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]], dtype=float)
     return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], dtype=float)
+
+
+def _homogeneous(rotation: np.ndarray | None = None, translation: np.ndarray | None = None) -> np.ndarray:
+    transform = np.eye(4, dtype=np.float64)
+    if rotation is not None:
+        transform[:3, :3] = np.asarray(rotation, dtype=np.float64).reshape(3, 3)
+    if translation is not None:
+        transform[:3, 3] = np.asarray(translation, dtype=np.float64).reshape(3)
+    return transform
+
+
+def _rpy_rotation(roll: float, pitch: float, yaw: float) -> np.ndarray:
+    return _rot("z", yaw) @ _rot("y", pitch) @ _rot("x", roll)
+
+
+def _axis_angle_rotation(axis: np.ndarray, angle: float) -> np.ndarray:
+    axis = np.asarray(axis, dtype=np.float64).reshape(3)
+    norm = float(np.linalg.norm(axis))
+    if norm < 1.0e-9:
+        return np.eye(3, dtype=np.float64)
+    x, y, z = axis / norm
+    c, s, t = math.cos(angle), math.sin(angle), 1.0 - math.cos(angle)
+    return np.array([
+        [t * x * x + c, t * x * y - s * z, t * x * z + s * y],
+        [t * x * y + s * z, t * y * y + c, t * y * z - s * x],
+        [t * x * z - s * y, t * y * z + s * x, t * z * z + c],
+    ], dtype=np.float64)
+
+
+def g1_link_transforms(q: np.ndarray) -> dict[str, np.ndarray]:
+    """Return pelvis-frame link transforms from the G1 29-DoF URDF chain."""
+    q = np.asarray(q, dtype=np.float64).reshape(-1)
+    if q.shape[0] < 29 or not np.isfinite(q[:29]).all():
+        raise ValueError("G1 q must contain at least 29 finite joints")
+    q_by_name = {name: float(q[i]) for i, name in enumerate(JOINT_NAMES_URDF)}
+    link_transforms = {"pelvis": np.eye(4, dtype=np.float64)}
+    for joint_name in JOINT_ORDER:
+        parent, child, xyz, rpy, axis = JOINT_DATA[joint_name]
+        parent_transform = link_transforms.get(parent)
+        if parent_transform is None:
+            raise ValueError(f"FK parent link unavailable: {parent}")
+        origin = _homogeneous(
+            _rpy_rotation(*[float(v) for v in rpy]),
+            np.asarray(xyz, dtype=np.float64),
+        )
+        joint_transform = parent_transform @ origin
+        rotation = _homogeneous(
+            _axis_angle_rotation(np.asarray(axis, dtype=np.float64), q_by_name[joint_name])
+        )
+        link_transforms[child] = joint_transform @ rotation
+    return link_transforms
+
+
+def g1_link_position(q: np.ndarray, link_name: str) -> np.ndarray:
+    transforms = g1_link_transforms(q)
+    transform = transforms.get(link_name)
+    if transform is None:
+        raise ValueError(f"unknown G1 link: {link_name}")
+    return transform[:3, 3].copy()
+
+
+def g1_wrist_ee_position(
+    q: np.ndarray,
+    target_link: str = "left_wrist_yaw_link",
+    ee_offset_m: float = 0.05,
+) -> np.ndarray:
+    """Return pelvis-frame EE point, matching the QP/FK viewer wrist offset."""
+    transforms = g1_link_transforms(q)
+    transform = transforms.get(target_link)
+    if transform is None:
+        raise ValueError(f"unknown G1 target link: {target_link}")
+    local = np.array([float(ee_offset_m), 0.0, 0.0, 1.0], dtype=np.float64)
+    return (transform @ local)[:3].copy()
 
 
 def quaternion_rotation_wxyz(q: np.ndarray) -> np.ndarray:

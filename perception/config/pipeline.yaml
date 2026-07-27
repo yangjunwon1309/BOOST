@@ -89,4 +89,41 @@ ee_target:
     right_y: [-0.50, -0.03]
     z: [-0.30, 0.35]
     radius_m: 0.62
+tasc_belief:
+  enabled: true
+  # Replace the old SAM3 mask center target with the selected depth contact
+  # point from the hierarchical grip belief. The existing QP-IK publisher and
+  # coordinate frame stay unchanged.
+  use_contact_target: true
+  object_max_points: 8000
+  log_every_sec: 1.0
+  action_apply_time: 0.01
+  beta: 1.0
+  w_sc: 0.95
+  max_prob_any_goal: 0.99
+  # FK point used as P_ee = target_link origin + local +X offset.
+  # This matches the wrist EE point shown by the QP/FK web telemetry.
+  ee_offset_m: 0.05
+  fallback_eef_position_m: [0.0, 0.0, 0.0]
+  features:
+    w_distance: 1.0
+    w_ray: 0.8
+    w_agreement: 0.6
+    w_delta: 0.0
+    min_user_speed_mps: 0.005
+    distance: {k: 1.5, delta: 0.10, c: 0.1}
+    ray: {k_r: 1.0, delta_r: 0.15, c_r: 0.1}
+    agreement: {lambda_a: 1.0, kappa: 1.0}
+    delta: {lambda_d: 0.3, lpf_alpha: 0.5}
+  leak:
+    kappa0: 0.3
+    gamma: 5.0
+  grip:
+    enable: true
+    top_k: 4
+    surface_augment: 8
+    h_th_m: 0.12
+    grip_update_hz: 10
+    w_geom_prior: 1.0
+    table_normal: [0.0, 0.0, 1.0]
 registry_dir: "registry_data"

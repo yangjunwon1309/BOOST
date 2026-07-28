@@ -704,6 +704,91 @@ def get_abxy_buttons():
         return False, False, False, False
 
 
+class PicoButtonEventPublisher:
+    """Poll ABXY independently from body/FK work and publish rising edges."""
+
+    def __init__(self, *, port: int = 5565, poll_hz: float = 100.0):
+        self.port = int(port)
+        self.poll_hz = max(20.0, float(poll_hz))
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._latest = (False, False, False, False)
+        self._sequence = 0
+        self._thread = threading.Thread(
+            target=self._run, name="pico-abxy-poller", daemon=True
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+
+    def latest(self) -> tuple[bool, bool, bool, bool]:
+        with self._lock:
+            return self._latest
+
+    def _run(self) -> None:
+        context = zmq.Context()
+        socket = context.socket(zmq.PUB)
+        socket.setsockopt(zmq.SNDHWM, 32)
+        socket.setsockopt(zmq.LINGER, 0)
+        socket.bind(f"tcp://*:{self.port}")
+        print(
+            f"[PicoButtons] polling ABXY at {self.poll_hz:.0f}Hz; "
+            f"publishing tcp://*:{self.port}/pico_button_event",
+            flush=True,
+        )
+        previous = (False, False, False, False)
+        period = 1.0 / self.poll_hz
+        deadline = time.monotonic()
+        try:
+            while not self._stop.is_set():
+                buttons = get_abxy_buttons()
+                read_timestamp_us = time.monotonic_ns() // 1000
+                with self._lock:
+                    self._latest = buttons
+                a, b, x, y = buttons
+                pa, pb, px, py = previous
+                events: list[str] = []
+                if a and b and x and y and not (pa and pb and px and py):
+                    events.append("start_combo")
+                elif a and x and not (pa and px):
+                    events.append("ax")
+                elif b and y and not (pb and py):
+                    events.append("by")
+                if buttons != previous:
+                    events.append("button_state")
+                for event in events:
+                    self._sequence += 1
+                    payload = {
+                        "schema": "path.pico_button_event.v1",
+                        "event": event,
+                        "sequence": self._sequence,
+                        "button_read_timestamp_us": int(read_timestamp_us),
+                        "publish_timestamp_us": int(time.monotonic_ns() // 1000),
+                        "a": bool(a),
+                        "b": bool(b),
+                        "x": bool(x),
+                        "y": bool(y),
+                    }
+                    socket.send(
+                        b"pico_button_event"
+                        + msgpack.packb(payload, use_bin_type=True)
+                    )
+                previous = buttons
+                deadline += period
+                delay = deadline - time.monotonic()
+                if delay > 0.0:
+                    self._stop.wait(delay)
+                elif delay < -period:
+                    deadline = time.monotonic()
+        finally:
+            socket.close()
+            context.term()
+
+
 def compute_hand_joints_from_inputs(
     left_solver, right_solver, left_trigger, left_grip, right_trigger, right_grip
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -2319,6 +2404,8 @@ def run_pico_manager(
     replay_hold_last: bool = False,
     replay_resume_control: bool = False,
     replay_stop_at_end: bool = False,
+    button_event_port: int = 5565,
+    button_poll_hz: float = 100.0,
 ):
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
@@ -2373,6 +2460,10 @@ def run_pico_manager(
     # Create shared reader and 3-point pose processor
     reader = PicoReader(max_queue_size=buffer_size)
     reader.start()
+    button_publisher = PicoButtonEventPublisher(
+        port=button_event_port, poll_hz=button_poll_hz
+    )
+    button_publisher.start()
 
     three_point = ThreePointPose(
         enable_vis_vr3pt=enable_vis_vr3pt,
@@ -2433,7 +2524,7 @@ def run_pico_manager(
         prev_left_axis_click = False
         while True:
             # Poll Pico controller for buttons/axes
-            a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons()
+            a_pressed, b_pressed, x_pressed, y_pressed = button_publisher.latest()
 
             left_menu_button, _, _, left_grip_mgr, _ = get_controller_inputs()
 
@@ -2592,6 +2683,7 @@ def run_pico_manager(
     finally:
         # Cleanup resources
         reader.stop()
+        button_publisher.stop()
         three_point.close()
         socket.close()
         context.term()
@@ -2605,6 +2697,18 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--buffer_size", type=int, default=15, help="Sliding window buffer size")
     parser.add_argument("--port", type=int, default=5556, help="ZMQ server port (default: 5556)")
+    parser.add_argument(
+        "--button_event_port",
+        type=int,
+        default=5565,
+        help="Dedicated ABXY event PUB port (default: 5565)",
+    )
+    parser.add_argument(
+        "--button_poll_hz",
+        type=float,
+        default=100.0,
+        help="Dedicated ABXY polling rate (default: 100Hz)",
+    )
     parser.add_argument(
         "--num_frames_to_send", type=int, default=5, help="Number of frames to send (default: 200)"
     )
@@ -2813,6 +2917,8 @@ if __name__ == "__main__":
             replay_hold_last=args.replay_hold_last,
             replay_resume_control=args.replay_resume_control,
             replay_stop_at_end=args.replay_stop_at_end,
+            button_event_port=args.button_event_port,
+            button_poll_hz=args.button_poll_hz,
         )
     else:
         # Run legacy single-thread pose streaming

@@ -230,6 +230,8 @@ class ZMQManager : public InputInterface {
       {
         std::lock_guard<std::mutex> lock(command_mutex_);
         if (latest_command_.valid) {
+          GlobalCommandTimingState().sonic_apply_timestamp_us.store(
+              CommandSteadyNowUs(), std::memory_order_relaxed);
           // Set control flags (already accumulated in callback)
           if (latest_command_.start) {
             start_control_ = true;
@@ -675,10 +677,16 @@ class ZMQManager : public InputInterface {
       if (hdr.fields.empty() || bufs.empty()) return;
       
       int start_idx = -1, stop_idx = -1, planner_idx = -1;
+      int sequence_idx = -1, read_ts_idx = -1;
+      int bridge_receive_idx = -1, bridge_forward_idx = -1;
       for (size_t i = 0; i < hdr.fields.size(); ++i) {
         if (hdr.fields[i].name == "start") start_idx = static_cast<int>(i);
         else if (hdr.fields[i].name == "stop") stop_idx = static_cast<int>(i);
         else if (hdr.fields[i].name == "planner") planner_idx = static_cast<int>(i);
+        else if (hdr.fields[i].name == "button_sequence") sequence_idx = static_cast<int>(i);
+        else if (hdr.fields[i].name == "button_read_timestamp_us") read_ts_idx = static_cast<int>(i);
+        else if (hdr.fields[i].name == "button_bridge_receive_timestamp_us") bridge_receive_idx = static_cast<int>(i);
+        else if (hdr.fields[i].name == "button_bridge_forward_timestamp_us") bridge_forward_idx = static_cast<int>(i);
       }
       
       if (start_idx < 0 || stop_idx < 0 || planner_idx < 0) {
@@ -690,6 +698,31 @@ class ZMQManager : public InputInterface {
       cmd.valid = true;
       
       bool needs_swap = hdr.NeedsByteSwap();
+      auto decode_i64 = [&](int index) -> int64_t {
+        if (index < 0 || static_cast<size_t>(index) >= bufs.size()) return 0;
+        int64_t value = 0;
+        if (bufs[index].size >= sizeof(value)) {
+          std::memcpy(&value, bufs[index].data, sizeof(value));
+          if (needs_swap) value = byte_swap(value);
+        }
+        return value;
+      };
+      cmd.button_sequence = decode_i64(sequence_idx);
+      cmd.button_read_timestamp_us = decode_i64(read_ts_idx);
+      cmd.button_bridge_receive_timestamp_us = decode_i64(bridge_receive_idx);
+      cmd.button_bridge_forward_timestamp_us = decode_i64(bridge_forward_idx);
+      if (cmd.button_sequence > 0) {
+        auto& timing = GlobalCommandTimingState();
+        timing.sequence.store(cmd.button_sequence, std::memory_order_relaxed);
+        timing.button_read_timestamp_us.store(
+            cmd.button_read_timestamp_us, std::memory_order_relaxed);
+        timing.bridge_receive_timestamp_us.store(
+            cmd.button_bridge_receive_timestamp_us, std::memory_order_relaxed);
+        timing.bridge_forward_timestamp_us.store(
+            cmd.button_bridge_forward_timestamp_us, std::memory_order_relaxed);
+        timing.sonic_receive_timestamp_us.store(
+            CommandSteadyNowUs(), std::memory_order_relaxed);
+      }
       
       // Decode start
       const auto& start_buf = bufs[start_idx];
@@ -758,6 +791,14 @@ class ZMQManager : public InputInterface {
       latest_command_.start = latest_command_.start || cmd.start;
       latest_command_.stop = latest_command_.stop || cmd.stop;
       latest_command_.planner = cmd.planner;  // Overwrite (mode should be latest)
+      if (cmd.button_sequence > 0) {
+        latest_command_.button_sequence = cmd.button_sequence;
+        latest_command_.button_read_timestamp_us = cmd.button_read_timestamp_us;
+        latest_command_.button_bridge_receive_timestamp_us =
+            cmd.button_bridge_receive_timestamp_us;
+        latest_command_.button_bridge_forward_timestamp_us =
+            cmd.button_bridge_forward_timestamp_us;
+      }
       latest_command_.valid = true;
       
       if constexpr (DEBUG_LOGGING) {

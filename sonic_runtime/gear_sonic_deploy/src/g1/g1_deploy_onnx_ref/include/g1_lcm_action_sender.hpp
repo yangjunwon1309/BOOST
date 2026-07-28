@@ -63,6 +63,31 @@ class ActionSender {
     return true;
   }
 
+  bool PublishCommand(
+      const std::array<float, kNumMotors>& q_target,
+      const std::array<float, kNumMotors>& dq_target,
+      const std::array<float, kNumMotors>& tau_ff,
+      bool emergency_stop = false,
+      uint16_t extra_flags = 0) {
+    if (!lcm_) {
+      return false;
+    }
+    PolicyCommandPacketV2 packet;
+    packet.sequence = sequence_++;
+    packet.send_time_us = NowUnixMicros();
+    packet.flags = (emergency_stop ? kActionFlagEmergencyStop : 0) | extra_flags;
+    packet.q_target = q_target;
+    packet.dq_target = dq_target;
+    packet.tau_ff = tau_ff;
+    const int result = lcm_publish(lcm_, channel_.c_str(), &packet, sizeof(packet));
+    if (result != 0) {
+      std::cerr << "[g1-lcm-action-sender] Direct command publish failed. seq="
+                << packet.sequence << '\n';
+      return false;
+    }
+    return true;
+  }
+
  private:
   static int64_t NowUnixMicros() {
     const auto now = std::chrono::system_clock::now().time_since_epoch();

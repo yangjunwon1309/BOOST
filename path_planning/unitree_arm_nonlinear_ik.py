@@ -56,6 +56,26 @@ RIGHT_ARM_NAMES = [
     "right_wrist_yaw_joint",
 ]
 
+G1_29_JOINT_NAMES = [
+    "left_hip_pitch_joint",
+    "left_hip_roll_joint",
+    "left_hip_yaw_joint",
+    "left_knee_joint",
+    "left_ankle_pitch_joint",
+    "left_ankle_roll_joint",
+    "right_hip_pitch_joint",
+    "right_hip_roll_joint",
+    "right_hip_yaw_joint",
+    "right_knee_joint",
+    "right_ankle_pitch_joint",
+    "right_ankle_roll_joint",
+    "waist_yaw_joint",
+    "waist_roll_joint",
+    "waist_pitch_joint",
+    *LEFT_ARM_NAMES,
+    *RIGHT_ARM_NAMES,
+]
+
 LOCKED_JOINTS = [
     "left_hip_pitch_joint",
     "left_hip_roll_joint",
@@ -226,6 +246,45 @@ class UnitreeG1ArmNonlinearIK:
         self.robot = pin.RobotWrapper.BuildFromURDF(
             str(self.urdf_path), [str(self.model_dir)]
         )
+        self.robot.model.addFrame(
+            pin.Frame(
+                "PATH_full_L_ee",
+                self.robot.model.getJointId("left_wrist_yaw_joint"),
+                0,
+                pin.SE3(np.eye(3), np.array([ee_offset_m, 0.0, 0.0])),
+                pin.FrameType.OP_FRAME,
+            )
+        )
+        self.robot.model.addFrame(
+            pin.Frame(
+                "PATH_full_R_ee",
+                self.robot.model.getJointId("right_wrist_yaw_joint"),
+                0,
+                pin.SE3(np.eye(3), np.array([ee_offset_m, 0.0, 0.0])),
+                pin.FrameType.OP_FRAME,
+            )
+        )
+        self.full_data = self.robot.model.createData()
+        self.full_left_frame_id = self.robot.model.getFrameId("PATH_full_L_ee")
+        self.full_right_frame_id = self.robot.model.getFrameId("PATH_full_R_ee")
+        self.full_q_indices = np.asarray(
+            [
+                int(self.robot.model.joints[
+                    self.robot.model.getJointId(name)
+                ].idx_q)
+                for name in G1_29_JOINT_NAMES
+            ],
+            dtype=np.int64,
+        )
+        self.full_v_indices = np.asarray(
+            [
+                int(self.robot.model.joints[
+                    self.robot.model.getJointId(name)
+                ].idx_v)
+                for name in G1_29_JOINT_NAMES
+            ],
+            dtype=np.int64,
+        )
         self.reduced_robot = self.robot.buildReducedRobot(
             list_of_joints_to_lock=LOCKED_JOINTS,
             reference_configuration=np.zeros(self.robot.model.nq),
@@ -380,6 +439,8 @@ class UnitreeG1ArmNonlinearIK:
         return q29
 
     def wrist_transforms_from_q29(self, q29: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Arm-solver FK with legs and waist locked at identity."""
+
         arm_q = self.q29_to_arm_q(q29)
         pin.framesForwardKinematics(self.reduced_robot.model, self.data, arm_q)
         left = np.eye(4, dtype=np.float64)
@@ -389,6 +450,36 @@ class UnitreeG1ArmNonlinearIK:
         right[:3, :3] = self.data.oMf[self.right_frame_id].rotation
         right[:3, 3] = self.data.oMf[self.right_frame_id].translation
         return left, right
+
+    def gmr_wrist_transforms_from_q29(
+        self, q29: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Pelvis-identity FK of the complete GMR waist+arm configuration."""
+
+        q_full = np.zeros(self.robot.model.nq, dtype=np.float64)
+        q_full[self.full_q_indices] = np.asarray(q29, dtype=np.float64).reshape(29)
+        pin.framesForwardKinematics(self.robot.model, self.full_data, q_full)
+        left = np.eye(4, dtype=np.float64)
+        right = np.eye(4, dtype=np.float64)
+        left[:3, :3] = self.full_data.oMf[self.full_left_frame_id].rotation
+        left[:3, 3] = self.full_data.oMf[self.full_left_frame_id].translation
+        right[:3, :3] = self.full_data.oMf[self.full_right_frame_id].rotation
+        right[:3, 3] = self.full_data.oMf[self.full_right_frame_id].translation
+        return left, right
+
+    def gravity_torque_from_q29(self, q29: np.ndarray) -> np.ndarray:
+        """Return full-model gravity compensation in G1 hardware joint order."""
+
+        q_full = np.zeros(self.robot.model.nq, dtype=np.float64)
+        q_full[self.full_q_indices] = np.asarray(q29, dtype=np.float64).reshape(29)
+        tau_full = pin.rnea(
+            self.robot.model,
+            self.full_data,
+            q_full,
+            np.zeros(self.robot.model.nv, dtype=np.float64),
+            np.zeros(self.robot.model.nv, dtype=np.float64),
+        )
+        return np.asarray(tau_full, dtype=np.float64)[self.full_v_indices].copy()
 
     def _filtered(self, q: np.ndarray) -> np.ndarray:
         if not self.use_smooth_filter:
@@ -402,6 +493,112 @@ class UnitreeG1ArmNonlinearIK:
             total += weight
         return out / max(total, 1.0e-9)
 
+    def _solve_transforms(
+        self,
+        *,
+        left_target_tf: np.ndarray,
+        right_target_tf: np.ndarray,
+        q_seed29: np.ndarray,
+        lower: np.ndarray | None = None,
+        upper: np.ndarray | None = None,
+    ) -> ArmIkResult:
+        """Solve both arm joint vectors against explicit pelvis-local EE poses."""
+
+        started = time.perf_counter()
+        q_seed29 = np.asarray(q_seed29, dtype=np.float64).reshape(29)
+        left_target_tf = np.asarray(left_target_tf, dtype=np.float64).reshape(4, 4)
+        right_target_tf = np.asarray(right_target_tf, dtype=np.float64).reshape(4, 4)
+        lower = self.lower.copy() if lower is None else np.asarray(lower, dtype=np.float64).copy()
+        upper = self.upper.copy() if upper is None else np.asarray(upper, dtype=np.float64).copy()
+        q_last = self.q29_to_arm_q(q_seed29)
+
+        self.opti.set_initial(self.var_q, np.clip(self.init_data, lower, upper))
+        self.opti.set_value(self.var_q_last, q_last)
+        self.opti.set_value(self.param_lower, lower)
+        self.opti.set_value(self.param_upper, upper)
+        self.opti.set_value(self.param_tf_l, left_target_tf)
+        self.opti.set_value(self.param_tf_r, right_target_tf)
+
+        try:
+            sol = self.opti.solve()
+            arm_q = np.asarray(sol.value(self.var_q), dtype=np.float64).reshape(14)
+            arm_q = self._filtered(arm_q)
+            self.init_data = arm_q.copy()
+            q_ref = self.arm_q_to_q29(q_seed29, arm_q)
+            q_ref[12:15] = 0.0
+            tau_ff = self.gravity_torque_from_q29(q_ref)
+            # Legs remain under SONIC. PATH supplies only identity-waist and
+            # arm gravity compensation.
+            tau_ff[:12] = 0.0
+
+            solved_left, solved_right = self.wrist_transforms_from_q29(q_ref)
+            position_error = max(
+                float(np.linalg.norm(solved_left[:3, 3] - left_target_tf[:3, 3])),
+                float(np.linalg.norm(solved_right[:3, 3] - right_target_tf[:3, 3])),
+            )
+            rotation_error = max(
+                float(np.linalg.norm(pin.log3(
+                    solved_left[:3, :3] @ left_target_tf[:3, :3].T
+                ))),
+                float(np.linalg.norm(pin.log3(
+                    solved_right[:3, :3] @ right_target_tf[:3, :3].T
+                ))),
+            )
+            return ArmIkResult(
+                success=True,
+                q_ref=q_ref,
+                tau_ff_ref=tau_ff,
+                solve_time_ms=(time.perf_counter() - started) * 1000.0,
+                position_error_m=position_error,
+                rotation_error_rad=rotation_error,
+            )
+        except Exception as exc:
+            return ArmIkResult(
+                success=False,
+                q_ref=q_seed29.copy(),
+                tau_ff_ref=np.zeros(29, dtype=np.float64),
+                solve_time_ms=(time.perf_counter() - started) * 1000.0,
+                position_error_m=float("inf"),
+                rotation_error_rad=float("inf"),
+                message=str(exc),
+            )
+
+    def solve_bimanual_targets(
+        self,
+        *,
+        left_target_tf: np.ndarray,
+        right_target_tf: np.ndarray,
+        q_seed29: np.ndarray,
+    ) -> ArmIkResult:
+        """Solve the authoritative 14-DoF arm target used by PATH q/e modes."""
+
+        return self._solve_transforms(
+            left_target_tf=left_target_tf,
+            right_target_tf=right_target_tf,
+            q_seed29=q_seed29,
+        )
+
+    def solve_gmr_reference(
+        self,
+        *,
+        q_gmr29: np.ndarray,
+        q_seed29: np.ndarray,
+        left_position_override: np.ndarray | None = None,
+        right_position_override: np.ndarray | None = None,
+    ) -> ArmIkResult:
+        """Solve GMR EE poses, optionally replacing only an e-mode position."""
+
+        left_tf, right_tf = self.gmr_wrist_transforms_from_q29(q_gmr29)
+        if left_position_override is not None:
+            left_tf[:3, 3] = np.asarray(left_position_override, dtype=np.float64).reshape(3)
+        if right_position_override is not None:
+            right_tf[:3, 3] = np.asarray(right_position_override, dtype=np.float64).reshape(3)
+        return self.solve_bimanual_targets(
+            left_target_tf=left_tf,
+            right_target_tf=right_tf,
+            q_seed29=q_seed29,
+        )
+
     def solve_single_target(
         self,
         *,
@@ -412,7 +609,6 @@ class UnitreeG1ArmNonlinearIK:
         q_hold29: np.ndarray,
         hard_lock_inactive_arm: bool = True,
     ) -> ArmIkResult:
-        started = time.perf_counter()
         q_seed29 = np.asarray(q_seed29, dtype=np.float64).reshape(29)
         q_hold29 = np.asarray(q_hold29, dtype=np.float64).reshape(29)
         target_side = "right" if "right" in target_link else "left"
@@ -435,49 +631,10 @@ class UnitreeG1ArmNonlinearIK:
                 lower[self.left_q_indices] = hold_arm_q[self.left_q_indices]
                 upper[self.left_q_indices] = hold_arm_q[self.left_q_indices]
 
-        q_last = self.q29_to_arm_q(q_seed29)
-        self.opti.set_initial(self.var_q, np.clip(self.init_data, lower, upper))
-        self.opti.set_value(self.var_q_last, q_last)
-        self.opti.set_value(self.param_lower, lower)
-        self.opti.set_value(self.param_upper, upper)
-        self.opti.set_value(self.param_tf_l, left_tf)
-        self.opti.set_value(self.param_tf_r, right_tf)
-
-        try:
-            sol = self.opti.solve()
-            arm_q = np.asarray(sol.value(self.var_q), dtype=np.float64).reshape(14)
-            arm_q = self._filtered(arm_q)
-            self.init_data = arm_q.copy()
-            tau_arm = pin.rnea(
-                self.reduced_robot.model,
-                self.reduced_robot.data,
-                arm_q,
-                np.zeros(14, dtype=np.float64),
-                np.zeros(14, dtype=np.float64),
-            )
-            q_ref = self.arm_q_to_q29(q_seed29, arm_q)
-            tau_ff = np.zeros(29, dtype=np.float64)
-            tau_ff[ARM_HW_INDICES] = np.asarray(tau_arm, dtype=np.float64).reshape(14)
-
-            solved_left, solved_right = self.wrist_transforms_from_q29(q_ref)
-            solved_tf = solved_left if target_side == "left" else solved_right
-            pos_error = float(np.linalg.norm(solved_tf[:3, 3] - target_tf[:3, 3]))
-            rot_error = float(np.linalg.norm(pin.log3(solved_tf[:3, :3] @ target_tf[:3, :3].T)))
-            return ArmIkResult(
-                success=True,
-                q_ref=q_ref,
-                tau_ff_ref=tau_ff,
-                solve_time_ms=(time.perf_counter() - started) * 1000.0,
-                position_error_m=pos_error,
-                rotation_error_rad=rot_error,
-            )
-        except Exception as exc:
-            return ArmIkResult(
-                success=False,
-                q_ref=q_seed29.copy(),
-                tau_ff_ref=np.zeros(29, dtype=np.float64),
-                solve_time_ms=(time.perf_counter() - started) * 1000.0,
-                position_error_m=float("inf"),
-                rotation_error_rad=float("inf"),
-                message=str(exc),
-            )
+        return self._solve_transforms(
+            left_target_tf=left_tf,
+            right_target_tf=right_tf,
+            q_seed29=q_seed29,
+            lower=lower,
+            upper=upper,
+        )

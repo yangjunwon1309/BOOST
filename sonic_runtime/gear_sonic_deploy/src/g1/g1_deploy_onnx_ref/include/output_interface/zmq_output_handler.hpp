@@ -114,6 +114,7 @@
 #include "../policy_parameters.hpp"  // For isaaclab_to_mujoco, default_angles, g1_action_scale
 #include "../robot_parameters.hpp"   // For HeadingState
 #include "../utils.hpp"              // For DataBuffer
+#include "../input_interface/input_command.hpp"
 #include "ee_qp/types.hpp"
 
 /**
@@ -293,7 +294,10 @@ private:
         int num_state_fields = has_heading_state ? 20 : 18;
         int num_viz_fields = static_cast<int>(output_data_map_.size());
         constexpr int kEeQpFields = 54;
-        pk.pack_map(num_state_fields + num_viz_fields + (ee_qp ? kEeQpFields : 0));
+        constexpr int kButtonTimingFields = 6;
+        pk.pack_map(
+            num_state_fields + num_viz_fields + kButtonTimingFields
+            + (ee_qp ? kEeQpFields : 0));
 
         // ---- State-logger fields ----
 
@@ -394,6 +398,20 @@ private:
         pk.pack("motor_temperature");
         pk.pack_array(state.motor_temperature.size());
         for (const auto& val : state.motor_temperature) pk.pack(val);
+
+        const auto& command_timing = GlobalCommandTimingState();
+        pk.pack("button_sequence");
+        pk.pack(command_timing.sequence.load(std::memory_order_relaxed));
+        pk.pack("button_read_timestamp_us");
+        pk.pack(command_timing.button_read_timestamp_us.load(std::memory_order_relaxed));
+        pk.pack("button_bridge_receive_timestamp_us");
+        pk.pack(command_timing.bridge_receive_timestamp_us.load(std::memory_order_relaxed));
+        pk.pack("button_bridge_forward_timestamp_us");
+        pk.pack(command_timing.bridge_forward_timestamp_us.load(std::memory_order_relaxed));
+        pk.pack("button_sonic_receive_timestamp_us");
+        pk.pack(command_timing.sonic_receive_timestamp_us.load(std::memory_order_relaxed));
+        pk.pack("button_sonic_apply_timestamp_us");
+        pk.pack(command_timing.sonic_apply_timestamp_us.load(std::memory_order_relaxed));
 
         if (has_heading_state) {
             pk.pack("init_base_quat");

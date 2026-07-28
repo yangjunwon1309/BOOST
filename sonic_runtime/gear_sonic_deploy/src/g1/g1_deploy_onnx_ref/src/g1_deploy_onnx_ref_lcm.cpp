@@ -347,10 +347,13 @@ class G1Deploy {
     bool use_hand_ik_ = false;
     bool use_hand_ik_origin_ = false;
     bool use_ee_qp_ = false;
-    uint64_t ee_qp_debug_counter_ = 0;
-    std::unique_ptr<::g1::ee_qp::EeQpCorrector> ee_qp_corrector_;
+    bool path_external_ipopt_arm_control_ = false;
+    bool has_last_ipopt_arm_target_ = false;
+    ::g1::ee_qp::JointVector last_ipopt_arm_q_target_ =
+        ::g1::ee_qp::JointVector::Zero();
+    ::g1::ee_qp::JointVector last_ipopt_arm_tau_ff_ =
+        ::g1::ee_qp::JointVector::Zero();
     std::shared_ptr<::g1::ee_qp::RobotFkAdapter> ee_qp_kinematics_;
-    std::unique_ptr<::g1::ee_qp::BufferedEeReferenceProvider> ee_qp_buffered_reference_provider_;
     std::unique_ptr<::g1::ee_qp::DynamicEeReferenceProvider> ee_qp_dynamic_reference_provider_;
     ::g1::ee_qp::EeReferenceProvider* ee_qp_reference_provider_ = nullptr;
     std::atomic<bool> gmr_reference_running_{false};
@@ -2217,6 +2220,7 @@ class G1Deploy {
       if (source == "replay") return ::g1::ee_qp::ReferenceSource::kReplay;
       if (source == "damped_return" || source == "damped") return ::g1::ee_qp::ReferenceSource::kDampedReturn;
       if (source == "cartesian_servo") return ::g1::ee_qp::ReferenceSource::kCartesianServo;
+      if (source == "smpl_relative_cartesian") return ::g1::ee_qp::ReferenceSource::kSmplRelative;
       return ::g1::ee_qp::ReferenceSource::kUnknown;
     }
 
@@ -2313,6 +2317,43 @@ class G1Deploy {
       reference.has_tau_ff_ref = true;
     }
 
+    static void ApplyArmTargetOwnershipFields(
+        const std::map<std::string, msgpack::object>& fields,
+        ::g1::ee_qp::EeReference& reference) {
+      std::string owner;
+      std::string backend;
+      std::string schema;
+      bool arm_target_valid = false;
+      if (auto it = fields.find("schema"); it != fields.end()) {
+        it->second.convert(schema);
+      }
+      if (auto it = fields.find("arm_target_owner"); it != fields.end()) {
+        it->second.convert(owner);
+      }
+      if (auto it = fields.find("solver_backend"); it != fields.end()) {
+        it->second.convert(backend);
+      }
+      if (auto it = fields.find("arm_target_valid"); it != fields.end()) {
+        it->second.convert(arm_target_valid);
+      }
+      reference.arm_target_is_ipopt_solution =
+          schema == "path.ipopt_arm_reference.v1" &&
+          arm_target_valid && owner == "casadi_ipopt" &&
+          backend == "casadi_opti_ipopt";
+      if (auto it = fields.find("bridge_timestamp_us"); it != fields.end()) {
+        it->second.convert(reference.bridge_timestamp_us);
+      }
+      if (auto it = fields.find("arm_ik_solve_ms"); it != fields.end()) {
+        it->second.convert(reference.external_arm_solve_time_ms);
+      }
+      if (auto it = fields.find("arm_ik_position_error_m"); it != fields.end()) {
+        it->second.convert(reference.external_arm_position_error_m);
+      }
+      if (auto it = fields.find("arm_ik_rotation_error_rad"); it != fields.end()) {
+        it->second.convert(reference.external_arm_rotation_error_rad);
+      }
+    }
+
     void StartPathReferenceSubscriber(const std::string& host, int port, const std::string& topic) {
       gmr_reference_running_.store(true);
       gmr_reference_thread_ = std::thread([this, host, port, topic]() {
@@ -2384,6 +2425,7 @@ class G1Deploy {
               reference.timestamp_us = received_us;
               reference.reference_pelvis_orientation = Eigen::Quaterniond::Identity();
               ApplyGmrSyncFields(fields, reference);
+              ApplyArmTargetOwnershipFields(fields, reference);
               auto q_it = fields.find("q_ref");
               if (q_it == fields.end()) q_it = fields.find("q_mujoco");
               if (q_it == fields.end()) {
@@ -2418,6 +2460,7 @@ class G1Deploy {
               reference.timestamp_us = received_us;
               reference.reference_pelvis_orientation = Eigen::Quaterniond::Identity();
               ApplyGmrSyncFields(fields, reference);
+              ApplyArmTargetOwnershipFields(fields, reference);
 
               auto q_it = fields.find("q_ref");
               if (q_it == fields.end()) q_it = fields.find("q_mujoco");
@@ -2469,6 +2512,7 @@ class G1Deploy {
               reference.plan_id = plan_id;
               reference.timestamp_us = received_us;
               ApplyGmrSyncFields(fields, reference);
+              ApplyArmTargetOwnershipFields(fields, reference);
               reference.valid = true;
               ee_qp_dynamic_reference_provider_->UpdateSample(reference);
             }
@@ -2623,28 +2667,34 @@ class G1Deploy {
         std::cout << "[G1Deploy-LCM] IK override ENABLED (" << IkModeDescription() << ")" << std::endl;
       }
       if (use_ee_qp_) {
+        if (!path_use_dynamic_reference) {
+          throw std::runtime_error(
+              "Real PATH arm control requires --path-use-dynamic-reference. "
+              "The legacy in-process EE QP is disabled.");
+        }
+        path_external_ipopt_arm_control_ = true;
         ee_qp_kinematics_ = std::make_shared<::g1::ee_qp::RobotFkAdapter>("g1/g1_29dof.xml");
         auto config = ::g1::ee_qp::LoadEeQpConfig(ee_qp_config_path);
-        if (path_use_dynamic_reference) {
-          const auto heartbeat_timeout_us = static_cast<std::int64_t>(path_reference_heartbeat_timeout_ms * 1000.0);
-          ee_qp_dynamic_reference_provider_ = std::make_unique<::g1::ee_qp::DynamicEeReferenceProvider>(
-              config.reference_timeout_us, heartbeat_timeout_us, ee_qp_kinematics_);
-          ee_qp_dynamic_reference_provider_->SetLookaheadUs(static_cast<std::int64_t>(path_reference_lookahead_ms * 1000.0));
-          ee_qp_reference_provider_ = ee_qp_dynamic_reference_provider_.get();
-          StartPathReferenceSubscriber(path_reference_host, path_reference_port, path_reference_topic);
-          std::cout << "[G1Deploy-LCM/PATH] EE QP dynamic reference enabled at "
-                    << path_reference_host << ":" << path_reference_port << "/" << path_reference_topic
-                    << ", lookahead=" << path_reference_lookahead_ms << "ms" << std::endl;
-        } else {
-          ee_qp_buffered_reference_provider_ = std::make_unique<::g1::ee_qp::BufferedEeReferenceProvider>(config.reference_timeout_us);
-          ee_qp_reference_provider_ = ee_qp_buffered_reference_provider_.get();
-          std::cout << "[G1Deploy-LCM] EE QP enabled without dynamic reference; no reference subscriber is active." << std::endl;
-        }
-        ee_qp_corrector_ = std::make_unique<::g1::ee_qp::EeQpCorrector>(config, ee_qp_kinematics_);
+        const auto heartbeat_timeout_us =
+            static_cast<std::int64_t>(path_reference_heartbeat_timeout_ms * 1000.0);
+        ee_qp_dynamic_reference_provider_ =
+            std::make_unique<::g1::ee_qp::DynamicEeReferenceProvider>(
+                config.reference_timeout_us, heartbeat_timeout_us,
+                ee_qp_kinematics_);
+        ee_qp_dynamic_reference_provider_->SetLookaheadUs(
+            static_cast<std::int64_t>(path_reference_lookahead_ms * 1000.0));
+        ee_qp_reference_provider_ = ee_qp_dynamic_reference_provider_.get();
+        StartPathReferenceSubscriber(
+            path_reference_host, path_reference_port, path_reference_topic);
         ::g1::ee_qp::EeQpTelemetry telemetry;
         telemetry.enabled = true;
         ee_qp_telemetry_buffer_.SetData(telemetry);
-        std::cout << "[G1Deploy-LCM] EE QP correction ENABLED, config=" << ee_qp_config_path << std::endl;
+        std::cout
+            << "[G1Deploy-LCM/PATH] External CasADi/IPOPT arm ownership enabled at "
+            << path_reference_host << ":" << path_reference_port << "/"
+            << path_reference_topic << ". SONIC owns lower body only; waist is "
+            << "locked to identity. Legacy ProxQP is not constructed."
+            << std::endl;
       }
 
       // =========================================================================
@@ -3146,14 +3196,21 @@ class G1Deploy {
 
     /**
      * @brief Command-writer thread body (500 Hz).
-     * ActionSender::Publish()로 PolicyActionPacket을 bridge에 송신.
-     * action[] = final raw IsaacLab-order action — bridge가 리매핑+scale 처리.
+     * Final motor-space q/dq/tau를 V2 LCM packet으로 bridge에 송신한다.
+     * This preserves IPOPT arm RNEA and identity-waist gravity compensation.
      */
     void LowCommandWriter() {
-      const auto action_data = action_command_buffer_.GetDataWithTime();
-      if (!action_data.data) return;
-
-      std::array<float, g1_lcm::kNumMotors> action = *action_data.data;
+      const auto command_data = motor_command_buffer_.GetDataWithTime();
+      if (!command_data.data) return;
+      const MotorCommand& command = *command_data.data;
+      std::array<float, g1_lcm::kNumMotors> q_target{};
+      std::array<float, g1_lcm::kNumMotors> dq_target{};
+      std::array<float, g1_lcm::kNumMotors> tau_ff{};
+      for (int hw = 0; hw < g1_lcm::kNumMotors; ++hw) {
+        q_target[hw] = command.q_target[hw];
+        dq_target[hw] = command.dq_target[hw];
+        tau_ff[hw] = command.tau_ff[hw];
+      }
       
       const bool left_grip  = has_left_hand_data_  && std::abs(left_hand_joint_buffer_[3])  > 0.1;
       const bool right_grip = has_right_hand_data_ && std::abs(right_hand_joint_buffer_[3]) > 0.1;
@@ -3163,10 +3220,12 @@ class G1Deploy {
       flags |= left_grip  ? g1_lcm::kActionFlagLeftGrip  : 0;
       flags |= right_grip ? g1_lcm::kActionFlagRightGrip : 0;
 
-      if (!lcm_sender_->Publish(action, emergency, flags)) {
+      if (!lcm_sender_->PublishCommand(
+              q_target, dq_target, tau_ff, emergency, flags)) {
         static int err = 0;
         if (++err <= 5 || err % 500 == 0)
-          std::cerr << "[LCM] ActionSender::Publish failed, count=" << err << std::endl;
+          std::cerr << "[LCM] ActionSender::PublishCommand failed, count="
+                    << err << std::endl;
       }
     }
 
@@ -3201,69 +3260,76 @@ class G1Deploy {
         : "SONIC lower body, IK waist + arms/hands";
     }
 
-    bool ShouldApplyPathDirectUpperOverride(
+    bool IsVerifiedIpoptArmReference(
         const ::g1::ee_qp::EeReference& reference) const {
-      if (!reference.valid || !reference.feasible) return false;
+      if (!path_external_ipopt_arm_control_ ||
+          !reference.valid || !reference.feasible ||
+          !reference.arm_target_is_ipopt_solution) {
+        return false;
+      }
       if (reference.reference_type == ::g1::ee_qp::ReferenceType::kNone ||
           reference.reference_type == ::g1::ee_qp::ReferenceType::kUnknown) {
         return false;
       }
-      // A cartesian_target is a task-space wrist goal. It must go through the
-      // EE-QP correction path instead of directly replaying q_ref, otherwise the
-      // SAM3/shared-control target is ignored while telemetry still looks fresh.
-      if (reference.reference_type ==
-          ::g1::ee_qp::ReferenceType::kCartesianTarget) {
-        return false;
-      }
-      switch (reference.source) {
-        case ::g1::ee_qp::ReferenceSource::kGmr:
-        case ::g1::ee_qp::ReferenceSource::kCurobo:
-        case ::g1::ee_qp::ReferenceSource::kReplay:
-        case ::g1::ee_qp::ReferenceSource::kDampedReturn:
-        case ::g1::ee_qp::ReferenceSource::kCartesianServo:
-          return true;
-        case ::g1::ee_qp::ReferenceSource::kUnknown:
-          return false;
-      }
-      return false;
-    }
-
-    bool ApplyPathDirectUpperOverride(
-        MotorCommand& command,
-        std::array<float, g1_lcm::kNumMotors>& action,
-        const ::g1::ee_qp::EeReference& reference) {
-      if (!ShouldApplyPathDirectUpperOverride(reference)) return false;
-
       for (const int hw : ::g1::ee_qp::kArmHardwareIndices) {
-        command.q_target[hw] = static_cast<float>(reference.q_ref[hw]);
-        command.dq_target[hw] = 0.0f;
-        command.tau_ff[hw] = reference.has_tau_ff_ref
-            ? static_cast<float>(reference.tau_ff_ref[hw])
-            : 0.0f;
-        const int action_idx = isaaclab_to_mujoco[hw];
-        action[action_idx] = ClampUpperBodyRawAction(
-            QTargetToRawAction(hw, command.q_target[hw]));
-        last_action[action_idx] = static_cast<double>(action[action_idx]);
+        if (!std::isfinite(reference.q_ref[hw])) return false;
+        if (reference.has_tau_ff_ref &&
+            !std::isfinite(reference.tau_ff_ref[hw])) {
+          return false;
+        }
       }
       return true;
     }
 
-    static bool IsPathWaistIdentityPdLocked(
+    bool ApplyPathAuthoritativeArmControl(
+        MotorCommand& command,
+        std::array<float, g1_lcm::kNumMotors>& action,
         const std::optional<::g1::ee_qp::EeReference>& reference) {
-      if (!reference) return false;
-      // PATH owns no waist motion.  Both q/w GMR teleoperation and e-mode
-      // Cartesian shared control must leave the waist PD target at identity;
-      // SONIC retains sole ownership of the lower-body balance policy.
-      const bool gmr_bimanual_teleop =
-          reference->reference_type == ::g1::ee_qp::ReferenceType::kSample &&
-          reference->control_mode == ::g1::ee_qp::ControlMode::kTeleop &&
-          reference->source == ::g1::ee_qp::ReferenceSource::kGmr;
-      const bool path_e_mode_plan_exec =
-          reference->control_mode == ::g1::ee_qp::ControlMode::kPlanExec;
-      // plan_exec also covers a fresh e-mode fallback/null target.  Keeping
-      // this clamp through that transition prevents a one-frame waist command
-      // leak while the arms fall back to their unassisted posture.
-      return gmr_bimanual_teleop || path_e_mode_plan_exec;
+      bool accepted_fresh_ipopt_target = false;
+      if (reference && IsVerifiedIpoptArmReference(*reference)) {
+        last_ipopt_arm_q_target_ = reference->q_ref;
+        last_ipopt_arm_tau_ff_ = reference->has_tau_ff_ref
+            ? reference->tau_ff_ref
+            : ::g1::ee_qp::JointVector::Zero();
+        has_last_ipopt_arm_target_ = true;
+        accepted_fresh_ipopt_target = true;
+      }
+
+      if (!has_last_ipopt_arm_target_) {
+        const auto low_state = used_low_state_data_.data;
+        for (const int hw : ::g1::ee_qp::kArmHardwareIndices) {
+          last_ipopt_arm_q_target_[hw] = low_state
+              ? static_cast<double>(low_state->motor_state()[hw].q())
+              : default_angles[hw];
+          last_ipopt_arm_tau_ff_[hw] = 0.0;
+        }
+        has_last_ipopt_arm_target_ = true;
+        std::cout
+            << "[G1Deploy-LCM/PATH] Waiting for first verified IPOPT target; "
+            << "holding measured arm posture." << std::endl;
+      }
+
+      for (const int hw : ::g1::ee_qp::kArmHardwareIndices) {
+        command.q_target[hw] =
+            static_cast<float>(last_ipopt_arm_q_target_[hw]);
+        command.dq_target[hw] = 0.0f;
+        command.tau_ff[hw] =
+            static_cast<float>(last_ipopt_arm_tau_ff_[hw]);
+        const int action_idx = isaaclab_to_mujoco[hw];
+        // q_ref already satisfies the Unitree URDF joint limits in IPOPT.
+        // An additional raw-action clamp here would silently alter that joint
+        // solution before the LCM bridge reconstructs q_target.
+        action[action_idx] =
+            QTargetToRawAction(hw, command.q_target[hw]);
+        last_action[action_idx] = static_cast<double>(action[action_idx]);
+      }
+      ForceWaistIdentityPdTarget(command, action);
+
+      if (reference) {
+        PublishPathDirectTelemetry(
+            command, *reference, accepted_fresh_ipopt_target);
+      }
+      return accepted_fresh_ipopt_target;
     }
 
     void ForceWaistIdentityPdTarget(
@@ -3272,7 +3338,8 @@ class G1Deploy {
       for (const int hw : ::g1::ee_qp::kWaistHardwareIndices) {
         command.q_target[hw] = 0.0f;
         command.dq_target[hw] = 0.0f;
-        command.tau_ff[hw] = 0.0f;
+        command.tau_ff[hw] =
+            static_cast<float>(last_ipopt_arm_tau_ff_[hw]);
         const int action_idx = isaaclab_to_mujoco[hw];
         action[action_idx] = QTargetToRawAction(hw, command.q_target[hw]);
         last_action[action_idx] = static_cast<double>(action[action_idx]);
@@ -3281,7 +3348,8 @@ class G1Deploy {
 
     void PublishPathDirectTelemetry(
         const MotorCommand& command,
-        const ::g1::ee_qp::EeReference& reference) {
+        const ::g1::ee_qp::EeReference& reference,
+        bool accepted_fresh_ipopt_target = true) {
       if (!ee_qp_kinematics_) return;
       const auto low_state = used_low_state_data_.data;
       if (!low_state) return;
@@ -3299,9 +3367,9 @@ class G1Deploy {
 
       ::g1::ee_qp::EeQpTelemetry telemetry;
       telemetry.enabled = true;
-      telemetry.valid = true;
-      telemetry.q_ref = reference.q_ref;
-      telemetry.tau_ff_ref = reference.tau_ff_ref;
+      telemetry.valid = accepted_fresh_ipopt_target;
+      telemetry.q_ref = last_ipopt_arm_q_target_;
+      telemetry.tau_ff_ref = last_ipopt_arm_tau_ff_;
       telemetry.q_corrected = q_command;
       telemetry.delta_q = q_command - q_measured;
       telemetry.joint_tracking_error = q_command - q_measured;
@@ -3346,7 +3414,10 @@ class G1Deploy {
           best_terminal_distance >= 0.0 ? best_terminal_distance : 0.0;
       telemetry.predicted_error_after_m = telemetry.error_before_m;
       telemetry.nonlinear_error_after_m = telemetry.error_before_m;
-      telemetry.fallback_reason = ::g1::ee_qp::EeQpFallbackReason::kNone;
+      telemetry.solve_time_ms = reference.external_arm_solve_time_ms;
+      telemetry.fallback_reason = accepted_fresh_ipopt_target
+          ? ::g1::ee_qp::EeQpFallbackReason::kNone
+          : ::g1::ee_qp::EeQpFallbackReason::kMissingReference;
 
       double arm_tracking_squared_norm = 0.0;
       double arm_tracking_max_abs = 0.0;
@@ -3365,105 +3436,6 @@ class G1Deploy {
       ee_qp_telemetry_buffer_.SetData(telemetry);
     }
 
-
-    bool ApplyEeQpCorrection(
-        MotorCommand& command,
-        std::array<float, g1_lcm::kNumMotors>& action,
-        const std::optional<::g1::ee_qp::EeReference>& preloaded_reference =
-            std::nullopt) {
-      if (!use_ee_qp_ || !ee_qp_corrector_ || !ee_qp_reference_provider_) return false;
-      const auto low_state = used_low_state_data_.data;
-      if (!low_state) return false;
-      const auto now_us = SteadyNowUs();
-      const auto reference = preloaded_reference.has_value()
-          ? preloaded_reference
-          : ee_qp_reference_provider_->Latest(now_us);
-      ::g1::ee_qp::EeQpInput input;
-      for (int hw = 0; hw < G1_NUM_MOTOR; ++hw) {
-        input.q_measured[hw] = low_state->motor_state()[hw].q();
-        input.dq_measured[hw] = low_state->motor_state()[hw].dq();
-        input.q_sonic[hw] = command.q_target[hw];
-      }
-      input.measured_pelvis_orientation = Eigen::Quaterniond::Identity();
-      if (reference) input.reference = *reference;
-      input.now_us = now_us;
-      input.dt = control_dt_;
-      const auto result = ee_qp_corrector_->Compute(input);
-      ::g1::ee_qp::EeQpTelemetry telemetry;
-      telemetry.enabled = true;
-      telemetry.valid = result.valid;
-      telemetry.q_ref = input.reference.q_ref;
-      telemetry.tau_ff_ref = input.reference.tau_ff_ref;
-      telemetry.q_corrected = result.q_corrected;
-      telemetry.delta_q = result.delta_q;
-      telemetry.joint_tracking_error = result.q_corrected - input.q_measured;
-      telemetry.error_before_m = result.error_before;
-      telemetry.predicted_error_after_m = result.predicted_error_after;
-      telemetry.nonlinear_error_after_m = result.nonlinear_error_after;
-      telemetry.reference_joint_error_before_rad = result.reference_joint_error_before;
-      telemetry.predicted_reference_joint_error_after_rad = result.predicted_reference_joint_error_after;
-      telemetry.arm_only_error_before_m = result.arm_only_error_before;
-      telemetry.waist_only_error_before_m = result.waist_only_error_before;
-      telemetry.lower_only_error_before_m = result.lower_only_error_before;
-      telemetry.upper_only_error_before_m = result.upper_only_error_before;
-      telemetry.joint_tracking_rmse_rad = std::sqrt(telemetry.joint_tracking_error.squaredNorm() / G1_NUM_MOTOR);
-      telemetry.joint_tracking_max_abs_rad = telemetry.joint_tracking_error.cwiseAbs().maxCoeff();
-      double arm_tracking_squared_norm = 0.0;
-      double arm_tracking_max_abs = 0.0;
-      for (const int hw : ::g1::ee_qp::kArmHardwareIndices) {
-        const double lag = result.q_corrected[hw] - input.q_measured[hw];
-        arm_tracking_squared_norm += lag * lag;
-        arm_tracking_max_abs = std::max(arm_tracking_max_abs, std::abs(lag));
-      }
-      telemetry.pd_tracking_lag_rmse_rad = std::sqrt(arm_tracking_squared_norm / ::g1::ee_qp::kNumArmJoints);
-      telemetry.pd_tracking_lag_max_abs_rad = arm_tracking_max_abs;
-      telemetry.solve_time_ms = result.solve_time_ms;
-      telemetry.reference_age_ms = result.reference_age_ms;
-      telemetry.left_wrist_position = result.left_wrist_position;
-      telemetry.right_wrist_position = result.right_wrist_position;
-      telemetry.active_wrist_position = result.active_wrist_position;
-      telemetry.terminal_target_position = result.terminal_target_position;
-      telemetry.terminal_target_distance_m = result.terminal_target_distance_m;
-      telemetry.terminal_capture_radius_m = result.terminal_capture_radius_m;
-      telemetry.correction_bound_saturation_fraction = result.correction_bound_saturation_fraction;
-      telemetry.rate_bound_saturation_fraction = result.rate_bound_saturation_fraction;
-      telemetry.correction_bound_saturation_mask = result.correction_bound_saturation_mask;
-      telemetry.rate_bound_saturation_mask = result.rate_bound_saturation_mask;
-      telemetry.backtracking_alpha = result.backtracking_alpha;
-      telemetry.fallback_reason = result.fallback_reason;
-      telemetry.reference_source = result.reference_source;
-      telemetry.control_mode = result.control_mode;
-      telemetry.plan_id = result.plan_id;
-      telemetry.plan_phase = result.plan_phase;
-      telemetry.reference_type = result.reference_type;
-      telemetry.pose_frame_index = result.pose_frame_index;
-      telemetry.gmr_frame_index = result.gmr_frame_index;
-      telemetry.gmr_frame_mismatch = result.gmr_frame_mismatch;
-      telemetry.gmr_prediction_horizon_ms = result.gmr_prediction_horizon_ms;
-      telemetry.gmr_sync_valid = result.gmr_sync_valid;
-      telemetry.reference_feasible = result.reference_feasible;
-      telemetry.fallback_active = result.fallback_active;
-      telemetry.candidate_rejected = result.candidate_rejected;
-      telemetry.terminal_target_active = result.terminal_target_active;
-      telemetry.terminal_target_side = result.terminal_target_side;
-      ee_qp_telemetry_buffer_.SetData(telemetry);
-      for (int hw = 0; hw < G1_NUM_MOTOR; ++hw) {
-        command.q_target[hw] = static_cast<float>(result.q_corrected[hw]);
-        const int action_idx = isaaclab_to_mujoco[hw];
-        action[action_idx] = QTargetToRawAction(hw, command.q_target[hw]);
-        last_action[action_idx] = static_cast<double>(action[action_idx]);
-      }
-      if (++ee_qp_debug_counter_ % 50 == 0) {
-        std::cout << "[EE-QP/LCM] error=" << result.error_before
-                  << " predicted=" << result.predicted_error_after
-                  << " nonlinear=" << result.nonlinear_error_after
-                  << " ref_joint=" << result.reference_joint_error_before
-                  << " predicted_ref_joint=" << result.predicted_reference_joint_error_after
-                  << " plan=" << result.plan_id
-                  << " solve_ms=" << result.solve_time_ms << std::endl;
-      }
-      return result.valid || result.fallback_active;
-    }
 
     void PreservePreviousUpperBodyActions(
         std::array<float, g1_lcm::kNumMotors>& action) {
@@ -4091,26 +4063,14 @@ class G1Deploy {
 
       std::array<float, g1_lcm::kNumMotors> final_action = sonic_action;
       std::optional<::g1::ee_qp::EeReference> path_reference;
-      bool path_direct_override_applied = false;
-      if (use_ee_qp_ && ee_qp_reference_provider_) {
+      if (path_external_ipopt_arm_control_ && ee_qp_reference_provider_) {
         path_reference = ee_qp_reference_provider_->Latest(SteadyNowUs());
-        if (path_reference) {
-          path_direct_override_applied =
-              ApplyPathDirectUpperOverride(
-                  motor_command_tmp, final_action, *path_reference);
-        }
-      }
-      if (path_direct_override_applied && path_reference) {
-        PublishPathDirectTelemetry(motor_command_tmp, *path_reference);
-      } else if (use_ee_qp_) {
-        ApplyEeQpCorrection(motor_command_tmp, final_action, path_reference);
+        ApplyPathAuthoritativeArmControl(
+            motor_command_tmp, final_action, path_reference);
       } else if (use_hand_ik_origin_) {
         ApplyHandIKOrigin(motor_command_tmp, final_action);
       } else if (UseAnyUpperIK() && has_vr_3point_data_) {
         PreservePreviousUpperBodyActions(final_action);
-      }
-      if (IsPathWaistIdentityPdLocked(path_reference)) {
-        ForceWaistIdentityPdTarget(motor_command_tmp, final_action);
       }
 
       motor_command_buffer_.SetData(motor_command_tmp);

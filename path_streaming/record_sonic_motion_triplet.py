@@ -63,7 +63,9 @@ DEFAULT_LCM_CAMERA_CHANNEL = "G1_CAMERA_FRAME"
 DEFAULT_LCM_URL = "udpm://239.255.76.67:7667?ttl=1"
 
 # ── ZMQ 기본 포트 (파일 내 기본값, --pose-port/--state-port로 변경 가능) ──────
-DEFAULT_POSE_PORT  = 5556
+# Record the subordinate Pico stream before the state-machine bridge. In the
+# safe default mode raw pose is intentionally not forwarded to SONIC:5556.
+DEFAULT_POSE_PORT  = 5559
 DEFAULT_STATE_PORT = 5557
 
 
@@ -232,6 +234,7 @@ def compose_frame(
     sonic_data: dict[str, Any],
     manager_data: Optional[dict[str, Any]],
     path_plan_data: Optional[dict[str, Any]] = None,
+    button_data: Optional[dict[str, Any]] = None,
 ) -> dict[str, np.ndarray]:
     """Compose one raw synchronized sample without changing joint conventions."""
     frame: dict[str, np.ndarray] = {
@@ -245,10 +248,32 @@ def compose_frame(
     frame.update(flatten_prefixed("pose", pose_data))
     frame.update(flatten_prefixed("state", state_data))
     frame.update(flatten_prefixed("sonic", sonic_data))
+    for timing_key in (
+        "button_sequence",
+        "button_read_timestamp_us",
+        "button_bridge_receive_timestamp_us",
+        "button_bridge_forward_timestamp_us",
+        "button_sonic_receive_timestamp_us",
+        "button_sonic_apply_timestamp_us",
+    ):
+        if timing_key in sonic_data:
+            frame[timing_key] = np.asarray(sonic_data[timing_key]).copy()
     if manager_data is not None:
         frame.update(flatten_prefixed("manager", manager_data))
     if path_plan_data is not None:
         frame.update(flatten_prefixed("path_plan", path_plan_data))
+    if button_data is not None:
+        button_fields = {
+            "event": button_data.get("event", ""),
+            "sequence": button_data.get("sequence", 0),
+            "read_timestamp_us": button_data.get("button_read_timestamp_us", 0),
+            "publish_timestamp_us": button_data.get("publish_timestamp_us", 0),
+            "a": button_data.get("a", False),
+            "b": button_data.get("b", False),
+            "x": button_data.get("x", False),
+            "y": button_data.get("y", False),
+        }
+        frame.update(flatten_prefixed("pico_button", button_fields))
     return frame
 
 
@@ -613,6 +638,12 @@ def write_manifest(path: Path, args: argparse.Namespace) -> None:
             "port": args.path_plan_port,
             "topic": args.path_plan_topic,
         },
+        "button_source": {
+            "transport": "zmq",
+            "host": args.button_host,
+            "port": args.button_port,
+            "topic": args.button_topic,
+        },
         "image_source": {
             "transport": "lcm",
             "lcm_url": args.lcm_url,
@@ -643,6 +674,10 @@ def write_manifest(path: Path, args: argparse.Namespace) -> None:
                         "without joint reordering or offset conversion.",
             "path_plan_*": "Latest PATH cuRobo plan heartbeat metadata, if the "
                             "planner server is running.",
+            "pico_button_*": "Latest dedicated Pico ABXY event and read/publish timestamps.",
+            "button_*_timestamp_us": "Clean end-to-end button timing aliases: Pico "
+                                     "read, bridge receive/forward, and SONIC receive/apply.",
+            "sonic_button_*": "Raw g1_debug copies of the same SONIC timing fields.",
             "image_path": "Relative path to saved JPEG frame under frames/ "
                            "(only if --record-image; camera transport is always LCM).",
         },
@@ -664,6 +699,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pose-port", type=int, default=DEFAULT_POSE_PORT)
     parser.add_argument("--pose-topic", default="pose")
     parser.add_argument("--max-pose-age", type=float, default=0.25)
+    parser.add_argument("--button-host", default="localhost")
+    parser.add_argument("--button-port", type=int, default=5565)
+    parser.add_argument("--button-topic", default="pico_button_event")
 
     # G1 measured state — zmq(g1_debug) 또는 lcm(G1_ROBOT_STATE) 선택
     parser.add_argument("--g1-source", choices=["zmq", "lcm"], default="zmq",
@@ -784,6 +822,14 @@ def main() -> None:
             conflate=True,
         )
 
+    button_sock = make_subscriber(
+        ctx,
+        args.button_host,
+        args.button_port,
+        [args.button_topic],
+        conflate=False,
+    )
+
     # G1 measured state: zmq debug payload 또는 LCM direct state
     lcm_receiver: Optional[LcmReceiver] = None
     if args.g1_source == "lcm":
@@ -807,12 +853,14 @@ def main() -> None:
     poller.register(state_sock, zmq.POLLIN)
     if path_plan_sock is not None:
         poller.register(path_plan_sock, zmq.POLLIN)
+    poller.register(button_sock, zmq.POLLIN)
 
     latest_pose: LatestMessage | None = None
     latest_state: LatestMessage | None = None
     latest_sonic: LatestMessage | None = None
     latest_manager: LatestMessage | None = None
     latest_path_plan: LatestMessage | None = None
+    latest_button: LatestMessage | None = None
     writer = FrameWriter()
     writer.start()
     frame_idx = 0
@@ -833,6 +881,10 @@ def main() -> None:
             f"[recorder] path plan (zmq) tcp://{args.path_plan_host}:"
             f"{args.path_plan_port}/{args.path_plan_topic}"
         )
+    print(
+        f"[recorder] Pico buttons (zmq) tcp://{args.button_host}:"
+        f"{args.button_port}/{args.button_topic}"
+    )
     if args.record_image:
         print(f"[recorder] image (lcm) {args.lcm_url} / {args.lcm_camera_channel}")
     print("[recorder] Ctrl+C to stop and write session_selected.npz")
@@ -895,6 +947,21 @@ def main() -> None:
                     pass
                 except Exception as exc:
                     print(f"[recorder] skipped malformed PATH plan message: {exc}")
+
+            if button_sock in events:
+                for _ in range(32):
+                    try:
+                        raw = button_sock.recv(zmq.NOBLOCK)
+                    except zmq.Again:
+                        break
+                    try:
+                        latest_button = LatestMessage(
+                            unpack_msgpack_topic(raw, args.button_topic),
+                            now_wall,
+                            now_mono,
+                        )
+                    except Exception as exc:
+                        print(f"[recorder] skipped malformed button event: {exc}")
 
             if now_mono < next_sample:
                 continue
@@ -987,6 +1054,7 @@ def main() -> None:
                 sonic_data=latest_sonic.data,
                 manager_data=latest_manager.data if latest_manager is not None else None,
                 path_plan_data=latest_path_plan.data if latest_path_plan is not None else None,
+                button_data=latest_button.data if latest_button is not None else None,
             )
 
             jpeg_bytes: Optional[bytes] = None
@@ -1055,6 +1123,7 @@ def main() -> None:
         state_sock.close()
         if path_plan_sock is not None:
             path_plan_sock.close()
+        button_sock.close()
         if lcm_receiver is not None:
             lcm_receiver.stop()
         if image_only_lcm is not None:

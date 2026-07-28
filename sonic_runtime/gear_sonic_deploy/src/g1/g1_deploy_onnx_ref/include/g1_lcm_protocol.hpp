@@ -12,6 +12,7 @@ constexpr const char* kDefaultStateChannel = "G1_ROBOT_STATE";
 constexpr uint32_t kPolicyActionMagic = 0x31414347U;  // "GCA1" little-endian.
 constexpr uint32_t kRobotStateMagic = 0x31545347U;    // "GST1" little-endian.
 constexpr uint16_t kProtocolVersion = 1;
+constexpr uint16_t kDirectCommandProtocolVersion = 2;
 constexpr uint16_t kActionFlagEmergencyStop = 1U << 0;
 constexpr uint16_t kActionFlagLeftGrip      = 1U << 1;
 constexpr uint16_t kActionFlagRightGrip     = 1U << 2;
@@ -25,6 +26,17 @@ struct PolicyActionPacket {
   uint64_t sequence = 0;
   int64_t send_time_us = 0;
   std::array<float, kNumMotors> action = {};
+};
+
+struct PolicyCommandPacketV2 {
+  uint32_t magic = kPolicyActionMagic;
+  uint16_t version = kDirectCommandProtocolVersion;
+  uint16_t flags = 0;
+  uint64_t sequence = 0;
+  int64_t send_time_us = 0;
+  std::array<float, kNumMotors> q_target = {};
+  std::array<float, kNumMotors> dq_target = {};
+  std::array<float, kNumMotors> tau_ff = {};
 };
 
 struct RobotStatePacket {
@@ -48,6 +60,7 @@ struct RobotStatePacket {
 #pragma pack(pop)
 
 static_assert(sizeof(PolicyActionPacket) == 140, "PolicyActionPacket size changed");
+static_assert(sizeof(PolicyCommandPacketV2) == 372, "PolicyCommandPacketV2 size changed");
 static_assert(sizeof(RobotStatePacket) == 461, "RobotStatePacket size changed");
 
 }  // namespace g1_lcm

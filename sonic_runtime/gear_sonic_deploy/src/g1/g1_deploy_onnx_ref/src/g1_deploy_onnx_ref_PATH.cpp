@@ -2181,6 +2181,7 @@ class G1Deploy {
         return ::g1::ee_qp::ReferenceSource::kDampedReturn;
       }
       if (source == "cartesian_servo") return ::g1::ee_qp::ReferenceSource::kCartesianServo;
+      if (source == "smpl_relative_cartesian") return ::g1::ee_qp::ReferenceSource::kSmplRelative;
       return ::g1::ee_qp::ReferenceSource::kUnknown;
     }
 

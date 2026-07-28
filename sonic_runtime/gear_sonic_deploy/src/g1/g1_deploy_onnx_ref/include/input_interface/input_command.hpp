@@ -17,7 +17,9 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <optional>
 
 #include "../localmotion_kplanner.hpp"  // For LocomotionMode enum
@@ -44,7 +46,30 @@ struct CommandMessage {
   /// written directly into HeadingState.delta_heading.
   std::optional<double> delta_heading;
   bool valid = false;     ///< Set to true once a message has been decoded successfully.
+  int64_t button_sequence = 0;
+  int64_t button_read_timestamp_us = 0;
+  int64_t button_bridge_receive_timestamp_us = 0;
+  int64_t button_bridge_forward_timestamp_us = 0;
 };
+
+struct CommandTimingState {
+  std::atomic<int64_t> sequence{0};
+  std::atomic<int64_t> button_read_timestamp_us{0};
+  std::atomic<int64_t> bridge_receive_timestamp_us{0};
+  std::atomic<int64_t> bridge_forward_timestamp_us{0};
+  std::atomic<int64_t> sonic_receive_timestamp_us{0};
+  std::atomic<int64_t> sonic_apply_timestamp_us{0};
+};
+
+inline CommandTimingState& GlobalCommandTimingState() {
+  static CommandTimingState state;
+  return state;
+}
+
+inline int64_t CommandSteadyNowUs() {
+  const auto now = std::chrono::steady_clock::now().time_since_epoch();
+  return std::chrono::duration_cast<std::chrono::microseconds>(now).count();
+}
 
 // ---------------------------------------------------------------------------
 // PlannerMessage
@@ -105,4 +130,3 @@ struct PlannerMessage {
   /// Used to detect planner timeouts (stale data → fallback to IDLE).
   std::chrono::steady_clock::time_point timestamp{};
 };
-

@@ -6,6 +6,7 @@ from typing import Iterable, Sequence
 import numpy as np
 
 SCHEMA_QP_REFERENCE_V1 = "path.qp_reference.v1"
+SCHEMA_IPOPT_ARM_REFERENCE_V1 = "path.ipopt_arm_reference.v1"
 QP_REFERENCE_TOPIC = "path_qp_reference"
 CUROBO_PLAN_TOPIC = "curobo_plan"
 PATH_GOAL_TOPIC = "path_goal"
@@ -164,3 +165,51 @@ def qp_none_reference(
         "timestamp_us": int(timestamp_us if timestamp_us is not None else now_us()),
         **metadata,
     }
+
+
+def ipopt_arm_sample_reference(
+    q_ref: Sequence[float] | np.ndarray,
+    *,
+    tau_ff_ref: Sequence[float] | np.ndarray,
+    **kwargs,
+) -> dict:
+    """Build the only sample schema accepted as a real PATH arm command."""
+
+    payload = qp_sample_reference(
+        q_ref,
+        tau_ff_ref=tau_ff_ref,
+        **kwargs,
+    )
+    payload.update(
+        {
+            "schema": SCHEMA_IPOPT_ARM_REFERENCE_V1,
+            "arm_target_owner": "casadi_ipopt",
+            "solver_backend": "casadi_opti_ipopt",
+            "arm_target_valid": True,
+        }
+    )
+    return payload
+
+
+def ipopt_arm_cartesian_target_reference(
+    *,
+    q_ref: Sequence[float] | np.ndarray,
+    tau_ff_ref: Sequence[float] | np.ndarray,
+    **kwargs,
+) -> dict:
+    """Build an e-mode target whose final arm joints were solved by IPOPT."""
+
+    payload = qp_cartesian_target_reference(
+        q_ref=q_ref,
+        tau_ff_ref=tau_ff_ref,
+        **kwargs,
+    )
+    payload.update(
+        {
+            "schema": SCHEMA_IPOPT_ARM_REFERENCE_V1,
+            "arm_target_owner": "casadi_ipopt",
+            "solver_backend": "casadi_opti_ipopt",
+            "arm_target_valid": True,
+        }
+    )
+    return payload

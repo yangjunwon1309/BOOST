@@ -2168,6 +2168,7 @@ class G1Deploy {
       if (source == "gmr") return ::g1::ee_qp::ReferenceSource::kGmr;
       if (source == "curobo") return ::g1::ee_qp::ReferenceSource::kCurobo;
       if (source == "replay") return ::g1::ee_qp::ReferenceSource::kReplay;
+      if (source == "smpl_relative_cartesian") return ::g1::ee_qp::ReferenceSource::kSmplRelative;
       return ::g1::ee_qp::ReferenceSource::kUnknown;
     }
 

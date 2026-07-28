@@ -9,4 +9,6 @@ cd "$PATH_G1_ROOT"
 exec python path_streaming/pico_manager_thread_server.py \
   --manager \
   --port "${PATH_PICO_INTERNAL_PORT:-5559}" \
+  --button_event_port "${PATH_PICO_BUTTON_PORT:-5565}" \
+  --button_poll_hz "${PATH_PICO_BUTTON_POLL_HZ:-100}" \
   "$@"

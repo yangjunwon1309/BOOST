@@ -28,7 +28,15 @@ def _build_header(fields: list, version: int = 1, count: int = 1) -> bytes:
 
 
 def build_command_message(
-    start: bool, stop: bool, planner: bool, delta_heading: float | None = None
+    start: bool,
+    stop: bool,
+    planner: bool,
+    delta_heading: float | None = None,
+    *,
+    button_sequence: int | None = None,
+    button_read_timestamp_us: int | None = None,
+    bridge_receive_timestamp_us: int | None = None,
+    bridge_forward_timestamp_us: int | None = None,
 ) -> bytes:
     """
     Assemble a 'command' topic message:
@@ -55,6 +63,18 @@ def build_command_message(
         # Append delta_heading field to header and payload
         fields.append({"name": "delta_heading", "dtype": "f32", "shape": [1]})
         payload += struct.pack("<f", float(delta_heading))
+
+    timing_fields = (
+        ("button_sequence", button_sequence),
+        ("button_read_timestamp_us", button_read_timestamp_us),
+        ("button_bridge_receive_timestamp_us", bridge_receive_timestamp_us),
+        ("button_bridge_forward_timestamp_us", bridge_forward_timestamp_us),
+    )
+    for name, value in timing_fields:
+        if value is None:
+            continue
+        fields.append({"name": name, "dtype": "i64", "shape": [1]})
+        payload += struct.pack("<q", int(value))
 
     header = _build_header(fields, version=1, count=1)
 

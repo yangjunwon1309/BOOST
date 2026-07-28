@@ -56,6 +56,7 @@ enum class ReferenceSource : std::uint8_t {
   kReplay,
   kDampedReturn,
   kCartesianServo,
+  kSmplRelative,
 };
 
 enum class ControlMode : std::uint8_t {
@@ -102,6 +103,7 @@ inline const char* ReferenceSourceName(ReferenceSource source) {
     case ReferenceSource::kReplay: return "replay";
     case ReferenceSource::kDampedReturn: return "damped_return";
     case ReferenceSource::kCartesianServo: return "cartesian_servo";
+    case ReferenceSource::kSmplRelative: return "smpl_relative";
   }
   return "unknown";
 }
@@ -139,6 +141,7 @@ struct EeReference {
   JointVector tau_ff_ref = JointVector::Zero();
   double terminal_capture_radius_m = 0.07;
   std::int64_t timestamp_us = 0;
+  std::int64_t bridge_timestamp_us = 0;
   std::uint64_t plan_id = 0;
   double phase = 0.0;
   ReferenceType reference_type = ReferenceType::kUnknown;
@@ -152,6 +155,10 @@ struct EeReference {
   std::int64_t gmr_frame_mismatch = 999999;
   double gmr_prediction_horizon_ms = -1.0;
   bool gmr_sync_valid = false;
+  bool arm_target_is_ipopt_solution = false;
+  double external_arm_solve_time_ms = 0.0;
+  double external_arm_position_error_m = 0.0;
+  double external_arm_rotation_error_rad = 0.0;
   bool feasible = true;
   bool valid = false;
 };

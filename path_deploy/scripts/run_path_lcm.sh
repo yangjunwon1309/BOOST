@@ -5,23 +5,28 @@ source "$(dirname "${BASH_SOURCE[0]}")/../../configs/runtime/local.env"
 
 cd "$PATH_SONIC_DEPLOY_ROOT"
 
-ee_qp_args=()
-if [[ "${EE_QP_ENABLED:-1}" == "1" ]]; then
-  ee_qp_args+=(
-    --use-ee-qp
-    --ee-qp-config "${EE_QP_CONFIG:-src/g1/ee_qp/config/ee_qp_real.yaml}"
-  )
-  if [[ "${PATH_DYNAMIC_REFERENCE_ENABLED:-1}" == "1" ]]; then
-    ee_qp_args+=(
-      --path-use-dynamic-reference
-      --path-reference-host "${PATH_REFERENCE_HOST:-127.0.0.1}"
-      --path-reference-port "${PATH_REFERENCE_PORT:-5560}"
-      --path-reference-topic "${PATH_REFERENCE_TOPIC:-path_qp_reference}"
-      --path-reference-lookahead-ms "${PATH_REFERENCE_LOOKAHEAD_MS:-10}"
-      --path-reference-heartbeat-timeout-ms "${PATH_REFERENCE_HEARTBEAT_TIMEOUT_MS:-500}"
-    )
-  fi
+if [[ "${EE_QP_ENABLED:-1}" != "1" ]]; then
+  echo "ERROR: real PATH requires external CasADi/IPOPT arm control; EE_QP_ENABLED=0 is unsupported." >&2
+  exit 2
 fi
+if [[ "${PATH_DYNAMIC_REFERENCE_ENABLED:-1}" != "1" ]]; then
+  echo "ERROR: real PATH requires PATH_DYNAMIC_REFERENCE_ENABLED=1." >&2
+  exit 2
+fi
+
+# Keep the historical --use-ee-qp flag for CLI compatibility. In the LCM
+# deploy it now enables only the dynamic reference transport/FK telemetry;
+# the legacy in-process ProxQP is not constructed.
+ee_qp_args=(
+  --use-ee-qp
+  --ee-qp-config "${EE_QP_CONFIG:-src/g1/ee_qp/config/ee_qp_real.yaml}"
+  --path-use-dynamic-reference
+  --path-reference-host "${PATH_REFERENCE_HOST:-127.0.0.1}"
+  --path-reference-port "${PATH_REFERENCE_PORT:-5560}"
+  --path-reference-topic "${PATH_REFERENCE_TOPIC:-path_qp_reference}"
+  --path-reference-lookahead-ms "${PATH_REFERENCE_LOOKAHEAD_MS:-10}"
+  --path-reference-heartbeat-timeout-ms "${PATH_REFERENCE_HEARTBEAT_TIMEOUT_MS:-500}"
+)
 
 lcm_args=(
   --input-type "${PATH_INPUT_TYPE:-zmq_manager}"

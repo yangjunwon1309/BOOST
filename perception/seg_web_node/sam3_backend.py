@@ -49,7 +49,7 @@ class TorchSam3Backend:
         return {"backend": self.name, "device": "cuda"}
 
     def infer(
-        self, image_bgr: np.ndarray, concepts: list[str]
+        self, image_bgr: np.ndarray, concepts: list[str], **_ignored: Any
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
         from PIL import Image
 
@@ -256,7 +256,7 @@ class TensorRTSam3Backend:
             )
 
     def infer(
-        self, image_bgr: np.ndarray, concepts: list[str]
+        self, image_bgr: np.ndarray, concepts: list[str], **_ignored: Any
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
         torch = self.torch
         height, width = image_bgr.shape[:2]

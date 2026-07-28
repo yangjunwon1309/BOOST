@@ -25,6 +25,105 @@ segmentation:
     engine: /models/sam3_trt/sam3_fp16_4out.engine
     model_id: facebook/sam3
     mask_threshold: 0.5
+  # Official SAM2.1 Tiny generic-mask replacement.  Select explicitly with
+  # --backend sam2-tiny after building the updated perception image.  It uses
+  # the same central ROI/filter geometry as the retired EfficientViT path.
+  sam2:
+    checkpoint: /models/sam2/sam2.1_hiera_tiny.pt
+    reinitialization: central
+    reinitialize_interval_frames: 15
+    automatic_points_per_side: 8
+    max_masks: 12
+    central:
+      reference_width_px: 640
+      reference_height_px: 360
+      roi_center_px: [320, 200]
+      roi_radius_px: [220, 125]
+      prompt_spacing_px: 50
+      max_mask_area_ratio: 0.20
+      max_center_distance_m: 0.60
+      plane_min_points: 300
+      plane_max_rms_m: 0.015
+      support_normal_up_dot_min: 0.85
+      lower_region_start_fraction: 0.60
+      lower_region_mask_fraction: 0.80
+      merge_overlap_min_fraction: 0.50
+      # Keep the last valid mask through short predictor/discovery dropouts.
+      track_missing_ttl_frames: 24
+      track_fallback_score_decay: 0.985
+      reinitialize_match_iou: 0.15
+      robot_exclusion:
+        # FK-projected G1 arm/hand silhouette for the next RGB-D frame.
+        arm_radius_px: 22
+        wrist_radius_px: 42
+        # Used only while G1_ROBOT_STATE is unavailable.
+        static_bottom_fraction: 0.16
+        static_side_fraction: 0.035
+        min_remaining_fraction: 0.30
+  # EfficientTAM Tiny-512 uses SAM2-style prompted masks/video architecture
+  # with a 512px encoder. Select explicitly with --backend efficienttam-ti-512.
+  efficienttam:
+    checkpoint: /models/efficienttam/efficienttam_ti_512x512.pt
+    reinitialization: central
+    reinitialize_interval_frames: 15
+    automatic_points_per_side: 8
+    max_masks: 12
+    central:
+      reference_width_px: 640
+      reference_height_px: 360
+      roi_center_px: [320, 200]
+      roi_radius_px: [220, 125]
+      prompt_spacing_px: 50
+      max_mask_area_ratio: 0.20
+      max_center_distance_m: 0.60
+      plane_min_points: 300
+      plane_max_rms_m: 0.015
+      support_normal_up_dot_min: 0.85
+      lower_region_start_fraction: 0.60
+      lower_region_mask_fraction: 0.80
+      merge_overlap_min_fraction: 0.50
+      # Preserve an object for ~7 s at the default 3.5 Hz if an automatic
+      # reinitialization or one box-prompt frame temporarily misses it.
+      track_missing_ttl_frames: 24
+      track_fallback_score_decay: 0.985
+      reinitialize_match_iou: 0.15
+      robot_exclusion:
+        arm_radius_px: 22
+        wrist_radius_px: 42
+        # Conservative fallback when robot state is not on G1_ROBOT_STATE.
+        static_bottom_fraction: 0.16
+        static_side_fraction: 0.035
+        min_remaining_fraction: 0.30
+  # COCO-80 semantic instance segmentation.  It is intentionally opt-in:
+  # --backend yolo11-seg.  COCO does not include a "robot" class, so the
+  # FK-projected arm/hand exclusion remains enabled below.
+  yolo11:
+    checkpoint: /models/yolo11/yolo11n-seg.pt
+    imgsz: 640
+    # Only COCO instances with score >= 0.80 may become masks/tracks/belief
+    # candidates. Lower-score detections never enter persistence fallback.
+    confidence: 0.80
+    iou_threshold: 0.50
+    max_masks: 20
+    quantize: 16
+    # Empty means all COCO classes except excluded_classes.  Restrict this
+    # list later if the real workcell needs only a smaller class set.
+    allowed_classes: []
+    excluded_classes: [person]
+    track:
+      # Retained internally only for a later IoU re-association. Missing
+      # tracks are never rendered or passed into belief/3-D geometry.
+      missing_ttl_frames: 6
+      fallback_score_decay: 0.985
+      match_iou: 0.15
+      # Erode every accepted instance by this many pixels before depth/belief.
+      boundary_crop_px: 4
+    robot_exclusion:
+      arm_radius_px: 22
+      wrist_radius_px: 42
+      static_bottom_fraction: 0.16
+      static_side_fraction: 0.035
+      min_remaining_fraction: 0.30
 cloud:
   workspace_lims: [-1.0, 1.0, -1.0, 1.0, 0.1, 1.5]
   voxel_size_m: 0.005

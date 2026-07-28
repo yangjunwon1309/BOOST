@@ -1,0 +1,89 @@
+{
+  "model": "efficientvit-sam-l0",
+  "reinitialization": "central",
+  "reinitialize_interval_frames": 15,
+  "image": "output/sam3_demo.jpg",
+  "depth": "synthetic mock depth from seg_web_node.mock_depth",
+  "iterations": 120,
+  "latency_ms": {
+    "mean": 61.785,
+    "p50": 47.294,
+    "p95": 253.846,
+    "p99": 267.919
+  },
+  "period_hz_mean": 16.185,
+  "masks_last_frame": 4,
+  "tracks_last_frame": [
+    {
+      "index": 0,
+      "center_camera_m": [
+        0.04244333133101463,
+        0.30962666869163513,
+        1.437000036239624
+      ],
+      "pixel_uv": [
+        337,
+        310
+      ],
+      "depth_points": 57741,
+      "track_id": "object:track0000"
+    },
+    {
+      "index": 1,
+      "center_camera_m": [
+        -0.225987508893013,
+        0.19577251374721527,
+        1.2330000400543213
+      ],
+      "pixel_uv": [
+        211,
+        276
+      ],
+      "depth_points": 1472,
+      "track_id": "object:track0001"
+    },
+    {
+      "index": 2,
+      "center_camera_m": [
+        -0.17772334814071655,
+        0.022183332592248917,
+        1.2820000648498535
+      ],
+      "pixel_uv": [
+        238,
+        190
+      ],
+      "depth_points": 2506,
+      "track_id": "object:track0003"
+    },
+    {
+      "index": 3,
+      "center_camera_m": [
+        -0.21221667528152466,
+        0.073170006275177,
+        1.1660000085830688
+      ],
+      "pixel_uv": [
+        209,
+        222
+      ],
+      "depth_points": 5176,
+      "track_id": "object:track0002"
+    }
+  ],
+  "overlay": "output/efficientvit_l0_central_rgbd.jpg",
+  "backend": {
+    "backend": "efficientvit-l0",
+    "model": "efficientvit-sam-l0",
+    "device": "cuda",
+    "image_size": [
+      1024,
+      512
+    ],
+    "reinitialization": "central",
+    "reinitialize_interval_frames": 15,
+    "last_mode": "central-mask-reinitialize",
+    "active_prompt_tracks": 4,
+    "central_prompt_count": 30
+  }
+}

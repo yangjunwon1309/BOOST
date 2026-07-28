@@ -1,0 +1,45 @@
+{
+  "model": "efficientvit-sam-l0",
+  "reinitialization": "all",
+  "reinitialize_interval_frames": 15,
+  "image": "output/sam3_demo.jpg",
+  "depth": "synthetic mock depth from seg_web_node.mock_depth",
+  "iterations": 6,
+  "latency_ms": {
+    "mean": 31.381,
+    "p50": 32.163,
+    "p95": 33.0,
+    "p99": 33.07
+  },
+  "period_hz_mean": 31.867,
+  "masks_last_frame": 1,
+  "tracks_last_frame": [
+    {
+      "index": 0,
+      "center_camera_m": [
+        0.04016000032424927,
+        0.3079100251197815,
+        1.4350000619888306
+      ],
+      "pixel_uv": [
+        337,
+        309
+      ],
+      "depth_points": 58567,
+      "track_id": "object:track0000"
+    }
+  ],
+  "overlay": "output/efficientvit_l0_rgbd_benchmark.jpg",
+  "backend": {
+    "backend": "efficientvit-l0",
+    "model": "efficientvit-sam-l0",
+    "device": "cuda",
+    "image_size": [
+      1024,
+      512
+    ],
+    "reinitialization": "all",
+    "reinitialize_interval_frames": 15,
+    "last_mode": "robot-state-prompt"
+  }
+}

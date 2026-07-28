@@ -109,6 +109,51 @@ Launch the SAM3 RGB-D web node with:
   --port 8080
 ```
 
+## EfficientViT-SAM-L0 generic-mask backend
+
+`efficientvit-l0` is a text-free alternative for the robot-state/belief
+pipeline. It returns generic `object` masks only. The RGB-D server then uses
+the existing depth deprojection and 3-D nearest-neighbour tracker to assign
+stable IDs such as `object:track0007`; it does not use SAM3 or YOLO labels.
+
+The current Thor image (`g1-perception-sam3:thor-jp71`) includes the pinned
+EfficientViT and Segment Anything sources. Cache its public checkpoint once:
+
+```bash
+./tools/run_thor.sh python tools/cache_efficientvit_l0.py
+```
+
+`reinitialization: central` is the default. It runs automatic generic-mask
+discovery only from 30 point prompts in a configurable 640×360 central ellipse
+(`center=(320,200)`, `radius=(220,125)`, `spacing=50 px`), rejects masks that
+are too large or outside that ellipse, and then refines every discovered object
+in one batched point/box-prompt decoder call. Each object keeps a local box
+prior; the RGB-D server assigns the persistent 3-D `object:trackNNNN` ID.
+
+`depth-only` remains available for diagnosis, but depth is deliberately not
+the normal segmentation proposal source. `all` uses the full-image grid and is
+useful only as an explicit broad scene reset because it creates periodic GPU
+bursts.
+
+```bash
+./tools/run_thor.sh python -m seg_web_node.web_server \
+  --config config/pipeline.yaml \
+  --backend efficientvit-l0 \
+  --allow-unaligned --host 0.0.0.0 --port 8080
+
+# Standalone synthetic RGB-D validation; it does not start the web server.
+./tools/run_thor.sh python tools/benchmark_efficientvit_l0_rgbd.py \
+  --reinitialization central --iterations 120
+```
+
+On this Thor with the included `output/sam3_demo.jpg` and its synthetic mock
+depth, central multi-object tracking retained four masks and measured 61.8 ms
+mean (16.2 Hz), 253.8 ms p95 with a central reset every 15 frames. The normal
+four-object tracking frame was about 44–47 ms; reset frames dominate the p95.
+The full-image `all` path was 59.3 ms mean and 467 ms p95, so central is the
+safer discovery mode even though it still needs a lower reset rate when SONIC
+shares the GPU.
+
 ## TensorRT backend
 
 The linked `dataplayer12/SAM3-TensorRT` project is a community implementation,

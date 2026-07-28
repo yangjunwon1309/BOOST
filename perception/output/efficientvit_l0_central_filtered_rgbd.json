@@ -1,0 +1,66 @@
+{
+  "model": "efficientvit-sam-l0",
+  "reinitialization": "central",
+  "reinitialize_interval_frames": 15,
+  "image": "output/sam3_demo.jpg",
+  "depth": "synthetic mock depth from seg_web_node.mock_depth",
+  "iterations": 20,
+  "latency_ms": {
+    "mean": 45.407,
+    "p50": 34.07,
+    "p95": 51.636,
+    "p99": 216.474
+  },
+  "period_hz_mean": 22.023,
+  "masks_last_frame": 2,
+  "tracks_last_frame": [
+    {
+      "index": 0,
+      "center_camera_m": [
+        -0.17782750725746155,
+        0.022316668182611465,
+        1.28000009059906
+      ],
+      "pixel_uv": [
+        238,
+        191
+      ],
+      "depth_points": 2554,
+      "track_id": "object:track0001"
+    },
+    {
+      "index": 1,
+      "center_camera_m": [
+        -0.21175000071525574,
+        0.07213000953197479,
+        1.1630001068115234
+      ],
+      "pixel_uv": [
+        209,
+        222
+      ],
+      "depth_points": 5034,
+      "track_id": "object:track0000"
+    }
+  ],
+  "overlay": "output/efficientvit_l0_central_filtered_rgbd.jpg",
+  "backend": {
+    "backend": "efficientvit-l0",
+    "model": "efficientvit-sam-l0",
+    "device": "cuda",
+    "image_size": [
+      1024,
+      512
+    ],
+    "reinitialization": "central",
+    "reinitialize_interval_frames": 15,
+    "last_mode": "multi-object-track-prompts",
+    "active_prompt_tracks": 2,
+    "central_prompt_count": 30,
+    "central_filter": {
+      "lower_region_start_fraction": 0.6,
+      "lower_region_mask_fraction": 0.8,
+      "merge_overlap_min_fraction": 0.5
+    }
+  }
+}

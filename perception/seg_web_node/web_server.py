@@ -23,7 +23,13 @@ from pydantic import BaseModel
 
 from .ee_target import GoalPublisher, Workspace, make_goal_payload
 from .depth_alignment import align_depth_to_color
-from .geometry import CameraIntrinsics, deproject, robust_mask_center, transform_points
+from .geometry import (
+    CameraIntrinsics,
+    central_mask_geometry_filter,
+    deproject,
+    robust_mask_center,
+    transform_points,
+)
 from .lcm_protocol import (
     DEPTH_SOURCE_ALIGNED_TO_COLOR,
     DEPTH_SOURCE_RAW_DEPTH_OPTICAL,
@@ -32,8 +38,16 @@ from .lcm_protocol import (
     decode_depth,
     decode_robot_state,
 )
-from .robot_geometry import RobotStateBuffer, g1_wrist_ee_position, pelvis_to_torso
+from .robot_geometry import (
+    RobotStateBuffer,
+    g1_link_transforms,
+    g1_wrist_ee_position,
+    pelvis_to_torso,
+)
 from .rgbd_sync import RgbdPair, RgbdSynchronizer, depth_at_rgb_size
+from .sam2_backend import Sam2HieraTinyBackend
+from .efficienttam_backend import EfficientTamTi512Backend
+from .yolo11_backend import Yolo11SegBackend
 from .sam3_backend import TensorRTSam3Backend, TorchSam3Backend
 from .tasc_belief import (
     BeliefInputObject,
@@ -266,6 +280,63 @@ def suppress_duplicate_masks(
     return masks[keep_array], boxes[keep_array], scores[keep_array], [labels[i] for i in keep]
 
 
+def projected_robot_arm_mask(
+    q: np.ndarray,
+    t_goal_cam: np.ndarray,
+    intrinsics: CameraIntrinsics,
+    *,
+    height: int,
+    width: int,
+    arm_radius_px: int,
+    wrist_radius_px: int,
+) -> np.ndarray:
+    """Rasterize the FK upper-arm chain in the RGB camera image.
+
+    The resulting silhouette is deliberately dilated beyond CAD link widths;
+    it is a conservative *exclusion* region, not a renderer.  Removing these
+    pixels from generic masks prevents the robot from becoming a target.
+    """
+    transforms = g1_link_transforms(q)
+    transform = np.asarray(t_goal_cam, dtype=np.float64)
+    rotation = transform[:3, :3]
+    translation = transform[:3, 3]
+    output = np.zeros((height, width), dtype=np.uint8)
+
+    def project(link_name: str) -> tuple[int, int] | None:
+        point_goal = transforms[link_name][:3, 3]
+        point_camera = rotation.T @ (point_goal - translation)
+        if not np.isfinite(point_camera).all() or point_camera[2] <= 0.05:
+            return None
+        u = intrinsics.fx * point_camera[0] / point_camera[2] + intrinsics.cx
+        v = intrinsics.fy * point_camera[1] / point_camera[2] + intrinsics.cy
+        # Retain a modest offscreen margin so a link entering the view remains
+        # excluded at the border.
+        if u < -wrist_radius_px or u >= width + wrist_radius_px or v < -wrist_radius_px or v >= height + wrist_radius_px:
+            return None
+        return int(round(u)), int(round(v))
+
+    for side in ("left", "right"):
+        links = [
+            "torso_link",
+            f"{side}_shoulder_pitch_link",
+            f"{side}_shoulder_roll_link",
+            f"{side}_shoulder_yaw_link",
+            f"{side}_elbow_link",
+            f"{side}_wrist_roll_link",
+            f"{side}_wrist_pitch_link",
+            f"{side}_wrist_yaw_link",
+        ]
+        points = [project(link) for link in links]
+        for first, second in zip(points[:-1], points[1:]):
+            if first is not None and second is not None:
+                cv2.line(output, first, second, 255, max(1, int(arm_radius_px) * 2), cv2.LINE_AA)
+        for index, point in enumerate(points):
+            if point is not None:
+                radius = wrist_radius_px if index >= len(points) - 3 else arm_radius_px
+                cv2.circle(output, point, max(1, int(radius)), 255, -1, cv2.LINE_AA)
+    return output.astype(bool)
+
+
 def select_tracking_candidate(
     instances: list[dict[str, Any]],
     label: str,
@@ -397,6 +468,9 @@ class SegmentationRuntime:
         checkpoint: Path | None,
         inference_backend: str,
         tensorrt_config: dict[str, Any],
+        sam2_config: dict[str, Any],
+        efficienttam_config: dict[str, Any],
+        yolo11_config: dict[str, Any],
         intrinsics: CameraIntrinsics | None,
         t_torso_cam: np.ndarray | None,
         static_t_goal_cam: np.ndarray | None,
@@ -420,6 +494,9 @@ class SegmentationRuntime:
         self.checkpoint = checkpoint
         self.inference_backend = inference_backend
         self.tensorrt_config = tensorrt_config
+        self.sam2_config = sam2_config
+        self.efficienttam_config = efficienttam_config
+        self.yolo11_config = yolo11_config
         self.intrinsics = intrinsics
         self.t_torso_cam = t_torso_cam
         self.static_t_goal_cam = static_t_goal_cam
@@ -511,6 +588,7 @@ class SegmentationRuntime:
             "alignment_ready": False,
             "robot_state_delta_ms": None,
             "torso_transform": None,
+            "timing_ms": None,
             "thread_affinity": {},
             "tasc_belief": self.tasc_belief.last_telemetry,
         }
@@ -838,7 +916,7 @@ class SegmentationRuntime:
     def _auto_publish_target_locked(self) -> tuple[GoalPublisher | None, dict[str, Any] | None, np.ndarray | None, str | None]:
         if self.publisher is None:
             return None, None, None, None
-        if self.belief_publishing_enabled:
+        if getattr(self, "belief_publishing_enabled", False):
             now = time.monotonic()
             period = 1.0 / max(0.1, self.target_auto_publish_hz)
             if now - self.target_last_stream_publish_monotonic < period:
@@ -1068,6 +1146,46 @@ class SegmentationRuntime:
                 time.sleep(0.1)
 
     def _load_model(self):
+        if self.inference_backend == "yolo11-seg":
+            options = self.yolo11_config
+            return Yolo11SegBackend(
+                checkpoint=Path(options.get("checkpoint", "/models/yolo11/yolo11n-seg.pt")),
+                threshold=self.threshold,
+                min_area_px=self.min_area_px,
+                imgsz=int(options.get("imgsz", 640)),
+                confidence=float(options.get("confidence", 0.80)),
+                iou_threshold=float(options.get("iou_threshold", 0.50)),
+                max_masks=int(options.get("max_masks", 20)),
+                quantize=options.get("quantize", 16),
+                track=dict(options.get("track", {})),
+                allowed_classes=list(options.get("allowed_classes", [])),
+                excluded_classes=list(options.get("excluded_classes", ["person"])),
+                robot_exclusion=dict(options.get("robot_exclusion", {})),
+            )
+        if self.inference_backend == "sam2-tiny":
+            options = self.sam2_config
+            return Sam2HieraTinyBackend(
+                checkpoint=Path(options.get("checkpoint", "/models/sam2/sam2.1_hiera_tiny.pt")),
+                threshold=self.threshold,
+                min_area_px=self.min_area_px,
+                reinitialization=str(options.get("reinitialization", "central")),
+                reinitialize_interval_frames=int(options.get("reinitialize_interval_frames", 15)),
+                automatic_points_per_side=int(options.get("automatic_points_per_side", 8)),
+                max_masks=int(options.get("max_masks", 12)),
+                central=dict(options.get("central", {})),
+            )
+        if self.inference_backend == "efficienttam-ti-512":
+            options = self.efficienttam_config
+            return EfficientTamTi512Backend(
+                checkpoint=Path(options.get("checkpoint", "/models/efficienttam/efficienttam_ti_512x512.pt")),
+                threshold=self.threshold,
+                min_area_px=self.min_area_px,
+                reinitialization=str(options.get("reinitialization", "central")),
+                reinitialize_interval_frames=int(options.get("reinitialize_interval_frames", 15)),
+                automatic_points_per_side=int(options.get("automatic_points_per_side", 8)),
+                max_masks=int(options.get("max_masks", 12)),
+                central=dict(options.get("central", {})),
+            )
         if self.inference_backend == "tensorrt":
             return TensorRTSam3Backend(
                 engine_path=Path(self.tensorrt_config["engine"]),
@@ -1120,6 +1238,7 @@ class SegmentationRuntime:
                 time.sleep(delay)
             last_started = time.monotonic()
             try:
+                frame_started = time.perf_counter()
                 encoded = np.frombuffer(pair.rgb.jpeg, dtype=np.uint8)
                 image_bgr = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
                 if image_bgr is None:
@@ -1144,8 +1263,15 @@ class SegmentationRuntime:
                             calibration.color_width, calibration.color_height,
                             *calibration.color_intrinsics,
                         )
-                started = time.perf_counter()
-                masks, boxes, scores, labels = backend.infer(image_bgr, concepts)
+                preprocess_finished = time.perf_counter()
+                model_started = preprocess_finished
+                masks, boxes, scores, labels = backend.infer(
+                    image_bgr,
+                    concepts,
+                    depth_raw=depth,
+                    depth_scale_um=pair.depth.depth_scale_um,
+                )
+                model_finished = time.perf_counter()
                 if len(masks):
                     masks, boxes, scores, labels = suppress_duplicate_masks(
                         masks, boxes, scores, labels
@@ -1199,6 +1325,56 @@ class SegmentationRuntime:
                                     t_goal_cam = None
                             else:
                                 t_goal_cam = None
+                central_filter_status: dict[str, Any] | None = None
+                if (
+                    isinstance(backend, (Sam2HieraTinyBackend, EfficientTamTi512Backend))
+                    and not isinstance(backend, Yolo11SegBackend)
+                    and backend.reinitialization == "central"
+                    and len(masks)
+                    and frame_intrinsics is not None
+                ):
+                    source_options = (
+                        self.efficienttam_config if isinstance(backend, EfficientTamTi512Backend)
+                        else self.sam2_config
+                    )
+                    central_options = dict(source_options.get("central", {}))
+                    try:
+                        xyz_for_filter = deproject(
+                            depth,
+                            frame_intrinsics,
+                            pair.depth.depth_scale_um,
+                            self.min_depth_m,
+                            self.max_depth_m,
+                        )
+                        keep_indices, rejected = central_mask_geometry_filter(
+                            masks,
+                            xyz_for_filter,
+                            max_area_ratio=float(central_options.get("max_mask_area_ratio", 0.20)),
+                            max_center_distance_m=float(central_options.get("max_center_distance_m", 0.60)),
+                            plane_min_points=int(central_options.get("plane_min_points", 300)),
+                            plane_max_rms_m=float(central_options.get("plane_max_rms_m", 0.015)),
+                            support_normal_up_dot_min=float(central_options.get("support_normal_up_dot_min", 0.85)),
+                            t_goal_cam=t_goal_cam,
+                        )
+                        masks = masks[keep_indices]
+                        boxes = boxes[keep_indices]
+                        scores = scores[keep_indices]
+                        labels = [labels[int(index)] for index in keep_indices]
+                        central_filter_status = {
+                            "input_masks": int(len(keep_indices) + len(rejected)),
+                            "kept_masks": int(len(keep_indices)),
+                            "rejected": rejected,
+                        }
+                        # The first render happened before depth geometry was
+                        # available; redraw only the surviving central masks.
+                        overlay, objects = render_segmented_rgbd(
+                            image_bgr, depth, masks, boxes, scores, labels,
+                            pair.depth.depth_scale_um, self.min_depth_m, self.max_depth_m,
+                        )
+                    except Exception as error:
+                        geometry_runtime_error = (
+                            f"{geometry_runtime_error}; " if geometry_runtime_error else ""
+                        ) + f"central geometry filter unavailable: {error}"
                 belief_eef_position = None
                 belief_eef_velocity = None
                 belief_ray_origin = None
@@ -1361,16 +1537,86 @@ class SegmentationRuntime:
                     draw_belief_highlight(overlay, objects, belief_telemetry)
                 else:
                     belief_telemetry = {"enabled": False, "objects": [], "target": None}
-                latency_ms = (time.perf_counter() - started) * 1000.0
+                # Feed the *next* frame with a robot-state-guided point.  The
+                # transform and state were timestamp matched to this RGB-D
+                # pair above; delaying it by one inference period is safer
+                # than mixing an unsynchronized state into this frame.
+                if (
+                    isinstance(backend, (Sam2HieraTinyBackend, EfficientTamTi512Backend, Yolo11SegBackend))
+                    and belief_eef_position is not None
+                    and t_goal_cam is not None
+                    and frame_intrinsics is not None
+                ):
+                    rotation = np.asarray(t_goal_cam[:3, :3], dtype=np.float64)
+                    translation = np.asarray(t_goal_cam[:3, 3], dtype=np.float64)
+                    eef_camera = rotation.T @ (belief_eef_position - translation)
+                    if float(eef_camera[2]) > 1.0e-5:
+                        point_uv = np.asarray(
+                            [
+                                frame_intrinsics.fx * eef_camera[0] / eef_camera[2]
+                                + frame_intrinsics.cx,
+                                frame_intrinsics.fy * eef_camera[1] / eef_camera[2]
+                                + frame_intrinsics.cy,
+                            ],
+                            dtype=np.float32,
+                        )
+                        backend.set_robot_state_prompt(point_uv)
+                    else:
+                        backend.set_robot_state_prompt(None)
+                if isinstance(backend, (Sam2HieraTinyBackend, EfficientTamTi512Backend, Yolo11SegBackend)):
+                    backend.set_robot_exclusion_mask(None)
+                    if state_for_belief is not None and t_goal_cam is not None and frame_intrinsics is not None:
+                        try:
+                            if isinstance(backend, Yolo11SegBackend):
+                                exclusion_options = dict(self.yolo11_config.get("robot_exclusion", {}))
+                            else:
+                                model_options = (
+                                    self.efficienttam_config
+                                    if isinstance(backend, EfficientTamTi512Backend)
+                                    else self.sam2_config
+                                )
+                                exclusion_options = dict(model_options.get("central", {})).get(
+                                    "robot_exclusion", {}
+                                )
+                            robot_mask = projected_robot_arm_mask(
+                                state_for_belief.q,
+                                t_goal_cam,
+                                frame_intrinsics,
+                                height=image_bgr.shape[0],
+                                width=image_bgr.shape[1],
+                                arm_radius_px=int(exclusion_options.get("arm_radius_px", 22)),
+                                wrist_radius_px=int(exclusion_options.get("wrist_radius_px", 42)),
+                            )
+                            backend.set_robot_exclusion_mask(robot_mask)
+                        except Exception as error:
+                            geometry_runtime_error = (
+                                f"{geometry_runtime_error}; " if geometry_runtime_error else ""
+                            ) + f"robot exclusion FK unavailable: {error}"
+                postprocess_finished = time.perf_counter()
+                latency_ms = (postprocess_finished - model_started) * 1000.0
                 cv2.putText(
                     overlay,
-                    f"SAM3-{backend.name} {latency_ms:.0f}ms | {len(concepts)} concepts | pair {pair.delta_us / 1000:.1f}ms",
+                    f"{backend.name} {latency_ms:.0f}ms | {len(masks)} masks | pair {pair.delta_us / 1000:.1f}ms",
                     (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                     (255, 255, 255), 2, cv2.LINE_AA,
                 )
                 ok, jpeg = cv2.imencode(".jpg", overlay, [cv2.IMWRITE_JPEG_QUALITY, 88])
                 if not ok:
                     raise RuntimeError("overlay JPEG encoding failed")
+                frame_finished = time.perf_counter()
+                timing_ms = {
+                    "jpeg_decode_depth_align": round(
+                        (preprocess_finished - frame_started) * 1000.0, 2
+                    ),
+                    "yolo_model": round((model_finished - model_started) * 1000.0, 2),
+                    "rgbd_belief_overlay": round(
+                        (postprocess_finished - model_finished) * 1000.0, 2
+                    ),
+                    "web_jpeg_encode": round(
+                        (frame_finished - postprocess_finished) * 1000.0, 2
+                    ),
+                    "end_to_end": round((frame_finished - frame_started) * 1000.0, 2),
+                }
                 auto_publisher = None
                 auto_payload = None
                 auto_position = None
@@ -1382,7 +1628,9 @@ class SegmentationRuntime:
                     self.status["backend_metadata"] = backend.metadata
                     self.status["last_frame_ts"] = pair.rgb.timestamp_us
                     self.status["last_inference_ms"] = round(latency_ms, 2)
+                    self.status["timing_ms"] = timing_ms
                     self.status["instances"] = objects
+                    self.status["central_mask_filter"] = central_filter_status
                     self.status["geometry_runtime_error"] = geometry_runtime_error
                     self.status["alignment_ready"] = pair.depth.source == DEPTH_SOURCE_ALIGNED_TO_COLOR or (
                         pair.depth.source == DEPTH_SOURCE_RAW_DEPTH_OPTICAL and calibration is not None
@@ -1523,7 +1771,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-area-px", type=int, default=None)
     parser.add_argument("--allow-unaligned", action="store_true")
     parser.add_argument("--checkpoint", type=Path, default=None)
-    parser.add_argument("--backend", choices=("pytorch", "tensorrt"), default=None)
+    parser.add_argument("--backend", choices=("pytorch", "tensorrt", "sam2-tiny", "efficienttam-ti-512", "yolo11-seg"), default=None)
     parser.add_argument("--engine", type=Path, default=None)
     parser.add_argument(
         "--enable-ee-publishing",
@@ -1577,6 +1825,9 @@ def main() -> int:
     depth_config = config.get("depth", {})
     segmentation_config = config.get("segmentation", {})
     tensorrt_config = dict(segmentation_config.get("tensorrt", {}))
+    sam2_config = dict(segmentation_config.get("sam2", {}))
+    efficienttam_config = dict(segmentation_config.get("efficienttam", {}))
+    yolo11_config = dict(segmentation_config.get("yolo11", {}))
     target_config = config.get("ee_target", {})
     belief_config = config.get("tasc_belief", {})
     concepts = segmentation_config.get("concepts") or []
@@ -1635,6 +1886,9 @@ def main() -> int:
         checkpoint=checkpoint,
         inference_backend=inference_backend,
         tensorrt_config=tensorrt_config,
+        sam2_config=sam2_config,
+        efficienttam_config=efficienttam_config,
+        yolo11_config=yolo11_config,
         intrinsics=intrinsics,
         t_torso_cam=t_torso_cam,
         static_t_goal_cam=static_t_goal_cam,

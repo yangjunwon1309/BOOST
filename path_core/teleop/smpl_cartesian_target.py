@@ -23,7 +23,7 @@ NECK = 12
 @dataclass(frozen=True)
 class SmplCartesianTargetConfig:
     scale_xyz: tuple[float, float, float] = (0.85, 0.85, 0.85)
-    displacement_sign: float = -1.0
+    displacement_sign: float = 1.0
     ema_alpha: float = 0.35
     max_velocity_m_s: float = 0.25
     max_acceleration_m_s2: float = 1.5
@@ -321,4 +321,3 @@ class SmplCartesianTargetTracker:
         self._last_frame_index = output.frame_index
         self._last_targets = output
         return output
-

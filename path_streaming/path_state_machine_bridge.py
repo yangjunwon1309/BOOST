@@ -133,7 +133,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--smpl-scale-x", type=float, default=0.85)
     parser.add_argument("--smpl-scale-y", type=float, default=0.85)
     parser.add_argument("--smpl-scale-z", type=float, default=0.85)
-    parser.add_argument("--smpl-displacement-sign", type=float, default=-1.0)
+    parser.add_argument("--smpl-displacement-sign", type=float, default=1.0)
     parser.add_argument("--smpl-target-ema-alpha", type=float, default=0.35)
     parser.add_argument("--smpl-target-max-velocity-m-s", type=float, default=0.25)
     parser.add_argument("--smpl-target-max-acceleration-m-s2", type=float, default=1.5)
@@ -294,6 +294,28 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--arm-ik-max-iter", type=int, default=30)
     parser.add_argument("--arm-ik-ee-offset-m", type=float, default=0.05)
+    parser.add_argument(
+        "--arm-ik-orientation-full-error-m", type=float, default=0.01
+    )
+    parser.add_argument(
+        "--arm-ik-orientation-zero-error-m", type=float, default=0.03
+    )
+    parser.add_argument(
+        "--arm-ik-orientation-min-scale", type=float, default=1.0e-3
+    )
+    parser.add_argument(
+        "--arm-ik-residual-projection-threshold-m",
+        type=float,
+        default=0.03,
+    )
+    parser.add_argument(
+        "--arm-ik-residual-success-threshold-m",
+        type=float,
+        default=0.05,
+    )
+    parser.add_argument(
+        "--arm-ik-projection-step-m", type=float, default=0.05
+    )
     parser.add_argument(
         "--arm-ik-smooth-filter",
         action=argparse.BooleanOptionalAction,
@@ -678,6 +700,29 @@ def latest_q_from_robot_state(payload: dict | None) -> np.ndarray | None:
         arr = np.asarray(q, dtype=np.float64).reshape(-1)
         if arr.shape[0] >= 29 and np.isfinite(arr[:29]).all():
             return arr[:29].copy()
+    return None
+
+
+def latest_base_quat_from_robot_state(
+    payload: dict | None,
+) -> np.ndarray | None:
+    if not payload:
+        return None
+    for key in (
+        "base_quat_measured",
+        "base_quat",
+        "state_base_quat_measured",
+        "state_base_quat",
+    ):
+        value = payload.get(key)
+        if value is None:
+            continue
+        quat = np.asarray(value, dtype=np.float64).reshape(-1)
+        if quat.shape[0] < 4 or not np.isfinite(quat[:4]).all():
+            continue
+        norm = float(np.linalg.norm(quat[:4]))
+        if norm > 1.0e-8:
+            return quat[:4].copy() / norm
     return None
 
 
@@ -1106,11 +1151,26 @@ def main() -> int:
             max_iter=args.arm_ik_max_iter,
             ee_offset_m=args.arm_ik_ee_offset_m,
             use_smooth_filter=args.arm_ik_smooth_filter,
+            orientation_full_error_m=args.arm_ik_orientation_full_error_m,
+            orientation_zero_error_m=args.arm_ik_orientation_zero_error_m,
+            orientation_min_scale=args.arm_ik_orientation_min_scale,
+            residual_projection_threshold_m=(
+                args.arm_ik_residual_projection_threshold_m
+            ),
+            residual_success_threshold_m=(
+                args.arm_ik_residual_success_threshold_m
+            ),
+            projection_step_m=args.arm_ik_projection_step_m,
         )
         log(
             "Unitree-style arm nonlinear IK enabled: "
             f"urdf={args.arm_ik_urdf}, max_iter={args.arm_ik_max_iter}, "
-            f"hard_lock_inactive={args.arm_ik_hard_lock_inactive_arm}"
+            f"hard_lock_inactive={args.arm_ik_hard_lock_inactive_arm}, "
+            f"orientation={100.0 * args.arm_ik_orientation_full_error_m:.1f}-"
+            f"{100.0 * args.arm_ik_orientation_zero_error_m:.1f}cm, "
+            f"residual_project/success="
+            f"{100.0 * args.arm_ik_residual_projection_threshold_m:.1f}/"
+            f"{100.0 * args.arm_ik_residual_success_threshold_m:.1f}cm"
         )
 
     current_state = args.state
@@ -1130,6 +1190,9 @@ def main() -> int:
     active_plan_us = 0
     active_plan_s: float | None = None
     latest_robot_q: np.ndarray | None = None
+    latest_robot_base_quat = np.array(
+        [1.0, 0.0, 0.0, 0.0], dtype=np.float64
+    )
     latest_robot_state_us = 0
     latest_pose_raw: bytes | None = None
     latest_pose_us = 0
@@ -1241,11 +1304,19 @@ def main() -> int:
             left_target_tf=np.asarray(left_target_tf, dtype=np.float64),
             right_target_tf=np.asarray(right_target_tf, dtype=np.float64),
             q_seed29=q_seed,
+            base_quaternion_wxyz=latest_robot_base_quat,
         )
         last_arm_ik_solve_ms = float(result.solve_time_ms)
         last_arm_ik_error_m = float(result.position_error_m)
         last_arm_ik_rot_error_rad = float(result.rotation_error_rad)
-        last_arm_ik_status = "ok" if result.success else str(result.message)
+        last_arm_ik_status = (
+            f"{result.message} "
+            f"L/R={100.0 * result.left_position_error_m:.1f}/"
+            f"{100.0 * result.right_position_error_m:.1f}cm "
+            f"ori_w={result.left_orientation_weight_scale:.3f}/"
+            f"{result.right_orientation_weight_scale:.3f} "
+            f"projected={int(result.target_projected)}"
+        )
         if result.success:
             result.q_ref[:15] = 0.0
             # Lower body remains SONIC-owned. Preserve waist and arm gravity
@@ -1763,6 +1834,11 @@ def main() -> int:
                     if q_robot is not None:
                         latest_robot_q = q_robot
                         latest_robot_state_us = tick_us
+                    base_quat = latest_base_quat_from_robot_state(
+                        latest_robot_state
+                    )
+                    if base_quat is not None:
+                        latest_robot_base_quat = base_quat
             except zmq.Again:
                 pass
 
@@ -1946,7 +2022,7 @@ def main() -> int:
                             arm_ik_solve_ms=float(ik_result.solve_time_ms),
                             arm_ik_position_error_m=float(ik_result.position_error_m),
                             arm_ik_rotation_error_rad=float(ik_result.rotation_error_rad),
-                            arm_ik_status="ok",
+                            arm_ik_status=str(last_arm_ik_status),
                         )
                     else:
                         qp_payload = qp_none_reference(
@@ -2120,7 +2196,7 @@ def main() -> int:
                                     arm_ik_rotation_error_rad=float(
                                         ik_result.rotation_error_rad
                                     ),
-                                    arm_ik_status="ok",
+                                    arm_ik_status=str(last_arm_ik_status),
                                     shared_control=True,
                                     shared_gate_reason=result.gate_reason,
                                 )
@@ -2156,7 +2232,7 @@ def main() -> int:
                                     arm_ik_rotation_error_rad=float(
                                         ik_result.rotation_error_rad
                                     ),
-                                    arm_ik_status="ok",
+                                    arm_ik_status=str(last_arm_ik_status),
                                     shared_control=True,
                                     shared_alpha=float(result.alpha),
                                     shared_alpha_raw=float(result.alpha_raw),
@@ -2307,11 +2383,19 @@ def main() -> int:
                                 q_seed29=ik_seed,
                                 q_hold29=static_target_hold_q,
                                 hard_lock_inactive_arm=args.arm_ik_hard_lock_inactive_arm,
+                                base_quaternion_wxyz=latest_robot_base_quat,
                             )
                             last_arm_ik_solve_ms = ik_result.solve_time_ms
                             last_arm_ik_error_m = ik_result.position_error_m
                             last_arm_ik_rot_error_rad = ik_result.rotation_error_rad
-                            last_arm_ik_status = "ok" if ik_result.success else ik_result.message
+                            last_arm_ik_status = (
+                                f"{ik_result.message} "
+                                f"L/R={100.0 * ik_result.left_position_error_m:.1f}/"
+                                f"{100.0 * ik_result.right_position_error_m:.1f}cm "
+                                f"ori_w={ik_result.left_orientation_weight_scale:.3f}/"
+                                f"{ik_result.right_orientation_weight_scale:.3f} "
+                                f"projected={int(ik_result.target_projected)}"
+                            )
                             arm_ik_cached_revision = static_target_revision
                             arm_ik_cached_feasible = bool(ik_result.success)
                             arm_ik_cached_source = (

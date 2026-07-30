@@ -18,6 +18,7 @@ python -u path_streaming/path_state_machine_bridge.py \
   --smpl-scale-x "${PATH_SMPL_SCALE_X:-0.85}" \
   --smpl-scale-y "${PATH_SMPL_SCALE_Y:-0.85}" \
   --smpl-scale-z "${PATH_SMPL_SCALE_Z:-0.85}" \
+  --smpl-displacement-sign "${PATH_SMPL_DISPLACEMENT_SIGN:-1.0}" \
   --smpl-target-ema-alpha "${PATH_SMPL_TARGET_EMA_ALPHA:-0.35}" \
   --smpl-target-max-velocity-m-s "${PATH_SMPL_TARGET_MAX_VELOCITY_M_S:-0.25}" \
   --smpl-target-max-acceleration-m-s2 "${PATH_SMPL_TARGET_MAX_ACCELERATION_M_S2:-1.5}" \
@@ -56,6 +57,12 @@ python -u path_streaming/path_state_machine_bridge.py \
   --arm-ik-model-dir "${PATH_ARM_IK_MODEL_DIR:-/home/url/00_workspace/xr_teleop/assets/g1}" \
   --arm-ik-max-iter "${PATH_ARM_IK_MAX_ITER:-30}" \
   --arm-ik-ee-offset-m "${PATH_ARM_IK_EE_OFFSET_M:-0.05}" \
+  --arm-ik-orientation-full-error-m "${PATH_ARM_IK_ORIENTATION_FULL_ERROR_M:-0.01}" \
+  --arm-ik-orientation-zero-error-m "${PATH_ARM_IK_ORIENTATION_ZERO_ERROR_M:-0.03}" \
+  --arm-ik-orientation-min-scale "${PATH_ARM_IK_ORIENTATION_MIN_SCALE:-0.001}" \
+  --arm-ik-residual-projection-threshold-m "${PATH_ARM_IK_RESIDUAL_PROJECTION_THRESHOLD_M:-0.03}" \
+  --arm-ik-residual-success-threshold-m "${PATH_ARM_IK_RESIDUAL_SUCCESS_THRESHOLD_M:-0.05}" \
+  --arm-ik-projection-step-m "${PATH_ARM_IK_PROJECTION_STEP_M:-0.05}" \
   ${PATH_AUTO_CLEAR_ON_TARGET_REACHED:+--auto-clear-on-target-reached} \
   ${PATH_CLEAR_PLAN_AFTER_TOTAL_DURATION:+--clear-plan-after-total-duration} \
   "$@"

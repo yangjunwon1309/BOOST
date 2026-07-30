@@ -118,6 +118,13 @@ class ArmIkResult:
     position_error_m: float
     rotation_error_rad: float
     message: str = "ok"
+    left_position_error_m: float = float("inf")
+    right_position_error_m: float = float("inf")
+    left_rotation_error_rad: float = float("inf")
+    right_rotation_error_rad: float = float("inf")
+    left_orientation_weight_scale: float = 0.0
+    right_orientation_weight_scale: float = 0.0
+    target_projected: bool = False
 
 
 def quat_wxyz_to_rot(quat_wxyz: np.ndarray) -> np.ndarray:
@@ -231,6 +238,12 @@ class UnitreeG1ArmNonlinearIK:
         smooth_weight: float = 0.1,
         ee_offset_m: float = 0.05,
         use_smooth_filter: bool = True,
+        orientation_full_error_m: float = 0.01,
+        orientation_zero_error_m: float = 0.03,
+        orientation_min_scale: float = 1.0e-3,
+        residual_projection_threshold_m: float = 0.03,
+        residual_success_threshold_m: float = 0.05,
+        projection_step_m: float = 0.05,
     ) -> None:
         if casadi is None:
             raise RuntimeError(
@@ -355,13 +368,17 @@ class UnitreeG1ArmNonlinearIK:
         self.param_upper = self.opti.parameter(self.reduced_robot.model.nq)
         self.param_tf_l = self.opti.parameter(4, 4)
         self.param_tf_r = self.opti.parameter(4, 4)
+        self.param_orientation_scale_l = self.opti.parameter()
+        self.param_orientation_scale_r = self.opti.parameter()
 
         translational_cost = casadi.sumsqr(
             self.translational_error(self.var_q, self.param_tf_l, self.param_tf_r)
         )
-        rotation_cost = casadi.sumsqr(
-            self.rotational_error(self.var_q, self.param_tf_l, self.param_tf_r)
+        rotation_error = self.rotational_error(
+            self.var_q, self.param_tf_l, self.param_tf_r
         )
+        left_rotation_cost = casadi.sumsqr(rotation_error[:3])
+        right_rotation_cost = casadi.sumsqr(rotation_error[3:])
         regularization_cost = casadi.sumsqr(self.var_q)
         smooth_cost = casadi.sumsqr(self.var_q - self.var_q_last)
         self.opti.subject_to(
@@ -369,7 +386,11 @@ class UnitreeG1ArmNonlinearIK:
         )
         self.opti.minimize(
             position_weight * translational_cost
-            + orientation_weight * rotation_cost
+            + orientation_weight
+            * (
+                self.param_orientation_scale_l * left_rotation_cost
+                + self.param_orientation_scale_r * right_rotation_cost
+            )
             + regularization_weight * regularization_cost
             + smooth_weight * smooth_cost
         )
@@ -397,6 +418,14 @@ class UnitreeG1ArmNonlinearIK:
         self.use_smooth_filter = bool(use_smooth_filter)
         self.filter_weights = np.array([0.4, 0.3, 0.2, 0.1], dtype=np.float64)
         self.filter_buffer: list[np.ndarray] = []
+        self.orientation_full_error_m = float(orientation_full_error_m)
+        self.orientation_zero_error_m = float(orientation_zero_error_m)
+        self.orientation_min_scale = float(orientation_min_scale)
+        self.residual_projection_threshold_m = float(
+            residual_projection_threshold_m
+        )
+        self.residual_success_threshold_m = float(residual_success_threshold_m)
+        self.projection_step_m = float(projection_step_m)
 
     def _joint_chain_to_root(self, joint_id: int) -> list[int]:
         chain: list[int] = []
@@ -467,18 +496,34 @@ class UnitreeG1ArmNonlinearIK:
         right[:3, 3] = self.full_data.oMf[self.full_right_frame_id].translation
         return left, right
 
-    def gravity_torque_from_q29(self, q29: np.ndarray) -> np.ndarray:
-        """Return full-model gravity compensation in G1 hardware joint order."""
+    def gravity_torque_from_q29(
+        self,
+        q29: np.ndarray,
+        base_quaternion_wxyz: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Return base-oriented gravity compensation in G1 hardware order."""
 
         q_full = np.zeros(self.robot.model.nq, dtype=np.float64)
         q_full[self.full_q_indices] = np.asarray(q29, dtype=np.float64).reshape(29)
-        tau_full = pin.rnea(
-            self.robot.model,
-            self.full_data,
-            q_full,
-            np.zeros(self.robot.model.nv, dtype=np.float64),
-            np.zeros(self.robot.model.nv, dtype=np.float64),
-        )
+        original_gravity = self.robot.model.gravity.linear.copy()
+        if base_quaternion_wxyz is not None:
+            # The IMU quaternion rotates pelvis-frame vectors into world.
+            # R_world_pelvis.T therefore expresses world gravity in pelvis.
+            rotation_world_pelvis = quat_wxyz_to_rot(base_quaternion_wxyz)
+            self.robot.model.gravity.linear = (
+                rotation_world_pelvis.T
+                @ np.array([0.0, 0.0, -9.81], dtype=np.float64)
+            )
+        try:
+            tau_full = pin.rnea(
+                self.robot.model,
+                self.full_data,
+                q_full,
+                np.zeros(self.robot.model.nv, dtype=np.float64),
+                np.zeros(self.robot.model.nv, dtype=np.float64),
+            )
+        finally:
+            self.robot.model.gravity.linear = original_gravity
         return np.asarray(tau_full, dtype=np.float64)[self.full_v_indices].copy()
 
     def _filtered(self, q: np.ndarray) -> np.ndarray:
@@ -493,6 +538,93 @@ class UnitreeG1ArmNonlinearIK:
             total += weight
         return out / max(total, 1.0e-9)
 
+    def _orientation_scale(self, position_error_m: float) -> float:
+        """Smoothly restore orientation only after position is within 3 cm."""
+
+        low = self.orientation_full_error_m
+        high = max(self.orientation_zero_error_m, low + 1.0e-6)
+        if position_error_m <= low:
+            return 1.0
+        if position_error_m >= high:
+            return self.orientation_min_scale
+        x = (high - position_error_m) / (high - low)
+        smooth = x * x * (3.0 - 2.0 * x)
+        return self.orientation_min_scale + (
+            1.0 - self.orientation_min_scale
+        ) * smooth
+
+    def _solution_metrics(
+        self,
+        q_ref: np.ndarray,
+        left_target_tf: np.ndarray,
+        right_target_tf: np.ndarray,
+    ) -> tuple[float, float, float, float]:
+        solved_left, solved_right = self.wrist_transforms_from_q29(q_ref)
+        left_position_error = float(
+            np.linalg.norm(solved_left[:3, 3] - left_target_tf[:3, 3])
+        )
+        right_position_error = float(
+            np.linalg.norm(solved_right[:3, 3] - right_target_tf[:3, 3])
+        )
+        left_rotation_error = float(
+            np.linalg.norm(
+                pin.log3(solved_left[:3, :3] @ left_target_tf[:3, :3].T)
+            )
+        )
+        right_rotation_error = float(
+            np.linalg.norm(
+                pin.log3(solved_right[:3, :3] @ right_target_tf[:3, :3].T)
+            )
+        )
+        return (
+            left_position_error,
+            right_position_error,
+            left_rotation_error,
+            right_rotation_error,
+        )
+
+    def _project_target_from_current(
+        self,
+        current_tf: np.ndarray,
+        requested_tf: np.ndarray,
+    ) -> np.ndarray:
+        projected = np.asarray(requested_tf, dtype=np.float64).copy()
+        delta = requested_tf[:3, 3] - current_tf[:3, 3]
+        distance = float(np.linalg.norm(delta))
+        if distance > self.projection_step_m > 0.0:
+            projected[:3, 3] = (
+                current_tf[:3, 3]
+                + delta * (self.projection_step_m / distance)
+            )
+        return projected
+
+    def _solve_once(
+        self,
+        *,
+        left_target_tf: np.ndarray,
+        right_target_tf: np.ndarray,
+        q_last: np.ndarray,
+        lower: np.ndarray,
+        upper: np.ndarray,
+        initial: np.ndarray,
+        left_orientation_scale: float,
+        right_orientation_scale: float,
+    ) -> np.ndarray:
+        self.opti.set_initial(self.var_q, np.clip(initial, lower, upper))
+        self.opti.set_value(self.var_q_last, q_last)
+        self.opti.set_value(self.param_lower, lower)
+        self.opti.set_value(self.param_upper, upper)
+        self.opti.set_value(self.param_tf_l, left_target_tf)
+        self.opti.set_value(self.param_tf_r, right_target_tf)
+        self.opti.set_value(
+            self.param_orientation_scale_l, float(left_orientation_scale)
+        )
+        self.opti.set_value(
+            self.param_orientation_scale_r, float(right_orientation_scale)
+        )
+        sol = self.opti.solve()
+        return np.asarray(sol.value(self.var_q), dtype=np.float64).reshape(14)
+
     def _solve_transforms(
         self,
         *,
@@ -501,6 +633,7 @@ class UnitreeG1ArmNonlinearIK:
         q_seed29: np.ndarray,
         lower: np.ndarray | None = None,
         upper: np.ndarray | None = None,
+        base_quaternion_wxyz: np.ndarray | None = None,
     ) -> ArmIkResult:
         """Solve both arm joint vectors against explicit pelvis-local EE poses."""
 
@@ -512,45 +645,141 @@ class UnitreeG1ArmNonlinearIK:
         upper = self.upper.copy() if upper is None else np.asarray(upper, dtype=np.float64).copy()
         q_last = self.q29_to_arm_q(q_seed29)
 
-        self.opti.set_initial(self.var_q, np.clip(self.init_data, lower, upper))
-        self.opti.set_value(self.var_q_last, q_last)
-        self.opti.set_value(self.param_lower, lower)
-        self.opti.set_value(self.param_upper, upper)
-        self.opti.set_value(self.param_tf_l, left_target_tf)
-        self.opti.set_value(self.param_tf_r, right_target_tf)
-
         try:
-            sol = self.opti.solve()
-            arm_q = np.asarray(sol.value(self.var_q), dtype=np.float64).reshape(14)
-            arm_q = self._filtered(arm_q)
+            current_left, current_right = self.wrist_transforms_from_q29(q_seed29)
+            left_request_distance = float(
+                np.linalg.norm(current_left[:3, 3] - left_target_tf[:3, 3])
+            )
+            right_request_distance = float(
+                np.linalg.norm(current_right[:3, 3] - right_target_tf[:3, 3])
+            )
+            left_orientation_scale = self._orientation_scale(
+                left_request_distance
+            )
+            right_orientation_scale = self._orientation_scale(
+                right_request_distance
+            )
+            arm_q = self._solve_once(
+                left_target_tf=left_target_tf,
+                right_target_tf=right_target_tf,
+                q_last=q_last,
+                lower=lower,
+                upper=upper,
+                initial=self.init_data,
+                left_orientation_scale=left_orientation_scale,
+                right_orientation_scale=right_orientation_scale,
+            )
+            q_raw = self.arm_q_to_q29(q_seed29, arm_q)
+            first_metrics = self._solution_metrics(
+                q_raw, left_target_tf, right_target_tf
+            )
+
+            target_projected = (
+                first_metrics[0] > self.residual_projection_threshold_m
+                or first_metrics[1] > self.residual_projection_threshold_m
+            )
+            applied_left_tf = left_target_tf
+            applied_right_tf = right_target_tf
+            if target_projected:
+                if first_metrics[0] > self.residual_projection_threshold_m:
+                    applied_left_tf = self._project_target_from_current(
+                        current_left, left_target_tf
+                    )
+                if first_metrics[1] > self.residual_projection_threshold_m:
+                    applied_right_tf = self._project_target_from_current(
+                        current_right, right_target_tf
+                    )
+                left_projected_distance = float(
+                    np.linalg.norm(
+                        current_left[:3, 3] - applied_left_tf[:3, 3]
+                    )
+                )
+                right_projected_distance = float(
+                    np.linalg.norm(
+                        current_right[:3, 3] - applied_right_tf[:3, 3]
+                    )
+                )
+                left_orientation_scale = self._orientation_scale(
+                    left_projected_distance
+                )
+                right_orientation_scale = self._orientation_scale(
+                    right_projected_distance
+                )
+                arm_q = self._solve_once(
+                    left_target_tf=applied_left_tf,
+                    right_target_tf=applied_right_tf,
+                    q_last=q_last,
+                    lower=lower,
+                    upper=upper,
+                    initial=arm_q,
+                    left_orientation_scale=left_orientation_scale,
+                    right_orientation_scale=right_orientation_scale,
+                )
+
+            q_raw = self.arm_q_to_q29(q_seed29, arm_q)
+            raw_metrics = self._solution_metrics(
+                q_raw, applied_left_tf, applied_right_tf
+            )
+            filtered_arm_q = self._filtered(arm_q)
+            q_ref = self.arm_q_to_q29(q_seed29, filtered_arm_q)
+            filtered_metrics = self._solution_metrics(
+                q_ref, applied_left_tf, applied_right_tf
+            )
+            # The moving-average filter must never turn a feasible position
+            # solution into a failed command. The target stream already has
+            # velocity/acceleration limits, so use the raw smooth-cost solution.
+            if (
+                max(filtered_metrics[:2]) > self.residual_success_threshold_m
+                and max(raw_metrics[:2]) <= self.residual_success_threshold_m
+            ):
+                q_ref = q_raw
+                filtered_metrics = raw_metrics
+                self.filter_buffer = [arm_q.copy()]
+
             self.init_data = arm_q.copy()
-            q_ref = self.arm_q_to_q29(q_seed29, arm_q)
             q_ref[12:15] = 0.0
-            tau_ff = self.gravity_torque_from_q29(q_ref)
+            tau_ff = self.gravity_torque_from_q29(
+                q_ref, base_quaternion_wxyz=base_quaternion_wxyz
+            )
             # Legs remain under SONIC. PATH supplies only identity-waist and
             # arm gravity compensation.
             tau_ff[:12] = 0.0
 
-            solved_left, solved_right = self.wrist_transforms_from_q29(q_ref)
-            position_error = max(
-                float(np.linalg.norm(solved_left[:3, 3] - left_target_tf[:3, 3])),
-                float(np.linalg.norm(solved_right[:3, 3] - right_target_tf[:3, 3])),
-            )
-            rotation_error = max(
-                float(np.linalg.norm(pin.log3(
-                    solved_left[:3, :3] @ left_target_tf[:3, :3].T
-                ))),
-                float(np.linalg.norm(pin.log3(
-                    solved_right[:3, :3] @ right_target_tf[:3, :3].T
-                ))),
+            (
+                left_position_error,
+                right_position_error,
+                left_rotation_error,
+                right_rotation_error,
+            ) = filtered_metrics
+            position_error = max(left_position_error, right_position_error)
+            rotation_error = max(left_rotation_error, right_rotation_error)
+            success = position_error <= self.residual_success_threshold_m
+            message = (
+                "ok_projected"
+                if success and target_projected
+                else "ok"
+                if success
+                else (
+                    "ee_residual_exceeded:"
+                    f"left={left_position_error:.4f}m,"
+                    f"right={right_position_error:.4f}m"
+                )
             )
             return ArmIkResult(
-                success=True,
+                success=success,
                 q_ref=q_ref,
                 tau_ff_ref=tau_ff,
                 solve_time_ms=(time.perf_counter() - started) * 1000.0,
                 position_error_m=position_error,
                 rotation_error_rad=rotation_error,
+                message=message,
+                left_position_error_m=left_position_error,
+                right_position_error_m=right_position_error,
+                left_rotation_error_rad=left_rotation_error,
+                right_rotation_error_rad=right_rotation_error,
+                left_orientation_weight_scale=left_orientation_scale,
+                right_orientation_weight_scale=right_orientation_scale,
+                target_projected=target_projected,
             )
         except Exception as exc:
             return ArmIkResult(
@@ -569,6 +798,7 @@ class UnitreeG1ArmNonlinearIK:
         left_target_tf: np.ndarray,
         right_target_tf: np.ndarray,
         q_seed29: np.ndarray,
+        base_quaternion_wxyz: np.ndarray | None = None,
     ) -> ArmIkResult:
         """Solve the authoritative 14-DoF arm target used by PATH q/e modes."""
 
@@ -576,6 +806,7 @@ class UnitreeG1ArmNonlinearIK:
             left_target_tf=left_target_tf,
             right_target_tf=right_target_tf,
             q_seed29=q_seed29,
+            base_quaternion_wxyz=base_quaternion_wxyz,
         )
 
     def solve_gmr_reference(
@@ -585,6 +816,7 @@ class UnitreeG1ArmNonlinearIK:
         q_seed29: np.ndarray,
         left_position_override: np.ndarray | None = None,
         right_position_override: np.ndarray | None = None,
+        base_quaternion_wxyz: np.ndarray | None = None,
     ) -> ArmIkResult:
         """Solve GMR EE poses, optionally replacing only an e-mode position."""
 
@@ -597,6 +829,7 @@ class UnitreeG1ArmNonlinearIK:
             left_target_tf=left_tf,
             right_target_tf=right_tf,
             q_seed29=q_seed29,
+            base_quaternion_wxyz=base_quaternion_wxyz,
         )
 
     def solve_single_target(
@@ -608,6 +841,7 @@ class UnitreeG1ArmNonlinearIK:
         q_seed29: np.ndarray,
         q_hold29: np.ndarray,
         hard_lock_inactive_arm: bool = True,
+        base_quaternion_wxyz: np.ndarray | None = None,
     ) -> ArmIkResult:
         q_seed29 = np.asarray(q_seed29, dtype=np.float64).reshape(29)
         q_hold29 = np.asarray(q_hold29, dtype=np.float64).reshape(29)
@@ -637,4 +871,5 @@ class UnitreeG1ArmNonlinearIK:
             q_seed29=q_seed29,
             lower=lower,
             upper=upper,
+            base_quaternion_wxyz=base_quaternion_wxyz,
         )

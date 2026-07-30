@@ -42,15 +42,28 @@ def apply_translation_action(
     )
 
 
-def robust_standardize(values: np.ndarray, eps: float = 1.0e-6) -> np.ndarray:
+def robust_standardize(
+    values: np.ndarray,
+    eps: float = 1.0e-6,
+    *,
+    min_signal_spread: float = 0.002,
+    scale_floor: float = 0.01,
+    clip: float = 2.0,
+) -> np.ndarray:
     arr = np.asarray(values, dtype=np.float64).reshape(-1)
     if arr.size <= 1 or not np.isfinite(arr).all():
         return np.zeros_like(arr)
     median = float(np.median(arr))
+    spread = float(np.max(arr) - np.min(arr))
+    if spread < max(0.0, float(min_signal_spread)):
+        return np.zeros_like(arr)
     mad = float(np.median(np.abs(arr - median)))
-    if mad < eps:
-        return arr - median
-    return (arr - median) / (1.4826 * mad + eps)
+    scale = max(1.4826 * mad, float(scale_floor), eps)
+    standardized = (arr - median) / scale
+    clip_limit = float(clip)
+    if clip_limit > 0.0 and np.isfinite(clip_limit):
+        standardized = np.clip(standardized, -clip_limit, clip_limit)
+    return standardized
 
 
 def logsumexp(values: np.ndarray) -> float:

@@ -500,13 +500,23 @@ class UnitreeG1ArmNonlinearIK:
         self,
         q29: np.ndarray,
         base_quaternion_wxyz: np.ndarray | None = None,
+        gravity_direction_pelvis: np.ndarray | None = None,
     ) -> np.ndarray:
         """Return base-oriented gravity compensation in G1 hardware order."""
 
         q_full = np.zeros(self.robot.model.nq, dtype=np.float64)
         q_full[self.full_q_indices] = np.asarray(q29, dtype=np.float64).reshape(29)
         original_gravity = self.robot.model.gravity.linear.copy()
-        if base_quaternion_wxyz is not None:
+        if gravity_direction_pelvis is not None:
+            gravity_direction = np.asarray(
+                gravity_direction_pelvis, dtype=np.float64
+            ).reshape(3)
+            norm = float(np.linalg.norm(gravity_direction))
+            if norm > 1.0e-8 and np.isfinite(gravity_direction).all():
+                self.robot.model.gravity.linear = (
+                    9.81 * gravity_direction / norm
+                )
+        elif base_quaternion_wxyz is not None:
             # The IMU quaternion rotates pelvis-frame vectors into world.
             # R_world_pelvis.T therefore expresses world gravity in pelvis.
             rotation_world_pelvis = quat_wxyz_to_rot(base_quaternion_wxyz)

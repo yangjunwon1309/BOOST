@@ -122,6 +122,7 @@ protected:
      *   body_q_target          | 29   | Target joint positions (MuJoCo order).
      *   base_trans_measured    |  3   | Measured base translation (fixed default).
      *   base_quat_measured     |  4   | Measured base quaternion from IMU.
+     *   base_accel_measured    |  3   | Measured base accelerometer in the IMU/pelvis frame.
      *   body_q_measured        | 29   | Measured joint positions (MuJoCo order + default offsets).
      *   left_hand_q_measured   |  7   | Left-hand Dex3 joint positions.
      *   right_hand_q_measured  |  7   | Right-hand Dex3 joint positions.
@@ -150,6 +151,7 @@ protected:
         static const std::string kBodyQTarget = "body_q_target";
         static const std::string kBaseTransMeasured = "base_trans_measured";
         static const std::string kBaseQuatMeasured = "base_quat_measured";
+        static const std::string kBaseAccelMeasured = "base_accel_measured";
         static const std::string kBodyQMeasured = "body_q_measured";
         static const std::string kLeftHandQMeasured = "left_hand_q_measured";
         static const std::string kRightHandQMeasured = "right_hand_q_measured";
@@ -185,6 +187,7 @@ protected:
         }
         std::array<double, 3> base_trans_measured = {0.0, -1.0, 0.793};  // Fixed default position
         std::array<double, 4> base_quat_measured = state.base_quat;       // From IMU
+        std::array<double, 3> base_accel_measured = state.base_accel;     // From IMU
 
         // Populate joint targets if available
         if (has_joint_data) {
@@ -261,6 +264,7 @@ protected:
 
         output_data_map_[kBaseTransMeasured].assign(base_trans_measured.begin(), base_trans_measured.end());
         output_data_map_[kBaseQuatMeasured].assign(base_quat_measured.begin(), base_quat_measured.end());
+        output_data_map_[kBaseAccelMeasured].assign(base_accel_measured.begin(), base_accel_measured.end());
         output_data_map_[kBodyQMeasured].assign(body_q_measured.begin(), body_q_measured.end());
         output_data_map_[kLeftHandQMeasured].assign(left_hand_joint.begin(), left_hand_joint.end());
         output_data_map_[kRightHandQMeasured].assign(right_hand_joint.begin(), right_hand_joint.end());
@@ -293,4 +297,3 @@ protected:
 };
 
 #endif // OUTPUT_INTERFACE_HPP
-

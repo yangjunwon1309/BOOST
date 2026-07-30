@@ -200,6 +200,10 @@ tasc_belief:
   log_every_sec: 1.0
   action_apply_time: 0.01
   feature_ema_alpha: 0.25
+  robust_standardize:
+    min_signal_spread: 0.002
+    scale_floor: 0.01
+    clip: 2.0
   beta: 1.0
   w_sc: 0.95
   max_prob_any_goal: 0.99
@@ -228,6 +232,7 @@ tasc_belief:
     grip_update_hz: 10
     w_geom_prior: 1.0
     match_max_distance_m: 0.04
+    merge_distance_m: 0.03
     switch_dwell_frames: 2
     switch_margin: 0.0
     table_normal: [0.0, 0.0, 1.0]

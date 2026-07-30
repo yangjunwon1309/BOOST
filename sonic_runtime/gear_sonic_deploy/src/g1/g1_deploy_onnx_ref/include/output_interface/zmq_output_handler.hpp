@@ -21,7 +21,7 @@
  * ## `{user_topic}` (e.g. `g1_debug`) — published every tick
  * ---------------------------------------------------------------------------
  *
- * A single msgpack map with up to 30 keys (28 always-present + 2 conditional).
+ * A single msgpack map with up to 31 keys (29 always-present + 2 conditional).
  * All joints are in **MuJoCo order** (remapped from IsaacLab via
  * `isaaclab_to_mujoco`).
  *
@@ -68,14 +68,15 @@
  *      | **Viz: measured**      |              |
  *  23  | base_trans_measured    | double[3]    | Measured base translation (fixed default).
  *  24  | base_quat_measured     | double[4]    | Measured base quaternion (= base_quat).
- *  25  | body_q_measured        | double[29]   | Measured joint positions (= body_q).
- *  26  | left_hand_q_measured   | double[7]    | Measured left-hand Dex3 positions.
- *  27  | right_hand_q_measured  | double[7]    | Measured right-hand Dex3 positions.
+ *  25  | base_accel_measured    | double[3]    | Measured base accelerometer.
+ *  26  | body_q_measured        | double[29]   | Measured joint positions (= body_q).
+ *  27  | left_hand_q_measured   | double[7]    | Measured left-hand Dex3 positions.
+ *  28  | right_hand_q_measured  | double[7]    | Measured right-hand Dex3 positions.
  *      |                        |              |
  *      | **Viz: VR 3-point**    |              |
- *  28  | vr_3point_position     | double[9]    | VR positions (3×xyz, target body frame).
- *  29  | vr_3point_orientation  | double[12]   | VR orientations (3×quat wxyz).
- *  30  | vr_3point_compliance   | double[3]    | VR compliance (left arm, right arm, head).
+ *  29  | vr_3point_position     | double[9]    | VR positions (3×xyz, target body frame).
+ *  30  | vr_3point_orientation  | double[12]   | VR orientations (3×quat wxyz).
+ *  31  | vr_3point_compliance   | double[3]    | VR compliance (left arm, right arm, head).
  *
  * ---------------------------------------------------------------------------
  * ## `robot_config` — re-published every ~2 s

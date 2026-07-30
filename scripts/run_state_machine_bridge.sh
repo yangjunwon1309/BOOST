@@ -34,6 +34,20 @@ python -u path_streaming/path_state_machine_bridge.py \
   --static-target-topic "${PATH_STATIC_TARGET_TOPIC:-path_static_ee_target}" \
   --static-target-timeout-sec "${PATH_STATIC_TARGET_TIMEOUT_SEC:-0.35}" \
   --static-target-hold-sec "${PATH_STATIC_TARGET_HOLD_SEC:-0.0}" \
+  --gravity-filter-cutoff-hz "${PATH_GRAVITY_FILTER_CUTOFF_HZ:-8.0}" \
+  $(if [[ "${PATH_GRAVITY_ACCEL_BIAS_ENABLED:-1}" != "0" ]]; then printf '%s' "--gravity-accel-bias-enabled"; else printf '%s' "--no-gravity-accel-bias-enabled"; fi) \
+  --gravity-bias-time-constant-sec "${PATH_GRAVITY_BIAS_TIME_CONSTANT_SEC:-10.0}" \
+  --gravity-bias-max-deg "${PATH_GRAVITY_BIAS_MAX_DEG:-3.0}" \
+  --gravity-accel-norm-tolerance "${PATH_GRAVITY_ACCEL_NORM_TOLERANCE:-0.50}" \
+  --gravity-bias-gyro-gate-rad-s "${PATH_GRAVITY_BIAS_GYRO_GATE_RAD_S:-0.05}" \
+  --waist-bias-integral-gain-nm-per-rad-s "${PATH_WAIST_BIAS_INTEGRAL_GAIN_NM_PER_RAD_S:-3.0}" \
+  --waist-bias-yaw-limit-nm "${PATH_WAIST_BIAS_YAW_LIMIT_NM:-0.75}" \
+  --waist-bias-roll-limit-nm "${PATH_WAIST_BIAS_ROLL_LIMIT_NM:-3.0}" \
+  --waist-bias-pitch-limit-nm "${PATH_WAIST_BIAS_PITCH_LIMIT_NM:-3.0}" \
+  --waist-bias-deadband-rad "${PATH_WAIST_BIAS_DEADBAND_RAD:-0.005}" \
+  --waist-bias-joint-velocity-gate-rad-s "${PATH_WAIST_BIAS_JOINT_VELOCITY_GATE_RAD_S:-0.12}" \
+  --waist-bias-base-gyro-gate-rad-s "${PATH_WAIST_BIAS_BASE_GYRO_GATE_RAD_S:-0.15}" \
+  --waist-torque-slew-nm-s "${PATH_WAIST_TORQUE_SLEW_NM_S:-5.0}" \
   --auto-planning-mode "${PATH_AUTO_PLANNING_MODE:-shared_control}" \
   --shared-rho1 "${PATH_SHARED_RHO1:-0.60}" \
   --shared-rho2 "${PATH_SHARED_RHO2:-0.90}" \

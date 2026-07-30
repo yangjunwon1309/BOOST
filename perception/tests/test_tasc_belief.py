@@ -4,11 +4,13 @@ from seg_web_node.feature_cost import (
     FeatureConfig,
     MultiFeatureCost,
     huber_like,
+    robust_standardize,
 )
 from seg_web_node.grip_candidates import (
     GripCandidate,
     GripCandidateConfig,
     generate_grip_candidates,
+    _merge_nearby_candidates,
 )
 from seg_web_node.robot_geometry import g1_wrist_ee_position
 from seg_web_node.tasc_belief import (
@@ -94,6 +96,26 @@ def test_agreement_direction_override_uses_robot_view_direction():
     assert aligned > off_axis
 
 
+def test_robust_standardize_ignores_tiny_signal_spread():
+    update = robust_standardize(
+        np.array([0.0001, 0.0002, 0.0003]),
+        min_signal_spread=0.002,
+        scale_floor=0.01,
+        clip=2.0,
+    )
+    np.testing.assert_allclose(update, np.zeros(3))
+
+
+def test_robust_standardize_uses_floor_and_clip_for_real_signal():
+    update = robust_standardize(
+        np.array([-0.10, 0.0, 0.10]),
+        min_signal_spread=0.002,
+        scale_floor=0.20,
+        clip=0.4,
+    )
+    np.testing.assert_allclose(update, [-0.4, 0.0, 0.4])
+
+
 def test_feature_breakdown_exposes_values_and_weighted_contributions():
     feature = MultiFeatureCost(FeatureConfig(w_distance=1.0, w_ray=0.8, w_agreement=0.6))
     breakdown = feature.breakdown(
@@ -120,6 +142,22 @@ def test_g1_wrist_fk_matches_pelvis_side_convention():
     assert left[1] > 0.0
     assert right[1] < 0.0
     assert left[0] > 0.15
+
+
+def test_grip_candidates_merge_nearby_contacts_before_topk():
+    candidates = [
+        GripCandidate(np.array([0.30, 0.00, 0.10]), np.array([0.0, 0.0, -1.0]), 0.02, 1.0, "a"),
+        GripCandidate(np.array([0.32, 0.00, 0.10]), np.array([0.0, 0.0, -1.0]), 0.04, 0.5, "b"),
+        GripCandidate(np.array([0.40, 0.00, 0.10]), np.array([0.0, 0.0, -1.0]), 0.01, 0.7, "c"),
+    ]
+    merged = _merge_nearby_candidates(candidates, 0.03)
+    assert len(merged) == 2
+    np.testing.assert_allclose(
+        merged[0].center,
+        (np.array([0.30, 0.00, 0.10]) * 1.0 + np.array([0.32, 0.00, 0.10]) * 0.5) / 1.5,
+    )
+    assert merged[0].geom_score == 1.0
+    assert merged[0].source == "merged(a+b)"
 
 
 def test_grip_candidates_are_depth_surface_points_not_only_center():

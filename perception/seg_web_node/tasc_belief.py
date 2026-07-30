@@ -61,6 +61,9 @@ class TascBeliefConfig:
     grip_switch_dwell_frames: int = 2
     grip_switch_margin: float = 0.0
     fallback_eef_position_m: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    robust_min_signal_spread: float = 0.002
+    robust_scale_floor: float = 0.01
+    robust_clip: float = 2.0
     log_every_sec: float = 1.0
     feature: FeatureConfig = field(default_factory=FeatureConfig)
     grip: GripCandidateConfig = field(default_factory=GripCandidateConfig)
@@ -102,6 +105,24 @@ class TascBeliefConfig:
             ),
             fallback_eef_position_m=tuple(
                 float(v) for v in data.get("fallback_eef_position_m", [0, 0, 0])
+            ),
+            robust_min_signal_spread=float(
+                dict(data.get("robust_standardize", {})).get(
+                    "min_signal_spread",
+                    data.get("robust_min_signal_spread", 0.002),
+                )
+            ),
+            robust_scale_floor=float(
+                dict(data.get("robust_standardize", {})).get(
+                    "scale_floor",
+                    data.get("robust_scale_floor", 0.01),
+                )
+            ),
+            robust_clip=float(
+                dict(data.get("robust_standardize", {})).get(
+                    "clip",
+                    data.get("robust_clip", 2.0),
+                )
             ),
             log_every_sec=float(data.get("log_every_sec", 1.0)),
             feature=FeatureConfig.from_dict(data),
@@ -494,7 +515,12 @@ class HierarchicalTascBelief:
         object_advantages = self._smooth_object_advantages(
             valid_objects, raw_object_advantages
         )
-        object_update = robust_standardize(object_advantages)
+        object_update = robust_standardize(
+            object_advantages,
+            min_signal_spread=self.config.robust_min_signal_spread,
+            scale_floor=self.config.robust_scale_floor,
+            clip=self.config.robust_clip,
+        )
         log_obj = (
             self.config.w_sc * self.log_object_distribution
             + self.config.beta * object_update
@@ -575,7 +601,12 @@ class HierarchicalTascBelief:
                 grip_advantages = self._smooth_grip_advantages(
                     obj.object_id, raw_grip_advantages, grip_match
                 )
-                grip_update = robust_standardize(grip_advantages)
+                grip_update = robust_standardize(
+                    grip_advantages,
+                    min_signal_spread=self.config.robust_min_signal_spread,
+                    scale_floor=self.config.robust_scale_floor,
+                    clip=self.config.robust_clip,
+                )
                 log_grip = (
                     self.config.w_sc * log_grip + self.config.beta * grip_update
                 )

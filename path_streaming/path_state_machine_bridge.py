@@ -160,6 +160,34 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--robot-state-endpoint", default="tcp://127.0.0.1:5557")
     parser.add_argument("--robot-state-topic", default="g1_debug")
+    parser.add_argument("--gravity-filter-cutoff-hz", type=float, default=8.0)
+    parser.add_argument(
+        "--gravity-accel-bias-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Slowly align quaternion gravity to accelerometer gravity only while "
+            "the base is quasi-static. Requires base_accel_measured in g1_debug."
+        ),
+    )
+    parser.add_argument("--gravity-bias-time-constant-sec", type=float, default=10.0)
+    parser.add_argument("--gravity-bias-max-deg", type=float, default=3.0)
+    parser.add_argument("--gravity-accel-norm-tolerance", type=float, default=0.50)
+    parser.add_argument("--gravity-bias-gyro-gate-rad-s", type=float, default=0.05)
+    parser.add_argument(
+        "--waist-bias-integral-gain-nm-per-rad-s", type=float, default=3.0
+    )
+    parser.add_argument("--waist-bias-yaw-limit-nm", type=float, default=0.75)
+    parser.add_argument("--waist-bias-roll-limit-nm", type=float, default=3.0)
+    parser.add_argument("--waist-bias-pitch-limit-nm", type=float, default=3.0)
+    parser.add_argument("--waist-bias-deadband-rad", type=float, default=0.005)
+    parser.add_argument(
+        "--waist-bias-joint-velocity-gate-rad-s", type=float, default=0.12
+    )
+    parser.add_argument(
+        "--waist-bias-base-gyro-gate-rad-s", type=float, default=0.15
+    )
+    parser.add_argument("--waist-torque-slew-nm-s", type=float, default=5.0)
     parser.add_argument(
         "--model-xml",
         type=Path,
@@ -726,6 +754,228 @@ def latest_base_quat_from_robot_state(
     return None
 
 
+def latest_vector_from_robot_state(
+    payload: dict | None,
+    keys: tuple[str, ...],
+    size: int,
+) -> np.ndarray | None:
+    if not payload:
+        return None
+    for key in keys:
+        value = payload.get(key)
+        if value is None:
+            continue
+        vector = np.asarray(value, dtype=np.float64).reshape(-1)
+        if vector.shape[0] >= size and np.isfinite(vector[:size]).all():
+            return vector[:size].copy()
+    return None
+
+
+def gravity_direction_from_quaternion(quat_wxyz: np.ndarray) -> np.ndarray:
+    quat = np.asarray(quat_wxyz, dtype=np.float64).reshape(4)
+    quat /= max(float(np.linalg.norm(quat)), 1.0e-12)
+    w, x, y, z = quat
+    rotation_world_pelvis = np.array(
+        [
+            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+            [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+            [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+        ],
+        dtype=np.float64,
+    )
+    gravity = rotation_world_pelvis.T @ np.array([0.0, 0.0, -1.0])
+    return gravity / max(float(np.linalg.norm(gravity)), 1.0e-12)
+
+
+def rotate_by_rotation_vector(vector: np.ndarray, rotation_vector: np.ndarray) -> np.ndarray:
+    vector = np.asarray(vector, dtype=np.float64).reshape(3)
+    rotation_vector = np.asarray(rotation_vector, dtype=np.float64).reshape(3)
+    angle = float(np.linalg.norm(rotation_vector))
+    if angle <= 1.0e-12:
+        return vector.copy()
+    axis = rotation_vector / angle
+    return (
+        vector * np.cos(angle)
+        + np.cross(axis, vector) * np.sin(angle)
+        + axis * float(np.dot(axis, vector)) * (1.0 - np.cos(angle))
+    )
+
+
+class PelvisGravityEstimator:
+    """Filtered pelvis-frame gravity with gated accelerometer bias correction."""
+
+    def __init__(self, args: argparse.Namespace):
+        self.cutoff_hz = max(float(args.gravity_filter_cutoff_hz), 0.0)
+        self.accel_bias_enabled = bool(args.gravity_accel_bias_enabled)
+        self.bias_time_constant_sec = max(
+            float(args.gravity_bias_time_constant_sec), 1.0e-3
+        )
+        self.bias_max_rad = np.deg2rad(max(float(args.gravity_bias_max_deg), 0.0))
+        self.accel_norm_tolerance = max(
+            float(args.gravity_accel_norm_tolerance), 0.0
+        )
+        self.gyro_gate = max(float(args.gravity_bias_gyro_gate_rad_s), 0.0)
+        self.filtered_gravity: np.ndarray | None = None
+        self.bias_rotation_vector = np.zeros(3, dtype=np.float64)
+        self.accel_correction_active = False
+        self.accel_samples = 0
+
+    def update(
+        self,
+        quat_wxyz: np.ndarray,
+        accel_pelvis: np.ndarray | None,
+        gyro_pelvis: np.ndarray | None,
+        dt: float,
+    ) -> np.ndarray:
+        gravity_quat = gravity_direction_from_quaternion(quat_wxyz)
+        self.accel_correction_active = False
+        if self.accel_bias_enabled and accel_pelvis is not None:
+            accel = np.asarray(accel_pelvis, dtype=np.float64).reshape(3)
+            accel_norm = float(np.linalg.norm(accel))
+            gyro_norm = (
+                float(np.linalg.norm(gyro_pelvis))
+                if gyro_pelvis is not None
+                else float("inf")
+            )
+            if (
+                np.isfinite(accel_norm)
+                and abs(accel_norm - 9.81) <= self.accel_norm_tolerance
+                and gyro_norm <= self.gyro_gate
+            ):
+                gravity_accel = -accel / max(accel_norm, 1.0e-12)
+                cross = np.cross(gravity_quat, gravity_accel)
+                cross_norm = float(np.linalg.norm(cross))
+                dot = float(np.clip(np.dot(gravity_quat, gravity_accel), -1.0, 1.0))
+                angle = float(np.arctan2(cross_norm, dot))
+                observed_rotation = (
+                    cross * (angle / cross_norm)
+                    if cross_norm > 1.0e-12
+                    else np.zeros(3, dtype=np.float64)
+                )
+                bias_alpha = 1.0 - np.exp(
+                    -max(float(dt), 0.0) / self.bias_time_constant_sec
+                )
+                self.bias_rotation_vector += bias_alpha * (
+                    observed_rotation - self.bias_rotation_vector
+                )
+                bias_norm = float(np.linalg.norm(self.bias_rotation_vector))
+                if bias_norm > self.bias_max_rad > 0.0:
+                    self.bias_rotation_vector *= self.bias_max_rad / bias_norm
+                self.accel_correction_active = True
+                self.accel_samples += 1
+
+        corrected = rotate_by_rotation_vector(
+            gravity_quat, self.bias_rotation_vector
+        )
+        corrected /= max(float(np.linalg.norm(corrected)), 1.0e-12)
+        if self.filtered_gravity is None:
+            self.filtered_gravity = corrected
+        else:
+            alpha = (
+                1.0
+                if self.cutoff_hz <= 0.0
+                else 1.0
+                - np.exp(-2.0 * np.pi * self.cutoff_hz * max(float(dt), 0.0))
+            )
+            self.filtered_gravity += alpha * (
+                corrected - self.filtered_gravity
+            )
+            self.filtered_gravity /= max(
+                float(np.linalg.norm(self.filtered_gravity)), 1.0e-12
+            )
+        return self.filtered_gravity.copy()
+
+    def status(self) -> str:
+        return (
+            f"gravity_bias={np.rad2deg(np.linalg.norm(self.bias_rotation_vector)):.2f}deg "
+            f"accel_corr={'on' if self.accel_correction_active else 'off'}"
+            f"/{self.accel_samples}"
+        )
+
+
+class WaistGravityHoldController:
+    """Bounded integral trim on top of model gravity for exact q_waist=0 hold."""
+
+    WAIST = slice(12, 15)
+
+    def __init__(self, args: argparse.Namespace):
+        self.integral_gain = max(
+            float(args.waist_bias_integral_gain_nm_per_rad_s), 0.0
+        )
+        self.bias_limit = np.array(
+            [
+                max(float(args.waist_bias_yaw_limit_nm), 0.0),
+                max(float(args.waist_bias_roll_limit_nm), 0.0),
+                max(float(args.waist_bias_pitch_limit_nm), 0.0),
+            ],
+            dtype=np.float64,
+        )
+        self.deadband = max(float(args.waist_bias_deadband_rad), 0.0)
+        self.joint_velocity_gate = max(
+            float(args.waist_bias_joint_velocity_gate_rad_s), 0.0
+        )
+        self.base_gyro_gate = max(
+            float(args.waist_bias_base_gyro_gate_rad_s), 0.0
+        )
+        self.torque_slew = max(float(args.waist_torque_slew_nm_s), 0.0)
+        self.bias_torque = np.zeros(3, dtype=np.float64)
+        self.last_waist_torque: np.ndarray | None = None
+        self.adaptation_active = False
+
+    def apply(
+        self,
+        model_torque: np.ndarray,
+        q_measured: np.ndarray | None,
+        dq_measured: np.ndarray | None,
+        base_gyro: np.ndarray | None,
+        dt: float,
+    ) -> np.ndarray:
+        output = np.asarray(model_torque, dtype=np.float64).reshape(29).copy()
+        self.adaptation_active = False
+        if q_measured is not None:
+            q = np.asarray(q_measured, dtype=np.float64).reshape(29)
+            dq_norm = (
+                float(np.max(np.abs(np.asarray(dq_measured)[self.WAIST])))
+                if dq_measured is not None
+                else float("inf")
+            )
+            gyro_norm = (
+                float(np.linalg.norm(base_gyro))
+                if base_gyro is not None
+                else float("inf")
+            )
+            if (
+                dq_norm <= self.joint_velocity_gate
+                and gyro_norm <= self.base_gyro_gate
+            ):
+                error = -q[self.WAIST]
+                error[np.abs(error) < self.deadband] = 0.0
+                self.bias_torque += (
+                    self.integral_gain * error * max(float(dt), 0.0)
+                )
+                self.bias_torque = np.clip(
+                    self.bias_torque, -self.bias_limit, self.bias_limit
+                )
+                self.adaptation_active = True
+
+        desired_waist = output[self.WAIST] + self.bias_torque
+        if self.last_waist_torque is not None and self.torque_slew > 0.0:
+            max_step = self.torque_slew * max(float(dt), 0.0)
+            desired_waist = self.last_waist_torque + np.clip(
+                desired_waist - self.last_waist_torque, -max_step, max_step
+            )
+        output[self.WAIST] = desired_waist
+        self.last_waist_torque = desired_waist.copy()
+        return output
+
+    def status(self) -> str:
+        bias = ",".join(f"{value:+.2f}" for value in self.bias_torque)
+        return (
+            f"waist_bias=[{bias}]Nm "
+            f"adapt={'on' if self.adaptation_active else 'off'}"
+        )
+
+
 def _nested(payload: dict | None, *keys: str):
     value = payload
     for key in keys:
@@ -1172,6 +1422,16 @@ def main() -> int:
             f"{100.0 * args.arm_ik_residual_projection_threshold_m:.1f}/"
             f"{100.0 * args.arm_ik_residual_success_threshold_m:.1f}cm"
         )
+    gravity_estimator = PelvisGravityEstimator(args)
+    waist_gravity_hold = WaistGravityHoldController(args)
+    log(
+        "50Hz gravity compensation enabled: "
+        f"cutoff={args.gravity_filter_cutoff_hz:.1f}Hz "
+        f"accel_bias={bool(args.gravity_accel_bias_enabled)} "
+        f"bias_tau={args.gravity_bias_time_constant_sec:.1f}s "
+        f"waist_integral_gain="
+        f"{args.waist_bias_integral_gain_nm_per_rad_s:.2f}Nm/(rad*s)"
+    )
 
     current_state = args.state
     planner_lower_body_idle = bool(args.planner_lower_body_idle_default)
@@ -1190,8 +1450,14 @@ def main() -> int:
     active_plan_us = 0
     active_plan_s: float | None = None
     latest_robot_q: np.ndarray | None = None
+    latest_robot_dq: np.ndarray | None = None
     latest_robot_base_quat = np.array(
         [1.0, 0.0, 0.0, 0.0], dtype=np.float64
+    )
+    latest_robot_base_accel: np.ndarray | None = None
+    latest_robot_base_gyro: np.ndarray | None = None
+    latest_gravity_direction = np.array(
+        [0.0, 0.0, -1.0], dtype=np.float64
     )
     latest_robot_state_us = 0
     latest_pose_raw: bytes | None = None
@@ -1839,8 +2105,44 @@ def main() -> int:
                     )
                     if base_quat is not None:
                         latest_robot_base_quat = base_quat
+                    body_dq = latest_vector_from_robot_state(
+                        latest_robot_state,
+                        ("body_dq", "body_dq_measured", "state_body_dq"),
+                        29,
+                    )
+                    if body_dq is not None:
+                        latest_robot_dq = body_dq
+                    base_accel = latest_vector_from_robot_state(
+                        latest_robot_state,
+                        (
+                            "base_accel_measured",
+                            "base_accel",
+                            "state_base_accel",
+                        ),
+                        3,
+                    )
+                    if base_accel is not None:
+                        latest_robot_base_accel = base_accel
+                    base_gyro = latest_vector_from_robot_state(
+                        latest_robot_state,
+                        (
+                            "base_ang_vel",
+                            "base_gyro",
+                            "state_base_gyro",
+                        ),
+                        3,
+                    )
+                    if base_gyro is not None:
+                        latest_robot_base_gyro = base_gyro
             except zmq.Again:
                 pass
+
+            latest_gravity_direction = gravity_estimator.update(
+                latest_robot_base_quat,
+                latest_robot_base_accel,
+                latest_robot_base_gyro,
+                dt,
+            )
 
             try:
                 while True:
@@ -2676,6 +2978,58 @@ def main() -> int:
                         timestamp_us=tick_us,
                     )
 
+            # IK owns q, while gravity compensation is evaluated independently
+            # at the 50 Hz bridge rate. This keeps arm-load/waist feedforward
+            # synchronized with the latest pelvis gravity even when a static IK
+            # solution is cached for many seconds.
+            if (
+                qp_payload is not None
+                and bool(qp_payload.get("feasible", False))
+                and arm_nonlinear_ik is not None
+                and qp_payload.get("q_ref") is not None
+            ):
+                torque_q = np.asarray(
+                    qp_payload["q_ref"], dtype=np.float64
+                ).reshape(29).copy()
+                torque_q[12:15] = 0.0
+                model_tau = arm_nonlinear_ik.gravity_torque_from_q29(
+                    torque_q,
+                    gravity_direction_pelvis=latest_gravity_direction,
+                )
+                model_tau[:12] = 0.0
+                robot_state_fresh = (
+                    latest_robot_q is not None
+                    and (tick_us - latest_robot_state_us) <= 100_000
+                )
+                tau_ff = waist_gravity_hold.apply(
+                    model_tau,
+                    latest_robot_q if robot_state_fresh else None,
+                    latest_robot_dq if robot_state_fresh else None,
+                    latest_robot_base_gyro if robot_state_fresh else None,
+                    dt,
+                )
+                qp_payload["tau_ff_ref"] = tau_ff.tolist()
+                qp_payload["gravity_direction_pelvis"] = (
+                    latest_gravity_direction.tolist()
+                )
+                qp_payload["gravity_bias_angle_deg"] = float(
+                    np.rad2deg(
+                        np.linalg.norm(
+                            gravity_estimator.bias_rotation_vector
+                        )
+                    )
+                )
+                qp_payload["gravity_accel_correction_active"] = bool(
+                    gravity_estimator.accel_correction_active
+                )
+                qp_payload["waist_gravity_model_tau_nm"] = (
+                    model_tau[12:15].tolist()
+                )
+                qp_payload["waist_adaptive_bias_tau_nm"] = (
+                    waist_gravity_hold.bias_torque.tolist()
+                )
+                qp_payload["waist_command_tau_nm"] = tau_ff[12:15].tolist()
+
             if qp_payload is not None and not qp_reference_enabled:
                 qp_payload = qp_none_reference(
                     state=current_state,
@@ -2755,6 +3109,8 @@ def main() -> int:
                     f"arm_ik={last_arm_ik_status} "
                     f"ik_err={100.0 * last_arm_ik_error_m if np.isfinite(last_arm_ik_error_m) else float('nan'):.2f}cm "
                     f"ik_solve={last_arm_ik_solve_ms if np.isfinite(last_arm_ik_solve_ms) else float('nan'):.2f}ms "
+                    f"{gravity_estimator.status()} "
+                    f"{waist_gravity_hold.status()} "
                     f"{shared_log} "
                     f"{outer_waist.status()} "
                     f"feasible={qp_payload.get('feasible') if qp_payload else False}"

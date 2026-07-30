@@ -35,6 +35,7 @@ class GripCandidateConfig:
     h_th_m: float = 0.12
     max_points: int = 8000
     table_normal: tuple[float, float, float] = (0.0, 0.0, 1.0)
+    merge_distance_m: float = 0.03
 
     @classmethod
     def from_dict(cls, data: dict | None) -> "GripCandidateConfig":
@@ -45,6 +46,7 @@ class GripCandidateConfig:
             h_th_m=float(data.get("h_th_m", 0.12)),
             max_points=int(data.get("max_points", data.get("object_max_points", 8000))),
             table_normal=tuple(float(v) for v in data.get("table_normal", [0, 0, 1])),
+            merge_distance_m=float(data.get("merge_distance_m", 0.03)),
         )
 
 
@@ -98,6 +100,56 @@ def _farthest_points(points: np.ndarray, seed: np.ndarray, count: int) -> list[n
         output.append(candidate)
         min_dist = np.minimum(min_dist, np.linalg.norm(points - candidate, axis=1))
     return output
+
+
+def _merge_candidate_cluster(cluster: list[GripCandidate]) -> GripCandidate:
+    if len(cluster) == 1:
+        return cluster[0]
+    scores = np.asarray([max(EPS, float(item.geom_score)) for item in cluster], dtype=np.float64)
+    weights = scores / max(EPS, float(np.sum(scores)))
+    centers = np.stack([np.asarray(item.center, dtype=np.float64).reshape(3) for item in cluster])
+    approaches = np.stack([np.asarray(item.approach, dtype=np.float64).reshape(3) for item in cluster])
+    center = np.sum(centers * weights[:, None], axis=0)
+    approach = _unit(np.sum(approaches * weights[:, None], axis=0), cluster[0].approach)
+    width = float(np.sum(np.asarray([float(item.width) for item in cluster]) * weights))
+    geom_score = float(np.max([float(item.geom_score) for item in cluster]))
+    sources = sorted({str(item.source) for item in cluster})
+    source = sources[0] if len(sources) == 1 else "merged(" + "+".join(sources) + ")"
+    return GripCandidate(
+        center=center,
+        approach=approach,
+        width=width,
+        geom_score=geom_score,
+        source=source,
+    )
+
+
+def _merge_nearby_candidates(
+    candidates: list[GripCandidate], merge_distance_m: float
+) -> list[GripCandidate]:
+    distance_threshold = max(0.0, float(merge_distance_m))
+    if distance_threshold <= 0.0 or len(candidates) <= 1:
+        return list(candidates)
+    clusters: list[list[GripCandidate]] = []
+    cluster_centers: list[np.ndarray] = []
+    for candidate in sorted(candidates, key=lambda item: item.geom_score, reverse=True):
+        center = np.asarray(candidate.center, dtype=np.float64).reshape(3)
+        best_index = -1
+        best_distance = float("inf")
+        for index, cluster_center in enumerate(cluster_centers):
+            distance = float(np.linalg.norm(center - cluster_center))
+            if distance < best_distance:
+                best_index = index
+                best_distance = distance
+        if best_index >= 0 and best_distance <= distance_threshold:
+            clusters[best_index].append(candidate)
+            cluster_centers[best_index] = _merge_candidate_cluster(clusters[best_index]).center
+        else:
+            clusters.append([candidate])
+            cluster_centers.append(center.copy())
+    merged = [_merge_candidate_cluster(cluster) for cluster in clusters]
+    merged.sort(key=lambda item: item.geom_score, reverse=True)
+    return merged
 
 
 def generate_grip_candidates(
@@ -159,14 +211,10 @@ def generate_grip_candidates(
             )
         )
 
-    unique: list[GripCandidate] = []
-    for candidate in sorted(candidates, key=lambda item: item.geom_score, reverse=True):
-        if all(float(np.linalg.norm(candidate.center - kept.center)) > 0.015 for kept in unique):
-            unique.append(candidate)
-        if len(unique) >= max(1, cfg.top_k):
-            break
-    if not unique:
-        unique.append(
+    merged = _merge_nearby_candidates(candidates, cfg.merge_distance_m)
+    selected = merged[: max(1, cfg.top_k)]
+    if not selected:
+        selected.append(
             GripCandidate(
                 center=_nearest_point(points, center),
                 approach=approach,
@@ -175,4 +223,4 @@ def generate_grip_candidates(
                 source="median_fallback",
             )
         )
-    return unique
+    return selected

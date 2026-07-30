@@ -2,6 +2,10 @@ pico_internal:
   bind: "tcp://*:5559"
   connect: "tcp://127.0.0.1:5559"
   topics: ["pose", "command", "planner", "manager_state"]
+pico_vr_debug:
+  bind: "tcp://*:5566"
+  connect: "tcp://127.0.0.1:5566"
+  topic: "vr_pose_debug"
 gmr_ref:
   bind: "tcp://*:5558"
   connect: "tcp://127.0.0.1:5558"
@@ -28,4 +32,3 @@ path_state_command:
   bind: "tcp://*:5563"
   connect: "tcp://127.0.0.1:5563"
   topic: "path_state_command"
-

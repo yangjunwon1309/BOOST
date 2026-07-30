@@ -70,6 +70,7 @@ show_usage() {
     echo "                               PATH reference lookahead in ms (default: 10)"
     echo "  --path-reference-heartbeat-timeout-ms MS"
     echo "                               PATH reference heartbeat timeout in ms (default: 500)"
+    echo "  --path-waist-*              Deprecated compatibility options; ignored"
     echo "  --desk-pose                 INIT ramps to a hands-on-desk ready pose (arms bent) instead of default_angles"
     echo ""
     echo "Examples:"
@@ -126,6 +127,10 @@ PATH_REFERENCE_PORT=5560
 PATH_REFERENCE_TOPIC="path_qp_reference"
 PATH_REFERENCE_LOOKAHEAD_MS=10
 PATH_REFERENCE_HEARTBEAT_TIMEOUT_MS=500
+PATH_WAIST_YAW_LIMIT_RAD=0.12
+PATH_WAIST_ROLL_LIMIT_RAD=0.08
+PATH_WAIST_PITCH_LIMIT_RAD=0.10
+PATH_WAIST_RATE_LIMIT_RAD_S=0.6
 DESK_POSE=false
 
 # ============================================================================
@@ -206,6 +211,18 @@ while [[ $# -gt 0 ]]; do
         --path-reference-heartbeat-timeout-ms)
             [[ -z "$2" ]] && { echo -e "${RED}Error: $1 requires an argument${NC}" >&2; exit 1; }
             PATH_REFERENCE_HEARTBEAT_TIMEOUT_MS="$2"; shift 2 ;;
+        --path-waist-yaw-limit-rad)
+            [[ -z "$2" ]] && { echo -e "${RED}Error: $1 requires an argument${NC}" >&2; exit 1; }
+            PATH_WAIST_YAW_LIMIT_RAD="$2"; shift 2 ;;
+        --path-waist-roll-limit-rad)
+            [[ -z "$2" ]] && { echo -e "${RED}Error: $1 requires an argument${NC}" >&2; exit 1; }
+            PATH_WAIST_ROLL_LIMIT_RAD="$2"; shift 2 ;;
+        --path-waist-pitch-limit-rad)
+            [[ -z "$2" ]] && { echo -e "${RED}Error: $1 requires an argument${NC}" >&2; exit 1; }
+            PATH_WAIST_PITCH_LIMIT_RAD="$2"; shift 2 ;;
+        --path-waist-rate-limit-rad-s)
+            [[ -z "$2" ]] && { echo -e "${RED}Error: $1 requires an argument${NC}" >&2; exit 1; }
+            PATH_WAIST_RATE_LIMIT_RAD_S="$2"; shift 2 ;;
         --desk-pose)
             DESK_POSE=true; shift ;;
         sim|real)
@@ -417,6 +434,8 @@ if [[ "$PATH_USE_DYNAMIC_REFERENCE" == true ]]; then
 echo -e "  PATH QP Reference:   ${GREEN}tcp://$PATH_REFERENCE_HOST:$PATH_REFERENCE_PORT/$PATH_REFERENCE_TOPIC${NC}"
 echo -e "  PATH Lookahead:      ${GREEN}${PATH_REFERENCE_LOOKAHEAD_MS} ms${NC}"
 echo -e "  PATH Heartbeat:      ${GREEN}${PATH_REFERENCE_HEARTBEAT_TIMEOUT_MS} ms${NC}"
+echo -e "  PATH Waist Clamp:    ${GREEN}${PATH_WAIST_YAW_LIMIT_RAD}/${PATH_WAIST_ROLL_LIMIT_RAD}/${PATH_WAIST_PITCH_LIMIT_RAD} rad (yaw/roll/pitch)${NC}"
+echo -e "  PATH Waist Rate:     ${GREEN}${PATH_WAIST_RATE_LIMIT_RAD_S} rad/s${NC}"
 else
 echo -e "  PATH QP Reference:   ${YELLOW}OFF${NC}"
 fi
@@ -460,6 +479,7 @@ echo -e "${BLUE}    --path-reference-host $PATH_REFERENCE_HOST --path-reference-
 echo -e "${BLUE}    --path-reference-topic $PATH_REFERENCE_TOPIC \\${NC}"
 echo -e "${BLUE}    --path-reference-lookahead-ms $PATH_REFERENCE_LOOKAHEAD_MS \\${NC}"
 echo -e "${BLUE}    --path-reference-heartbeat-timeout-ms $PATH_REFERENCE_HEARTBEAT_TIMEOUT_MS${NC}"
+echo -e "${BLUE}    # SONIC waist q/dq/tau passes through without PATH filtering${NC}"
 fi
 fi
 echo ""

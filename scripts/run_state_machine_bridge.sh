@@ -14,18 +14,17 @@ python -u path_streaming/path_state_machine_bridge.py \
   $(if [[ "${PATH_FREEZE_PLANNER_LOWER_BODY:-1}" != "0" ]]; then printf '%s' "--freeze-planner-lower-body"; else printf '%s' "--no-freeze-planner-lower-body"; fi) \
   $(if [[ "${PATH_FREEZE_PLANNER_WAIST:-1}" != "0" ]]; then printf '%s' "--freeze-planner-waist"; else printf '%s' "--no-freeze-planner-waist"; fi) \
   --pico-hand-timeout-sec "${PATH_PICO_HAND_TIMEOUT_SEC:-0.35}" \
-  --smpl-timeout-sec "${PATH_SMPL_TIMEOUT_SEC:-0.20}" \
-  --smpl-scale-x "${PATH_SMPL_SCALE_X:-0.85}" \
-  --smpl-scale-y "${PATH_SMPL_SCALE_Y:-0.85}" \
-  --smpl-scale-z "${PATH_SMPL_SCALE_Z:-0.85}" \
-  --smpl-displacement-sign "${PATH_SMPL_DISPLACEMENT_SIGN:-1.0}" \
-  --smpl-target-ema-alpha "${PATH_SMPL_TARGET_EMA_ALPHA:-0.35}" \
-  --smpl-target-max-velocity-m-s "${PATH_SMPL_TARGET_MAX_VELOCITY_M_S:-0.25}" \
-  --smpl-target-max-acceleration-m-s2 "${PATH_SMPL_TARGET_MAX_ACCELERATION_M_S2:-1.5}" \
-  --smpl-jump-reject-m "${PATH_SMPL_JUMP_REJECT_M:-0.07}" \
-  --smpl-max-anchor-offset-m "${PATH_SMPL_MAX_ANCHOR_OFFSET_M:-0.45}" \
+  --pico-body-calibration-sec "${PATH_PICO_BODY_CALIBRATION_SEC:-0.5}" \
+  --pico-body-gap-hold-ms "${PATH_PICO_BODY_GAP_HOLD_MS:-100}" \
+  --pico-body-position-jump-m "${PATH_PICO_BODY_POSITION_JUMP_M:-0.05}" \
+  --pico-body-orientation-jump-deg "${PATH_PICO_BODY_ORIENTATION_JUMP_DEG:-12}" \
+  --pico-body-recovery-frames "${PATH_PICO_BODY_RECOVERY_FRAMES:-3}" \
+  --pico-body-scale-x "${PATH_PICO_BODY_SCALE_X:-1.20}" \
+  --pico-body-scale-y "${PATH_PICO_BODY_SCALE_Y:-1.20}" \
+  --pico-body-scale-z "${PATH_PICO_BODY_SCALE_Z:-1.20}" \
   --phase-tracking-mode "${PATH_PHASE_TRACKING_MODE:-fixed_rate}" \
   --pico-endpoint "${PATH_PICO_INTERNAL_ENDPOINT:-tcp://127.0.0.1:5559}" \
+  --pico-vr-endpoint "${PATH_PICO_VR_ENDPOINT:-tcp://127.0.0.1:5566}" \
   --button-endpoint "${PATH_PICO_BUTTON_ENDPOINT:-tcp://127.0.0.1:5565}" \
   --button-topic "${PATH_PICO_BUTTON_TOPIC:-pico_button_event}" \
   --plan-endpoint "${PATH_PLAN_ENDPOINT:-tcp://127.0.0.1:5562}" \
@@ -40,14 +39,6 @@ python -u path_streaming/path_state_machine_bridge.py \
   --gravity-bias-max-deg "${PATH_GRAVITY_BIAS_MAX_DEG:-3.0}" \
   --gravity-accel-norm-tolerance "${PATH_GRAVITY_ACCEL_NORM_TOLERANCE:-0.50}" \
   --gravity-bias-gyro-gate-rad-s "${PATH_GRAVITY_BIAS_GYRO_GATE_RAD_S:-0.05}" \
-  --waist-bias-integral-gain-nm-per-rad-s "${PATH_WAIST_BIAS_INTEGRAL_GAIN_NM_PER_RAD_S:-3.0}" \
-  --waist-bias-yaw-limit-nm "${PATH_WAIST_BIAS_YAW_LIMIT_NM:-0.75}" \
-  --waist-bias-roll-limit-nm "${PATH_WAIST_BIAS_ROLL_LIMIT_NM:-3.0}" \
-  --waist-bias-pitch-limit-nm "${PATH_WAIST_BIAS_PITCH_LIMIT_NM:-3.0}" \
-  --waist-bias-deadband-rad "${PATH_WAIST_BIAS_DEADBAND_RAD:-0.005}" \
-  --waist-bias-joint-velocity-gate-rad-s "${PATH_WAIST_BIAS_JOINT_VELOCITY_GATE_RAD_S:-0.12}" \
-  --waist-bias-base-gyro-gate-rad-s "${PATH_WAIST_BIAS_BASE_GYRO_GATE_RAD_S:-0.15}" \
-  --waist-torque-slew-nm-s "${PATH_WAIST_TORQUE_SLEW_NM_S:-5.0}" \
   --auto-planning-mode "${PATH_AUTO_PLANNING_MODE:-shared_control}" \
   --shared-rho1 "${PATH_SHARED_RHO1:-0.60}" \
   --shared-rho2 "${PATH_SHARED_RHO2:-0.90}" \
@@ -73,10 +64,12 @@ python -u path_streaming/path_state_machine_bridge.py \
   --arm-ik-ee-offset-m "${PATH_ARM_IK_EE_OFFSET_M:-0.05}" \
   --arm-ik-orientation-full-error-m "${PATH_ARM_IK_ORIENTATION_FULL_ERROR_M:-0.01}" \
   --arm-ik-orientation-zero-error-m "${PATH_ARM_IK_ORIENTATION_ZERO_ERROR_M:-0.03}" \
-  --arm-ik-orientation-min-scale "${PATH_ARM_IK_ORIENTATION_MIN_SCALE:-0.001}" \
+  --arm-ik-orientation-min-scale "1.0" \
   --arm-ik-residual-projection-threshold-m "${PATH_ARM_IK_RESIDUAL_PROJECTION_THRESHOLD_M:-0.03}" \
   --arm-ik-residual-success-threshold-m "${PATH_ARM_IK_RESIDUAL_SUCCESS_THRESHOLD_M:-0.05}" \
   --arm-ik-projection-step-m "${PATH_ARM_IK_PROJECTION_STEP_M:-0.05}" \
+  --arm-ik-output-velocity-limit-rad-s "${PATH_ARM_IK_OUTPUT_VELOCITY_LIMIT_RAD_S:-20.0}" \
+  --arm-ik-output-control-hz "${PATH_ARM_IK_OUTPUT_CONTROL_HZ:-250.0}" \
   ${PATH_AUTO_CLEAR_ON_TARGET_REACHED:+--auto-clear-on-target-reached} \
   ${PATH_CLEAR_PLAN_AFTER_TOTAL_DURATION:+--clear-plan-after-total-duration} \
   "$@"

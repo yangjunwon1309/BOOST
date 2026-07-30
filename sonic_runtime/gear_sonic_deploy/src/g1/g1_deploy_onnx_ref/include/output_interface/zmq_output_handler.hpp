@@ -294,7 +294,7 @@ private:
         // Visualisation fields: output_data_map_.size() (typically 11)
         int num_state_fields = has_heading_state ? 20 : 18;
         int num_viz_fields = static_cast<int>(output_data_map_.size());
-        constexpr int kEeQpFields = 54;
+        constexpr int kEeQpFields = 56;
         constexpr int kButtonTimingFields = 6;
         pk.pack_map(
             num_state_fields + num_viz_fields + kButtonTimingFields
@@ -568,6 +568,12 @@ private:
             pk.pack("ee_qp_joint_tracking_error");
             pk.pack_array(::g1::ee_qp::kNumJoints);
             for (const auto value : ee_qp->joint_tracking_error) pk.pack(value);
+            pk.pack("ee_qp_sonic_waist_raw_q_target");
+            pk.pack_array(3);
+            for (const auto value : ee_qp->sonic_waist_raw_q_target) pk.pack(value);
+            pk.pack("ee_qp_final_waist_q_target");
+            pk.pack_array(3);
+            for (const auto value : ee_qp->final_waist_q_target) pk.pack(value);
         }
 
         // ---- Visualisation fields (from output_data_map_) ----

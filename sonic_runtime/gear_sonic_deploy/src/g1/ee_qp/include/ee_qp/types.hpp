@@ -57,6 +57,7 @@ enum class ReferenceSource : std::uint8_t {
   kDampedReturn,
   kCartesianServo,
   kSmplRelative,
+  kPicoBody,
 };
 
 enum class ControlMode : std::uint8_t {
@@ -104,6 +105,7 @@ inline const char* ReferenceSourceName(ReferenceSource source) {
     case ReferenceSource::kDampedReturn: return "damped_return";
     case ReferenceSource::kCartesianServo: return "cartesian_servo";
     case ReferenceSource::kSmplRelative: return "smpl_relative";
+    case ReferenceSource::kPicoBody: return "pico_body";
   }
   return "unknown";
 }
@@ -223,6 +225,8 @@ struct EeQpTelemetry {
   JointVector q_corrected = JointVector::Zero();
   JointVector delta_q = JointVector::Zero();
   JointVector joint_tracking_error = JointVector::Zero();
+  Eigen::Vector3d sonic_waist_raw_q_target = Eigen::Vector3d::Zero();
+  Eigen::Vector3d final_waist_q_target = Eigen::Vector3d::Zero();
   double error_before_m = 0.0;
   double predicted_error_after_m = 0.0;
   double nonlinear_error_after_m = 0.0;

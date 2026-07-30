@@ -235,6 +235,7 @@ def compose_frame(
     manager_data: Optional[dict[str, Any]],
     path_plan_data: Optional[dict[str, Any]] = None,
     button_data: Optional[dict[str, Any]] = None,
+    pico_target_data: Optional[dict[str, Any]] = None,
 ) -> dict[str, np.ndarray]:
     """Compose one raw synchronized sample without changing joint conventions."""
     frame: dict[str, np.ndarray] = {
@@ -262,6 +263,8 @@ def compose_frame(
         frame.update(flatten_prefixed("manager", manager_data))
     if path_plan_data is not None:
         frame.update(flatten_prefixed("path_plan", path_plan_data))
+    if pico_target_data is not None:
+        frame.update(flatten_prefixed("pico_target", pico_target_data))
     if button_data is not None:
         button_fields = {
             "event": button_data.get("event", ""),
@@ -410,12 +413,34 @@ def append_selected(history: dict[str, list[np.ndarray]], frame: dict[str, np.nd
         "pose_joint_pos",
         "pose_vr_position",
         "pose_vr_orientation",
+        "pose_vr_position_raw",
+        "pose_vr_orientation_raw",
         "pose_left_trigger",
         "pose_right_trigger",
         "pose_left_grip",
         "pose_right_grip",
         "pose_left_hand_joints",
         "pose_right_hand_joints",
+        "pico_target_frame_index",
+        "pico_target_timestamp_monotonic",
+        "pico_target_vr_position",
+        "pico_target_vr_orientation",
+        "pico_target_vr_position_raw",
+        "pico_target_vr_orientation_raw",
+        "pico_target_calibrated",
+        "pico_target_ee_frame_offset_m",
+        "pico_target_pose_source",
+        "pico_target_ctrl_pos_hy",
+        "pico_target_ctrl_quat_hy",
+        "pico_target_ctrl_pos_aligned",
+        "pico_target_ctrl_quat_aligned",
+        "pico_target_ctrl_align_rev",
+        "pico_target_left_trigger",
+        "pico_target_right_trigger",
+        "pico_target_left_grip",
+        "pico_target_right_grip",
+        "pico_target_left_hand_joints",
+        "pico_target_right_hand_joints",
         "manager_state",
         "path_plan_source",
         "path_plan_control_mode",
@@ -493,6 +518,8 @@ def append_selected(history: dict[str, list[np.ndarray]], frame: dict[str, np.nd
         "state_ee_qp_q_corrected",
         "state_ee_qp_delta_q",
         "state_ee_qp_joint_tracking_error",
+        "state_ee_qp_sonic_waist_raw_q_target",
+        "state_ee_qp_final_waist_q_target",
         "state_ee_qp_target_position",
         "state_ee_qp_target_link",
         "state_ee_qp_left_wrist_error_before_m",
@@ -521,6 +548,8 @@ def append_selected(history: dict[str, list[np.ndarray]], frame: dict[str, np.nd
         "sonic_ee_qp_fallback_reason",
         "sonic_ee_qp_fallback_active",
         "sonic_ee_qp_candidate_rejected",
+        "sonic_ee_qp_sonic_waist_raw_q_target",
+        "sonic_ee_qp_final_waist_q_target",
         "image_path",
     ]
     for key in selected_keys:
@@ -699,6 +728,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pose-port", type=int, default=DEFAULT_POSE_PORT)
     parser.add_argument("--pose-topic", default="pose")
     parser.add_argument("--max-pose-age", type=float, default=0.25)
+    parser.add_argument("--pico-target-host", default="localhost")
+    parser.add_argument("--pico-target-port", type=int, default=5566)
+    parser.add_argument("--pico-target-topic", default="vr_pose_debug")
     parser.add_argument("--button-host", default="localhost")
     parser.add_argument("--button-port", type=int, default=5565)
     parser.add_argument("--button-topic", default="pico_button_event")
@@ -722,9 +754,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--allow-missing-pose",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="Record state/image frames even when the PICO pose ZMQ stream is absent. "
-             "Pose-prefixed arrays will be omitted from the saved frames.",
+             "Enabled by default; use --no-allow-missing-pose for legacy strict sync.",
     )
     parser.add_argument(
         "--allow-missing-sonic",
@@ -805,6 +838,13 @@ def main() -> None:
         ctx, args.pose_host, args.pose_port,
         [args.pose_topic, "manager_state"], conflate=False,
     )
+    pico_target_sock = make_subscriber(
+        ctx,
+        args.pico_target_host,
+        args.pico_target_port,
+        [args.pico_target_topic],
+        conflate=True,
+    )
 
     # SONIC debug/action은 measured-state source와 무관하게 항상 ZMQ로 수신한다.
     state_sock = make_subscriber(
@@ -850,12 +890,14 @@ def main() -> None:
 
     poller = zmq.Poller()
     poller.register(pose_sock, zmq.POLLIN)
+    poller.register(pico_target_sock, zmq.POLLIN)
     poller.register(state_sock, zmq.POLLIN)
     if path_plan_sock is not None:
         poller.register(path_plan_sock, zmq.POLLIN)
     poller.register(button_sock, zmq.POLLIN)
 
     latest_pose: LatestMessage | None = None
+    latest_pico_target: LatestMessage | None = None
     latest_state: LatestMessage | None = None
     latest_sonic: LatestMessage | None = None
     latest_manager: LatestMessage | None = None
@@ -869,6 +911,10 @@ def main() -> None:
 
     print(f"[recorder] Writing to {output_dir}")
     print(f"[recorder] pose tcp://{args.pose_host}:{args.pose_port}/{args.pose_topic}")
+    print(
+        f"[recorder] PICO target tcp://{args.pico_target_host}:"
+        f"{args.pico_target_port}/{args.pico_target_topic}"
+    )
     if args.g1_source == "zmq":
         print(f"[recorder] g1 state (zmq) tcp://{args.state_host}:{args.state_port}/"
               f"{args.state_topic}")
@@ -914,6 +960,19 @@ def main() -> None:
                             )
                     except Exception as exc:
                         print(f"[recorder] skipped malformed pose-side message: {exc}")
+
+            if pico_target_sock in events:
+                try:
+                    raw = pico_target_sock.recv(zmq.NOBLOCK)
+                    latest_pico_target = LatestMessage(
+                        unpack_pose_message(raw, args.pico_target_topic),
+                        now_wall,
+                        now_mono,
+                    )
+                except zmq.Again:
+                    pass
+                except Exception as exc:
+                    print(f"[recorder] skipped malformed PICO target: {exc}")
 
             if state_sock in events:
                 try:
@@ -967,8 +1026,12 @@ def main() -> None:
                 continue
             next_sample += 1.0 / args.frequency
 
-            if args.allow_missing_pose and latest_pose is None:
-                latest_pose = LatestMessage({}, now_wall, now_mono)
+            pose_for_frame = latest_pose
+            if args.allow_missing_pose and (
+                pose_for_frame is None
+                or now_mono - pose_for_frame.monotonic_time > args.max_pose_age
+            ):
+                pose_for_frame = LatestMessage({}, now_wall, now_mono)
             if args.allow_missing_sonic and latest_sonic is None:
                 latest_sonic = LatestMessage(
                     {args.sonic_action_key: np.zeros(29, dtype=np.float64)},
@@ -977,7 +1040,7 @@ def main() -> None:
                 )
 
             missing = missing_required_streams(
-                pose=latest_pose, state=latest_state, sonic=latest_sonic,
+                pose=pose_for_frame, state=latest_state, sonic=latest_sonic,
             )
             if missing:
                 if now_mono - last_status > 1.0:
@@ -993,7 +1056,7 @@ def main() -> None:
                     last_status = now_mono
                 continue
 
-            assert latest_pose is not None
+            assert pose_for_frame is not None
             assert latest_state is not None
             assert latest_sonic is not None
             if args.sonic_action_key not in latest_sonic.data:
@@ -1006,7 +1069,7 @@ def main() -> None:
                     last_status = now_mono
                 continue
 
-            pose_age = now_mono - latest_pose.monotonic_time
+            pose_age = now_mono - pose_for_frame.monotonic_time
             state_age = now_mono - latest_state.monotonic_time
             sonic_age = now_mono - latest_sonic.monotonic_time
             if (pose_age > args.max_pose_age or state_age > args.max_state_age
@@ -1049,12 +1112,17 @@ def main() -> None:
                 state_age=state_age,
                 sonic_age=sonic_age,
                 stream_mode=stream_mode,
-                pose_data=latest_pose.data,
+                pose_data=pose_for_frame.data,
                 state_data=latest_state.data,
                 sonic_data=latest_sonic.data,
                 manager_data=latest_manager.data if latest_manager is not None else None,
                 path_plan_data=latest_path_plan.data if latest_path_plan is not None else None,
                 button_data=latest_button.data if latest_button is not None else None,
+                pico_target_data=(
+                    latest_pico_target.data
+                    if latest_pico_target is not None
+                    else None
+                ),
             )
 
             jpeg_bytes: Optional[bytes] = None
@@ -1120,6 +1188,7 @@ def main() -> None:
                   f"due to full writer queue")
         print(f"[recorder] total frames: {frame_idx}")
         pose_sock.close()
+        pico_target_sock.close()
         state_sock.close()
         if path_plan_sock is not None:
             path_plan_sock.close()

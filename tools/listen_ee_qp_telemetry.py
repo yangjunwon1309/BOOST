@@ -91,6 +91,25 @@ def vector_norms(samples: list[dict[str, Any]], key: str) -> list[float]:
     return values
 
 
+def waist_passthrough_stats(
+    samples: list[dict[str, Any]],
+) -> tuple[list[float] | None, list[float] | None, float]:
+    raw_values: list[list[float]] = []
+    final_values: list[list[float]] = []
+    mismatches: list[float] = []
+    for sample in samples:
+        raw = as_float_list(sample.get("ee_qp_sonic_waist_raw_q_target"), 3)
+        final = as_float_list(sample.get("ee_qp_final_waist_q_target"), 3)
+        if raw is None or final is None:
+            continue
+        raw_values.append(raw[:3])
+        final_values.append(final[:3])
+        mismatches.append(max(abs(a - b) for a, b in zip(raw[:3], final[:3])))
+    if not raw_values:
+        return None, None, math.nan
+    return raw_values[-1], final_values[-1], max(mismatches, default=math.nan)
+
+
 def vector_slice_stats(
     samples: list[dict[str, Any]], key: str, indices: list[int]
 ) -> tuple[float, float]:
@@ -320,6 +339,18 @@ def summarize(samples: list[dict[str, Any]], elapsed: float, top_joints: int) ->
     servo_after = numeric(samples, "ee_qp_servo_error_after_m")
     servo_before = [value for value in servo_before if value >= 0.0]
     servo_after = [value for value in servo_after if value >= 0.0]
+    waist_raw, waist_final, waist_passthrough_error = waist_passthrough_stats(
+        samples
+    )
+    waist_cmd_text = "waist_cmd=n/a"
+    if waist_raw is not None and waist_final is not None:
+        waist_cmd_text = (
+            "waist_cmd="
+            f"[{waist_raw[0]:+.3f},{waist_raw[1]:+.3f},{waist_raw[2]:+.3f}]"
+            "->"
+            f"[{waist_final[0]:+.3f},{waist_final[1]:+.3f},{waist_final[2]:+.3f}] "
+            f"diff={waist_passthrough_error:.2e}rad"
+        )
 
     return (
         f"[{elapsed:5.1f}s] n={len(samples):3d} "
@@ -333,6 +364,7 @@ def summarize(samples: list[dict[str, Any]], elapsed: float, top_joints: int) ->
         f"corr_top={mask_top_text(samples, 'ee_qp_correction_bound_saturation_mask', 'ee_qp_correction_bound_saturation_mask_est', top_joints)} "
         f"rate_top={mask_top_text(samples, 'ee_qp_rate_bound_saturation_mask', 'ee_qp_rate_bound_saturation_mask_est', top_joints)} | "
         f"waist_lag={waist_rmse:.4f}/{waist_max:.4f}rad lower_lag={lower_rmse:.4f}/{lower_max:.4f}rad | "
+        f"{waist_cmd_text} | "
         f"err_split={100.0 * mean(arm_err):.1f}/{100.0 * mean(waist_err):.1f}/"
         f"{100.0 * mean(lower_err):.1f}/{100.0 * mean(upper_err):.1f}cm"
         f"(arm/waist/lower/upper) | "

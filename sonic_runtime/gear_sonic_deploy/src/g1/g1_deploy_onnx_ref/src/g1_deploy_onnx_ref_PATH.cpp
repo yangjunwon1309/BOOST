@@ -2182,6 +2182,7 @@ class G1Deploy {
       }
       if (source == "cartesian_servo") return ::g1::ee_qp::ReferenceSource::kCartesianServo;
       if (source == "smpl_relative_cartesian") return ::g1::ee_qp::ReferenceSource::kSmplRelative;
+      if (source == "pico_body_cartesian") return ::g1::ee_qp::ReferenceSource::kPicoBody;
       return ::g1::ee_qp::ReferenceSource::kUnknown;
     }
 
@@ -3540,32 +3541,6 @@ class G1Deploy {
       return true;
     }
 
-    static bool IsPathWaistIdentityPdLocked(
-        const std::optional<::g1::ee_qp::EeReference>& reference) {
-      if (!reference) return false;
-      // PATH owns no waist motion.  Both q/w GMR teleoperation and e-mode
-      // Cartesian shared control must leave the waist PD target at identity;
-      // SONIC retains sole ownership of the lower-body balance policy.
-      const bool gmr_bimanual_teleop =
-          reference->reference_type == ::g1::ee_qp::ReferenceType::kSample &&
-          reference->control_mode == ::g1::ee_qp::ControlMode::kTeleop &&
-          reference->source == ::g1::ee_qp::ReferenceSource::kGmr;
-      const bool path_e_mode_plan_exec =
-          reference->control_mode == ::g1::ee_qp::ControlMode::kPlanExec;
-      // plan_exec also covers a fresh e-mode fallback/null target.  Keeping
-      // this clamp through that transition prevents a one-frame waist command
-      // leak while the arms fall back to their unassisted posture.
-      return gmr_bimanual_teleop || path_e_mode_plan_exec;
-    }
-
-    static void ForceWaistIdentityPdTarget(MotorCommand& command) {
-      for (const int hw : ::g1::ee_qp::kWaistHardwareIndices) {
-        command.q_target[hw] = 0.0f;
-        command.dq_target[hw] = 0.0f;
-        command.tau_ff[hw] = 0.0f;
-      }
-    }
-
     void PublishPathDirectTelemetry(
         const MotorCommand& command,
         const ::g1::ee_qp::EeReference& reference) {
@@ -3594,6 +3569,12 @@ class G1Deploy {
       telemetry.q_corrected = q_command;
       telemetry.delta_q = q_command - q_measured;
       telemetry.joint_tracking_error = q_command - q_measured;
+      for (std::size_t axis = 0;
+           axis < ::g1::ee_qp::kWaistHardwareIndices.size(); ++axis) {
+        const int hw = ::g1::ee_qp::kWaistHardwareIndices[axis];
+        telemetry.sonic_waist_raw_q_target[axis] = q_command[hw];
+        telemetry.final_waist_q_target[axis] = q_command[hw];
+      }
       telemetry.reference_source = reference.source;
       telemetry.control_mode = reference.control_mode;
       telemetry.plan_id = reference.plan_id;
@@ -4311,9 +4292,6 @@ class G1Deploy {
         ApplyHandIKOrigin(motor_command_tmp);
       } else if (UseAnyUpperIK() && has_vr_3point_data_) {
         PreservePreviousUpperBodyCommand(motor_command_tmp);
-      }
-      if (IsPathWaistIdentityPdLocked(path_reference)) {
-        ForceWaistIdentityPdTarget(motor_command_tmp);
       }
       motor_command_buffer_.SetData(motor_command_tmp);
       return true;

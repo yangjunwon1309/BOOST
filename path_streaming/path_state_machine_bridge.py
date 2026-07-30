@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PATH state-machine bridge between Pico SMPL targets and SONIC.
+"""PATH state-machine bridge between PICO body targets and SONIC.
 
 This bridge is the only process that publishes to SONIC's ZMQ manager port.
 Other producers are subordinate inputs:
@@ -13,23 +13,21 @@ Other producers are subordinate inputs:
 
 State behavior:
   teleop/intention:
-    Convert torso-relative SMPL wrist displacement into pelvis-local Cartesian
-    targets anchored at the robot's initial wrist FK, then solve both arms with
-    CasADi/IPOPT. SMPL root/global translation is never used.
+    Validate the manager-calibrated PICO pelvis-frame wrist poses, then solve
+    both arms with CasADi/IPOPT. No wrist-minus-neck displacement or robot-FK
+    re-anchoring is performed here.
   auto_planning:
-    Blend the belief/object contact point with the same torso-relative SMPL
+    Blend the belief/object contact point with the same PICO body
     wrist target. CasADi/IPOPT remains the sole owner of both arm commands.
   damped_return:
-    Return the arm target toward the current torso-relative SMPL target while
+    Return the arm target toward the current PICO body target while
     SONIC continues to own only the lower body.
 
 Runtime hotkeys:
   q/w/e/r switch PATH state.
-  p toggles whether this bridge publishes a valid QP reference. When disabled,
-    the bridge still forwards the proper SONIC input, but QP receives an
-    infeasible none-reference and falls back to the uncorrected SONIC target.
-  m toggles SONIC lower-body conditioning between the safe zero-root planner
-    input and raw SMPL pose input. Arm and waist ownership never changes.
+  p arm-disable requests are rejected because IPOPT owns both arms.
+  m SONIC-mode requests are ignored; q/e keep identical planner conditioning
+    and differ only in Cartesian target blending.
 """
 
 from __future__ import annotations
@@ -78,10 +76,11 @@ from path_core.messaging.path_schema import (
 from path_core.messaging.zmq_bus import pack_topic, unpack_topic
 from path_planning.unitree_arm_nonlinear_ik import UnitreeG1ArmNonlinearIK
 from path_streaming.path_smpl_thread_server import UPPER_BODY_PLANNER_INDICES
-from path_core.teleop.smpl_cartesian_target import (
-    SmplCartesianTargetConfig,
-    SmplCartesianTargetTracker,
-    SmplCartesianTargets,
+from path_core.teleop.pico_body_cartesian_target import (
+    PicoBodyCartesianTargetTracker,
+    PicoBodyTrackingSample,
+    PicoCartesianTargetConfig,
+    PicoCartesianTargets,
 )
 
 VALID_STATES = {"teleop", "intention", "auto_planning", "damped_return"}
@@ -129,18 +128,30 @@ def parse_args() -> argparse.Namespace:
         help="Force planner q_ref waist yaw/roll/pitch joints to zero before publishing to SONIC/QP.",
     )
     parser.add_argument("--pico-hand-timeout-sec", type=float, default=0.35)
-    parser.add_argument("--smpl-timeout-sec", type=float, default=0.20)
-    parser.add_argument("--smpl-scale-x", type=float, default=0.85)
-    parser.add_argument("--smpl-scale-y", type=float, default=0.85)
-    parser.add_argument("--smpl-scale-z", type=float, default=0.85)
-    parser.add_argument("--smpl-displacement-sign", type=float, default=1.0)
-    parser.add_argument("--smpl-target-ema-alpha", type=float, default=0.35)
-    parser.add_argument("--smpl-target-max-velocity-m-s", type=float, default=0.25)
-    parser.add_argument("--smpl-target-max-acceleration-m-s2", type=float, default=1.5)
-    parser.add_argument("--smpl-jump-reject-m", type=float, default=0.07)
-    parser.add_argument("--smpl-max-anchor-offset-m", type=float, default=0.45)
+    parser.add_argument("--pico-body-calibration-sec", type=float, default=0.5)
+    parser.add_argument("--pico-body-gap-hold-ms", type=float, default=100.0)
+    parser.add_argument("--pico-body-position-jump-m", type=float, default=0.05)
+    parser.add_argument("--pico-body-orientation-jump-deg", type=float, default=12.0)
+    parser.add_argument("--pico-body-recovery-frames", type=int, default=3)
+    parser.add_argument(
+        "--pico-body-scale-x", type=float, default=1.20,
+        help="Body-tracked wrist displacement gain about the G1 anchor (robot X).",
+    )
+    parser.add_argument(
+        "--pico-body-scale-y", type=float, default=1.20,
+        help="Body-tracked wrist displacement gain about the G1 anchor (robot Y).",
+    )
+    parser.add_argument(
+        "--pico-body-scale-z", type=float, default=1.20,
+        help="Body-tracked wrist displacement gain about the G1 anchor (robot Z).",
+    )
 
     parser.add_argument("--pico-endpoint", default="tcp://127.0.0.1:5559")
+    parser.add_argument(
+        "--pico-vr-endpoint",
+        default="tcp://127.0.0.1:5566",
+        help="Independent calibrated PICO pelvis-frame wrist stream.",
+    )
     parser.add_argument("--button-endpoint", default="tcp://127.0.0.1:5565")
     parser.add_argument("--button-topic", default="pico_button_event")
     parser.add_argument("--plan-endpoint", default="tcp://127.0.0.1:5562")
@@ -174,20 +185,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gravity-bias-max-deg", type=float, default=3.0)
     parser.add_argument("--gravity-accel-norm-tolerance", type=float, default=0.50)
     parser.add_argument("--gravity-bias-gyro-gate-rad-s", type=float, default=0.05)
-    parser.add_argument(
-        "--waist-bias-integral-gain-nm-per-rad-s", type=float, default=3.0
-    )
-    parser.add_argument("--waist-bias-yaw-limit-nm", type=float, default=0.75)
-    parser.add_argument("--waist-bias-roll-limit-nm", type=float, default=3.0)
-    parser.add_argument("--waist-bias-pitch-limit-nm", type=float, default=3.0)
-    parser.add_argument("--waist-bias-deadband-rad", type=float, default=0.005)
-    parser.add_argument(
-        "--waist-bias-joint-velocity-gate-rad-s", type=float, default=0.12
-    )
-    parser.add_argument(
-        "--waist-bias-base-gyro-gate-rad-s", type=float, default=0.15
-    )
-    parser.add_argument("--waist-torque-slew-nm-s", type=float, default=5.0)
     parser.add_argument(
         "--model-xml",
         type=Path,
@@ -328,9 +325,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--arm-ik-orientation-zero-error-m", type=float, default=0.03
     )
-    parser.add_argument(
-        "--arm-ik-orientation-min-scale", type=float, default=1.0e-3
-    )
+    parser.add_argument("--arm-ik-orientation-min-scale", type=float, default=1.0)
     parser.add_argument(
         "--arm-ik-residual-projection-threshold-m",
         type=float,
@@ -345,10 +340,16 @@ def parse_args() -> argparse.Namespace:
         "--arm-ik-projection-step-m", type=float, default=0.05
     )
     parser.add_argument(
-        "--arm-ik-smooth-filter",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Keep Unitree's short weighted moving average on the IK q solution.",
+        "--arm-ik-output-velocity-limit-rad-s",
+        type=float,
+        default=20.0,
+        help="XR G1-29 arm command velocity limit applied after the weighted filter.",
+    )
+    parser.add_argument(
+        "--arm-ik-output-control-hz",
+        type=float,
+        default=250.0,
+        help="XR G1-29 writer rate used to derive the per-command arm step.",
     )
     parser.add_argument(
         "--arm-ik-hard-lock-inactive-arm",
@@ -545,6 +546,70 @@ def smpl_sample_from_pose(
                 source_timestamp_us = int(values[-1])
                 break
         return joints[-1].copy(), source_timestamp_us, frame_index
+    except Exception:
+        return None
+
+
+def pico_body_sample_from_message(
+    raw: bytes,
+    topic: str,
+    fallback_timestamp_us: int,
+) -> PicoBodyTrackingSample | None:
+    """Extract one L-wrist/R-wrist/neck body-tracking sample.
+
+    Only manager-aligned poses are accepted. The state machine must not
+    recreate another wrist-minus-neck/FK transform.
+    PICO quaternions are scalar-first (w, x, y, z).
+    """
+
+    try:
+        fields = parse_packed_fields(raw, topic)
+        position_value = fields.get("vr_position")
+        orientation_value = fields.get("vr_orientation")
+        if position_value is None or orientation_value is None:
+            return None
+        calibrated = np.asarray(fields.get("calibrated", [True])).reshape(-1)
+        if calibrated.size and not bool(calibrated[-1]):
+            return None
+        offset = np.asarray(
+            fields.get("ee_frame_offset_m", [0.05]), dtype=np.float64
+        ).reshape(-1)
+        if offset.size and abs(float(offset[-1]) - 0.05) > 1.0e-4:
+            return None
+        positions = np.asarray(position_value, dtype=np.float64).reshape(3, 3)
+        orientations = np.asarray(orientation_value, dtype=np.float64).reshape(3, 4)
+        if not np.isfinite(positions).all() or not np.isfinite(orientations).all():
+            return None
+
+        indices = np.asarray(fields.get("frame_index", []), dtype=np.int64).reshape(-1)
+        frame_index = int(indices[-1]) if indices.size else -1
+        source_timestamp_us = int(fallback_timestamp_us)
+        monotonic_value = fields.get("timestamp_monotonic")
+        if monotonic_value is not None:
+            values = np.asarray(monotonic_value, dtype=np.float64).reshape(-1)
+            if values.size and np.isfinite(values[-1]) and values[-1] > 0.0:
+                source_timestamp_us = int(round(float(values[-1]) * 1.0e6))
+        else:
+            for name in ("timestamp_monotonic_us", "timestamp_us", "source_timestamp_us"):
+                value = fields.get(name)
+                if value is None:
+                    continue
+                values = np.asarray(value, dtype=np.int64).reshape(-1)
+                if values.size and int(values[-1]) > 0:
+                    source_timestamp_us = int(values[-1])
+                    break
+
+        return PicoBodyTrackingSample(
+            left_position=positions[0].copy(),
+            right_position=positions[1].copy(),
+            neck_position=positions[2].copy(),
+            left_orientation_wxyz=orientations[0].copy(),
+            right_orientation_wxyz=orientations[1].copy(),
+            neck_orientation_wxyz=orientations[2].copy(),
+            source_timestamp_us=source_timestamp_us,
+            frame_index=frame_index,
+            source=f"{topic}:pico_calibrated",
+        )
     except Exception:
         return None
 
@@ -893,89 +958,6 @@ class PelvisGravityEstimator:
         )
 
 
-class WaistGravityHoldController:
-    """Bounded integral trim on top of model gravity for exact q_waist=0 hold."""
-
-    WAIST = slice(12, 15)
-
-    def __init__(self, args: argparse.Namespace):
-        self.integral_gain = max(
-            float(args.waist_bias_integral_gain_nm_per_rad_s), 0.0
-        )
-        self.bias_limit = np.array(
-            [
-                max(float(args.waist_bias_yaw_limit_nm), 0.0),
-                max(float(args.waist_bias_roll_limit_nm), 0.0),
-                max(float(args.waist_bias_pitch_limit_nm), 0.0),
-            ],
-            dtype=np.float64,
-        )
-        self.deadband = max(float(args.waist_bias_deadband_rad), 0.0)
-        self.joint_velocity_gate = max(
-            float(args.waist_bias_joint_velocity_gate_rad_s), 0.0
-        )
-        self.base_gyro_gate = max(
-            float(args.waist_bias_base_gyro_gate_rad_s), 0.0
-        )
-        self.torque_slew = max(float(args.waist_torque_slew_nm_s), 0.0)
-        self.bias_torque = np.zeros(3, dtype=np.float64)
-        self.last_waist_torque: np.ndarray | None = None
-        self.adaptation_active = False
-
-    def apply(
-        self,
-        model_torque: np.ndarray,
-        q_measured: np.ndarray | None,
-        dq_measured: np.ndarray | None,
-        base_gyro: np.ndarray | None,
-        dt: float,
-    ) -> np.ndarray:
-        output = np.asarray(model_torque, dtype=np.float64).reshape(29).copy()
-        self.adaptation_active = False
-        if q_measured is not None:
-            q = np.asarray(q_measured, dtype=np.float64).reshape(29)
-            dq_norm = (
-                float(np.max(np.abs(np.asarray(dq_measured)[self.WAIST])))
-                if dq_measured is not None
-                else float("inf")
-            )
-            gyro_norm = (
-                float(np.linalg.norm(base_gyro))
-                if base_gyro is not None
-                else float("inf")
-            )
-            if (
-                dq_norm <= self.joint_velocity_gate
-                and gyro_norm <= self.base_gyro_gate
-            ):
-                error = -q[self.WAIST]
-                error[np.abs(error) < self.deadband] = 0.0
-                self.bias_torque += (
-                    self.integral_gain * error * max(float(dt), 0.0)
-                )
-                self.bias_torque = np.clip(
-                    self.bias_torque, -self.bias_limit, self.bias_limit
-                )
-                self.adaptation_active = True
-
-        desired_waist = output[self.WAIST] + self.bias_torque
-        if self.last_waist_torque is not None and self.torque_slew > 0.0:
-            max_step = self.torque_slew * max(float(dt), 0.0)
-            desired_waist = self.last_waist_torque + np.clip(
-                desired_waist - self.last_waist_torque, -max_step, max_step
-            )
-        output[self.WAIST] = desired_waist
-        self.last_waist_torque = desired_waist.copy()
-        return output
-
-    def status(self) -> str:
-        bias = ",".join(f"{value:+.2f}" for value in self.bias_torque)
-        return (
-            f"waist_bias=[{bias}]Nm "
-            f"adapt={'on' if self.adaptation_active else 'off'}"
-        )
-
-
 def _nested(payload: dict | None, *keys: str):
     value = payload
     for key in keys:
@@ -1317,15 +1299,22 @@ def main() -> int:
             "PATH e-mode requires shared_control position blending followed by "
             "CasADi/IPOPT arm IK; legacy planner mode is disabled."
         )
-    # PATH's command ownership is invariant, not a tunable mode:
-    # SONIC lower body only, identity waist, CasADi/IPOPT arms.
+    # PATH's arm ownership is invariant. The planner input keeps a neutral
+    # waist reference while the deploy forwards SONIC's resulting waist
+    # q/dq/tau command without PATH filtering.
     args.freeze_planner_lower_body = True
     args.freeze_planner_waist = True
     args.shared_waist_mode = "hold_identity"
     args.outer_waist_enabled = False
     ctx = zmq.Context.instance()
 
-    def make_pico_sub(topic: str, *, conflate: bool, hwm: int = 8) -> zmq.Socket:
+    def make_pico_sub(
+        topic: str,
+        *,
+        conflate: bool,
+        hwm: int = 8,
+        endpoint: str | None = None,
+    ) -> zmq.Socket:
         socket = ctx.socket(zmq.SUB)
         socket.setsockopt(zmq.SUBSCRIBE, topic.encode())
         if conflate:
@@ -1333,12 +1322,15 @@ def main() -> int:
         else:
             socket.setsockopt(zmq.RCVHWM, int(hwm))
         socket.setsockopt(zmq.RCVTIMEO, 1)
-        socket.connect(args.pico_endpoint)
+        socket.connect(endpoint or args.pico_endpoint)
         return socket
 
     # Keep independent queues so high-rate manager/planner traffic cannot push
-    # SMPL pose frames behind a backlog. Pose/planner/manager use latest-only
-    # semantics; command keeps a small edge queue for replay compatibility.
+    # control or body-pose frames behind a backlog. vr_pose_debug is independent
+    # of PICO's SONIC stream mode and is the authoritative arm target source.
+    pico_vr_body = make_pico_sub(
+        "vr_pose_debug", conflate=True, endpoint=args.pico_vr_endpoint
+    )
     pico_pose = make_pico_sub("pose", conflate=True)
     pico_command = make_pico_sub("command", conflate=False, hwm=32)
     pico_planner = make_pico_sub("planner", conflate=True)
@@ -1386,7 +1378,10 @@ def main() -> int:
 
     log(f"Pico input SUB {args.pico_endpoint}/pose,command,planner,manager_state")
     log(f"Pico ABXY SUB {args.button_endpoint}/{args.button_topic}")
-    log("GMR input disabled: wrist targets come directly from relative SMPL motion")
+    log(
+        "GMR input disabled: wrist targets use manager-calibrated PICO "
+        "pelvis-frame SE(3) directly"
+    )
     log(f"cuRobo plan SUB {args.plan_endpoint}/{args.plan_topic}")
     log(f"static EE target SUB {args.static_target_bind}/{args.static_target_topic}")
     log(f"robot state SUB {args.robot_state_endpoint}/{args.robot_state_topic}")
@@ -1400,7 +1395,6 @@ def main() -> int:
             model_dir=args.arm_ik_model_dir,
             max_iter=args.arm_ik_max_iter,
             ee_offset_m=args.arm_ik_ee_offset_m,
-            use_smooth_filter=args.arm_ik_smooth_filter,
             orientation_full_error_m=args.arm_ik_orientation_full_error_m,
             orientation_zero_error_m=args.arm_ik_orientation_zero_error_m,
             orientation_min_scale=args.arm_ik_orientation_min_scale,
@@ -1411,30 +1405,37 @@ def main() -> int:
                 args.arm_ik_residual_success_threshold_m
             ),
             projection_step_m=args.arm_ik_projection_step_m,
+            output_velocity_limit_rad_s=(
+                args.arm_ik_output_velocity_limit_rad_s
+            ),
+            output_control_dt_s=(
+                1.0 / max(float(args.arm_ik_output_control_hz), 1.0)
+            ),
         )
         log(
             "Unitree-style arm nonlinear IK enabled: "
             f"urdf={args.arm_ik_urdf}, max_iter={args.arm_ik_max_iter}, "
             f"hard_lock_inactive={args.arm_ik_hard_lock_inactive_arm}, "
-            f"orientation={100.0 * args.arm_ik_orientation_full_error_m:.1f}-"
-            f"{100.0 * args.arm_ik_orientation_zero_error_m:.1f}cm, "
+            "orientation_weight_scale=fixed_1.0, "
             f"residual_project/success="
             f"{100.0 * args.arm_ik_residual_projection_threshold_m:.1f}/"
-            f"{100.0 * args.arm_ik_residual_success_threshold_m:.1f}cm"
+            f"{100.0 * args.arm_ik_residual_success_threshold_m:.1f}cm, "
+            "q_output=xr_wma[0.4,0.3,0.2,0.1]+"
+            f"{args.arm_ik_output_velocity_limit_rad_s:.1f}rad/s@"
+            f"{args.arm_ik_output_control_hz:.0f}Hz"
         )
     gravity_estimator = PelvisGravityEstimator(args)
-    waist_gravity_hold = WaistGravityHoldController(args)
     log(
-        "50Hz gravity compensation enabled: "
+        "50Hz arm-only RNEA enabled (waist feedforward zero): "
         f"cutoff={args.gravity_filter_cutoff_hz:.1f}Hz "
         f"accel_bias={bool(args.gravity_accel_bias_enabled)} "
-        f"bias_tau={args.gravity_bias_time_constant_sec:.1f}s "
-        f"waist_integral_gain="
-        f"{args.waist_bias_integral_gain_nm_per_rad_s:.2f}Nm/(rad*s)"
+        f"bias_tau={args.gravity_bias_time_constant_sec:.1f}s"
     )
 
     current_state = args.state
-    planner_lower_body_idle = bool(args.planner_lower_body_idle_default)
+    # q/e share one SONIC planner-conditioning mode. State changes affect only
+    # the Cartesian target blend sent to IPOPT.
+    planner_lower_body_idle = True
     released_pose_frames = 0
     latest_plan: dict | None = None
     latest_plan_us = 0
@@ -1465,6 +1466,12 @@ def main() -> int:
     latest_smpl_joints: np.ndarray | None = None
     latest_smpl_source_us = 0
     latest_smpl_frame = -1
+    latest_pico_body_sample: PicoBodyTrackingSample | None = None
+    latest_pico_body_receive_us = 0
+    last_pico_target_frame = -1
+    pico_tracking_armed = False
+    pico_calibration_session = 0
+    pico_calibration_armed_receive_us = 0
     last_forwarded_pose_frame = -1
     latest_manager_mode = 0
     policy_started = False
@@ -1516,23 +1523,38 @@ def main() -> int:
     )
     shared_control = TaskSpaceBlender(shared_config)
     latest_shared_result = None
-    smpl_targets = SmplCartesianTargetTracker(
-        SmplCartesianTargetConfig(
-            scale_xyz=(
-                float(args.smpl_scale_x),
-                float(args.smpl_scale_y),
-                float(args.smpl_scale_z),
+    pico_targets = PicoBodyCartesianTargetTracker(
+        PicoCartesianTargetConfig(
+            calibration_sec=float(args.pico_body_calibration_sec),
+            gap_hold_sec=float(args.pico_body_gap_hold_ms) / 1000.0,
+            position_jump_m=float(args.pico_body_position_jump_m),
+            orientation_jump_rad=np.deg2rad(
+                float(args.pico_body_orientation_jump_deg)
             ),
-            displacement_sign=float(args.smpl_displacement_sign),
-            ema_alpha=float(args.smpl_target_ema_alpha),
-            max_velocity_m_s=float(args.smpl_target_max_velocity_m_s),
-            max_acceleration_m_s2=float(args.smpl_target_max_acceleration_m_s2),
-            jump_reject_m=float(args.smpl_jump_reject_m),
-            max_anchor_offset_m=float(args.smpl_max_anchor_offset_m),
-            stale_after_sec=float(args.smpl_timeout_sec),
+            recovery_frames=max(1, int(args.pico_body_recovery_frames)),
+            scale_xyz=(
+                float(args.pico_body_scale_x),
+                float(args.pico_body_scale_y),
+                float(args.pico_body_scale_z),
+            ),
         )
     )
-    latest_smpl_targets: SmplCartesianTargets | None = None
+    # Keep this local name for compatibility with existing payload/viewer keys;
+    # its contents now come exclusively from PICO body tracking.
+    latest_smpl_targets: PicoCartesianTargets | None = None
+    log(
+        "PICO body Cartesian targets enabled: "
+        f"topic={args.pico_vr_endpoint}/vr_pose_debug "
+        f"calibration={args.pico_body_calibration_sec:.2f}s "
+        f"gap_hold={args.pico_body_gap_hold_ms:.0f}ms "
+        f"jump={100.0 * args.pico_body_position_jump_m:.1f}cm/"
+        f"{args.pico_body_orientation_jump_deg:.1f}deg "
+        f"recovery={args.pico_body_recovery_frames} frames "
+        f"gain=[{args.pico_body_scale_x:.2f},"
+        f"{args.pico_body_scale_y:.2f},"
+        f"{args.pico_body_scale_z:.2f}]; "
+        "waiting for A+X"
+    )
     log(
         "auto_planning mode="
         f"{args.auto_planning_mode} shared_control="
@@ -1551,7 +1573,7 @@ def main() -> int:
         left_target_tf: np.ndarray,
         right_target_tf: np.ndarray,
     ):
-        """Solve the authoritative arm joints from pelvis-local SMPL targets."""
+        """Solve authoritative arm joints from pelvis-local PICO body targets."""
 
         nonlocal last_ipopt_q_ref, last_ipopt_tau_ff
         nonlocal last_arm_ik_solve_ms, last_arm_ik_error_m
@@ -1566,10 +1588,17 @@ def main() -> int:
         else:
             q_seed = np.zeros(29, dtype=np.float64)
         q_seed[:15] = 0.0
+        q_smooth = (
+            last_ipopt_q_ref.copy()
+            if last_ipopt_q_ref is not None
+            else q_seed.copy()
+        )
+        q_smooth[:15] = 0.0
         result = arm_nonlinear_ik.solve_bimanual_targets(
             left_target_tf=np.asarray(left_target_tf, dtype=np.float64),
             right_target_tf=np.asarray(right_target_tf, dtype=np.float64),
             q_seed29=q_seed,
+            q_smooth29=q_smooth,
             base_quaternion_wxyz=latest_robot_base_quat,
         )
         last_arm_ik_solve_ms = float(result.solve_time_ms)
@@ -1581,13 +1610,17 @@ def main() -> int:
             f"{100.0 * result.right_position_error_m:.1f}cm "
             f"ori_w={result.left_orientation_weight_scale:.3f}/"
             f"{result.right_orientation_weight_scale:.3f} "
-            f"projected={int(result.target_projected)}"
+            f"projected={int(result.target_projected)} "
+            f"post_rate={int(result.postprocess_rate_limited)} "
+            f"post_scale={result.postprocess_motion_scale:.2f} "
+            f"post_step={result.postprocess_max_step_rad:.3f}rad"
         )
         if result.success:
             result.q_ref[:15] = 0.0
-            # Lower body remains SONIC-owned. Preserve waist and arm gravity
-            # compensation generated from the full Pinocchio model.
+            # Lower body and waist remain SONIC-owned. Only arm RNEA torque is
+            # carried with the authoritative IPOPT arm target.
             result.tau_ff_ref[:12] = 0.0
+            result.tau_ff_ref[12:15] = 0.0
             last_ipopt_q_ref = result.q_ref.copy()
             last_ipopt_tau_ff = result.tau_ff_ref.copy()
         return result
@@ -1650,9 +1683,10 @@ def main() -> int:
             latest_hand_us > 0
             and (tick_us - latest_hand_us) <= max(0.0, args.pico_hand_timeout_sec) * 1.0e6
         )
-        if not fresh:
-            return None, None, False
-        return latest_left_hand_joints, latest_right_hand_joints, True
+        # Preserve the last explicit open/close command over a transient gap.
+        # Returning None is serialized as all-zero/open and loses a binary grip
+        # command exactly when PICO changes stream mode.
+        return latest_left_hand_joints, latest_right_hand_joints, fresh
 
     def clear_active_plan(reason: str) -> None:
         nonlocal active_plan, active_plan_us, active_plan_s, phase_mode, phase_sync_error_rad
@@ -1727,9 +1761,7 @@ def main() -> int:
         )
 
     def planner_mode_for_current_state() -> bool:
-        if current_state in {"auto_planning", "damped_return"}:
-            return True
-        return current_state in {"teleop", "intention"} and planner_lower_body_idle
+        return True
 
     def apply_state_request(requested: str, source: str, tick_us: int | None = None) -> None:
         nonlocal current_state, next_mode_command, blended_q, active_plan, active_plan_us
@@ -1752,7 +1784,7 @@ def main() -> int:
             active_plan_s = None
             phase_mode = "none"
             phase_sync_error_rad = float("nan")
-            send_mode_command(sonic, planner=planner_lower_body_idle)
+            send_mode_command(sonic, planner=True)
             next_mode_command = time.monotonic() + max(0.05, args.command_period_sec)
         else:
             send_mode_command(sonic, planner=True)
@@ -1776,6 +1808,42 @@ def main() -> int:
             elif requested == "damped_return":
                 shared_control.reset()
 
+    def set_pico_tracking_armed(enabled: bool, source: str) -> None:
+        """Start or clear one A+X-delimited PICO stability-validation session."""
+
+        nonlocal pico_tracking_armed, pico_calibration_session
+        nonlocal pico_calibration_armed_receive_us
+        nonlocal latest_smpl_targets, last_pico_target_frame
+        nonlocal last_ipopt_q_ref, last_ipopt_tau_ff, blended_q
+        enabled = bool(enabled)
+        if enabled == pico_tracking_armed:
+            log(
+                f"{source}: PICO validation already "
+                f"{'armed' if enabled else 'reset'}"
+            )
+            return
+        pico_targets.reset()
+        latest_smpl_targets = None
+        last_pico_target_frame = -1
+        last_ipopt_q_ref = None
+        last_ipopt_tau_ff = None
+        blended_q = None
+        pico_tracking_armed = enabled
+        if enabled:
+            pico_calibration_session += 1
+            pico_calibration_armed_receive_us = now_us()
+            log(
+                f"{source}: PICO stability session "
+                f"{pico_calibration_session} armed; collecting "
+                f"{args.pico_body_calibration_sec:.2f}s from the next valid frame"
+            )
+        else:
+            pico_calibration_armed_receive_us = 0
+            log(
+                f"{source}: PICO validation reset; "
+                "arm target held until the next A+X"
+            )
+
     def set_qp_reference_enabled(enabled: bool, source: str) -> None:
         nonlocal qp_reference_enabled
         qp_reference_enabled = True
@@ -1789,25 +1857,22 @@ def main() -> int:
 
     def set_planner_lower_body_idle(enabled: bool, source: str) -> None:
         nonlocal planner_lower_body_idle, next_mode_command
-        enabled = bool(enabled)
-        if enabled == planner_lower_body_idle:
+        planner_lower_body_idle = True
+        if not enabled:
             log(
-                f"{source} SONIC lower-body source: staying "
-                f"{'zero-root planner' if enabled else 'raw SMPL'}"
+                f"{source} raw-SMPL SONIC mode request ignored: "
+                "q/e keep one planner-conditioning mode"
             )
-            return
-        planner_lower_body_idle = enabled
-        mode = "zero-root planner" if enabled else "raw SMPL"
-        log(f"{source} SONIC lower-body source: {mode}")
-        if current_state in {"teleop", "intention"}:
-            send_mode_command(sonic, planner=planner_lower_body_idle)
-            next_mode_command = time.monotonic() + max(0.05, args.command_period_sec)
+        else:
+            log(f"{source} SONIC planner conditioning: staying ON")
+        send_mode_command(sonic, planner=True)
+        next_mode_command = time.monotonic() + max(0.05, args.command_period_sec)
 
     if keyboard.enabled:
         log(
             "keyboard hotkeys enabled: q=teleop, w=intention, e=auto_planning, "
             "r=damped_return, p=IPOPT arm disable rejected, "
-            "m=SONIC lower-body conditioning planner/raw-SMPL toggle"
+            "m=SONIC mode toggle ignored (planner conditioning is invariant)"
         )
     else:
         log("keyboard hotkeys disabled; use tcp://*:5563/path_state_command")
@@ -1853,15 +1918,18 @@ def main() -> int:
                         policy_started = start
                         if stop:
                             current_state = "teleop"
-                            smpl_targets.reset()
+                            set_pico_tracking_armed(False, "Pico stop")
                     elif event_name == "ax":
+                        set_pico_tracking_armed(
+                            not pico_tracking_armed, "Pico A+X"
+                        )
                         requested = (
                             "teleop"
                             if current_state in {"auto_planning", "damped_return"}
                             else "auto_planning"
                         )
                         apply_state_request(requested, "Pico A+X", tick_us)
-                        planner = requested == "auto_planning" or planner_lower_body_idle
+                        planner = True
                     elif event_name == "by":
                         planner = True
                     bridge_forward_us = now_us()
@@ -1891,65 +1959,75 @@ def main() -> int:
                         continue
                     flags = command_flags(raw)
                     if flags is not None:
-                        start, stop, planner = flags
+                        start, stop, planner_requested = flags
                         if start:
                             policy_started = True
                         if stop:
-                            sonic.send(raw)
+                            sonic.send(
+                                build_command_message(
+                                    start=False, stop=True, planner=True
+                                )
+                            )
                             policy_started = False
                             current_state = "teleop"
                             shared_control.reset()
-                            smpl_targets.reset()
+                            set_pico_tracking_armed(False, "Pico stop")
                             continue
 
-                        if planner and current_state in {"teleop", "intention"}:
+                        if planner_requested and current_state in {"teleop", "intention"}:
                             if start:
                                 # A+B+X+Y startup/alignment uses start=True, planner=True.
-                                sonic.send(raw)
-                            else:
-                                apply_state_request(
-                                    "auto_planning", "Pico command", tick_us
-                                )
-                                sonic.send(raw)
-                            continue
-
-                        if (not planner) and current_state in {
-                            "auto_planning",
-                            "damped_return",
-                        }:
-                            log(f"A+X/pose command: {current_state} -> teleop")
-                            current_state = "teleop"
-                            shared_control.reset()
-                            sonic.send(raw)
-                            continue
-
-                        if (
-                            current_state in {"teleop", "intention"}
-                            and planner_lower_body_idle
-                        ):
-                            # Safe q/w default: keep SONIC in planner mode and
-                            # prevent raw SMPL/Pico pose-mode commands from
-                            # re-enabling lower/root tracking. Press m first
-                            # if full raw SMPL passthrough is intentionally needed.
-                            if start:
                                 sonic.send(
                                     build_command_message(
                                         start=True, stop=False, planner=True
                                     )
                                 )
                             else:
+                                set_pico_tracking_armed(True, "Pico A+X legacy")
+                                apply_state_request(
+                                    "auto_planning", "Pico command", tick_us
+                                )
                                 send_mode_command(sonic, planner=True)
                             continue
 
-                        sonic.send(raw)
+                        if (not planner_requested) and current_state in {
+                            "auto_planning",
+                            "damped_return",
+                        }:
+                            log(f"A+X target-mode command: {current_state} -> teleop")
+                            set_pico_tracking_armed(False, "Pico A+X legacy")
+                            current_state = "teleop"
+                            shared_control.reset()
+                            send_mode_command(sonic, planner=True)
+                            continue
+
+                        sonic.send(
+                            build_command_message(
+                                start=start, stop=stop, planner=True
+                            )
+                        )
                     else:
                         sonic.send(raw)
             except zmq.Again:
                 pass
 
-            # Pose has latest-only semantics. If the 50Hz loop misses a
-            # deadline, ZeroMQ replaces the stale sample instead of replaying a
-            # burst of old SMPL frames on the next tick.
+            # PICO body tracking is published independently of SONIC's stream
+            # mode. It therefore remains available in q/e planner modes.
+            try:
+                raw = pico_vr_body.recv(zmq.NOBLOCK)
+                remember_pico_hand_fields(raw, "vr_pose_debug", tick_us)
+                body_sample = pico_body_sample_from_message(
+                    raw, "vr_pose_debug", tick_us
+                )
+                if body_sample is not None:
+                    latest_pico_body_sample = body_sample
+                    latest_pico_body_receive_us = tick_us
+            except zmq.Again:
+                pass
+
+            # Pose remains subscribed only for hand fields and legacy recording.
+            # Arm targets never fall back from the independent calibrated
+            # vr_pose_debug stream to this mode-dependent channel.
             try:
                 raw = pico_pose.recv(zmq.NOBLOCK)
                 remember_pico_hand_fields(raw, "pose", tick_us)
@@ -1964,8 +2042,6 @@ def main() -> int:
             try:
                 raw = pico_planner.recv(zmq.NOBLOCK)
                 remember_pico_hand_fields(raw, "planner", tick_us)
-                if current_state in {"teleop", "intention"} and not planner_lower_body_idle:
-                    sonic.send(raw)
             except zmq.Again:
                 pass
 
@@ -2196,39 +2272,35 @@ def main() -> int:
             )
             smpl_fresh = (
                 latest_smpl_joints is not None
-                and smpl_age_sec <= max(0.01, args.smpl_timeout_sec)
+                and smpl_age_sec <= 0.20
+            )
+            pico_body_age_sec = (
+                (tick_us - latest_pico_body_receive_us) / 1.0e6
+                if latest_pico_body_receive_us > 0
+                else float("inf")
+            )
+            pico_body_fresh = (
+                pico_tracking_armed
+                and latest_pico_body_sample is not None
+                and latest_pico_body_receive_us
+                >= pico_calibration_armed_receive_us
+                and pico_body_age_sec
+                <= max(0.001, float(args.pico_body_gap_hold_ms) / 1000.0)
             )
             if (
-                smpl_fresh
-                and latest_robot_q is not None
-                and arm_nonlinear_ik is not None
+                pico_body_fresh
+                and latest_pico_body_sample is not None
+                and latest_pico_body_sample.frame_index != last_pico_target_frame
             ):
-                robot_left_tf, robot_right_tf = (
-                    arm_nonlinear_ik.wrist_transforms_from_q29(latest_robot_q)
+                latest_smpl_targets = pico_targets.update(
+                    sample=latest_pico_body_sample
                 )
-                latest_smpl_targets = smpl_targets.update(
-                    smpl_joints=latest_smpl_joints,
-                    robot_left_transform=robot_left_tf,
-                    robot_right_transform=robot_right_tf,
-                    source_timestamp_us=latest_smpl_source_us,
-                    frame_index=latest_smpl_frame,
-                    dt=dt,
-                )
+                last_pico_target_frame = latest_pico_body_sample.frame_index
             elif latest_smpl_targets is not None:
-                latest_smpl_targets = smpl_targets.hold(
-                    reason="stale_smpl" if not smpl_fresh else "missing_robot_state"
-                )
-
-            if (
-                current_state in {"teleop", "intention"}
-                and not planner_lower_body_idle
-                and latest_pose_raw is not None
-                and latest_smpl_frame != last_forwarded_pose_frame
-            ):
-                pose_to_send = latest_pose_raw
-                released_pose_frame = latest_smpl_frame
-                released_pose_frames += 1
-                last_forwarded_pose_frame = latest_smpl_frame
+                if not pico_body_fresh:
+                    latest_smpl_targets = pico_targets.hold(
+                        reason=f"pico_stream_gap_{1000.0 * pico_body_age_sec:.1f}ms"
+                    )
 
             left_hand_cmd, right_hand_cmd, hand_fresh = current_pico_hand_joints(tick_us)
             plan_fresh = latest_plan is not None and (tick_us - latest_plan_us) <= args.plan_timeout_sec * 1.0e6
@@ -2303,7 +2375,7 @@ def main() -> int:
                         qp_payload = ipopt_arm_sample_reference(
                             ik_result.q_ref,
                             state=current_state,
-                            source="smpl_relative_cartesian",
+                            source="pico_body_cartesian",
                             control_mode="teleop",
                             feasible=True,
                             plan_id=0,
@@ -2316,11 +2388,11 @@ def main() -> int:
                             smpl_target_held=bool(latest_smpl_targets.held),
                             smpl_left_target_position=latest_smpl_targets.left_transform[:3, 3].tolist(),
                             smpl_right_target_position=latest_smpl_targets.right_transform[:3, 3].tolist(),
-                            q_prior_source="ipopt_smpl_relative_ee",
+                            q_prior_source="ipopt_pico_body_ee",
                             belief_enabled=False,
                             shared_control=False,
                             teleop_qp_bimanual=True,
-                            teleop_waist_locked=True,
+                            teleop_waist_locked=False,
                             arm_ik_solve_ms=float(ik_result.solve_time_ms),
                             arm_ik_position_error_m=float(ik_result.position_error_m),
                             arm_ik_rotation_error_rad=float(ik_result.rotation_error_rad),
@@ -2344,6 +2416,16 @@ def main() -> int:
                             arm_ik_status=str(ik_result.message),
                         )
                 else:
+                    missing_pico_source_us = (
+                        int(latest_pico_body_sample.source_timestamp_us)
+                        if latest_pico_body_sample is not None
+                        else 0
+                    )
+                    missing_pico_frame = (
+                        int(latest_pico_body_sample.frame_index)
+                        if latest_pico_body_sample is not None
+                        else -1
+                    )
                     qp_payload = qp_none_reference(
                         state=current_state,
                         source="casadi_ipopt",
@@ -2351,12 +2433,16 @@ def main() -> int:
                         feasible=False,
                         timestamp_us=tick_us,
                         bridge_timestamp_us=tick_us,
-                        smpl_source_timestamp_us=int(latest_smpl_source_us),
-                        smpl_frame_index=int(latest_smpl_frame),
+                        smpl_source_timestamp_us=missing_pico_source_us,
+                        smpl_frame_index=missing_pico_frame,
                         smpl_target_reason=(
                             latest_smpl_targets.reason
                             if latest_smpl_targets is not None
-                            else "waiting_smpl_anchor"
+                            else (
+                                "waiting_pico_validation"
+                                if pico_tracking_armed
+                                else "waiting_pico_ax"
+                            )
                         ),
                         arm_target_owner="casadi_ipopt",
                         solver_backend="casadi_opti_ipopt",
@@ -2433,8 +2519,9 @@ def main() -> int:
                                 if ik_result.success
                                 else last_ipopt_or_measured_hold()
                             )
-                            # The planner input may condition SONIC's lower-body
-                            # policy, but PATH owns every waist/arm PD target.
+                            # Keep planner conditioning neutral below the arms.
+                            # Real deploy takes waist from bounded SONIC output
+                            # and takes both arm PD targets from this IPOPT solve.
                             q_for_sonic[:15] = 0.0
                             send_planner_command(
                                 sonic,
@@ -2477,11 +2564,11 @@ def main() -> int:
                             elif active_target is None:
                                 # No object target yet: e mode keeps the exact
                                 # same IPOPT arm ownership as q mode and uses
-                                # the SMPL-relative wrist poses (zero Cartesian blend).
+                                # the calibrated PICO wrist poses (zero Cartesian blend).
                                 qp_payload = ipopt_arm_sample_reference(
                                     ik_result.q_ref,
                                     state="auto_planning",
-                                    source="smpl_relative_cartesian",
+                                    source="pico_body_cartesian",
                                     control_mode="plan_exec",
                                     feasible=True,
                                     plan_id=static_target_plan_id,
@@ -2490,7 +2577,7 @@ def main() -> int:
                                     bridge_timestamp_us=tick_us,
                                     smpl_source_timestamp_us=source_timestamp_us,
                                     smpl_frame_index=int(latest_smpl_targets.frame_index),
-                                    q_prior_source="ipopt_smpl_relative_ee",
+                                    q_prior_source="ipopt_pico_body_ee",
                                     arm_ik_solve_ms=float(ik_result.solve_time_ms),
                                     arm_ik_position_error_m=float(
                                         ik_result.position_error_m
@@ -2581,7 +2668,7 @@ def main() -> int:
                     else:
                         missing = []
                         if latest_smpl_targets is None or not latest_smpl_targets.valid:
-                            missing.append("smpl_target")
+                            missing.append("pico_target")
                         if arm_nonlinear_ik is None:
                             missing.append("ipopt_fk")
                         if target is None:
@@ -2959,7 +3046,7 @@ def main() -> int:
                         blended_q,
                         tau_ff_ref=return_result.tau_ff_ref,
                         state="damped_return",
-                        source="smpl_relative_damped_return",
+                        source="pico_body_damped_return",
                         control_mode="blend_back",
                         feasible=bool(return_result.success),
                         plan_id=int(latest_plan.get("plan_id", 0)) if latest_plan else 0,
@@ -2978,8 +3065,8 @@ def main() -> int:
                         timestamp_us=tick_us,
                     )
 
-            # IK owns q, while gravity compensation is evaluated independently
-            # at the 50 Hz bridge rate. This keeps arm-load/waist feedforward
+            # IK owns q, while arm gravity compensation is evaluated independently
+            # at the 50 Hz bridge rate. This keeps arm-load feedforward
             # synchronized with the latest pelvis gravity even when a static IK
             # solution is cached for many seconds.
             if (
@@ -2996,18 +3083,8 @@ def main() -> int:
                     torque_q,
                     gravity_direction_pelvis=latest_gravity_direction,
                 )
-                model_tau[:12] = 0.0
-                robot_state_fresh = (
-                    latest_robot_q is not None
-                    and (tick_us - latest_robot_state_us) <= 100_000
-                )
-                tau_ff = waist_gravity_hold.apply(
-                    model_tau,
-                    latest_robot_q if robot_state_fresh else None,
-                    latest_robot_dq if robot_state_fresh else None,
-                    latest_robot_base_gyro if robot_state_fresh else None,
-                    dt,
-                )
+                tau_ff = model_tau.copy()
+                tau_ff[:15] = 0.0
                 qp_payload["tau_ff_ref"] = tau_ff.tolist()
                 qp_payload["gravity_direction_pelvis"] = (
                     latest_gravity_direction.tolist()
@@ -3026,7 +3103,7 @@ def main() -> int:
                     model_tau[12:15].tolist()
                 )
                 qp_payload["waist_adaptive_bias_tau_nm"] = (
-                    waist_gravity_hold.bias_torque.tolist()
+                    [0.0, 0.0, 0.0]
                 )
                 qp_payload["waist_command_tau_nm"] = tau_ff[12:15].tolist()
 
@@ -3041,19 +3118,80 @@ def main() -> int:
                 )
 
             if qp_payload is not None:
-                qp_payload["smpl_frame_index"] = int(latest_smpl_frame)
-                qp_payload["smpl_source_timestamp_us"] = int(latest_smpl_source_us)
-                qp_payload["smpl_input_age_ms"] = float(
-                    1000.0 * smpl_age_sec if np.isfinite(smpl_age_sec) else -1.0
+                pico_frame = (
+                    int(latest_pico_body_sample.frame_index)
+                    if latest_pico_body_sample is not None
+                    else -1
                 )
-                qp_payload["smpl_target_valid"] = bool(
+                pico_source_us = (
+                    int(latest_pico_body_sample.source_timestamp_us)
+                    if latest_pico_body_sample is not None
+                    else 0
+                )
+                pico_target_valid = bool(
                     latest_smpl_targets is not None and latest_smpl_targets.valid
                 )
-                qp_payload["smpl_target_reason"] = (
+                pico_target_reason = (
                     latest_smpl_targets.reason
                     if latest_smpl_targets is not None
-                    else "waiting_smpl_anchor"
+                    else (
+                        "waiting_pico_validation"
+                        if pico_tracking_armed
+                        else "waiting_pico_ax"
+                    )
                 )
+                qp_payload["pico_body_frame_index"] = pico_frame
+                qp_payload["pico_body_source_timestamp_us"] = pico_source_us
+                qp_payload["pico_body_tracking_armed"] = bool(
+                    pico_tracking_armed
+                )
+                qp_payload["pico_body_calibration_session"] = int(
+                    pico_calibration_session
+                )
+                qp_payload["pico_body_input_age_ms"] = float(
+                    1000.0 * pico_body_age_sec
+                    if np.isfinite(pico_body_age_sec)
+                    else -1.0
+                )
+                qp_payload["pico_body_target_valid"] = pico_target_valid
+                qp_payload["pico_body_target_reason"] = pico_target_reason
+                qp_payload["pico_body_target_held"] = bool(
+                    latest_smpl_targets.held
+                    if latest_smpl_targets is not None
+                    else True
+                )
+                if latest_smpl_targets is not None:
+                    qp_payload["pico_left_target_position"] = (
+                        latest_smpl_targets.left_transform[:3, 3].tolist()
+                    )
+                    qp_payload["pico_right_target_position"] = (
+                        latest_smpl_targets.right_transform[:3, 3].tolist()
+                    )
+                    qp_payload["pico_left_target_rotation"] = (
+                        latest_smpl_targets.left_transform[:3, :3].reshape(-1).tolist()
+                    )
+                    qp_payload["pico_right_target_rotation"] = (
+                        latest_smpl_targets.right_transform[:3, :3].reshape(-1).tolist()
+                    )
+                    qp_payload["pico_body_source"] = str(
+                        latest_smpl_targets.source
+                    )
+                    qp_payload["pico_body_calibration_frames"] = int(
+                        latest_smpl_targets.calibration_frames
+                    )
+                    qp_payload["pico_body_recovery_count"] = int(
+                        latest_smpl_targets.recovery_count
+                    )
+
+                # Compatibility fields consumed by existing viewers/recorders.
+                # Their values now identify the PICO body target, not GMR/SMPL.
+                qp_payload["smpl_frame_index"] = pico_frame
+                qp_payload["smpl_source_timestamp_us"] = pico_source_us
+                qp_payload["smpl_input_age_ms"] = qp_payload[
+                    "pico_body_input_age_ms"
+                ]
+                qp_payload["smpl_target_valid"] = pico_target_valid
+                qp_payload["smpl_target_reason"] = pico_target_reason
 
             if now >= next_mode_command:
                 send_mode_command(sonic, planner=planner_mode_for_current_state())
@@ -3079,7 +3217,10 @@ def main() -> int:
                         f"shared_grip={latest_shared_result.grip_index}"
                     )
                 log(
-                    f"state={current_state} smpl_fresh={smpl_fresh} plan_fresh={plan_fresh} "
+                    f"state={current_state} pico_fresh={pico_body_fresh} "
+                    f"pico_session={pico_calibration_session}/"
+                    f"{'armed' if pico_tracking_armed else 'wait_ax'} "
+                    f"smpl_lower_fresh={smpl_fresh} plan_fresh={plan_fresh} "
                     f"static_target={'fresh' if static_target_fresh else 'held' if static_target_usable else 'missing'} "
                     f"static_age={static_target_age_sec if np.isfinite(static_target_age_sec) else float('nan'):.2f}s "
                     f"static_rev={static_target_revision} "
@@ -3096,8 +3237,8 @@ def main() -> int:
                     f"qp_type={qp_payload.get('reference_type') if qp_payload else 'none'} "
                     f"source={qp_payload.get('source', 'none') if qp_payload else 'none'} "
                     f"q_prior={qp_payload.get('q_prior_source', 'n/a') if qp_payload else 'n/a'} "
-                    f"smpl_target={latest_smpl_targets.reason if latest_smpl_targets else 'waiting'} "
-                    f"smpl_age={1000.0 * smpl_age_sec if np.isfinite(smpl_age_sec) else -1.0:.1f}ms "
+                    f"pico_target={latest_smpl_targets.reason if latest_smpl_targets else 'waiting'} "
+                    f"pico_age={1000.0 * pico_body_age_sec if np.isfinite(pico_body_age_sec) else -1.0:.1f}ms "
                     f"released={released_pose_frame}/{released_pose_frames} "
                     f"pose_frame={latest_smpl_frame} "
                     f"button_seq={last_button_sequence} "
@@ -3110,7 +3251,7 @@ def main() -> int:
                     f"ik_err={100.0 * last_arm_ik_error_m if np.isfinite(last_arm_ik_error_m) else float('nan'):.2f}cm "
                     f"ik_solve={last_arm_ik_solve_ms if np.isfinite(last_arm_ik_solve_ms) else float('nan'):.2f}ms "
                     f"{gravity_estimator.status()} "
-                    f"{waist_gravity_hold.status()} "
+                    f"waist_ff=off "
                     f"{shared_log} "
                     f"{outer_waist.status()} "
                     f"feasible={qp_payload.get('feasible') if qp_payload else False}"
@@ -3127,6 +3268,7 @@ def main() -> int:
     except KeyboardInterrupt:
         return 0
     finally:
+        pico_vr_body.close()
         pico_pose.close()
         pico_command.close()
         pico_planner.close()

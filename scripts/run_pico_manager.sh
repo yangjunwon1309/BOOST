@@ -11,4 +11,6 @@ exec python path_streaming/pico_manager_thread_server.py \
   --port "${PATH_PICO_INTERNAL_PORT:-5559}" \
   --button_event_port "${PATH_PICO_BUTTON_PORT:-5565}" \
   --button_poll_hz "${PATH_PICO_BUTTON_POLL_HZ:-100}" \
+  --vr_pose_debug_port "${PATH_PICO_VR_PORT:-5566}" \
+  --vr_pose_debug_hz "${PATH_PICO_VR_HZ:-90}" \
   "$@"

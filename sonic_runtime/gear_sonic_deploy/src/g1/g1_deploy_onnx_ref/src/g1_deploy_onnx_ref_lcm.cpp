@@ -353,6 +353,8 @@ class G1Deploy {
         ::g1::ee_qp::JointVector::Zero();
     ::g1::ee_qp::JointVector last_ipopt_arm_tau_ff_ =
         ::g1::ee_qp::JointVector::Zero();
+    Eigen::Vector3d last_sonic_waist_raw_q_target_ =
+        Eigen::Vector3d::Zero();
     std::shared_ptr<::g1::ee_qp::RobotFkAdapter> ee_qp_kinematics_;
     std::unique_ptr<::g1::ee_qp::DynamicEeReferenceProvider> ee_qp_dynamic_reference_provider_;
     ::g1::ee_qp::EeReferenceProvider* ee_qp_reference_provider_ = nullptr;
@@ -2221,6 +2223,7 @@ class G1Deploy {
       if (source == "damped_return" || source == "damped") return ::g1::ee_qp::ReferenceSource::kDampedReturn;
       if (source == "cartesian_servo") return ::g1::ee_qp::ReferenceSource::kCartesianServo;
       if (source == "smpl_relative_cartesian") return ::g1::ee_qp::ReferenceSource::kSmplRelative;
+      if (source == "pico_body_cartesian") return ::g1::ee_qp::ReferenceSource::kPicoBody;
       return ::g1::ee_qp::ReferenceSource::kUnknown;
     }
 
@@ -2581,7 +2584,11 @@ class G1Deploy {
       int path_reference_port = 5560,
       std::string path_reference_topic = "path_qp_reference",
       double path_reference_lookahead_ms = 10.0,
-      double path_reference_heartbeat_timeout_ms = 500.0)
+      double path_reference_heartbeat_timeout_ms = 500.0,
+      double path_waist_yaw_limit_rad = 0.12,
+      double path_waist_roll_limit_rad = 0.08,
+      double path_waist_pitch_limit_rad = 0.10,
+      double path_waist_rate_limit_rad_s = 0.6)
       : time_(0.0),
         publish_dt_(0.002),
         control_dt_(0.02),
@@ -2606,6 +2613,12 @@ class G1Deploy {
         lcm_action_channel_(lcm_action_channel),
         lcm_state_channel_(lcm_state_channel),
         dummy_state_mode_(dummy_state_mode) {
+      // Compatibility arguments are intentionally ignored. PATH does not
+      // clamp, filter, slew-limit, or replace the SONIC waist command.
+      (void)path_waist_yaw_limit_rad;
+      (void)path_waist_roll_limit_rad;
+      (void)path_waist_pitch_limit_rad;
+      (void)path_waist_rate_limit_rad_s;
       
       // =========================================================================
       // unitree SDK 런타임 초기화
@@ -2692,8 +2705,9 @@ class G1Deploy {
         std::cout
             << "[G1Deploy-LCM/PATH] External CasADi/IPOPT arm ownership enabled at "
             << path_reference_host << ":" << path_reference_port << "/"
-            << path_reference_topic << ". SONIC owns lower body only; waist is "
-            << "locked to identity. Legacy ProxQP is not constructed."
+            << path_reference_topic << ". SONIC owns lower body and unmodified "
+            << "waist q/dq/tau; arms are owned by IPOPT. Waist PATH clamps and "
+            << "filters are disabled. Legacy ProxQP is not constructed."
             << std::endl;
       }
 
@@ -3197,7 +3211,7 @@ class G1Deploy {
     /**
      * @brief Command-writer thread body (500 Hz).
      * Final motor-space q/dq/tau를 V2 LCM packet으로 bridge에 송신한다.
-     * This preserves IPOPT arm RNEA and identity-waist gravity compensation.
+     * This preserves IPOPT arm RNEA and the unmodified SONIC waist command.
      */
     void LowCommandWriter() {
       const auto command_data = motor_command_buffer_.GetDataWithTime();
@@ -3309,6 +3323,13 @@ class G1Deploy {
             << "holding measured arm posture." << std::endl;
       }
 
+      for (std::size_t axis = 0;
+           axis < ::g1::ee_qp::kWaistHardwareIndices.size(); ++axis) {
+        const int hw = ::g1::ee_qp::kWaistHardwareIndices[axis];
+        last_sonic_waist_raw_q_target_[axis] =
+            static_cast<double>(command.q_target[hw]);
+      }
+
       for (const int hw : ::g1::ee_qp::kArmHardwareIndices) {
         command.q_target[hw] =
             static_cast<float>(last_ipopt_arm_q_target_[hw]);
@@ -3323,27 +3344,12 @@ class G1Deploy {
             QTargetToRawAction(hw, command.q_target[hw]);
         last_action[action_idx] = static_cast<double>(action[action_idx]);
       }
-      ForceWaistIdentityPdTarget(command, action);
 
       if (reference) {
         PublishPathDirectTelemetry(
             command, *reference, accepted_fresh_ipopt_target);
       }
       return accepted_fresh_ipopt_target;
-    }
-
-    void ForceWaistIdentityPdTarget(
-        MotorCommand& command,
-        std::array<float, g1_lcm::kNumMotors>& action) {
-      for (const int hw : ::g1::ee_qp::kWaistHardwareIndices) {
-        command.q_target[hw] = 0.0f;
-        command.dq_target[hw] = 0.0f;
-        command.tau_ff[hw] =
-            static_cast<float>(last_ipopt_arm_tau_ff_[hw]);
-        const int action_idx = isaaclab_to_mujoco[hw];
-        action[action_idx] = QTargetToRawAction(hw, command.q_target[hw]);
-        last_action[action_idx] = static_cast<double>(action[action_idx]);
-      }
     }
 
     void PublishPathDirectTelemetry(
@@ -3373,6 +3379,13 @@ class G1Deploy {
       telemetry.q_corrected = q_command;
       telemetry.delta_q = q_command - q_measured;
       telemetry.joint_tracking_error = q_command - q_measured;
+      telemetry.sonic_waist_raw_q_target =
+          last_sonic_waist_raw_q_target_;
+      for (std::size_t axis = 0;
+           axis < ::g1::ee_qp::kWaistHardwareIndices.size(); ++axis) {
+        telemetry.final_waist_q_target[axis] =
+            q_command[::g1::ee_qp::kWaistHardwareIndices[axis]];
+      }
       telemetry.reference_source = reference.source;
       telemetry.control_mode = reference.control_mode;
       telemetry.plan_id = reference.plan_id;
@@ -5066,6 +5079,7 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --enable-motion-recording: enable motion recording" << std::endl;
     std::cout << "  --set-compliance <value>: VR 3-point compliance" << std::endl;
     std::cout << "  --max-close-ratio <value>: hand max close ratio (0.2-1.0)" << std::endl;
+    std::cout << "  --path-waist-* options: deprecated compatibility flags; ignored" << std::endl;
     std::cout << "  --use-upper-ik: enable IK override for waist + arms/hands (SONIC lower body)" << std::endl;
     std::cout << "  --use-hand-ik: enable IK override for arms/hands only (SONIC lower body + waist)" << std::endl;
     std::cout << "  --use-hand-ik-origin: legacy 50 Hz arms/hands IK override without the 500 Hz IK thread" << std::endl;
@@ -5124,6 +5138,10 @@ int main(int argc, char const* argv[]) {
   std::string pathReferenceTopic = "path_qp_reference";
   double pathReferenceLookaheadMs = 10.0;
   double pathReferenceHeartbeatTimeoutMs = 500.0;
+  double pathWaistYawLimitRad = 0.12;
+  double pathWaistRollLimitRad = 0.08;
+  double pathWaistPitchLimitRad = 0.10;
+  double pathWaistRateLimitRadS = 0.6;
 
   for (int i = 4; i < argc; i++) {
     if (std::string(argv[i]) == "--disable-crc-check") {
@@ -5168,6 +5186,18 @@ int main(int argc, char const* argv[]) {
     } else if (std::string(argv[i]) == "--path-reference-heartbeat-timeout-ms") {
       if (i + 1 < argc) { pathReferenceHeartbeatTimeoutMs = std::stod(argv[++i]); }
       else { std::cerr << "Error: --path-reference-heartbeat-timeout-ms requires a value" << std::endl; exit(1); }
+    } else if (std::string(argv[i]) == "--path-waist-yaw-limit-rad") {
+      if (i + 1 < argc) { pathWaistYawLimitRad = std::stod(argv[++i]); }
+      else { std::cerr << "Error: --path-waist-yaw-limit-rad requires a value" << std::endl; exit(1); }
+    } else if (std::string(argv[i]) == "--path-waist-roll-limit-rad") {
+      if (i + 1 < argc) { pathWaistRollLimitRad = std::stod(argv[++i]); }
+      else { std::cerr << "Error: --path-waist-roll-limit-rad requires a value" << std::endl; exit(1); }
+    } else if (std::string(argv[i]) == "--path-waist-pitch-limit-rad") {
+      if (i + 1 < argc) { pathWaistPitchLimitRad = std::stod(argv[++i]); }
+      else { std::cerr << "Error: --path-waist-pitch-limit-rad requires a value" << std::endl; exit(1); }
+    } else if (std::string(argv[i]) == "--path-waist-rate-limit-rad-s") {
+      if (i + 1 < argc) { pathWaistRateLimitRadS = std::stod(argv[++i]); }
+      else { std::cerr << "Error: --path-waist-rate-limit-rad-s requires a value" << std::endl; exit(1); }
     } else if (std::string(argv[i]) == "--lcm-url") {
       if (i + 1 < argc) {
         lcm_url = argv[++i];
@@ -5465,7 +5495,11 @@ int main(int argc, char const* argv[]) {
     pathReferencePort,
     pathReferenceTopic,
     pathReferenceLookaheadMs,
-    pathReferenceHeartbeatTimeoutMs
+    pathReferenceHeartbeatTimeoutMs,
+    pathWaistYawLimitRad,
+    pathWaistRollLimitRad,
+    pathWaistPitchLimitRad,
+    pathWaistRateLimitRadS
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
   

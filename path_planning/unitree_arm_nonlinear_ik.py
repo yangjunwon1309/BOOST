@@ -21,6 +21,8 @@ import time
 import numpy as np
 import pinocchio as pin
 
+from path_core.teleop.xr_arm_postprocessing import XrArmCommandPostprocessor
+
 try:
     import casadi
 except ImportError as exc:  # pragma: no cover - exercised on machines without CasADi.
@@ -125,6 +127,9 @@ class ArmIkResult:
     left_orientation_weight_scale: float = 0.0
     right_orientation_weight_scale: float = 0.0
     target_projected: bool = False
+    postprocess_rate_limited: bool = False
+    postprocess_motion_scale: float = 1.0
+    postprocess_max_step_rad: float = 0.0
 
 
 def quat_wxyz_to_rot(quat_wxyz: np.ndarray) -> np.ndarray:
@@ -237,13 +242,14 @@ class UnitreeG1ArmNonlinearIK:
         regularization_weight: float = 0.02,
         smooth_weight: float = 0.1,
         ee_offset_m: float = 0.05,
-        use_smooth_filter: bool = True,
         orientation_full_error_m: float = 0.01,
         orientation_zero_error_m: float = 0.03,
-        orientation_min_scale: float = 1.0e-3,
+        orientation_min_scale: float = 1.0,
         residual_projection_threshold_m: float = 0.03,
         residual_success_threshold_m: float = 0.05,
         projection_step_m: float = 0.05,
+        output_velocity_limit_rad_s: float = 20.0,
+        output_control_dt_s: float = 1.0 / 250.0,
     ) -> None:
         if casadi is None:
             raise RuntimeError(
@@ -415,9 +421,6 @@ class UnitreeG1ArmNonlinearIK:
         self.lower = np.asarray(self.reduced_robot.model.lowerPositionLimit, dtype=np.float64)
         self.upper = np.asarray(self.reduced_robot.model.upperPositionLimit, dtype=np.float64)
         self.init_data = np.zeros(self.reduced_robot.model.nq, dtype=np.float64)
-        self.use_smooth_filter = bool(use_smooth_filter)
-        self.filter_weights = np.array([0.4, 0.3, 0.2, 0.1], dtype=np.float64)
-        self.filter_buffer: list[np.ndarray] = []
         self.orientation_full_error_m = float(orientation_full_error_m)
         self.orientation_zero_error_m = float(orientation_zero_error_m)
         self.orientation_min_scale = float(orientation_min_scale)
@@ -426,6 +429,11 @@ class UnitreeG1ArmNonlinearIK:
         )
         self.residual_success_threshold_m = float(residual_success_threshold_m)
         self.projection_step_m = float(projection_step_m)
+        self.arm_postprocessor = XrArmCommandPostprocessor(
+            velocity_limit_rad_s=output_velocity_limit_rad_s,
+            control_dt_s=output_control_dt_s,
+            data_size=self.reduced_robot.model.nq,
+        )
 
     def _joint_chain_to_root(self, joint_id: int) -> list[int]:
         chain: list[int] = []
@@ -536,32 +544,11 @@ class UnitreeG1ArmNonlinearIK:
             self.robot.model.gravity.linear = original_gravity
         return np.asarray(tau_full, dtype=np.float64)[self.full_v_indices].copy()
 
-    def _filtered(self, q: np.ndarray) -> np.ndarray:
-        if not self.use_smooth_filter:
-            return q
-        self.filter_buffer.insert(0, q.copy())
-        del self.filter_buffer[len(self.filter_weights):]
-        out = np.zeros_like(q)
-        total = 0.0
-        for weight, item in zip(self.filter_weights, self.filter_buffer):
-            out += weight * item
-            total += weight
-        return out / max(total, 1.0e-9)
-
     def _orientation_scale(self, position_error_m: float) -> float:
-        """Smoothly restore orientation only after position is within 3 cm."""
+        """Use the XR-teleop orientation objective at full weight."""
 
-        low = self.orientation_full_error_m
-        high = max(self.orientation_zero_error_m, low + 1.0e-6)
-        if position_error_m <= low:
-            return 1.0
-        if position_error_m >= high:
-            return self.orientation_min_scale
-        x = (high - position_error_m) / (high - low)
-        smooth = x * x * (3.0 - 2.0 * x)
-        return self.orientation_min_scale + (
-            1.0 - self.orientation_min_scale
-        ) * smooth
+        del position_error_m
+        return 1.0
 
     def _solution_metrics(
         self,
@@ -641,6 +628,7 @@ class UnitreeG1ArmNonlinearIK:
         left_target_tf: np.ndarray,
         right_target_tf: np.ndarray,
         q_seed29: np.ndarray,
+        q_smooth29: np.ndarray | None = None,
         lower: np.ndarray | None = None,
         upper: np.ndarray | None = None,
         base_quaternion_wxyz: np.ndarray | None = None,
@@ -653,7 +641,10 @@ class UnitreeG1ArmNonlinearIK:
         right_target_tf = np.asarray(right_target_tf, dtype=np.float64).reshape(4, 4)
         lower = self.lower.copy() if lower is None else np.asarray(lower, dtype=np.float64).copy()
         upper = self.upper.copy() if upper is None else np.asarray(upper, dtype=np.float64).copy()
-        q_last = self.q29_to_arm_q(q_seed29)
+        smooth_source = q_seed29 if q_smooth29 is None else np.asarray(
+            q_smooth29, dtype=np.float64
+        ).reshape(29)
+        q_last = self.q29_to_arm_q(smooth_source)
 
         try:
             current_left, current_right = self.wrist_transforms_from_q29(q_seed29)
@@ -730,49 +721,47 @@ class UnitreeG1ArmNonlinearIK:
             raw_metrics = self._solution_metrics(
                 q_raw, applied_left_tf, applied_right_tf
             )
-            filtered_arm_q = self._filtered(arm_q)
-            q_ref = self.arm_q_to_q29(q_seed29, filtered_arm_q)
-            filtered_metrics = self._solution_metrics(
+            postprocessed = self.arm_postprocessor.apply(
+                arm_q,
+                self.q29_to_arm_q(q_seed29),
+            )
+            q_ref = self.arm_q_to_q29(q_seed29, postprocessed.command_q)
+            command_metrics = self._solution_metrics(
                 q_ref, applied_left_tf, applied_right_tf
             )
-            # The moving-average filter must never turn a feasible position
-            # solution into a failed command. The target stream already has
-            # velocity/acceleration limits, so use the raw smooth-cost solution.
-            if (
-                max(filtered_metrics[:2]) > self.residual_success_threshold_m
-                and max(raw_metrics[:2]) <= self.residual_success_threshold_m
-            ):
-                q_ref = q_raw
-                filtered_metrics = raw_metrics
-                self.filter_buffer = [arm_q.copy()]
 
-            self.init_data = arm_q.copy()
+            # XR teleop warms IPOPT from the filtered solution; controller-side
+            # velocity clipping does not alter the next optimization seed.
+            self.init_data = postprocessed.filtered_q.copy()
             q_ref[12:15] = 0.0
             tau_ff = self.gravity_torque_from_q29(
                 q_ref, base_quaternion_wxyz=base_quaternion_wxyz
             )
-            # Legs remain under SONIC. PATH supplies only identity-waist and
-            # arm gravity compensation.
-            tau_ff[:12] = 0.0
+            # Legs and waist remain under SONIC/PD ownership. PATH supplies
+            # RNEA feedforward only for the two IPOPT-controlled arms.
+            tau_ff[:15] = 0.0
 
             (
                 left_position_error,
                 right_position_error,
                 left_rotation_error,
                 right_rotation_error,
-            ) = filtered_metrics
+            ) = command_metrics
             position_error = max(left_position_error, right_position_error)
             rotation_error = max(left_rotation_error, right_rotation_error)
-            success = position_error <= self.residual_success_threshold_m
+            raw_solution_success = (
+                max(raw_metrics[:2]) <= self.residual_success_threshold_m
+            )
+            success = raw_solution_success
             message = (
-                "ok_projected"
+                "ok_projected_postprocessed"
                 if success and target_projected
-                else "ok"
+                else "ok_postprocessed"
                 if success
                 else (
                     "ee_residual_exceeded:"
-                    f"left={left_position_error:.4f}m,"
-                    f"right={right_position_error:.4f}m"
+                    f"left={raw_metrics[0]:.4f}m,"
+                    f"right={raw_metrics[1]:.4f}m"
                 )
             )
             return ArmIkResult(
@@ -790,6 +779,9 @@ class UnitreeG1ArmNonlinearIK:
                 left_orientation_weight_scale=left_orientation_scale,
                 right_orientation_weight_scale=right_orientation_scale,
                 target_projected=target_projected,
+                postprocess_rate_limited=postprocessed.rate_limited,
+                postprocess_motion_scale=postprocessed.motion_scale,
+                postprocess_max_step_rad=postprocessed.max_command_step_rad,
             )
         except Exception as exc:
             return ArmIkResult(
@@ -808,6 +800,7 @@ class UnitreeG1ArmNonlinearIK:
         left_target_tf: np.ndarray,
         right_target_tf: np.ndarray,
         q_seed29: np.ndarray,
+        q_smooth29: np.ndarray | None = None,
         base_quaternion_wxyz: np.ndarray | None = None,
     ) -> ArmIkResult:
         """Solve the authoritative 14-DoF arm target used by PATH q/e modes."""
@@ -816,6 +809,7 @@ class UnitreeG1ArmNonlinearIK:
             left_target_tf=left_target_tf,
             right_target_tf=right_target_tf,
             q_seed29=q_seed29,
+            q_smooth29=q_smooth29,
             base_quaternion_wxyz=base_quaternion_wxyz,
         )
 

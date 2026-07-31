@@ -3506,7 +3506,9 @@ class G1Deploy {
         case ::g1::ee_qp::ReferenceSource::kReplay:
         case ::g1::ee_qp::ReferenceSource::kDampedReturn:
         case ::g1::ee_qp::ReferenceSource::kCartesianServo:
+        case ::g1::ee_qp::ReferenceSource::kPicoBody:
           return true;
+        case ::g1::ee_qp::ReferenceSource::kSmplRelative:
         case ::g1::ee_qp::ReferenceSource::kUnknown:
           return false;
       }

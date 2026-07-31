@@ -13,11 +13,10 @@ Other producers are subordinate inputs:
 
 State behavior:
   teleop/intention:
-    Validate the manager-calibrated PICO pelvis-frame wrist poses, then solve
-    both arms with CasADi/IPOPT. No wrist-minus-neck displacement or robot-FK
-    re-anchoring is performed here.
+    Pass absolute PICO head-position-to-waist wrist poses directly to
+    CasADi/IPOPT. No anchor, gain, target hold, or SMPL wrist fallback exists.
   auto_planning:
-    Blend the belief/object contact point with the same PICO body
+    Blend the belief/object contact point with the same PICO controller
     wrist target. CasADi/IPOPT remains the sole owner of both arm commands.
   damped_return:
     Return the arm target toward the current PICO body target while
@@ -35,6 +34,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import copy
+from dataclasses import dataclass
 import json
 import os
 import select
@@ -65,7 +65,6 @@ from path_core.messaging.path_schema import (
     CUROBO_PLAN_TOPIC,
     QP_REFERENCE_TOPIC,
     STATIC_EE_TARGET_TOPIC,
-    ipopt_arm_cartesian_target_reference,
     ipopt_arm_sample_reference,
     now_us,
     qp_bspline_reference,
@@ -76,12 +75,6 @@ from path_core.messaging.path_schema import (
 from path_core.messaging.zmq_bus import pack_topic, unpack_topic
 from path_planning.unitree_arm_nonlinear_ik import UnitreeG1ArmNonlinearIK
 from path_streaming.path_smpl_thread_server import UPPER_BODY_PLANNER_INDICES
-from path_core.teleop.pico_body_cartesian_target import (
-    PicoBodyCartesianTargetTracker,
-    PicoBodyTrackingSample,
-    PicoCartesianTargetConfig,
-    PicoCartesianTargets,
-)
 
 VALID_STATES = {"teleop", "intention", "auto_planning", "damped_return"}
 
@@ -89,6 +82,14 @@ VALID_STATES = {"teleop", "intention", "auto_planning", "damped_return"}
 # standing height.  PATH never owns the floating-base height: the lower body
 # remains under SONIC's locomotion policy in every state.
 SONIC_DEFAULT_STANDING_HEIGHT = -1.0
+
+STREAM_MODE_OFF = 0
+STREAM_MODE_ALIGNING = 6
+STREAM_MODE_TRACKING = 7
+
+# G1 URDF zero pose: upper arms hang vertically from the shoulders while the
+# forearms point forward (+X), giving the requested geometric 90-degree elbow.
+Q_READY = np.zeros(29, dtype=np.float64)
 
 
 def parse_args() -> argparse.Namespace:
@@ -128,29 +129,18 @@ def parse_args() -> argparse.Namespace:
         help="Force planner q_ref waist yaw/roll/pitch joints to zero before publishing to SONIC/QP.",
     )
     parser.add_argument("--pico-hand-timeout-sec", type=float, default=0.35)
-    parser.add_argument("--pico-body-calibration-sec", type=float, default=0.5)
     parser.add_argument("--pico-body-gap-hold-ms", type=float, default=100.0)
-    parser.add_argument("--pico-body-position-jump-m", type=float, default=0.05)
-    parser.add_argument("--pico-body-orientation-jump-deg", type=float, default=12.0)
-    parser.add_argument("--pico-body-recovery-frames", type=int, default=3)
     parser.add_argument(
-        "--pico-body-scale-x", type=float, default=1.20,
-        help="Body-tracked wrist displacement gain about the G1 anchor (robot X).",
-    )
-    parser.add_argument(
-        "--pico-body-scale-y", type=float, default=1.20,
-        help="Body-tracked wrist displacement gain about the G1 anchor (robot Y).",
-    )
-    parser.add_argument(
-        "--pico-body-scale-z", type=float, default=1.20,
-        help="Body-tracked wrist displacement gain about the G1 anchor (robot Z).",
+        "--arm-reference-mode",
+        choices=["head_position", "head_yaw"],
+        default="head_position",
     )
 
     parser.add_argument("--pico-endpoint", default="tcp://127.0.0.1:5559")
     parser.add_argument(
         "--pico-vr-endpoint",
         default="tcp://127.0.0.1:5566",
-        help="Independent calibrated PICO pelvis-frame wrist stream.",
+        help="Independent absolute PICO waist-frame wrist stream.",
     )
     parser.add_argument("--button-endpoint", default="tcp://127.0.0.1:5565")
     parser.add_argument("--button-topic", default="pico_button_event")
@@ -342,14 +332,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--arm-ik-output-velocity-limit-rad-s",
         type=float,
-        default=20.0,
+        default=10.0,
         help="XR G1-29 arm command velocity limit applied after the weighted filter.",
     )
     parser.add_argument(
         "--arm-ik-output-control-hz",
         type=float,
-        default=250.0,
-        help="XR G1-29 writer rate used to derive the per-command arm step.",
+        default=50.0,
+        help="PATH state-machine rate used to derive the per-command arm step.",
     )
     parser.add_argument(
         "--arm-ik-hard-lock-inactive-arm",
@@ -550,54 +540,58 @@ def smpl_sample_from_pose(
         return None
 
 
-def pico_body_sample_from_message(
+@dataclass(frozen=True)
+class WaistWristTargets:
+    left_waist: np.ndarray
+    right_waist: np.ndarray
+    session_id: int
+    frame_index: int
+    source_timestamp_us: int
+    valid: bool
+
+
+def wrist_targets_from_message(
     raw: bytes,
     topic: str,
     fallback_timestamp_us: int,
-) -> PicoBodyTrackingSample | None:
-    """Extract one native-controller L/R wrist sample plus diagnostic neck.
-
-    Only manager-aligned native controller poses are accepted. A body-tracking
-    fallback (pose_source=0) is deliberately rejected so it cannot silently
-    become the IPOPT wrist target.
-    PICO quaternions are scalar-first (w, x, y, z).
-    """
+) -> WaistWristTargets | None:
+    """Read absolute waist-frame wrist transforms without anchor or gain."""
 
     try:
         fields = parse_packed_fields(raw, topic)
-        position_value = fields.get("vr_position")
-        orientation_value = fields.get("vr_orientation")
-        if position_value is None or orientation_value is None:
-            return None
-        calibrated = np.asarray(fields.get("calibrated", [True])).reshape(-1)
-        if calibrated.size and not bool(calibrated[-1]):
-            return None
-        pose_source_value = np.asarray(
-            fields.get("pose_source", [0]), dtype=np.int32
+        valid_values = np.asarray(
+            fields.get("targets_valid", [False]), dtype=bool
         ).reshape(-1)
-        pose_source = int(pose_source_value[-1]) if pose_source_value.size else 0
-        if pose_source != 1:
-            return None
-        alignment_value = np.asarray(
-            fields.get("ctrl_align_rev", [-1]), dtype=np.int32
-        ).reshape(-1)
-        alignment_revision = (
-            int(alignment_value[-1]) if alignment_value.size else -1
-        )
-        if alignment_revision < 0:
+        if not valid_values.size or not bool(valid_values[-1]):
             return None
         offset = np.asarray(
             fields.get("ee_frame_offset_m", [0.05]), dtype=np.float64
         ).reshape(-1)
         if offset.size and abs(float(offset[-1]) - 0.05) > 1.0e-4:
             return None
-        positions = np.asarray(position_value, dtype=np.float64).reshape(3, 3)
-        orientations = np.asarray(orientation_value, dtype=np.float64).reshape(3, 4)
-        if not np.isfinite(positions).all() or not np.isfinite(orientations).all():
+        reference_modes = np.asarray(
+            fields.get("arm_reference_mode", [-1]), dtype=np.int32
+        ).reshape(-1)
+        if not reference_modes.size or int(reference_modes[-1]) != 0:
+            return None
+        left_waist = np.asarray(
+            fields["wrist_left_waist"], dtype=np.float64
+        ).reshape(4, 4)
+        right_waist = np.asarray(
+            fields["wrist_right_waist"], dtype=np.float64
+        ).reshape(4, 4)
+        if not (
+            np.isfinite(left_waist).all()
+            and np.isfinite(right_waist).all()
+        ):
             return None
 
         indices = np.asarray(fields.get("frame_index", []), dtype=np.int64).reshape(-1)
         frame_index = int(indices[-1]) if indices.size else -1
+        sessions = np.asarray(
+            fields.get("session_id", [-1]), dtype=np.int32
+        ).reshape(-1)
+        session_id = int(sessions[-1]) if sessions.size else -1
         source_timestamp_us = int(fallback_timestamp_us)
         monotonic_value = fields.get("timestamp_monotonic")
         if monotonic_value is not None:
@@ -614,18 +608,13 @@ def pico_body_sample_from_message(
                     source_timestamp_us = int(values[-1])
                     break
 
-        return PicoBodyTrackingSample(
-            left_position=positions[0].copy(),
-            right_position=positions[1].copy(),
-            neck_position=positions[2].copy(),
-            left_orientation_wxyz=orientations[0].copy(),
-            right_orientation_wxyz=orientations[1].copy(),
-            neck_orientation_wxyz=orientations[2].copy(),
+        return WaistWristTargets(
+            left_waist=left_waist.copy(),
+            right_waist=right_waist.copy(),
+            session_id=session_id,
             source_timestamp_us=source_timestamp_us,
             frame_index=frame_index,
-            source=f"{topic}:native_controller_aligned",
-            pose_source=pose_source,
-            alignment_revision=alignment_revision,
+            valid=True,
         )
     except Exception:
         return None
@@ -1484,13 +1473,10 @@ def main() -> int:
     latest_smpl_joints: np.ndarray | None = None
     latest_smpl_source_us = 0
     latest_smpl_frame = -1
-    latest_pico_body_sample: PicoBodyTrackingSample | None = None
+    latest_wrist_targets: WaistWristTargets | None = None
     latest_pico_body_receive_us = 0
-    latest_pico_alignment_revision = -1
-    last_pico_target_frame = -1
+    latest_pico_session_id = -1
     pico_tracking_armed = False
-    pico_calibration_session = 0
-    pico_calibration_armed_receive_us = 0
     last_forwarded_pose_frame = -1
     latest_manager_mode = 0
     policy_started = False
@@ -1542,35 +1528,10 @@ def main() -> int:
     )
     shared_control = TaskSpaceBlender(shared_config)
     latest_shared_result = None
-    pico_targets = PicoBodyCartesianTargetTracker(
-        PicoCartesianTargetConfig(
-            calibration_sec=float(args.pico_body_calibration_sec),
-            gap_hold_sec=float(args.pico_body_gap_hold_ms) / 1000.0,
-            position_jump_m=float(args.pico_body_position_jump_m),
-            orientation_jump_rad=np.deg2rad(
-                float(args.pico_body_orientation_jump_deg)
-            ),
-            recovery_frames=max(1, int(args.pico_body_recovery_frames)),
-            scale_xyz=(
-                float(args.pico_body_scale_x),
-                float(args.pico_body_scale_y),
-                float(args.pico_body_scale_z),
-            ),
-        )
-    )
-    latest_pico_targets: PicoCartesianTargets | None = None
     log(
-        "PICO native-controller Cartesian targets enabled: "
+        "PICO absolute waist-frame controller targets enabled: "
         f"topic={args.pico_vr_endpoint}/vr_pose_debug "
-        f"calibration={args.pico_body_calibration_sec:.2f}s "
-        f"gap_hold={args.pico_body_gap_hold_ms:.0f}ms "
-        f"jump={100.0 * args.pico_body_position_jump_m:.1f}cm/"
-        f"{args.pico_body_orientation_jump_deg:.1f}deg "
-        f"recovery={args.pico_body_recovery_frames} frames "
-        f"gain=[{args.pico_body_scale_x:.2f},"
-        f"{args.pico_body_scale_y:.2f},"
-        f"{args.pico_body_scale_z:.2f}]; "
-        "waiting for A+X"
+        "mode=head_position, anchor=none, gain=none; waiting for Q_READY/A+X"
     )
     log(
         "auto_planning mode="
@@ -1590,7 +1551,7 @@ def main() -> int:
         left_target_tf: np.ndarray,
         right_target_tf: np.ndarray,
     ):
-        """Solve authoritative arm joints from pelvis-local PICO body targets."""
+        """Solve authoritative arm joints from absolute waist-frame PICO targets."""
 
         nonlocal last_ipopt_q_ref, last_ipopt_tau_ff
         nonlocal last_arm_ik_solve_ms, last_arm_ik_error_m
@@ -1826,40 +1787,51 @@ def main() -> int:
                 shared_control.reset()
 
     def set_pico_tracking_armed(enabled: bool, source: str) -> None:
-        """Start or clear one A+X-delimited PICO stability-validation session."""
+        """Arm/disarm absolute controller tracking without changing SONIC mode."""
 
-        nonlocal pico_tracking_armed, pico_calibration_session
-        nonlocal pico_calibration_armed_receive_us
-        nonlocal latest_pico_targets, last_pico_target_frame
+        nonlocal pico_tracking_armed
         nonlocal last_ipopt_q_ref, last_ipopt_tau_ff, blended_q
         enabled = bool(enabled)
+        if enabled:
+            ready_error_rad = (
+                float(
+                    np.max(
+                        np.abs(
+                            np.asarray(latest_robot_q, dtype=np.float64)[15:29]
+                            - Q_READY[15:29]
+                        )
+                    )
+                )
+                if latest_robot_q is not None
+                else float("inf")
+            )
+            robot_ready = (
+                latest_robot_q is not None
+                and ready_error_rad < 0.10
+            )
+            if latest_manager_mode != STREAM_MODE_TRACKING:
+                log(f"{source}: A+X ignored: manager not in TRACKING")
+                return
+            if not robot_ready:
+                log(
+                    f"{source}: A+X ignored: robot_not_ready "
+                    f"max_arm_error={ready_error_rad:.3f}rad threshold=0.100rad"
+                )
+                return
         if enabled == pico_tracking_armed:
             log(
-                f"{source}: PICO validation already "
-                f"{'armed' if enabled else 'reset'}"
+                f"{source}: PICO tracking already "
+                f"{'armed' if enabled else 'disarmed'}"
             )
             return
-        pico_targets.reset()
-        latest_pico_targets = None
-        last_pico_target_frame = -1
         last_ipopt_q_ref = None
         last_ipopt_tau_ff = None
         blended_q = None
         pico_tracking_armed = enabled
         if enabled:
-            pico_calibration_session += 1
-            pico_calibration_armed_receive_us = now_us()
-            log(
-                f"{source}: PICO stability session "
-                f"{pico_calibration_session} armed; collecting "
-                f"{args.pico_body_calibration_sec:.2f}s from the next valid frame"
-            )
+            log(f"{source}: absolute PICO tracking armed")
         else:
-            pico_calibration_armed_receive_us = 0
-            log(
-                f"{source}: PICO validation reset; "
-                "arm target held until the next A+X"
-            )
+            log(f"{source}: absolute PICO tracking disarmed; Q_READY active")
 
     def set_qp_reference_enabled(enabled: bool, source: str) -> None:
         nonlocal qp_reference_enabled
@@ -1933,19 +1905,13 @@ def main() -> int:
                         stop = policy_started
                         planner = True
                         policy_started = start
+                        set_pico_tracking_armed(False, "Pico start/stop")
                         if stop:
                             current_state = "teleop"
-                            set_pico_tracking_armed(False, "Pico stop")
                     elif event_name == "ax":
                         set_pico_tracking_armed(
                             not pico_tracking_armed, "Pico A+X"
                         )
-                        requested = (
-                            "teleop"
-                            if current_state in {"auto_planning", "damped_return"}
-                            else "auto_planning"
-                        )
-                        apply_state_request(requested, "Pico A+X", tick_us)
                         planner = True
                     elif event_name == "by":
                         planner = True
@@ -1991,31 +1957,16 @@ def main() -> int:
                             set_pico_tracking_armed(False, "Pico stop")
                             continue
 
-                        if planner_requested and current_state in {"teleop", "intention"}:
-                            if start:
-                                # A+B+X+Y startup/alignment uses start=True, planner=True.
-                                sonic.send(
-                                    build_command_message(
-                                        start=True, stop=False, planner=True
-                                    )
+                        if planner_requested:
+                            if not start:
+                                set_pico_tracking_armed(
+                                    not pico_tracking_armed, "Pico A+X legacy"
                                 )
-                            else:
-                                set_pico_tracking_armed(True, "Pico A+X legacy")
-                                apply_state_request(
-                                    "auto_planning", "Pico command", tick_us
+                            sonic.send(
+                                build_command_message(
+                                    start=start, stop=False, planner=True
                                 )
-                                send_mode_command(sonic, planner=True)
-                            continue
-
-                        if (not planner_requested) and current_state in {
-                            "auto_planning",
-                            "damped_return",
-                        }:
-                            log(f"A+X target-mode command: {current_state} -> teleop")
-                            set_pico_tracking_armed(False, "Pico A+X legacy")
-                            current_state = "teleop"
-                            shared_control.reset()
-                            send_mode_command(sonic, planner=True)
+                            )
                             continue
 
                         sonic.send(
@@ -2033,29 +1984,20 @@ def main() -> int:
             try:
                 raw = pico_vr_body.recv(zmq.NOBLOCK)
                 remember_pico_hand_fields(raw, "vr_pose_debug", tick_us)
-                body_sample = pico_body_sample_from_message(
+                targets = wrist_targets_from_message(
                     raw, "vr_pose_debug", tick_us
                 )
-                if body_sample is not None:
-                    if (
-                        body_sample.alignment_revision
-                        != latest_pico_alignment_revision
-                    ):
-                        latest_pico_alignment_revision = (
-                            body_sample.alignment_revision
-                        )
-                        pico_targets.reset()
-                        latest_pico_targets = None
-                        last_pico_target_frame = -1
+                if targets is not None:
+                    if targets.session_id != latest_pico_session_id:
+                        latest_pico_session_id = targets.session_id
                         last_ipopt_q_ref = None
                         last_ipopt_tau_ff = None
                         blended_q = None
                         log(
-                            "PICO controller alignment revision="
-                            f"{latest_pico_alignment_revision}; reset target "
-                            "validation and IPOPT warm start"
+                            "PICO absolute-target session="
+                            f"{latest_pico_session_id}; reset IPOPT warm start"
                         )
-                    latest_pico_body_sample = body_sample
+                    latest_wrist_targets = targets
                     latest_pico_body_receive_us = tick_us
             except zmq.Again:
                 pass
@@ -2164,6 +2106,14 @@ def main() -> int:
                         continue
                     position = np.asarray(position_value, dtype=np.float64).reshape(-1)
                     if position.shape[0] == 3 and np.isfinite(position).all():
+                        previous_object_id = str(
+                            latest_static_target.get("object_id", "")
+                            if latest_static_target is not None
+                            else ""
+                        )
+                        incoming_object_id = str(
+                            incoming_target.get("object_id", "")
+                        )
                         explicit_reset = bool(
                             incoming_target.get("new_goal", False)
                             or incoming_target.get("reset_hold", False)
@@ -2171,7 +2121,17 @@ def main() -> int:
                         is_new_goal = (
                             latest_static_target is None
                             or explicit_reset
-                            or (incoming_uid and incoming_uid != latest_static_target_uid)
+                            or (
+                                args.auto_planning_mode != "shared_control"
+                                and incoming_uid
+                                and incoming_uid != latest_static_target_uid
+                            )
+                            or (
+                                args.auto_planning_mode == "shared_control"
+                                and incoming_object_id
+                                and previous_object_id
+                                and incoming_object_id != previous_object_id
+                            )
                             or (
                                 args.auto_planning_mode != "shared_control"
                                 and target_side != static_target_hold_side
@@ -2316,26 +2276,11 @@ def main() -> int:
             )
             pico_body_fresh = (
                 pico_tracking_armed
-                and latest_pico_body_sample is not None
-                and latest_pico_body_receive_us
-                >= pico_calibration_armed_receive_us
+                and latest_manager_mode == STREAM_MODE_TRACKING
+                and latest_wrist_targets is not None
                 and pico_body_age_sec
                 <= max(0.001, float(args.pico_body_gap_hold_ms) / 1000.0)
             )
-            if (
-                pico_body_fresh
-                and latest_pico_body_sample is not None
-                and latest_pico_body_sample.frame_index != last_pico_target_frame
-            ):
-                latest_pico_targets = pico_targets.update(
-                    sample=latest_pico_body_sample
-                )
-                last_pico_target_frame = latest_pico_body_sample.frame_index
-            elif latest_pico_targets is not None:
-                if not pico_body_fresh:
-                    latest_pico_targets = pico_targets.hold(
-                        reason=f"pico_stream_gap_{1000.0 * pico_body_age_sec:.1f}ms"
-                    )
 
             left_hand_cmd, right_hand_cmd, hand_fresh = current_pico_hand_joints(tick_us)
             plan_fresh = latest_plan is not None and (tick_us - latest_plan_us) <= args.plan_timeout_sec * 1.0e6
@@ -2384,10 +2329,10 @@ def main() -> int:
             if current_state in {"teleop", "intention"}:
                 if planner_lower_body_idle:
                     pose_to_send = None
-                if latest_pico_targets is not None and latest_pico_targets.valid:
+                if pico_body_fresh and latest_wrist_targets is not None:
                     ik_result = solve_authoritative_ipopt_transforms(
-                        latest_pico_targets.left_transform,
-                        latest_pico_targets.right_transform,
+                        latest_wrist_targets.left_waist,
+                        latest_wrist_targets.right_waist,
                     )
                     q_for_sonic = (
                         ik_result.q_ref.copy()
@@ -2405,7 +2350,7 @@ def main() -> int:
                             left_hand_position=left_hand_cmd,
                             right_hand_position=right_hand_cmd,
                         )
-                    source_timestamp_us = int(latest_pico_targets.source_timestamp_us)
+                    source_timestamp_us = int(latest_wrist_targets.source_timestamp_us)
                     if ik_result.success:
                         qp_payload = ipopt_arm_sample_reference(
                             ik_result.q_ref,
@@ -2418,11 +2363,11 @@ def main() -> int:
                             tau_ff_ref=ik_result.tau_ff_ref,
                             bridge_timestamp_us=tick_us,
                             smpl_source_timestamp_us=source_timestamp_us,
-                            smpl_frame_index=int(latest_pico_targets.frame_index),
-                            smpl_target_reason=str(latest_pico_targets.reason),
-                            smpl_target_held=bool(latest_pico_targets.held),
-                            smpl_left_target_position=latest_pico_targets.left_transform[:3, 3].tolist(),
-                            smpl_right_target_position=latest_pico_targets.right_transform[:3, 3].tolist(),
+                            smpl_frame_index=int(latest_wrist_targets.frame_index),
+                            smpl_target_reason="absolute_head_position",
+                            smpl_target_held=False,
+                            smpl_left_target_position=latest_wrist_targets.left_waist[:3, 3].tolist(),
+                            smpl_right_target_position=latest_wrist_targets.right_waist[:3, 3].tolist(),
                             q_prior_source="ipopt_pico_controller_ee",
                             belief_enabled=False,
                             shared_control=False,
@@ -2434,54 +2379,93 @@ def main() -> int:
                             arm_ik_status=str(last_arm_ik_status),
                         )
                     else:
-                        qp_payload = qp_none_reference(
+                        hold_q = last_ipopt_or_measured_hold()
+                        qp_payload = ipopt_arm_sample_reference(
+                            hold_q,
                             state=current_state,
-                            source="casadi_ipopt",
+                            source="pico_body_cartesian",
                             control_mode="teleop",
-                            feasible=False,
+                            feasible=True,
                             plan_id=0,
                             timestamp_us=tick_us,
+                            tau_ff_ref=(
+                                last_ipopt_tau_ff
+                                if last_ipopt_tau_ff is not None
+                                else np.zeros(29, dtype=np.float64)
+                            ),
                             bridge_timestamp_us=tick_us,
                             smpl_source_timestamp_us=source_timestamp_us,
-                            smpl_frame_index=int(latest_pico_targets.frame_index),
-                            arm_target_owner="casadi_ipopt",
-                            solver_backend="casadi_opti_ipopt",
-                            arm_target_valid=False,
+                            smpl_frame_index=int(latest_wrist_targets.frame_index),
+                            smpl_target_reason="ipopt_failed_hold",
+                            smpl_target_held=True,
+                            arm_target_owner="casadi_ipopt_hold",
+                            solver_backend="casadi_opti_ipopt_hold",
+                            arm_target_valid=True,
                             arm_ik_solve_ms=float(ik_result.solve_time_ms),
                             arm_ik_status=str(ik_result.message),
                         )
                 else:
                     missing_pico_source_us = (
-                        int(latest_pico_body_sample.source_timestamp_us)
-                        if latest_pico_body_sample is not None
+                        int(latest_wrist_targets.source_timestamp_us)
+                        if latest_wrist_targets is not None
                         else 0
                     )
                     missing_pico_frame = (
-                        int(latest_pico_body_sample.frame_index)
-                        if latest_pico_body_sample is not None
+                        int(latest_wrist_targets.frame_index)
+                        if latest_wrist_targets is not None
                         else -1
                     )
-                    qp_payload = qp_none_reference(
+                    hold_tracking_target = bool(pico_tracking_armed)
+                    hold_q = (
+                        last_ipopt_or_measured_hold()
+                        if hold_tracking_target
+                        else Q_READY.copy()
+                    )
+                    if policy_started:
+                        send_planner_command(
+                            sonic,
+                            hold_q,
+                            neutralize_waist=True,
+                            freeze_lower_body=True,
+                            left_hand_position=left_hand_cmd,
+                            right_hand_position=right_hand_cmd,
+                        )
+                    # Q_READY is used only before tracking is armed. Once A+X
+                    # completes the one-shot alignment, transient source gaps
+                    # hold the last successful IPOPT solution.
+                    qp_payload = ipopt_arm_sample_reference(
+                        hold_q,
                         state=current_state,
-                        source="casadi_ipopt",
+                        source="pico_body_cartesian",
                         control_mode="teleop",
-                        feasible=False,
+                        feasible=True,
                         timestamp_us=tick_us,
+                        tau_ff_ref=(
+                            last_ipopt_tau_ff
+                            if hold_tracking_target
+                            and last_ipopt_tau_ff is not None
+                            else np.zeros(29, dtype=np.float64)
+                        ),
                         bridge_timestamp_us=tick_us,
                         smpl_source_timestamp_us=missing_pico_source_us,
                         smpl_frame_index=missing_pico_frame,
                         smpl_target_reason=(
-                            latest_pico_targets.reason
-                            if latest_pico_targets is not None
-                            else (
-                                "waiting_pico_validation"
-                                if pico_tracking_armed
-                                else "waiting_pico_ax"
-                            )
+                            "stale_absolute_target_hold"
+                            if hold_tracking_target
+                            else "q_ready_waiting_pico_ax"
                         ),
-                        arm_target_owner="casadi_ipopt",
-                        solver_backend="casadi_opti_ipopt",
-                        arm_target_valid=False,
+                        smpl_target_held=hold_tracking_target,
+                        arm_target_owner=(
+                            "casadi_ipopt_hold"
+                            if hold_tracking_target
+                            else "q_ready_direct"
+                        ),
+                        solver_backend=(
+                            "casadi_opti_ipopt_hold"
+                            if hold_tracking_target
+                            else "q_ready_direct"
+                        ),
+                        arm_target_valid=True,
                     )
             elif current_state == "auto_planning":
                 if args.auto_planning_mode == "shared_control":
@@ -2505,13 +2489,13 @@ def main() -> int:
                     )
                     requested_hand = target_side_from_link(requested_target_link)
                     if (
-                        latest_pico_targets is not None
-                        and latest_pico_targets.valid
+                        pico_body_fresh
+                        and latest_wrist_targets is not None
                         and arm_nonlinear_ik is not None
                     ):
                         try:
-                            human_left_tf = latest_pico_targets.left_transform.copy()
-                            human_right_tf = latest_pico_targets.right_transform.copy()
+                            human_left_tf = latest_wrist_targets.left_waist.copy()
+                            human_right_tf = latest_wrist_targets.right_waist.copy()
                             p_human_left = human_left_tf[:3, 3].copy()
                             p_human_right = human_right_tf[:3, 3].copy()
                             q_measured_for_hand = (
@@ -2569,22 +2553,31 @@ def main() -> int:
                             last_plan_q = q_for_sonic.copy()
                             blended_q = q_for_sonic.copy()
                             source_timestamp_us = int(
-                                latest_pico_targets.source_timestamp_us
+                                latest_wrist_targets.source_timestamp_us
                             )
                             if not ik_result.success:
-                                qp_payload = qp_none_reference(
+                                hold_q = last_ipopt_or_measured_hold()
+                                qp_payload = ipopt_arm_sample_reference(
+                                    hold_q,
                                     state="auto_planning",
-                                    source="casadi_ipopt",
+                                    source="pico_body_cartesian",
                                     control_mode="plan_exec",
-                                    feasible=False,
+                                    feasible=True,
                                     plan_id=static_target_plan_id,
                                     timestamp_us=tick_us,
+                                    tau_ff_ref=(
+                                        last_ipopt_tau_ff
+                                        if last_ipopt_tau_ff is not None
+                                        else np.zeros(29, dtype=np.float64)
+                                    ),
                                     bridge_timestamp_us=tick_us,
                                     smpl_source_timestamp_us=source_timestamp_us,
-                                    smpl_frame_index=int(latest_pico_targets.frame_index),
-                                    arm_target_owner="casadi_ipopt",
-                                    solver_backend="casadi_opti_ipopt",
-                                    arm_target_valid=False,
+                                    smpl_frame_index=int(latest_wrist_targets.frame_index),
+                                    smpl_target_reason="ipopt_failed_hold",
+                                    smpl_target_held=True,
+                                    arm_target_owner="casadi_ipopt_hold",
+                                    solver_backend="casadi_opti_ipopt_hold",
+                                    arm_target_valid=True,
                                     arm_ik_solve_ms=float(ik_result.solve_time_ms),
                                     arm_ik_position_error_m=float(
                                         ik_result.position_error_m
@@ -2611,7 +2604,7 @@ def main() -> int:
                                     tau_ff_ref=ik_result.tau_ff_ref,
                                     bridge_timestamp_us=tick_us,
                                     smpl_source_timestamp_us=source_timestamp_us,
-                                    smpl_frame_index=int(latest_pico_targets.frame_index),
+                                    smpl_frame_index=int(latest_wrist_targets.frame_index),
                                     q_prior_source="ipopt_pico_controller_ee",
                                     arm_ik_solve_ms=float(ik_result.solve_time_ms),
                                     arm_ik_position_error_m=float(
@@ -2626,21 +2619,27 @@ def main() -> int:
                                 )
                                 phase_mode = "shared_control_wait"
                             else:
-                                qp_payload = ipopt_arm_cartesian_target_reference(
-                                    target_link=result.target_link,
-                                    target_position=active_target,
-                                    q_ref=ik_result.q_ref,
+                                # e mode differs from q mode only in the
+                                # task-space target blended before IPOPT. The
+                                # solved arm joints use the same direct sample
+                                # override and never enter the legacy C++ EE-QP.
+                                qp_payload = ipopt_arm_sample_reference(
+                                    ik_result.q_ref,
                                     state="auto_planning",
-                                    source="cartesian_servo",
+                                    source="pico_body_cartesian",
                                     control_mode="plan_exec",
                                     feasible=True,
                                     plan_id=static_target_plan_id,
                                     timestamp_us=tick_us,
-                                    terminal_capture_radius_m=float(args.terminal_capture_radius_m),
                                     tau_ff_ref=ik_result.tau_ff_ref,
                                     bridge_timestamp_us=tick_us,
                                     smpl_source_timestamp_us=source_timestamp_us,
-                                    smpl_frame_index=int(latest_pico_targets.frame_index),
+                                    smpl_frame_index=int(latest_wrist_targets.frame_index),
+                                    terminal_target_link=result.target_link,
+                                    terminal_target_position=active_target.tolist(),
+                                    terminal_capture_radius_m=float(
+                                        args.terminal_capture_radius_m
+                                    ),
                                     target_source=str(
                                         latest_static_target.get("source", "sam3_tasc_contact")
                                         if latest_static_target
@@ -2687,38 +2686,60 @@ def main() -> int:
                                 phase_mode = "shared_control"
                             phase_sync_error_rad = float("nan")
                         except Exception as exc:
-                            shared_control.reset()
-                            latest_shared_result = None
-                            qp_payload = qp_none_reference(
+                            hold_q = last_ipopt_or_measured_hold()
+                            qp_payload = ipopt_arm_sample_reference(
+                                hold_q,
                                 state="auto_planning",
-                                source="shared_control",
+                                source="pico_body_cartesian",
                                 control_mode="plan_exec",
-                                feasible=False,
+                                feasible=True,
                                 plan_id=static_target_plan_id,
                                 timestamp_us=tick_us,
+                                tau_ff_ref=(
+                                    last_ipopt_tau_ff
+                                    if last_ipopt_tau_ff is not None
+                                    else np.zeros(29, dtype=np.float64)
+                                ),
+                                smpl_target_reason="shared_control_error_hold",
+                                smpl_target_held=True,
+                                arm_target_owner="casadi_ipopt_hold",
+                                solver_backend="casadi_opti_ipopt_hold",
+                                arm_target_valid=True,
                                 shared_gate_reason=f"error:{exc}",
                             )
-                            phase_mode = "shared_control_error"
+                            phase_mode = "shared_control_error_hold"
                             phase_sync_error_rad = float("nan")
                     else:
                         missing = []
-                        if latest_pico_targets is None or not latest_pico_targets.valid:
+                        if not pico_body_fresh or latest_wrist_targets is None:
                             missing.append("pico_target")
                         if arm_nonlinear_ik is None:
                             missing.append("ipopt_fk")
                         if target is None:
                             missing.append("target")
                         latest_shared_result = None
-                        qp_payload = qp_none_reference(
+                        hold_q = last_ipopt_or_measured_hold()
+                        qp_payload = ipopt_arm_sample_reference(
+                            hold_q,
                             state="auto_planning",
-                            source="shared_control",
+                            source="pico_body_cartesian",
                             control_mode="plan_exec",
-                            feasible=False,
+                            feasible=True,
                             plan_id=static_target_plan_id,
                             timestamp_us=tick_us,
+                            tau_ff_ref=(
+                                last_ipopt_tau_ff
+                                if last_ipopt_tau_ff is not None
+                                else np.zeros(29, dtype=np.float64)
+                            ),
+                            smpl_target_reason="shared_control_input_hold",
+                            smpl_target_held=True,
+                            arm_target_owner="casadi_ipopt_hold",
+                            solver_backend="casadi_opti_ipopt_hold",
+                            arm_target_valid=True,
                             shared_gate_reason="missing_" + "_".join(missing),
                         )
-                        phase_mode = "shared_control_wait"
+                        phase_mode = "shared_control_input_hold"
                         phase_sync_error_rad = float("nan")
                 elif static_target_usable:
                     target_link = str(latest_static_target.get("target_link", "left_wrist_yaw_link"))
@@ -3041,10 +3062,10 @@ def main() -> int:
                         timestamp_us=tick_us,
                     )
             else:  # damped_return
-                if latest_pico_targets is not None and latest_pico_targets.valid:
+                if pico_body_fresh and latest_wrist_targets is not None:
                     return_result = solve_authoritative_ipopt_transforms(
-                        latest_pico_targets.left_transform,
-                        latest_pico_targets.right_transform,
+                        latest_wrist_targets.left_waist,
+                        latest_wrist_targets.right_waist,
                     )
                     return_target = (
                         return_result.q_ref.copy()
@@ -3087,9 +3108,9 @@ def main() -> int:
                         plan_id=int(latest_plan.get("plan_id", 0)) if latest_plan else 0,
                         timestamp_us=tick_us,
                         smpl_source_timestamp_us=int(
-                            latest_pico_targets.source_timestamp_us
+                            latest_wrist_targets.source_timestamp_us
                         ),
-                        smpl_frame_index=int(latest_pico_targets.frame_index),
+                        smpl_frame_index=int(latest_wrist_targets.frame_index),
                     )
                 else:
                     qp_payload = qp_none_reference(
@@ -3154,25 +3175,23 @@ def main() -> int:
 
             if qp_payload is not None:
                 pico_frame = (
-                    int(latest_pico_body_sample.frame_index)
-                    if latest_pico_body_sample is not None
+                    int(latest_wrist_targets.frame_index)
+                    if latest_wrist_targets is not None
                     else -1
                 )
                 pico_source_us = (
-                    int(latest_pico_body_sample.source_timestamp_us)
-                    if latest_pico_body_sample is not None
+                    int(latest_wrist_targets.source_timestamp_us)
+                    if latest_wrist_targets is not None
                     else 0
                 )
-                pico_target_valid = bool(
-                    latest_pico_targets is not None and latest_pico_targets.valid
-                )
+                pico_target_valid = bool(pico_body_fresh)
                 pico_target_reason = (
-                    latest_pico_targets.reason
-                    if latest_pico_targets is not None
+                    "absolute_head_position"
+                    if pico_body_fresh
                     else (
-                        "waiting_pico_validation"
+                        "waiting_fresh_absolute_target"
                         if pico_tracking_armed
-                        else "waiting_pico_ax"
+                        else "waiting_q_ready_ax"
                     )
                 )
                 qp_payload["pico_body_frame_index"] = pico_frame
@@ -3181,7 +3200,7 @@ def main() -> int:
                     pico_tracking_armed
                 )
                 qp_payload["pico_body_calibration_session"] = int(
-                    pico_calibration_session
+                    latest_pico_session_id
                 )
                 qp_payload["pico_body_input_age_ms"] = float(
                     1000.0 * pico_body_age_sec
@@ -3191,42 +3210,28 @@ def main() -> int:
                 qp_payload["pico_body_target_valid"] = pico_target_valid
                 qp_payload["pico_body_target_reason"] = pico_target_reason
                 qp_payload["pico_body_target_held"] = bool(
-                    latest_pico_targets.held
-                    if latest_pico_targets is not None
-                    else True
+                    qp_payload.get("smpl_target_held", False)
                 )
-                qp_payload["pico_pose_source"] = int(
-                    latest_pico_body_sample.pose_source
-                    if latest_pico_body_sample is not None
-                    else 0
-                )
+                qp_payload["pico_pose_source"] = 1
                 qp_payload["pico_controller_alignment_revision"] = int(
-                    latest_pico_body_sample.alignment_revision
-                    if latest_pico_body_sample is not None
-                    else -1
+                    latest_pico_session_id
                 )
-                if latest_pico_targets is not None:
+                if latest_wrist_targets is not None:
                     qp_payload["pico_left_target_position"] = (
-                        latest_pico_targets.left_transform[:3, 3].tolist()
+                        latest_wrist_targets.left_waist[:3, 3].tolist()
                     )
                     qp_payload["pico_right_target_position"] = (
-                        latest_pico_targets.right_transform[:3, 3].tolist()
+                        latest_wrist_targets.right_waist[:3, 3].tolist()
                     )
                     qp_payload["pico_left_target_rotation"] = (
-                        latest_pico_targets.left_transform[:3, :3].reshape(-1).tolist()
+                        latest_wrist_targets.left_waist[:3, :3].reshape(-1).tolist()
                     )
                     qp_payload["pico_right_target_rotation"] = (
-                        latest_pico_targets.right_transform[:3, :3].reshape(-1).tolist()
+                        latest_wrist_targets.right_waist[:3, :3].reshape(-1).tolist()
                     )
-                    qp_payload["pico_body_source"] = str(
-                        latest_pico_targets.source
-                    )
-                    qp_payload["pico_body_calibration_frames"] = int(
-                        latest_pico_targets.calibration_frames
-                    )
-                    qp_payload["pico_body_recovery_count"] = int(
-                        latest_pico_targets.recovery_count
-                    )
+                    qp_payload["pico_body_source"] = "absolute_head_position"
+                    qp_payload["pico_body_calibration_frames"] = 0
+                    qp_payload["pico_body_recovery_count"] = 0
 
                 # Compatibility fields consumed by existing viewers/recorders.
                 # Their values now identify the PICO body target, not GMR/SMPL.
@@ -3249,6 +3254,20 @@ def main() -> int:
 
             if now - last_log > 1.0:
                 shared_log = "shared=none"
+                pico_position_log = "pico_L/R=missing"
+                if latest_wrist_targets is not None:
+                    left_position = latest_wrist_targets.left_waist[:3, 3]
+                    right_position = latest_wrist_targets.right_waist[:3, 3]
+                    pico_position_log = (
+                        "pico_L=("
+                        f"{left_position[0]:+.3f},"
+                        f"{left_position[1]:+.3f},"
+                        f"{left_position[2]:+.3f}) "
+                        "pico_R=("
+                        f"{right_position[0]:+.3f},"
+                        f"{right_position[1]:+.3f},"
+                        f"{right_position[2]:+.3f})"
+                    )
                 if latest_shared_result is not None:
                     shared_log = (
                         f"shared_alpha={latest_shared_result.alpha:.3f} "
@@ -3263,7 +3282,7 @@ def main() -> int:
                     )
                 log(
                     f"state={current_state} pico_fresh={pico_body_fresh} "
-                    f"pico_session={pico_calibration_session}/"
+                    f"pico_session={latest_pico_session_id}/"
                     f"{'armed' if pico_tracking_armed else 'wait_ax'} "
                     f"smpl_lower_fresh={smpl_fresh} plan_fresh={plan_fresh} "
                     f"static_target={'fresh' if static_target_fresh else 'held' if static_target_usable else 'missing'} "
@@ -3282,7 +3301,8 @@ def main() -> int:
                     f"qp_type={qp_payload.get('reference_type') if qp_payload else 'none'} "
                     f"source={qp_payload.get('source', 'none') if qp_payload else 'none'} "
                     f"q_prior={qp_payload.get('q_prior_source', 'n/a') if qp_payload else 'n/a'} "
-                    f"pico_target={latest_pico_targets.reason if latest_pico_targets else 'waiting'} "
+                    f"pico_target={'absolute_head_position' if latest_wrist_targets else 'waiting'} "
+                    f"{pico_position_log} "
                     f"pico_age={1000.0 * pico_body_age_sec if np.isfinite(pico_body_age_sec) else -1.0:.1f}ms "
                     f"released={released_pose_frame}/{released_pose_frames} "
                     f"pose_frame={latest_smpl_frame} "

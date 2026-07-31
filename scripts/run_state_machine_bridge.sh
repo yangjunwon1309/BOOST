@@ -14,14 +14,8 @@ python -u path_streaming/path_state_machine_bridge.py \
   $(if [[ "${PATH_FREEZE_PLANNER_LOWER_BODY:-1}" != "0" ]]; then printf '%s' "--freeze-planner-lower-body"; else printf '%s' "--no-freeze-planner-lower-body"; fi) \
   $(if [[ "${PATH_FREEZE_PLANNER_WAIST:-1}" != "0" ]]; then printf '%s' "--freeze-planner-waist"; else printf '%s' "--no-freeze-planner-waist"; fi) \
   --pico-hand-timeout-sec "${PATH_PICO_HAND_TIMEOUT_SEC:-0.35}" \
-  --pico-body-calibration-sec "${PATH_PICO_BODY_CALIBRATION_SEC:-0.5}" \
   --pico-body-gap-hold-ms "${PATH_PICO_BODY_GAP_HOLD_MS:-100}" \
-  --pico-body-position-jump-m "${PATH_PICO_BODY_POSITION_JUMP_M:-0.05}" \
-  --pico-body-orientation-jump-deg "${PATH_PICO_BODY_ORIENTATION_JUMP_DEG:-12}" \
-  --pico-body-recovery-frames "${PATH_PICO_BODY_RECOVERY_FRAMES:-3}" \
-  --pico-body-scale-x "${PATH_PICO_BODY_SCALE_X:-1.20}" \
-  --pico-body-scale-y "${PATH_PICO_BODY_SCALE_Y:-1.20}" \
-  --pico-body-scale-z "${PATH_PICO_BODY_SCALE_Z:-1.20}" \
+  --arm-reference-mode head_position \
   --phase-tracking-mode "${PATH_PHASE_TRACKING_MODE:-fixed_rate}" \
   --pico-endpoint "${PATH_PICO_INTERNAL_ENDPOINT:-tcp://127.0.0.1:5559}" \
   --pico-vr-endpoint "${PATH_PICO_VR_ENDPOINT:-tcp://127.0.0.1:5566}" \
@@ -68,8 +62,8 @@ python -u path_streaming/path_state_machine_bridge.py \
   --arm-ik-residual-projection-threshold-m "${PATH_ARM_IK_RESIDUAL_PROJECTION_THRESHOLD_M:-0.03}" \
   --arm-ik-residual-success-threshold-m "${PATH_ARM_IK_RESIDUAL_SUCCESS_THRESHOLD_M:-0.05}" \
   --arm-ik-projection-step-m "${PATH_ARM_IK_PROJECTION_STEP_M:-0.05}" \
-  --arm-ik-output-velocity-limit-rad-s "${PATH_ARM_IK_OUTPUT_VELOCITY_LIMIT_RAD_S:-20.0}" \
-  --arm-ik-output-control-hz "${PATH_ARM_IK_OUTPUT_CONTROL_HZ:-250.0}" \
+  --arm-ik-output-velocity-limit-rad-s "${PATH_ARM_IK_OUTPUT_VELOCITY_LIMIT_RAD_S:-10.0}" \
+  --arm-ik-output-control-hz "${PATH_ARM_IK_OUTPUT_CONTROL_HZ:-50.0}" \
   ${PATH_AUTO_CLEAR_ON_TARGET_REACHED:+--auto-clear-on-target-reached} \
   ${PATH_CLEAR_PLAN_AFTER_TOTAL_DURATION:+--clear-plan-after-total-duration} \
   "$@"

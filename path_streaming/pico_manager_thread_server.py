@@ -27,6 +27,7 @@
 """
 
 from collections import defaultdict, deque
+from dataclasses import dataclass
 from enum import Enum, IntEnum
 import os
 from pathlib import Path
@@ -45,8 +46,6 @@ PATH_G1_ROOT = Path(__file__).resolve().parents[1]
 HUMAN_JOINTS_INFO_PATH = (
     PATH_G1_ROOT / "sonic_runtime" / "gear_sonic" / "data" / "human" / "human_joints_info.pkl"
 )
-
-from path_core.teleop.xr_controller_alignment import align_controller_pose
 
 from gear_sonic.utils.teleop.zmq.zmq_poller import ZMQPoller
 from gear_sonic.trl.utils.rotation_conversion import decompose_rotation_aa
@@ -142,6 +141,8 @@ class StreamMode(Enum):
     PLANNER_FROZEN_UPPER_BODY = 3
     POSE_PAUSE = 4
     PLANNER_VR_3PT = 5
+    ALIGNING = 6
+    TRACKING = 7
 
 
 ### Parse 3 point pose from SMPL
@@ -210,64 +211,123 @@ def _compute_rel_transform(pose, world_frame, scalar_first=True):
     return rel_pos, rel_rot.as_quat(scalar_first=True)
 
 
-R_OPENXR_TO_ROBOT = np.array(
-    [
-        [0.0, 0.0, -1.0],
-        [-1.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0],
-    ],
+T_ROBOT_OPENXR = np.array(
+    [[0, 0, -1, 0], [-1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 1]],
     dtype=np.float64,
 )
-XR_TELEOP_WAIST_OFFSET_M = np.array([0.15, 0.0, 0.45], dtype=np.float64)
+T_OPENXR_ROBOT = np.array(
+    [[0, -1, 0, 0], [0, 0, 1, 0], [-1, 0, 0, 0], [0, 0, 0, 1]],
+    dtype=np.float64,
+)
+T_TO_UNITREE_HUMANOID_LEFT_ARM = np.array(
+    [[1, 0, 0, 0], [0, 0, -1, 0], [0, 1, 0, 0], [0, 0, 0, 1]],
+    dtype=np.float64,
+)
+T_TO_UNITREE_HUMANOID_RIGHT_ARM = np.array(
+    [[1, 0, 0, 0], [0, 0, 1, 0], [0, -1, 0, 0], [0, 0, 0, 1]],
+    dtype=np.float64,
+)
+WAIST_OFFSET_XYZ = np.array([0.15, 0.0, 0.45], dtype=np.float64)
+CONST_HEAD_POSE = np.array(
+    [[1, 0, 0, 0], [0, 1, 0, 1.5], [0, 0, 1, -0.2], [0, 0, 0, 1]],
+    dtype=np.float64,
+)
+CONST_LEFT_ARM_POSE = np.array(
+    [[1, 0, 0, -0.15], [0, 1, 0, 1.13], [0, 0, 1, -0.3], [0, 0, 0, 1]],
+    dtype=np.float64,
+)
+CONST_RIGHT_ARM_POSE = np.array(
+    [[1, 0, 0, 0.15], [0, 1, 0, 1.13], [0, 0, 1, -0.3], [0, 0, 0, 1]],
+    dtype=np.float64,
+)
+
+# G1 URDF zero pose: upper arms hang vertically from the shoulders while the
+# forearms point forward (+X), giving the requested geometric 90-degree elbow.
+Q_READY = np.zeros(29, dtype=np.float64)
 
 
-def _controller_pose_in_head_yaw_frame(
-    controller_pose: np.ndarray | list[float],
-    headset_pose: np.ndarray | list[float],
-) -> np.ndarray:
-    """Match XR teleop's metric controller-to-head-yaw transform."""
+def _pico_pose_to_mat_openxr(
+    pose7: np.ndarray | list[float],
+) -> tuple[np.ndarray, bool]:
+    """PICO SDK [x,y,z,qx,qy,qz,qw] to OpenXR-basis SE(3)."""
 
-    controller = np.asarray(controller_pose, dtype=np.float64).reshape(7)
-    headset = np.asarray(headset_pose, dtype=np.float64).reshape(7)
-    if not np.isfinite(controller).all() or not np.isfinite(headset).all():
-        raise ValueError("non-finite controller/headset pose")
-    if np.linalg.norm(controller[3:]) < 1.0e-8 or np.linalg.norm(headset[3:]) < 1.0e-8:
-        raise ValueError("invalid controller/headset quaternion")
-
-    controller_position = R_OPENXR_TO_ROBOT @ controller[:3]
-    headset_position = R_OPENXR_TO_ROBOT @ headset[:3]
-    controller_rotation = (
-        R_OPENXR_TO_ROBOT
-        @ sRot.from_quat(controller[3:]).as_matrix()
-        @ R_OPENXR_TO_ROBOT.T
-    )
-    headset_rotation = (
-        R_OPENXR_TO_ROBOT
-        @ sRot.from_quat(headset[3:]).as_matrix()
-        @ R_OPENXR_TO_ROBOT.T
-    )
-    headset_x_axis = headset_rotation[:, 0].copy()
-    headset_x_axis[2] = 0.0
-    x_norm = float(np.linalg.norm(headset_x_axis))
-    if not np.isfinite(x_norm) or x_norm < 1.0e-8:
-        headset_yaw_rotation = np.eye(3, dtype=np.float64)
-    else:
-        headset_x_axis /= x_norm
-        headset_z_axis = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-        headset_y_axis = np.cross(headset_z_axis, headset_x_axis)
-        headset_y_axis /= np.linalg.norm(headset_y_axis)
-        headset_yaw_rotation = np.column_stack(
-            [headset_x_axis, headset_y_axis, headset_z_axis]
-        )
-    inverse_yaw = headset_yaw_rotation.T
-
+    p = np.asarray(pose7, dtype=np.float64).reshape(7)
+    if not np.isfinite(p).all() or np.linalg.norm(p[3:]) < 1.0e-8:
+        return np.eye(4, dtype=np.float64), False
     transform = np.eye(4, dtype=np.float64)
-    transform[:3, :3] = inverse_yaw @ controller_rotation
+    transform[:3, :3] = sRot.from_quat(p[3:]).as_matrix()
+    transform[:3, 3] = p[:3]
+    return transform, True
+
+
+def world_arm_to_waist_head_position(
+    arm_world: np.ndarray,
+    head_world: np.ndarray,
+) -> np.ndarray:
+    """Current head position to waist; no yaw, freeze, anchor, or gain."""
+
+    transform = np.asarray(arm_world, dtype=np.float64).reshape(4, 4).copy()
+    head = np.asarray(head_world, dtype=np.float64).reshape(4, 4)
     transform[:3, 3] = (
-        inverse_yaw @ (controller_position - headset_position)
-        + XR_TELEOP_WAIST_OFFSET_M
+        transform[:3, 3] - head[:3, 3] + WAIST_OFFSET_XYZ
     )
     return transform
+
+
+def controller_waist_targets(
+    left_pose7: np.ndarray | list[float],
+    right_pose7: np.ndarray | list[float],
+    head_pose7: np.ndarray | list[float],
+) -> tuple[np.ndarray, np.ndarray, bool]:
+    """PICO raw controller poses to absolute waist-frame wrist SE(3)."""
+
+    head_xr, head_ok = _pico_pose_to_mat_openxr(head_pose7)
+    if not head_ok:
+        head_xr = CONST_HEAD_POSE.copy()
+    left_xr, left_ok = _pico_pose_to_mat_openxr(left_pose7)
+    if not left_ok:
+        left_xr = CONST_LEFT_ARM_POSE.copy()
+    right_xr, right_ok = _pico_pose_to_mat_openxr(right_pose7)
+    if not right_ok:
+        right_xr = CONST_RIGHT_ARM_POSE.copy()
+
+    head_robot = T_ROBOT_OPENXR @ head_xr @ T_OPENXR_ROBOT
+    left_robot = T_ROBOT_OPENXR @ left_xr @ T_OPENXR_ROBOT
+    right_robot = T_ROBOT_OPENXR @ right_xr @ T_OPENXR_ROBOT
+    left_waist = world_arm_to_waist_head_position(left_robot, head_robot)
+    right_waist = world_arm_to_waist_head_position(right_robot, head_robot)
+    return left_waist, right_waist, bool(head_ok and left_ok and right_ok)
+
+
+@dataclass
+class AlignmentGate:
+    ctrl_fwd_tol_rad: float = np.deg2rad(30.0)
+    ctrl_speed_tol_mps: float = 0.05
+    hold_frames: int = 25
+
+    def check(
+        self,
+        left_waist: np.ndarray,
+        right_waist: np.ndarray,
+        left_velocity: np.ndarray,
+        right_velocity: np.ndarray,
+    ) -> tuple[bool, str]:
+        for name, transform in (("L", left_waist), ("R", right_waist)):
+            angle = np.arccos(
+                np.clip(
+                    np.asarray(transform, dtype=np.float64)[:3, 0]
+                    @ np.array([1.0, 0.0, 0.0]),
+                    -1.0,
+                    1.0,
+                )
+            )
+            if angle > self.ctrl_fwd_tol_rad:
+                return False, f"ctrl_{name}_not_forward"
+        if max(np.linalg.norm(left_velocity), np.linalg.norm(right_velocity)) > (
+            self.ctrl_speed_tol_mps
+        ):
+            return False, "operator_moving"
+        return True, "ok"
 
 
 def _process_3pt_pose(smpl_pose_np):
@@ -1029,17 +1089,9 @@ def _pose_stream_common(
 
 
 class ThreePointPose:
-    """
-    Encapsulates everything around calculating 3-point pose from SMPL input.
+    """Legacy SMPL visualization plus a tracking-session counter.
 
-    This includes:
-    - Processing SMPL poses to extract 3-point VR pose (L-Wrist, R-Wrist, Neck)
-    - Calibration logic to align VR poses with G1 robot
-    - Optional visualization of 3-point poses
-
-    Calibration is done in two steps:
-    1. Neck orientation: Captures initial neck orientation to align subsequent poses as upright
-    2. Wrist positions: Aligns wrist positions to match G1 robot key frame positions
+    Arm targets never pass through this class.
     """
 
     # Kinematic chain constants for neck position (matches VR3PtPoseVisualizer)
@@ -1072,15 +1124,14 @@ class ThreePointPose:
         self.enable_waist_tracking = enable_waist_tracking
         self.enable_smpl_vis = enable_smpl_vis
 
-        # Robot model for FK-based calibration (headless, no display required)
         self._robot_model = robot_model
-        if self._robot_model is None:
+        if enable_vis_vr3pt and self._robot_model is None:
             from gear_sonic.data.robot_model.instantiation.g1 import (
                 instantiate_g1_robot_model,
             )
 
             self._robot_model = instantiate_g1_robot_model()
-            print(f"[{log_prefix}] Robot model loaded for FK calibration")
+            print(f"[{log_prefix}] Robot model loaded for visualization")
 
         # Optional visualization (requires display + PyVista)
         self.vr3pt_visualizer = None
@@ -1104,33 +1155,25 @@ class ThreePointPose:
             smpl_str = " + SMPL body" if enable_smpl_vis else ""
             print(f"[{log_prefix}] VR 3pt pose visualization enabled{g1_str}{waist_str}{smpl_str}")
 
-        # Calibration state — triggered explicitly by calibrate_now() or reset_with_measured_q()
-        self._calibration_pending = False
-        self._calibration_neck_quat_inv: np.ndarray | None = None  # inv(initial neck quat)
-        self._calibration_lwrist_offset: np.ndarray | None = None  # position offset
-        self._calibration_rwrist_offset: np.ndarray | None = None
-        self._calibration_lwrist_rot_offset: sRot | None = None  # orientation offset
-        self._calibration_rwrist_rot_offset: sRot | None = None
-        # Override robot q for FK during recalibration (e.g. measured joints for VR 3PT)
-        self._override_robot_q: np.ndarray | None = None
         self._calibration_lock = threading.RLock()
         self._calibration_revision = 0
 
     @property
     def is_pending(self) -> bool:
-        """Check if calibration is pending."""
-        with self._calibration_lock:
-            return self._calibration_pending
+        return False
 
     @property
     def is_calibrated(self) -> bool:
-        """Check if calibration has been captured."""
-        with self._calibration_lock:
-            return self._calibration_neck_quat_inv is not None
+        return True
 
     @property
     def calibration_revision(self) -> int:
         with self._calibration_lock:
+            return int(self._calibration_revision)
+
+    def start_tracking_session(self) -> int:
+        with self._calibration_lock:
+            self._calibration_revision += 1
             return int(self._calibration_revision)
 
     def process_smpl_pose(
@@ -1151,11 +1194,7 @@ class ThreePointPose:
             vr_3pt_pose: np.ndarray shape (3, 7) - Calibrated 3-point pose
                          [L-Wrist, R-Wrist, Neck], each row [x, y, z, qw, qx, qy, qz]
         """
-        with self._calibration_lock:
-            vr_3pt_pose_raw = _process_3pt_pose(smpl_pose_np)
-            if self._calibration_pending:
-                self._capture_calibration(vr_3pt_pose_raw)
-            vr_3pt_pose = self._apply_calibration(vr_3pt_pose_raw)
+        vr_3pt_pose = _process_3pt_pose(smpl_pose_np)
 
         if self.vr3pt_visualizer is not None:
             self.vr3pt_visualizer.update_from_vr_pose(vr_3pt_pose, waist_scale=1.0)
@@ -1173,189 +1212,17 @@ class ThreePointPose:
             except Exception as e:
                 print(f"[{self.log_prefix}] Warning: Error closing VR3pt visualizer: {e}")
 
-    def calibrate_now(self, body_poses_np: np.ndarray) -> bool:
-        """Calibrate using current SMPL frame against FK of all-zero body joints.
-        Operator should be in zero-reference pose when calling this."""
-        try:
-            with self._calibration_lock:
-                vr_3pt_pose_raw = _process_3pt_pose(body_poses_np)
-                self._override_robot_q = np.zeros(29, dtype=np.float64)
-                self._capture_calibration(vr_3pt_pose_raw)
-            print(f"[{self.log_prefix}] Calibration completed (zero-pose reference)")
-            return True
-        except Exception as e:
-            print(f"[{self.log_prefix}] Calibration failed: {e}")
-            import traceback
-
-            traceback.print_exc()
-            return False
-
-    def _capture_calibration(self, vr_3pt_pose: np.ndarray) -> None:
-        """Capture calibration offsets from vr_3pt_pose against G1 FK reference.
-        If neck calibration already exists (e.g. from calibrate_now), it is preserved
-        to avoid jumps from SMPL noise during recalibration."""
-
-        # Step 1: Neck orientation — only capture if not already set
-        if self._calibration_neck_quat_inv is None:
-            neck_quat_wxyz = vr_3pt_pose[2, 3:].copy()
-            neck_rot = sRot.from_quat(neck_quat_wxyz, scalar_first=True)
-            self._calibration_neck_quat_inv = neck_rot.inv().as_quat(scalar_first=True)
-        calib_inv_rot = sRot.from_quat(self._calibration_neck_quat_inv, scalar_first=True)
-
-        # Step 2: Rotate VR wrist positions/orientations by neck inverse
-        lwrist_pos_corrected = calib_inv_rot.apply(vr_3pt_pose[0, :3].copy())
-        rwrist_pos_corrected = calib_inv_rot.apply(vr_3pt_pose[1, :3].copy())
-        lwrist_rot_corrected = calib_inv_rot * sRot.from_quat(vr_3pt_pose[0, 3:], scalar_first=True)
-        rwrist_rot_corrected = calib_inv_rot * sRot.from_quat(vr_3pt_pose[1, 3:], scalar_first=True)
-
-        # Step 3: Get G1 FK reference poses
-        if self._robot_model is None:
-            raise RuntimeError(
-                "Robot model is required for calibration but was not loaded. "
-                "Ensure the G1 robot model and URDF are available."
-            )
-        if get_g1_key_frame_poses is None:
-            raise RuntimeError(
-                "get_g1_key_frame_poses could not be imported. "
-                "Ensure gear_sonic.utils.teleop.vis.vr3pt_pose_visualizer is available."
-            )
-
-        # Convert 29-DOF override to full model config if needed
-        if self._override_robot_q is not None:
-            robot_q = self._robot_model.get_configuration_from_actuated_joints(
-                body_actuated_joint_values=self._override_robot_q[:29]
-            )
-        else:
-            robot_q = None
-        # The visualizer's default key-frame offsets are 18 cm and include a
-        # lateral component. IPOPT instead optimizes a frame exactly 5 cm along
-        # local +X from each wrist-yaw joint. Build that same frame explicitly.
-        g1_poses = get_g1_key_frame_poses(
-            self._robot_model, q=robot_q, apply_offset=False
-        )
-        g1_lwrist_rot = sRot.from_quat(
-            g1_poses["left_wrist"]["orientation_wxyz"], scalar_first=True
-        )
-        g1_rwrist_rot = sRot.from_quat(
-            g1_poses["right_wrist"]["orientation_wxyz"], scalar_first=True
-        )
-        ee_offset = np.array([0.05, 0.0, 0.0], dtype=np.float64)
-        g1_lwrist_pos = (
-            np.asarray(g1_poses["left_wrist"]["position"], dtype=np.float64)
-            + g1_lwrist_rot.apply(ee_offset)
-        )
-        g1_rwrist_pos = (
-            np.asarray(g1_poses["right_wrist"]["position"], dtype=np.float64)
-            + g1_rwrist_rot.apply(ee_offset)
-        )
-
-        # Compute position offsets: calibrated = neck_corrected - offset
-        self._calibration_lwrist_offset = lwrist_pos_corrected - g1_lwrist_pos
-        self._calibration_rwrist_offset = rwrist_pos_corrected - g1_rwrist_pos
-
-        # Compute orientation offsets: calibrated = rot_offset * neck_corrected
-        self._calibration_lwrist_rot_offset = g1_lwrist_rot * lwrist_rot_corrected.inv()
-        self._calibration_rwrist_rot_offset = g1_rwrist_rot * rwrist_rot_corrected.inv()
-
-        self._calibration_pending = False
-        self._override_robot_q = None
-        self._calibration_revision += 1
-
-        # Log summary
-        source = "override q" if g1_lwrist_pos.any() else "default/zero"
-        print(
-            f"[{self.log_prefix}] Calibration captured (FK ref: {source}):\n"
-            f"  L-Wrist pos offset: [{self._calibration_lwrist_offset[0]:.4f}, "
-            f"{self._calibration_lwrist_offset[1]:.4f}, {self._calibration_lwrist_offset[2]:.4f}]\n"
-            f"  R-Wrist pos offset: [{self._calibration_rwrist_offset[0]:.4f}, "
-            f"{self._calibration_rwrist_offset[1]:.4f}, {self._calibration_rwrist_offset[2]:.4f}]"
-        )
-
-    def _apply_calibration(self, vr_3pt_pose: np.ndarray) -> np.ndarray:
-        """Apply stored calibration offsets to raw VR 3-point pose."""
-        if self._calibration_neck_quat_inv is None:
-            return vr_3pt_pose
-
-        calibrated = vr_3pt_pose.copy()
-        calib_inv_rot = sRot.from_quat(self._calibration_neck_quat_inv, scalar_first=True)
-
-        # Neck orientation: calibrated = inv(initial) * current
-        neck_rot = sRot.from_quat(vr_3pt_pose[2, 3:], scalar_first=True)
-        calibrated[2, 3:] = (calib_inv_rot * neck_rot).as_quat(scalar_first=True)
-
-        # Wrist positions: rotate by neck inverse, then subtract offset
-        if self._calibration_lwrist_offset is not None:
-            calibrated[0, :3] = (
-                calib_inv_rot.apply(vr_3pt_pose[0, :3]) - self._calibration_lwrist_offset
-            )
-        if self._calibration_rwrist_offset is not None:
-            calibrated[1, :3] = (
-                calib_inv_rot.apply(vr_3pt_pose[1, :3]) - self._calibration_rwrist_offset
-            )
-
-        # Wrist orientations: rot_offset * (neck_inv * current)
-        if self._calibration_lwrist_rot_offset is not None:
-            lw_corrected = calib_inv_rot * sRot.from_quat(vr_3pt_pose[0, 3:], scalar_first=True)
-            calibrated[0, 3:] = (self._calibration_lwrist_rot_offset * lw_corrected).as_quat(
-                scalar_first=True
-            )
-        if self._calibration_rwrist_rot_offset is not None:
-            rw_corrected = calib_inv_rot * sRot.from_quat(vr_3pt_pose[1, 3:], scalar_first=True)
-            calibrated[1, 3:] = (self._calibration_rwrist_rot_offset * rw_corrected).as_quat(
-                scalar_first=True
-            )
-
-        # Neck position via kinematic chain: root → torso_link (+Z) → neck (along calibrated Z)
-        neck_z = sRot.from_quat(calibrated[2, 3:], scalar_first=True).apply([0, 0, 1])
-        calibrated[2, :3] = (
-            np.array([0, 0, self.TORSO_LINK_OFFSET_Z]) + self.NECK_LINK_LENGTH * neck_z
-        ).astype(np.float32)
-
-        return calibrated
-
-    def _clear_calibration(self):
-        """Clear all calibration state."""
-        self._calibration_neck_quat_inv = None
-        self._calibration_lwrist_offset = None
-        self._calibration_rwrist_offset = None
-        self._calibration_lwrist_rot_offset = None
-        self._calibration_rwrist_rot_offset = None
-        self._override_robot_q = None
-
-    def reset(self) -> None:
-        """Reset calibration. Next process_smpl_pose() call will recalibrate."""
-        with self._calibration_lock:
-            self._clear_calibration()
-            self._calibration_pending = True
-        print(f"[{self.log_prefix}] Calibration reset, will re-calibrate on next frame")
-
-    def reset_with_measured_q(self, body_q_measured: np.ndarray) -> None:
-        """Recalibrate wrist offsets using measured robot joints (29 DOFs).
-        Preserves neck calibration to avoid jumps from SMPL noise.
-        Next process_smpl_pose() will recompute wrist offsets against FK of these joints."""
-        with self._calibration_lock:
-            # Preserve neck calibration — only clear wrist offsets.
-            self._calibration_lwrist_offset = None
-            self._calibration_rwrist_offset = None
-            self._calibration_lwrist_rot_offset = None
-            self._calibration_rwrist_rot_offset = None
-            self._override_robot_q = body_q_measured.copy()
-            self._calibration_pending = True
-        print(f"[{self.log_prefix}] Wrist recalibration pending (neck preserved, measured q)")
-
     def debug_pose(
         self, body_poses_np: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray, bool]:
-        """Return raw and calibrated 3-point poses without visualization work."""
+        """Return legacy body diagnostics; never used as an arm target."""
 
-        with self._calibration_lock:
-            raw = _process_3pt_pose(body_poses_np)
-            calibrated = self._apply_calibration(raw)
-            return raw, calibrated, self._calibration_neck_quat_inv is not None
+        raw = _process_3pt_pose(body_poses_np)
+        return raw, raw.copy(), True
 
 
 class PicoVrPoseDebugPublisher:
-    """Publish body-tracked, G1-FK-anchored wrist targets."""
+    """Publish absolute PICO controller targets in the waist frame."""
 
     def __init__(
         self,
@@ -1371,14 +1238,25 @@ class PicoVrPoseDebugPublisher:
         self.port = int(port)
         self.publish_hz = min(90.0, max(50.0, float(publish_hz)))
         self.stream_mode_getter = stream_mode_getter
+        self.arm_reference_mode = "head_position"
         self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
-        self._controller_source_anchors: tuple[np.ndarray, np.ndarray] | None = None
-        self._controller_robot_anchors: tuple[np.ndarray, np.ndarray] | None = None
-        self._controller_alignment_revision = -1
+        self.alignment_gate = AlignmentGate()
+        self._align_ok = False
+        self._align_reason = "inactive"
+        self._align_ok_frames = 0
+        self._align_lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = threading.Thread(
             target=self._run, name="pico-vr-pose-publisher", daemon=True
         )
+
+    @property
+    def alignment_ready(self) -> bool:
+        with self._align_lock:
+            return bool(
+                self._align_ok
+                and self._align_ok_frames >= self.alignment_gate.hold_frames
+            )
 
     def start(self) -> None:
         self._thread.start()
@@ -1396,10 +1274,14 @@ class PicoVrPoseDebugPublisher:
         period = 1.0 / self.publish_hz
         next_deadline = time.monotonic()
         last_timestamp_ns = -1
+        previous_left_position: np.ndarray | None = None
+        previous_right_position: np.ndarray | None = None
+        previous_time = time.monotonic()
+        last_alignment_log = 0.0
         print(
             f"[PICO-VR] publishing tcp://*:{self.port}/vr_pose_debug "
             f"at up to {self.publish_hz:.0f}Hz "
-            "(native-controller/G1-FK wrist targets + body diagnostics)"
+            "(absolute controller head-position -> waist targets)"
         )
         try:
             while not self._stop.is_set():
@@ -1407,131 +1289,85 @@ class PicoVrPoseDebugPublisher:
                 timestamp_ns = int(sample.get("timestamp_ns", 0)) if sample else 0
                 if sample is not None and timestamp_ns > 0 and timestamp_ns != last_timestamp_ns:
                     try:
-                        raw, calibrated, is_calibrated = self.three_point.debug_pose(
-                            sample["body_poses_np"]
+                        mode = (
+                            self.stream_mode_getter()
+                            if self.stream_mode_getter is not None
+                            else StreamMode.OFF
                         )
-                        pose_source = 0
-                        controller_position_head_yaw = np.full(
-                            6, np.nan, dtype=np.float32
-                        )
-                        controller_orientation_head_yaw = np.full(
-                            8, np.nan, dtype=np.float32
-                        )
-                        controller_aligned_position = np.full(
-                            6, np.nan, dtype=np.float32
-                        )
-                        controller_aligned_orientation = np.full(
-                            8, np.nan, dtype=np.float32
-                        )
-                        try:
-                            headset_pose = xrt.get_headset_pose()
-                            left_controller = _controller_pose_in_head_yaw_frame(
-                                xrt.get_left_controller_pose(), headset_pose
+                        active = mode in (StreamMode.ALIGNING, StreamMode.TRACKING)
+                        left_waist = np.full((4, 4), np.nan, dtype=np.float64)
+                        right_waist = np.full((4, 4), np.nan, dtype=np.float64)
+                        targets_ok = False
+                        if active:
+                            left_waist, right_waist, targets_ok = (
+                                controller_waist_targets(
+                                    xrt.get_left_controller_pose(),
+                                    xrt.get_right_controller_pose(),
+                                    xrt.get_headset_pose(),
+                                )
                             )
-                            right_controller = _controller_pose_in_head_yaw_frame(
-                                xrt.get_right_controller_pose(), headset_pose
-                            )
-                            controller_position_head_yaw = np.concatenate(
-                                (
-                                    left_controller[:3, 3],
-                                    right_controller[:3, 3],
-                                )
-                            ).astype(np.float32)
-                            controller_orientation_head_yaw = np.concatenate(
-                                (
-                                    sRot.from_matrix(
-                                        left_controller[:3, :3]
-                                    ).as_quat(scalar_first=True),
-                                    sRot.from_matrix(
-                                        right_controller[:3, :3]
-                                    ).as_quat(scalar_first=True),
-                                )
-                            ).astype(np.float32)
-                            controller_revision = (
-                                self.three_point.calibration_revision
-                            )
-                            if (
-                                is_calibrated
-                                and (
-                                    self._controller_source_anchors is None
-                                    or controller_revision
-                                    != self._controller_alignment_revision
-                                )
-                            ):
-                                robot_anchors = []
-                                for index in (0, 1):
-                                    anchor = np.eye(4, dtype=np.float64)
-                                    anchor[:3, 3] = calibrated[index, :3]
-                                    anchor[:3, :3] = sRot.from_quat(
-                                        calibrated[index, 3:], scalar_first=True
-                                    ).as_matrix()
-                                    robot_anchors.append(anchor)
-                                self._controller_source_anchors = (
-                                    left_controller.copy(),
-                                    right_controller.copy(),
-                                )
-                                self._controller_robot_anchors = (
-                                    robot_anchors[0],
-                                    robot_anchors[1],
-                                )
-                                self._controller_alignment_revision = (
-                                    controller_revision
-                                )
-                                print(
-                                    "[PICO-VR] native controller target anchored "
-                                    "to G1 FK at "
-                                    f"revision={controller_revision}"
-                                )
 
-                            if (
-                                self._controller_source_anchors is not None
-                                and self._controller_robot_anchors is not None
-                            ):
-                                aligned_controllers = (
-                                    align_controller_pose(
-                                        left_controller,
-                                        self._controller_source_anchors[0],
-                                        self._controller_robot_anchors[0],
-                                    ),
-                                    align_controller_pose(
-                                        right_controller,
-                                        self._controller_source_anchors[1],
-                                        self._controller_robot_anchors[1],
-                                    ),
-                                )
-                                controller_aligned_position = np.concatenate(
-                                    tuple(
-                                        controller[:3, 3]
-                                        for controller in aligned_controllers
-                                    )
-                                ).astype(np.float32)
-                                controller_aligned_orientation = np.concatenate(
-                                    tuple(
-                                        sRot.from_matrix(
-                                            controller[:3, :3]
-                                        ).as_quat(scalar_first=True)
-                                        for controller in aligned_controllers
-                                    )
-                                ).astype(np.float32)
-                        except Exception:
-                            # Keep the body rows available for diagnostics, but
-                            # pose_source remains 0 and the PATH bridge will hold
-                            # its last controller target instead of using them.
-                            pass
+                        now = time.monotonic()
+                        dt = max(now - previous_time, 1.0e-6)
+                        if (
+                            targets_ok
+                            and previous_left_position is not None
+                            and previous_right_position is not None
+                        ):
+                            left_velocity = (
+                                left_waist[:3, 3] - previous_left_position
+                            ) / dt
+                            right_velocity = (
+                                right_waist[:3, 3] - previous_right_position
+                            ) / dt
+                        else:
+                            left_velocity = np.full(3, np.inf)
+                            right_velocity = np.full(3, np.inf)
 
-                        vr_position = calibrated[:, :3].astype(np.float32).copy()
-                        vr_orientation = calibrated[:, 3:].astype(np.float32).copy()
-                        controller_target_valid = (
-                            is_calibrated
-                            and np.isfinite(controller_aligned_position).all()
-                            and np.isfinite(controller_aligned_orientation).all()
-                        )
-                        if controller_target_valid:
-                            vr_position[:2] = controller_aligned_position.reshape(2, 3)
-                            vr_orientation[:2] = (
-                                controller_aligned_orientation.reshape(2, 4)
+                        align_ok = False
+                        align_reason = "inactive"
+                        if mode == StreamMode.ALIGNING and targets_ok:
+                            align_ok, align_reason = self.alignment_gate.check(
+                                left_waist,
+                                right_waist,
+                                left_velocity,
+                                right_velocity,
                             )
-                            pose_source = 1
+                        elif mode == StreamMode.TRACKING and targets_ok:
+                            align_ok, align_reason = True, "tracking"
+
+                        with self._align_lock:
+                            if mode == StreamMode.ALIGNING:
+                                self._align_ok_frames = (
+                                    self._align_ok_frames + 1 if align_ok else 0
+                                )
+                            elif mode != StreamMode.TRACKING:
+                                self._align_ok_frames = 0
+                            self._align_ok = align_ok
+                            self._align_reason = align_reason
+                            align_ok_frames = self._align_ok_frames
+
+                        if (
+                            mode == StreamMode.ALIGNING
+                            and now - last_alignment_log >= 1.0
+                        ):
+                            max_speed = max(
+                                float(np.linalg.norm(left_velocity)),
+                                float(np.linalg.norm(right_velocity)),
+                            )
+                            print(
+                                "[PICO-VR] ALIGNING "
+                                f"reason={align_reason} "
+                                f"stable={align_ok_frames}/"
+                                f"{self.alignment_gate.hold_frames} "
+                                f"controller_speed={max_speed:.3f}m/s"
+                            )
+                            last_alignment_log = now
+
+                        if targets_ok:
+                            previous_left_position = left_waist[:3, 3].copy()
+                            previous_right_position = right_waist[:3, 3].copy()
+                            previous_time = now
 
                         (
                             _,
@@ -1550,21 +1386,22 @@ class PicoVrPoseDebugPublisher:
                                 right_grip,
                             )
                         )
-                        stream_mode = -1
-                        if self.stream_mode_getter is not None:
-                            mode = self.stream_mode_getter()
-                            stream_mode = int(getattr(mode, "value", mode))
                         socket.send(
                             pack_pose_message(
                                 {
-                                    "vr_position": vr_position.reshape(-1),
-                                    "vr_orientation": vr_orientation.reshape(-1),
-                                    "vr_position_raw": raw[:, :3]
-                                    .reshape(-1)
-                                    .astype(np.float32),
-                                    "vr_orientation_raw": raw[:, 3:]
-                                    .reshape(-1)
-                                    .astype(np.float32),
+                                    "wrist_left_waist": (
+                                        left_waist.reshape(-1).astype(np.float32)
+                                        if targets_ok
+                                        else np.full(16, np.nan, dtype=np.float32)
+                                    ),
+                                    "wrist_right_waist": (
+                                        right_waist.reshape(-1).astype(np.float32)
+                                        if targets_ok
+                                        else np.full(16, np.nan, dtype=np.float32)
+                                    ),
+                                    "targets_valid": np.array(
+                                        [targets_ok and active], dtype=bool
+                                    ),
                                     "frame_index": np.array(
                                         [timestamp_ns], dtype=np.int64
                                     ),
@@ -1578,32 +1415,33 @@ class PicoVrPoseDebugPublisher:
                                     "pico_fps": np.array(
                                         [sample.get("fps", 0.0)], dtype=np.float32
                                     ),
-                                    "calibrated": np.array(
-                                        [is_calibrated], dtype=bool
-                                    ),
                                     "ee_frame_offset_m": np.array(
                                         [0.05], dtype=np.float32
                                     ),
                                     "stream_mode": np.array(
-                                        [stream_mode], dtype=np.int32
+                                        [mode.value], dtype=np.int32
                                     ),
-                                    "pose_source": np.array(
-                                        [pose_source], dtype=np.int32
+                                    "session_id": np.array(
+                                        [self.three_point.calibration_revision],
+                                        dtype=np.int32,
                                     ),
-                                    "ctrl_pos_hy": (
-                                        controller_position_head_yaw
+                                    "arm_reference_mode": np.array(
+                                        [0], dtype=np.int32
                                     ),
-                                    "ctrl_quat_hy": (
-                                        controller_orientation_head_yaw
+                                    "align_ok": np.array(
+                                        [align_ok], dtype=bool
                                     ),
-                                    "ctrl_pos_aligned": (
-                                        controller_aligned_position
-                                    ),
-                                    "ctrl_quat_aligned": (
-                                        controller_aligned_orientation
-                                    ),
-                                    "ctrl_align_rev": np.array(
-                                        [self._controller_alignment_revision],
+                                    "align_reason": np.array(
+                                        [
+                                            {
+                                                "ok": 0,
+                                                "tracking": 1,
+                                                "inactive": 2,
+                                                "operator_moving": 3,
+                                                "ctrl_L_not_forward": 4,
+                                                "ctrl_R_not_forward": 5,
+                                            }.get(align_reason, 6)
+                                        ],
                                         dtype=np.int32,
                                     ),
                                     "left_trigger": np.array(
@@ -1730,9 +1568,7 @@ class LivePoseStreamer:
         self.yaw_accumulator = YawAccumulator()
 
     def reset_yaw(self):
-        """Called when entering pose mode. Resets yaw only.
-        Pelvis-frame calibration is triggered separately on session start and
-        again when A+X enters the tracking pose mode."""
+        """Called when entering a legacy pose mode. Resets yaw only."""
         self.yaw_accumulator.reset()
 
     def on_mode_exit(self):
@@ -2400,26 +2236,6 @@ class PlannerStreamer:
         """Poll feedback and save upper body position target."""
         self.feedback_reader.poll_feedback()
 
-    def recalibrate_for_vr3pt(self):
-        """
-        Recalibrate VR 3-point pose tracking using the robot's current measured joints.
-
-        Polls the g1_debug feedback to get the robot's actual joint state, then
-        schedules recalibration so VR tracking aligns with the robot's current pose.
-        This prevents sudden jumps when entering VR 3PT mode from PLANNER mode.
-        """
-        self.feedback_reader.poll_feedback()
-        if self.feedback_reader.full_body_q_measured is not None:
-            self.three_point.reset_with_measured_q(self.feedback_reader.full_body_q_measured)
-            print("[PlannerLoop] VR 3PT recalibration scheduled with measured robot pose")
-        else:
-            # Fallback: use zeros if no feedback available
-            print(
-                "[PlannerLoop] WARNING: No feedback data for VR 3PT recalibration, "
-                "using zero body_q as fallback"
-            )
-            self.three_point.reset_with_measured_q(np.zeros(29, dtype=np.float64))
-
     def run_once(self, stream_mode: StreamMode):
         """Execute one iteration of the planner control loop."""
         try:
@@ -2801,8 +2617,8 @@ def run_pico_manager(
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
     Controller input:
-      A+X: Toggle between planner and pose mode
-      A+B+X+Y: Toggle policy start/stop
+      A+X: PATH tracking arm/disarm only
+      A+B+X+Y: Q_READY alignment and policy start/stop
     """
     if replay_session:
         if enable_vis_vr3pt or enable_smpl_vis:
@@ -2886,22 +2702,10 @@ def run_pico_manager(
         desk_pose=desk_pose,
     )
 
-    # State machine diagram:
-    #
-    #   Chain 1 (by_pressed enters/exits, left_axis_click toggles sub-mode):
-    #     POSE <--(by)--> PLANNER_FROZEN_UPPER_BODY <--(left_axis_click)--> PLANNER_VR_3PT
-    #                                                                         |
-    #                                                                    (by)--> POSE
-    #
-    #   Chain 2 (ax_pressed enters/exits, left_axis_click toggles sub-mode):
-    #     POSE <--(ax)--> PLANNER <--(left_axis_click)--> PLANNER_VR_3PT
-    #                                                        |
-    #                                                   (ax)--> POSE
-    #
-    #   Emergency stop from any mode: A+B+X+Y (start_combo) --> OFF
-    #   POSE_PAUSE: left_menu_button held --> POSE_PAUSE, released --> POSE
-    #
-    print("Manager controls: A+X=toggle mode, A+B+X+Y=start/stop policy")
+    print(
+        "Manager controls: A+B+X+Y=Q_READY alignment/start/stop; "
+        "A+X=PATH tracking arm/disarm only"
+    )
     current_mode = StreamMode.OFF
     vr_pose_publisher = PicoVrPoseDebugPublisher(
         reader=reader,
@@ -2911,9 +2715,6 @@ def run_pico_manager(
         stream_mode_getter=lambda: current_mode,
     )
     vr_pose_publisher.start()
-    # Track which mode VR_3PT was entered from, so left_axis_click returns to it.
-    # Will be either PLANNER or PLANNER_FROZEN_UPPER_BODY.
-    vr3pt_parent_mode = StreamMode.PLANNER
     prev_toggle_dc = False
     prev_toggle_da = False
     try:
@@ -2929,145 +2730,40 @@ def run_pico_manager(
 
             left_axis_click, _ = get_axis_clicks()
 
-            # Rising edge: A+X pressed together -> toggle POSE/PLANNER mode
             ax_pressed = (a_pressed) and (x_pressed)
-
-            # Rising edge: B+Y pressed together -> toggle POSE/PLANNER_FROZEN_UPPER_BODY mode
             by_pressed = (b_pressed) and (y_pressed)
-
-            # Rising edge: A+B+X+Y pressed together -> toggle policy start/stop (planner=True)
             start_combo = (a_pressed) and (b_pressed) and (x_pressed) and (y_pressed)
 
             new_mode = current_mode
             if current_mode == StreamMode.OFF:
                 if start_combo and not prev_start_combo:
-                    new_mode = StreamMode.PLANNER
-                    # Calibrate VR 3pt tracking NOW: operator should be in zero-ref pose.
-                    # Uses the current Pico SMPL frame + FK of all-zero body joints.
-                    sample = reader.get_latest()
-                    if sample is not None:
-                        three_point.calibrate_now(sample["body_poses_np"])
-                    else:
-                        print("[Manager] WARNING: No SMPL data available for calibration")
-
-            elif current_mode == StreamMode.PLANNER:
-                # Chain 2: POSE <--(ax)--> PLANNER <--(left_axis_click)--> VR_3PT
+                    new_mode = StreamMode.ALIGNING
+            elif current_mode == StreamMode.ALIGNING:
                 if start_combo and not prev_start_combo:
                     new_mode = StreamMode.OFF
-                elif ax_pressed and not prev_ax_pressed:
-                    new_mode = StreamMode.POSE
-                elif left_axis_click and not prev_left_axis_click:
-                    new_mode = StreamMode.PLANNER_VR_3PT
-
-            elif current_mode == StreamMode.POSE:
+                elif vr_pose_publisher.alignment_ready:
+                    three_point.start_tracking_session()
+                    new_mode = StreamMode.TRACKING
+            elif current_mode == StreamMode.TRACKING:
                 if start_combo and not prev_start_combo:
                     new_mode = StreamMode.OFF
-                elif ax_pressed and not prev_ax_pressed:
-                    new_mode = StreamMode.PLANNER  # Enter chain 2
-                elif by_pressed and not prev_by_pressed:
-                    new_mode = StreamMode.PLANNER_FROZEN_UPPER_BODY  # Enter chain 1
-                elif left_menu_button:
-                    new_mode = StreamMode.POSE_PAUSE
-
-            elif current_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY:
-                # Chain 1: POSE <--(by)--> FROZEN <--(left_axis_click)--> VR_3PT
-                if start_combo and not prev_start_combo:
-                    new_mode = StreamMode.OFF
-                elif by_pressed and not prev_by_pressed:
-                    new_mode = StreamMode.POSE
-                elif left_axis_click and not prev_left_axis_click:
-                    new_mode = StreamMode.PLANNER_VR_3PT
-
-            elif current_mode == StreamMode.POSE_PAUSE:
-                if start_combo and not prev_start_combo:
-                    new_mode = StreamMode.OFF
-                elif not left_menu_button:
-                    new_mode = StreamMode.POSE
-
-            elif current_mode == StreamMode.PLANNER_VR_3PT:
-                # VR_3PT is reachable from both chains:
-                #   left_axis_click → return to parent (PLANNER or FROZEN)
-                #   ax_pressed      → POSE (chain 2 exit)
-                #   by_pressed      → POSE (chain 1 exit)
-                if start_combo and not prev_start_combo:
-                    new_mode = StreamMode.OFF
-                elif left_axis_click and not prev_left_axis_click:
-                    new_mode = vr3pt_parent_mode  # Return to parent mode
-                elif ax_pressed and not prev_ax_pressed:
-                    new_mode = StreamMode.POSE
-                elif by_pressed and not prev_by_pressed:
-                    new_mode = StreamMode.POSE
 
             # Handle mode transitions before running loop
             if new_mode != current_mode:
-                if current_mode == StreamMode.POSE:
-                    pose_streamer.on_mode_exit()
-
-                # A+X starts one calibrated PICO tracking session. Perform the
-                # single pelvis/FK frame alignment here. The controller thread
-                # uses the resulting G1 EE pose as its native-controller anchor;
-                # the PATH bridge only validates the aligned stream for 0.5 s.
-                if (
-                    new_mode == StreamMode.POSE
-                    and ax_pressed
-                    and not prev_ax_pressed
-                ):
-                    sample = reader.get_latest()
-                    if sample is not None:
-                        three_point.calibrate_now(sample["body_poses_np"])
-                    else:
-                        print(
-                            "[Manager] WARNING: no PICO frame for A+X "
-                            "pelvis-frame alignment"
-                        )
-
-                # Track parent when entering VR_3PT
-                if new_mode == StreamMode.PLANNER_VR_3PT:
-                    vr3pt_parent_mode = current_mode
-                    print(f"[Manager] VR_3PT parent: {vr3pt_parent_mode.name}")
-
-                if new_mode == StreamMode.POSE:
-                    pose_streamer.reset_yaw()
-                elif new_mode == StreamMode.PLANNER and current_mode != StreamMode.PLANNER_VR_3PT:
-                    # Only reset yaw when freshly entering PLANNER from POSE,
-                    # not when returning from VR_3PT sub-mode
+                if new_mode == StreamMode.ALIGNING:
                     planner_streamer.reset_yaw()
-                elif new_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY:
-                    if current_mode != StreamMode.PLANNER_VR_3PT:
-                        # Freshly entering from POSE: reset yaw and grab initial targets
-                        planner_streamer.reset_yaw()
-                    # Always re-grab the latest robot state as frozen targets,
-                    # whether entering from POSE or returning from VR_3PT
-                    # (the old targets are stale after VR_3PT moved the arms)
-                    planner_streamer.save_upper_body_position_target()
-                elif new_mode == StreamMode.PLANNER_VR_3PT:
-                    # Recalibrate VR tracking against the robot's actual current pose
-                    # (read via g1_debug feedback + FK) to prevent sudden jumps
-                    planner_streamer.recalibrate_for_vr3pt()
 
             # Run one iteration of the new mode
-            if new_mode == StreamMode.POSE:
-                pose_streamer.run_once()
-            elif (
-                new_mode == StreamMode.PLANNER
-                or new_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY
-                or new_mode == StreamMode.PLANNER_VR_3PT
-            ):
-                planner_streamer.run_once(new_mode)
+            if new_mode in (StreamMode.ALIGNING, StreamMode.TRACKING):
+                planner_streamer.run_once(StreamMode.PLANNER)
 
             # Make sure to send command messages after loop iteration to ensure data arrives before mode switch
             if new_mode != current_mode:
                 if new_mode == StreamMode.OFF:
                     socket.send(build_command_message(start=False, stop=True, planner=True))
                     exit()
-                elif (
-                    new_mode == StreamMode.PLANNER
-                    or new_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY
-                    or new_mode == StreamMode.PLANNER_VR_3PT
-                ):
+                elif new_mode in (StreamMode.ALIGNING, StreamMode.TRACKING):
                     socket.send(build_command_message(start=True, stop=False, planner=True))
-                elif new_mode == StreamMode.POSE:
-                    socket.send(build_command_message(start=True, stop=False, planner=False))
 
                 print(f"[Manager] StreamMode switch: {current_mode.name} -> {new_mode.name}")
                 current_mode = new_mode

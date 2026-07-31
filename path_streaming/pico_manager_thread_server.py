@@ -1399,7 +1399,7 @@ class PicoVrPoseDebugPublisher:
         print(
             f"[PICO-VR] publishing tcp://*:{self.port}/vr_pose_debug "
             f"at up to {self.publish_hz:.0f}Hz "
-            "(body/G1-FK targets + native-controller diagnostics)"
+            "(native-controller/G1-FK wrist targets + body diagnostics)"
         )
         try:
             while not self._stop.is_set():
@@ -1478,8 +1478,8 @@ class PicoVrPoseDebugPublisher:
                                     controller_revision
                                 )
                                 print(
-                                    "[PICO-VR] body target anchored to G1 FK; "
-                                    "native controller diagnostic aligned at "
+                                    "[PICO-VR] native controller target anchored "
+                                    "to G1 FK at "
                                     f"revision={controller_revision}"
                                 )
 
@@ -1514,9 +1514,24 @@ class PicoVrPoseDebugPublisher:
                                     )
                                 ).astype(np.float32)
                         except Exception:
-                            # Native controller data is diagnostic only. Body
-                            # tracking remains authoritative if it is missing.
+                            # Keep the body rows available for diagnostics, but
+                            # pose_source remains 0 and the PATH bridge will hold
+                            # its last controller target instead of using them.
                             pass
+
+                        vr_position = calibrated[:, :3].astype(np.float32).copy()
+                        vr_orientation = calibrated[:, 3:].astype(np.float32).copy()
+                        controller_target_valid = (
+                            is_calibrated
+                            and np.isfinite(controller_aligned_position).all()
+                            and np.isfinite(controller_aligned_orientation).all()
+                        )
+                        if controller_target_valid:
+                            vr_position[:2] = controller_aligned_position.reshape(2, 3)
+                            vr_orientation[:2] = (
+                                controller_aligned_orientation.reshape(2, 4)
+                            )
+                            pose_source = 1
 
                         (
                             _,
@@ -1542,12 +1557,8 @@ class PicoVrPoseDebugPublisher:
                         socket.send(
                             pack_pose_message(
                                 {
-                                    "vr_position": calibrated[:, :3]
-                                    .reshape(-1)
-                                    .astype(np.float32),
-                                    "vr_orientation": calibrated[:, 3:]
-                                    .reshape(-1)
-                                    .astype(np.float32),
+                                    "vr_position": vr_position.reshape(-1),
+                                    "vr_orientation": vr_orientation.reshape(-1),
                                     "vr_position_raw": raw[:, :3]
                                     .reshape(-1)
                                     .astype(np.float32),

@@ -1,10 +1,10 @@
-"""Validated pelvis-local Cartesian wrist targets from PICO body tracking.
+"""Validated pelvis-local Cartesian wrist targets from native PICO controllers.
 
-``vr_position`` and ``vr_orientation`` are generated from PICO body tracking
-and anchored by the PICO manager to G1 FK. They use the same wrist-yaw + 5 cm
-EE frame as the arm IPOPT model. Native controller poses are recorded only as
-diagnostics. This tracker validates the authoritative body/G1 stream and does
-not create another coordinate transform.
+``vr_position`` and ``vr_orientation`` contain native controller motion aligned
+by the PICO manager to the G1 FK anchor. They use the same wrist-yaw + 5 cm EE
+frame as the arm IPOPT model. Body tracking remains only in the neck row and
+diagnostic fields. This tracker validates the authoritative controller stream
+and does not create another coordinate transform.
 """
 
 from __future__ import annotations
@@ -25,6 +25,8 @@ class PicoBodyTrackingSample:
     source_timestamp_us: int
     frame_index: int
     source: str = "vr_pose_debug"
+    pose_source: int = 1
+    alignment_revision: int = -1
 
 
 @dataclass(frozen=True)
@@ -113,6 +115,8 @@ def _validate_sample(sample: PicoBodyTrackingSample) -> PicoBodyTrackingSample:
         int(sample.source_timestamp_us),
         int(sample.frame_index),
         str(sample.source),
+        int(sample.pose_source),
+        int(sample.alignment_revision),
     )
 
 
@@ -237,6 +241,8 @@ class PicoBodyCartesianTargetTracker:
             int(sample.source_timestamp_us),
             int(sample.frame_index),
             str(sample.source),
+            int(sample.pose_source),
+            int(sample.alignment_revision),
         )
         self._last_accepted_source_us = sample.source_timestamp_us
         self._recovering = False

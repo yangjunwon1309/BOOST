@@ -2,6 +2,9 @@
 
 RGB-D transport, mock validation, and G1 interoperability commands are in
 [`RGBD_RUNBOOK.md`](RGBD_RUNBOOK.md).
+Remote x86/Titan XP Wi-Fi offload for YOLO11/SAM3 inference and the external
+webview is documented in
+[`REMOTE_SAM3_WIFI_OFFLOAD.md`](REMOTE_SAM3_WIFI_OFFLOAD.md).
 
 This directory provides the isolated SAM3-only runtime specified by the G1
 Perception Pipeline v2 document. It deliberately contains no AnyGrasp,

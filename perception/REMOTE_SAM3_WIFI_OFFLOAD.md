@@ -1,49 +1,379 @@
-# Thor remote SAM3 Wi-Fi transport
+# PATH-G1 Remote Vision Wi-Fi Offload
 
-Thor keeps G1 Ethernet LCM and all control paths local. The two new processes
-only relay perception inputs/results; neither imports the state machine nor
-publishes an EE target.
+This mode moves vision inference and the visualization webview from Thor to an
+external x86 desktop with a Titan XP. Thor stays responsible for G1 Ethernet
+LCM, SONIC policy/control, result validation, and dry-run diagnostics. The first
+integration stage never publishes EE targets or robot commands from Wi-Fi.
 
-## Channels
+## Network Contract
 
-| Direction | Channel | Payload |
-|---|---|---|
-| Thor → desktop | `PATH_REMOTE_RGB_FRAME` | Existing `CameraFrame` bytes |
-| Thor → desktop | `PATH_REMOTE_DEPTH_FRAME` | Existing depth bytes |
-| Thor → desktop | `PATH_REMOTE_CAMERA_CALIBRATION` | Existing calibration bytes |
-| Thor → desktop | `PATH_REMOTE_ROBOT_STATE` | Existing robot-state bytes |
-| Desktop → Thor | `PATH_REMOTE_PERCEPTION_RESULT` | Versioned MessagePack result |
-| Thor local | `PATH_REMOTE_PERCEPTION_RESULT_LOCAL` | Validated unchanged result |
+Keep the two LCM domains separate:
 
-Use a dedicated Wi-Fi LCM URL/group, never the G1 Ethernet group. The Wi-Fi AP
-must allow peer multicast. If it does not, replace only the Wi-Fi transport
-with a unicast relay; preserve the channel names and MessagePack protocol.
+```bash
+export G1_LCM_URL='udpm://239.255.76.67:7667?ttl=1'
+export WIFI_LCM_URL='udpm://239.255.77.67:7667?ttl=1'
+```
 
-## Thor launch
+Example interface names:
 
-Run these in separate terminals. They do not start SAM3 or SONIC.
+```bash
+export G1_INTERFACE=enP2p1s0
+export WIFI_INTERFACE=wlan0
+```
+
+Validate Thor routes before launch:
+
+```bash
+ip -brief addr show "$G1_INTERFACE"
+ip -brief addr show "$WIFI_INTERFACE"
+ip route get 239.255.76.67
+ip route get 239.255.77.67
+```
+
+The G1 multicast route must resolve to the G1 Ethernet interface. The Wi-Fi
+remote group must resolve to the Wi-Fi interface. Do not bridge Ethernet and
+Wi-Fi:
+
+```bash
+bridge link
+ip link show type bridge
+```
+
+On both Thor and the desktop, confirm they are on the same WLAN:
+
+```bash
+ip -brief addr
+ping -c 3 <other-machine-wifi-ip>
+```
+
+If the AP blocks multicast or client-to-client traffic, use a WLAN/AP that
+allows UDP multicast between clients, or introduce a unicast relay that forwards
+the same channel payloads. Do not move remote perception traffic onto the G1
+LCM multicast group.
+
+## External Desktop Environment
+
+Clone this repository on the Titan XP x86 desktop, then inspect the machine:
+
+```bash
+cd /path/to/PATH-G1
+nvidia-smi
+python3 --version
+docker --version
+ip -brief addr
+```
+
+Titan XP is Pascal/x86 (`sm_61`). Build a separate desktop environment; do not
+reuse the Thor ARM64 Docker image and do not copy Thor TensorRT engines.
+TensorRT plan files are tied to the GPU, TensorRT version, CUDA stack, and build
+settings. The first Titan XP target is YOLO11 through PyTorch/Ultralytics, not
+TensorRT.
+
+PyTorch publishes CUDA wheel install commands from its official selector, and
+Ultralytics supports Python `YOLO(...).predict(...)` with `imgsz`, `conf`,
+`iou`, `classes`, `device`, and `quantize` arguments. This repo pins a known
+CUDA 12.1 PyTorch wheel line in the remote YOLO11 Dockerfile and installs
+Ultralytics without dependency resolution so it cannot replace that GPU stack.
+
+Docker build on the external desktop:
+
+```bash
+cd /path/to/PATH-G1/perception
+docker build -t path-g1-remote-yolo11:titan-xp \
+  -f docker/Dockerfile.remote-yolo11 .
+docker run --rm --gpus all --network host \
+  -v "$PWD/models:/models" \
+  -v "$PWD/.cache/torch:/cache/torch" \
+  -v "$PWD/.cache/ultralytics:/cache/ultralytics" \
+  path-g1-remote-yolo11:titan-xp
+```
+
+Cache the public YOLO11n segmentation checkpoint once:
+
+```bash
+docker run --rm --gpus all --network host \
+  -v "$PWD/models:/models" \
+  -v "$PWD/.cache/torch:/cache/torch" \
+  -v "$PWD/.cache/ultralytics:/cache/ultralytics" \
+  path-g1-remote-yolo11:titan-xp \
+  python3 tools/cache_yolo11n_seg.py --output /models/yolo11/yolo11n-seg.pt
+```
+
+One Python venv option:
+
+```bash
+cd /path/to/PATH-G1/perception
+python3 -m venv .venv-remote-yolo11
+source .venv-remote-yolo11/bin/activate
+python -m pip install --upgrade pip
+python -m pip install torch==2.4.0 torchvision==0.19.0 \
+  --index-url https://download.pytorch.org/whl/cu121
+python -m pip install -r docker/requirements-remote-yolo11.txt
+python -m pip install --no-deps ultralytics==8.4.108
+```
+
+Use the SAM3 venv only if explicitly testing SAM3. Keep Hugging Face tokens
+outside repo files.
+
+## Thor Gateway
+
+Run this on Thor, separate from the existing SAM3 web server:
 
 ```bash
 cd /home/url/PATH-G1/perception
-
-bash tools/run_thor_remote_gateway.sh \
-  --g1-lcm-url 'udpm://239.255.76.67:7667?ttl=1' \
-  --wifi-lcm-url 'udpm://239.255.77.67:7667?ttl=1' \
-  --forward-hz 5 --robot-state-hz 50
-
-bash tools/run_thor_remote_result_receiver.sh \
-  --g1-lcm-url 'udpm://239.255.76.67:7667?ttl=1' \
-  --wifi-lcm-url 'udpm://239.255.77.67:7667?ttl=1' \
-  --max-source-lag-ms 1500
+python tools/thor_remote_rgbd_gateway.py \
+  --g1-lcm-url "$G1_LCM_URL" \
+  --wifi-lcm-url "$WIFI_LCM_URL" \
+  --forward-hz 5 \
+  --result-max-age-ms 800
 ```
 
-Pin the multicast route for `239.255.76.67` to the G1 Ethernet interface and
-the dedicated Wi-Fi group to `wlan0` before launch. Do not bridge interfaces.
+Equivalent module form from the `perception` directory:
 
-## Desktop contract
+```bash
+python -m remote_offload.thor_gateway \
+  --g1-lcm-url "$G1_LCM_URL" \
+  --wifi-lcm-url "$WIFI_LCM_URL" \
+  --forward-hz 5 \
+  --result-max-age-ms 800
+```
 
-The desktop worker subscribes to the four `PATH_REMOTE_*` input channels,
-synchronizes RGB/depth by their original timestamps, and publishes a v1
-MessagePack result defined in `remote_offload/protocol.py`. It hosts its own
-webview; overlay images are not a control transport. The worker must publish
-only the latest inference result and must never publish robot commands.
+The gateway subscribes to local G1 channels, timestamp-pairs RGB/depth, forwards
+only the latest matched pair at the configured rate, periodically republishes
+latched calibration and downsampled robot state, and validates incoming remote
+results. It logs valid/invalid results only; it does not publish targets.
+
+## Desktop YOLO11 Worker
+
+Run this on the external desktop:
+
+```bash
+cd /path/to/PATH-G1/perception
+docker run --rm --gpus all --network host \
+  -v "$PWD/models:/models" \
+  -v "$PWD/config:/workspace/perception/config:ro" \
+  -v "$PWD/.cache/torch:/cache/torch" \
+  -v "$PWD/.cache/ultralytics:/cache/ultralytics" \
+  path-g1-remote-yolo11:titan-xp \
+  python3 -m remote_offload.remote_yolo11_worker \
+    --wifi-lcm-url "$WIFI_LCM_URL" \
+    --config config/pipeline.yaml \
+    --checkpoint /models/yolo11/yolo11n-seg.pt \
+    --concepts 'object' \
+    --inference-hz 3 \
+    --extrinsics config/extrinsics.yaml \
+    --publish-overlay-jpeg
+```
+
+`--concepts` maps to COCO labels through
+`seg_web_node.yolo11_backend.Yolo11SegBackend`. Use `object`, `objects`, `all`,
+or `*` for all allowed COCO classes except exclusions. Use comma-separated COCO
+labels or aliases such as `bottle,cup,chair` to restrict GPU work and candidate
+output. The worker publishes object masks, stable 3-D IDs, centers, and optional
+geometry contact candidates in the same MessagePack result channel as SAM3.
+
+For transport-only validation without YOLO weights:
+
+```bash
+python -m remote_offload.remote_yolo11_worker \
+  --wifi-lcm-url "$WIFI_LCM_URL" \
+  --backend mock \
+  --concepts 'object' \
+  --inference-hz 3
+```
+
+If YOLO/model state is unavailable, the worker publishes a fresh `valid=false`
+result with an error string instead of reusing old coordinates.
+
+## Desktop SAM3 Worker
+
+Run this on the external desktop:
+
+```bash
+cd /path/to/PATH-G1/perception
+source .venv-remote-sam3/bin/activate
+python -m remote_offload.remote_sam3_worker \
+  --wifi-lcm-url "$WIFI_LCM_URL" \
+  --backend pytorch \
+  --concepts 'object' \
+  --inference-hz 3 \
+  --extrinsics config/extrinsics.yaml
+```
+
+For transport-only validation without SAM3 weights:
+
+```bash
+python -m remote_offload.remote_sam3_worker \
+  --wifi-lcm-url "$WIFI_LCM_URL" \
+  --backend mock \
+  --concepts 'object' \
+  --inference-hz 3
+```
+
+If SAM3/model state is unavailable, the worker publishes a fresh
+`valid=false` result with an error string instead of reusing old coordinates.
+
+## Desktop Webview
+
+Run this on the external desktop:
+
+```bash
+cd /path/to/PATH-G1/perception
+source .venv-remote-sam3/bin/activate
+python -m remote_offload.remote_web_server \
+  --wifi-lcm-url "$WIFI_LCM_URL" \
+  --host 0.0.0.0 \
+  --port 8081
+```
+
+Open:
+
+```text
+http://<desktop-wifi-ip>:8081
+```
+
+The page shows RGB, segmentation overlay, aligned depth inset, per-object
+stable ID, result timestamps, heartbeat data, latency, and link status. The
+browser is visualization only; no machine-to-machine result is scraped from
+MJPEG, HTML, or browser state.
+
+## LCM Channels
+
+Thor local input:
+
+```text
+G1_CAMERA_FRAME
+G1_DEPTH_FRAME
+G1_CAMERA_CALIBRATION
+G1_ROBOT_STATE
+```
+
+Wi-Fi forwarded input:
+
+```text
+PATH_REMOTE_RGB_FRAME
+PATH_REMOTE_DEPTH_FRAME
+PATH_REMOTE_CAMERA_CALIBRATION
+PATH_REMOTE_ROBOT_STATE
+```
+
+Wi-Fi desktop output:
+
+```text
+PATH_REMOTE_PERCEPTION_RESULT
+PATH_REMOTE_PERCEPTION_HEARTBEAT
+PATH_REMOTE_OVERLAY_JPEG
+```
+
+`PATH_REMOTE_PERCEPTION_RESULT` is MessagePack, version 1:
+
+```text
+{
+  version: 1,
+  sequence: int,
+  published_timestamp_us: int,
+  source_rgb_timestamp_us: int,
+  source_depth_timestamp_us: int,
+  calibration_id: int | null,
+  image_width: int,
+  image_height: int,
+  backend: "sam3_pytorch" | "sam3_tensorrt" | "yolo11_pytorch" | "mock",
+  inference_ms: float,
+  valid: bool,
+  error: string | null,
+  objects: [
+    {
+      track_id: string,
+      label: string,
+      score: float,
+      box_xyxy: [float, float, float, float],
+      mask_encoding: "bitpack-zlib-row-major",
+      mask_data: bytes,
+      mask_height: int,
+      mask_width: int,
+      median_depth_m: float | null,
+      center_pixel_uv: [int, int] | null,
+      center_camera_m: [float, float, float] | null,
+      center_goal_m: [float, float, float] | null,
+      valid_depth_points: int,
+      target_contact_goal_m: [float, float, float] | null,  # optional
+      contact_candidates: [                                 # optional
+        {
+          center_goal_m: [float, float, float],
+          approach_goal: [float, float, float],
+          width_m: float,
+          geom_score: float,
+          source: string
+        }
+      ]
+    }
+  ],
+  belief: optional reserved map
+}
+```
+
+Masks are packed with `np.packbits(..., bitorder="little")`, compressed with
+zlib, and must decode to the source RGB resolution. Pickle is never used.
+
+## Diagnostics
+
+Mock end-to-end:
+
+```bash
+# Terminal 1, Thor
+python tools/thor_remote_rgbd_gateway.py \
+  --g1-lcm-url "$G1_LCM_URL" \
+  --wifi-lcm-url "$WIFI_LCM_URL"
+
+# Terminal 2, desktop
+python -m remote_offload.remote_sam3_worker \
+  --wifi-lcm-url "$WIFI_LCM_URL" \
+  --backend mock
+
+# Terminal 3, desktop
+python -m remote_offload.remote_web_server \
+  --wifi-lcm-url "$WIFI_LCM_URL" \
+  --host 0.0.0.0 \
+  --port 8081
+
+# Terminal 4, Thor, using the existing mock publisher
+python tools/mock_rgbd_publisher.py \
+  --lcm-url "$G1_LCM_URL" \
+  --image output/sam3_demo.jpg \
+  --fps 5
+```
+
+Expected Thor gateway logs:
+
+```text
+forwarded_pairs increases
+heartbeats increases
+valid_results increases
+invalid_results remains zero for the mock backend
+```
+
+Expected matching checks:
+
+```text
+source_rgb_timestamp_us equals the forwarded RGB timestamp
+source_depth_timestamp_us equals the forwarded depth timestamp
+calibration_id matches the latest latched calibration when available
+mask dimensions equal image_width/image_height
+stable IDs remain stable on repeated static frames
+```
+
+Performance counters:
+
+```text
+gateway: forwarded_pairs, dropped_before_forward, valid_results, invalid_results
+worker: input_frame_count, processed_count, dropped_count, inference_latency_ms
+webview: rgb_frames, depth_frames, results, result_age_ms
+```
+
+Safety checks:
+
+```bash
+# Disconnect Wi-Fi and confirm SONIC/control processes continue unaffected.
+# Confirm Thor logs stale/missing remote results but emits no EE target packets.
+# Confirm no process is launched that starts, stops, rebuilds, or modifies SONIC.
+```

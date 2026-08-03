@@ -3,6 +3,7 @@ import pytest
 from remote_offload.protocol import (
     MASK_ENCODING,
     decode_perception_result,
+    encode_mask,
     encode_perception_result,
 )
 
@@ -17,25 +18,42 @@ def _payload():
         "calibration_id": 7,
         "image_width": 640,
         "image_height": 360,
-        "backend": "sam3_pytorch",
+        "backend": "yolo11_pytorch",
         "inference_ms": 130.0,
         "valid": True,
         "error": None,
-        "objects": [{
-            "track_id": "object:track0001",
-            "label": "object",
-            "score": 0.9,
-            "box_xyxy": [1.0, 2.0, 3.0, 4.0],
-            "mask_encoding": MASK_ENCODING,
-            "mask_data": b"compressed-mask",
-            "mask_height": 360,
-            "mask_width": 640,
-            "median_depth_m": 0.45,
-            "center_pixel_uv": [100, 120],
-            "center_camera_m": [0.1, 0.0, 0.45],
-            "center_goal_m": [0.3, 0.1, 0.2],
-            "valid_depth_points": 1000,
-        }],
+        "objects": [
+            {
+                "track_id": "object:track0001",
+                "label": "object",
+                "score": 0.9,
+                "box_xyxy": [1.0, 2.0, 3.0, 4.0],
+                "mask_encoding": MASK_ENCODING,
+                "mask_data": encode_mask(
+                    [
+                        [(100 <= x <= 140 and 120 <= y <= 160) for x in range(640)]
+                        for y in range(360)
+                    ]
+                ),
+                "mask_height": 360,
+                "mask_width": 640,
+                "median_depth_m": 0.45,
+                "center_pixel_uv": [100, 120],
+                "center_camera_m": [0.1, 0.0, 0.45],
+                "center_goal_m": [0.3, 0.1, 0.2],
+                "valid_depth_points": 1000,
+                "target_contact_goal_m": [0.31, 0.11, 0.2],
+                "contact_candidates": [
+                    {
+                        "center_goal_m": [0.31, 0.11, 0.2],
+                        "approach_goal": [0.0, 0.0, -1.0],
+                        "width_m": 0.06,
+                        "geom_score": 0.7,
+                        "source": "pca_surface",
+                    }
+                ],
+            }
+        ],
     }
 
 

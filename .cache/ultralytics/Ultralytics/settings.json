@@ -1,0 +1,21 @@
+{
+  "settings_version": "0.0.6",
+  "datasets_dir": "/workspace/perception/datasets",
+  "weights_dir": "weights",
+  "runs_dir": "runs",
+  "uuid": "efeba0bad52cdd82cb37f3665b32363f3978d8e987cfb1a1886b1a955815c04e",
+  "sync": true,
+  "api_key": "",
+  "openai_api_key": "",
+  "clearml": true,
+  "comet": true,
+  "dvc": true,
+  "hub": true,
+  "mlflow": true,
+  "neptune": true,
+  "raytune": true,
+  "tensorboard": false,
+  "wandb": false,
+  "vscode_msg": true,
+  "openvino_msg": true
+}

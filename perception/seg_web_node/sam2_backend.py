@@ -16,11 +16,11 @@ import numpy as np
 from .efficientvit_backend import (
     _box_from_mask,
     central_point_grid,
-    filter_and_merge_central_masks,
 )
+from .depth_based_filter import DepthSelfFilterBackendMixin
 
 
-class Sam2HieraTinyBackend:
+class Sam2HieraTinyBackend(DepthSelfFilterBackendMixin):
     """SAM2.1 Tiny with periodic generic discovery and box-prompt tracking.
 
     The image predictor recomputes the image embedding per live RGB frame.
@@ -44,6 +44,7 @@ class Sam2HieraTinyBackend:
         automatic_points_per_side: int = 8,
         max_masks: int = 12,
         central: dict[str, Any] | None = None,
+        depth_self_filter: dict[str, Any] | None = None,
     ) -> None:
         import torch
         from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
@@ -89,23 +90,14 @@ class Sam2HieraTinyBackend:
         self.central_center_px = tuple(float(v) for v in central.get("roi_center_px", [320, 200]))
         self.central_radius_px = tuple(float(v) for v in central.get("roi_radius_px", [220, 125]))
         self.central_spacing_px = float(central.get("prompt_spacing_px", 50))
-        self.central_lower_region_start_fraction = float(central.get("lower_region_start_fraction", 0.60))
-        self.central_lower_region_mask_fraction = float(central.get("lower_region_mask_fraction", 0.80))
-        self.central_merge_overlap_min_fraction = float(central.get("merge_overlap_min_fraction", 0.50))
         self.track_missing_ttl_frames = max(0, int(central.get("track_missing_ttl_frames", 3)))
         self.track_fallback_score_decay = float(central.get("track_fallback_score_decay", 0.985))
         self.reinitialize_match_iou = float(central.get("reinitialize_match_iou", 0.15))
-        robot_exclusion = dict(central.get("robot_exclusion", {}))
-        self.robot_static_bottom_fraction = float(robot_exclusion.get("static_bottom_fraction", 0.16))
-        self.robot_static_side_fraction = float(robot_exclusion.get("static_side_fraction", 0.035))
-        self.robot_min_remaining_fraction = float(robot_exclusion.get("min_remaining_fraction", 0.30))
+        self._init_depth_self_filter(depth_self_filter)
         self.frame_index = 0
         self.track_priors: list[dict[str, Any]] = []
         self.last_mode = "uninitialized"
         self.last_central_prompt_count = 0
-        self.robot_prompt_point: np.ndarray | None = None
-        self.robot_exclusion_mask: np.ndarray | None = None
-        self.last_robot_filter = {"dynamic": False, "removed_masks": 0, "trimmed_masks": 0}
 
     @property
     def metadata(self) -> dict[str, Any]:
@@ -120,61 +112,13 @@ class Sam2HieraTinyBackend:
             "active_prompt_tracks": sum(int(track.get("missing", 0)) == 0 for track in self.track_priors),
             "fallback_prompt_tracks": sum(int(track.get("missing", 0)) > 0 for track in self.track_priors),
             "central_prompt_count": self.last_central_prompt_count,
-            "robot_exclusion": dict(self.last_robot_filter),
+            "depth_self_filter": self._depth_self_filter_metadata(),
         }
-
-    def set_robot_state_prompt(
-        self, point_uv: np.ndarray | list[float] | None, _box_xyxy: np.ndarray | list[float] | None = None
-    ) -> None:
-        self.robot_prompt_point = None if point_uv is None else np.asarray(point_uv, dtype=np.float32).reshape(2)
-
-    def set_robot_exclusion_mask(self, mask: np.ndarray | None) -> None:
-        """Set the next-frame projected arm/hand silhouette from G1 FK."""
-        if mask is None:
-            self.robot_exclusion_mask = None
-            return
-        self.robot_exclusion_mask = np.asarray(mask, dtype=bool).copy()
 
     @staticmethod
     def _mask_iou(first: np.ndarray, second: np.ndarray) -> float:
         union = int(np.logical_or(first, second).sum())
         return 0.0 if union == 0 else float(np.logical_and(first, second).sum()) / union
-
-    def _static_robot_exclusion(self, height: int, width: int) -> np.ndarray:
-        """Conservative fallback when no timestamp-matched robot state arrives."""
-        exclusion = np.zeros((height, width), dtype=bool)
-        bottom = int(round(height * (1.0 - np.clip(self.robot_static_bottom_fraction, 0.0, 0.9))))
-        side = int(round(width * np.clip(self.robot_static_side_fraction, 0.0, 0.45)))
-        exclusion[max(0, bottom):, :] = True
-        if side:
-            exclusion[:, :side] = True
-            exclusion[:, width - side:] = True
-        return exclusion
-
-    def _exclude_robot_pixels(self, raw_mask: np.ndarray) -> np.ndarray | None:
-        """Subtract robot pixels, rejecting masks that are mostly robot body."""
-        mask = np.asarray(raw_mask, dtype=bool)
-        original_area = int(mask.sum())
-        if original_area == 0:
-            return None
-        height, width = mask.shape
-        exclusion = self._static_robot_exclusion(height, width)
-        dynamic = self.robot_exclusion_mask
-        dynamic_available = dynamic is not None and dynamic.shape == mask.shape
-        if dynamic_available:
-            exclusion |= dynamic
-        self.last_robot_filter["dynamic"] = bool(dynamic_available)
-        trimmed = mask & ~exclusion
-        remaining_area = int(trimmed.sum())
-        if remaining_area != original_area:
-            self.last_robot_filter["trimmed_masks"] += 1
-        if (
-            remaining_area < self.min_area_px
-            or remaining_area / max(1, original_area) < self.robot_min_remaining_fraction
-        ):
-            self.last_robot_filter["removed_masks"] += 1
-            return None
-        return trimmed
 
     def _discover(self, image_rgb: np.ndarray) -> list[tuple[np.ndarray, float]]:
         height, width = image_rgb.shape[:2]
@@ -193,18 +137,10 @@ class Sam2HieraTinyBackend:
         entries = self.automatic.generate(image_rgb)
         candidates: list[tuple[np.ndarray, float]] = []
         for entry in entries:
-            mask = self._exclude_robot_pixels(np.asarray(entry["segmentation"], dtype=bool))
+            mask = self._apply_depth_self_filter(np.asarray(entry["segmentation"], dtype=bool))
             score = float(entry.get("predicted_iou", 0.0))
             if mask is not None and score >= self.threshold and int(mask.sum()) >= self.min_area_px:
                 candidates.append((mask, score))
-        if self.reinitialization == "central":
-            candidates = filter_and_merge_central_masks(
-                candidates,
-                lower_region_start_fraction=self.central_lower_region_start_fraction,
-                lower_region_mask_fraction=self.central_lower_region_mask_fraction,
-                merge_overlap_min_fraction=self.central_merge_overlap_min_fraction,
-                max_masks=self.max_masks,
-            )
         candidates.sort(key=lambda value: (value[1], int(value[0].sum())), reverse=True)
         return candidates[: self.max_masks]
 
@@ -216,7 +152,7 @@ class Sam2HieraTinyBackend:
                 box=np.asarray(track["box"], dtype=np.float32), multimask_output=False
             )
             if len(masks) and float(scores[0]) >= self.threshold and int(masks[0].sum()) >= self.min_area_px:
-                mask = self._exclude_robot_pixels(np.asarray(masks[0], dtype=bool))
+                mask = self._apply_depth_self_filter(np.asarray(masks[0], dtype=bool))
                 box = None if mask is None else _box_from_mask(mask)
                 if box is not None:
                     updated.append({"box": box, "mask": mask, "score": float(scores[0]), "missing": 0})
@@ -284,7 +220,6 @@ class Sam2HieraTinyBackend:
         depth_scale_um: int | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
         del depth_raw, depth_scale_um
-        self.last_robot_filter = {"dynamic": False, "removed_masks": 0, "trimmed_masks": 0}
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
         self.predictor.set_image(image_rgb)
         reset = not self.track_priors or self.frame_index % self.reinitialize_interval_frames == 0

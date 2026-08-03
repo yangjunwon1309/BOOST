@@ -10,11 +10,20 @@ import warnings
 import cv2
 import numpy as np
 
+from .depth_based_filter import DepthSelfFilterBackendMixin
 
-class TorchSam3Backend:
+
+class TorchSam3Backend(DepthSelfFilterBackendMixin):
     name = "pytorch"
 
-    def __init__(self, *, checkpoint: Path | None, threshold: float, min_area_px: int):
+    def __init__(
+        self,
+        *,
+        checkpoint: Path | None,
+        threshold: float,
+        min_area_px: int,
+        depth_self_filter: dict[str, Any] | None = None,
+    ):
         import sam3
         import torch
         from sam3 import build_sam3_image_model
@@ -43,10 +52,15 @@ class TorchSam3Backend:
             confidence_threshold=threshold,
         )
         self.min_area_px = min_area_px
+        self._init_depth_self_filter(depth_self_filter)
 
     @property
     def metadata(self) -> dict[str, Any]:
-        return {"backend": self.name, "device": "cuda"}
+        return {
+            "backend": self.name,
+            "device": "cuda",
+            "depth_self_filter": self._depth_self_filter_metadata(),
+        }
 
     def infer(
         self, image_bgr: np.ndarray, concepts: list[str], **_ignored: Any
@@ -73,14 +87,18 @@ class TorchSam3Backend:
                     )
                     masks, boxes, scores = masks[keep], boxes[keep], scores[keep]
                 if len(masks):
-                    masks_parts.append(masks)
-                    boxes_parts.append(boxes)
-                    scores_parts.append(scores)
-                    labels.extend([concept] * len(masks))
+                    filtered_masks, filtered_boxes, filtered_scores = _filter_mask_arrays(
+                        self, masks, scores
+                    )
+                    if len(filtered_masks):
+                        masks_parts.append(filtered_masks)
+                        boxes_parts.append(filtered_boxes)
+                        scores_parts.append(filtered_scores)
+                        labels.extend([concept] * len(filtered_masks))
         return _merge(masks_parts, boxes_parts, scores_parts, labels, image_bgr.shape[:2])
 
 
-class TensorRTSam3Backend:
+class TensorRTSam3Backend(DepthSelfFilterBackendMixin):
     name = "tensorrt"
     REQUIRED_INPUTS = {"pixel_values", "input_ids", "attention_mask"}
     REQUIRED_OUTPUTS = {
@@ -99,6 +117,7 @@ class TensorRTSam3Backend:
         min_area_px: int,
         mask_threshold: float = 0.5,
         use_cuda_graph: bool | None = None,
+        depth_self_filter: dict[str, Any] | None = None,
     ) -> None:
         import tensorrt as trt
         import torch
@@ -115,6 +134,7 @@ class TensorRTSam3Backend:
         self.threshold = float(threshold)
         self.mask_threshold = float(mask_threshold)
         self.min_area_px = int(min_area_px)
+        self._init_depth_self_filter(depth_self_filter)
         if use_cuda_graph is None:
             use_cuda_graph = os.environ.get("G1_SAM3_CUDA_GRAPH", "1").lower() not in {
                 "0",
@@ -171,6 +191,7 @@ class TensorRTSam3Backend:
             "image_size": list(self.image_size),
             "cuda_graph": self._cuda_graph_state,
             "cuda_graph_error": self._cuda_graph_error,
+            "depth_self_filter": self._depth_self_filter_metadata(),
         }
 
     def _pixels(self, image_bgr: np.ndarray):
@@ -288,13 +309,16 @@ class TensorRTSam3Backend:
                         scores[area_keep],
                     )
                 if len(masks):
-                    scale = torch.tensor(
-                        [width, height, width, height], device=boxes.device
+                    filtered_masks, filtered_boxes, filtered_scores = _filter_mask_arrays(
+                        self,
+                        masks.cpu().numpy(),
+                        scores.float().cpu().numpy(),
                     )
-                    masks_parts.append(masks.cpu().numpy())
-                    boxes_parts.append((boxes * scale).float().cpu().numpy())
-                    scores_parts.append(scores.float().cpu().numpy())
-                    labels.extend([concept] * len(masks))
+                    if len(filtered_masks):
+                        masks_parts.append(filtered_masks)
+                        boxes_parts.append(filtered_boxes)
+                        scores_parts.append(filtered_scores)
+                        labels.extend([concept] * len(filtered_masks))
         return _merge(masks_parts, boxes_parts, scores_parts, labels, (height, width))
 
 
@@ -310,6 +334,43 @@ def _torch_dtype(trt, torch, dtype):
     if dtype not in mapping:
         raise TypeError(f"unsupported TensorRT tensor dtype: {dtype}")
     return mapping[dtype]
+
+
+def _box_from_mask(mask: np.ndarray) -> np.ndarray | None:
+    ys, xs = np.nonzero(mask)
+    if not len(xs):
+        return None
+    return np.asarray([xs.min(), ys.min(), xs.max() + 1, ys.max() + 1], dtype=np.float32)
+
+
+def _filter_mask_arrays(
+    backend: DepthSelfFilterBackendMixin,
+    masks: np.ndarray,
+    scores: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    kept_masks: list[np.ndarray] = []
+    kept_boxes: list[np.ndarray] = []
+    kept_scores: list[float] = []
+    for mask, score in zip(np.asarray(masks, dtype=bool), np.asarray(scores, dtype=np.float32)):
+        filtered = backend._apply_depth_self_filter(mask)
+        box = None if filtered is None else _box_from_mask(filtered)
+        if box is None:
+            continue
+        kept_masks.append(filtered)
+        kept_boxes.append(box)
+        kept_scores.append(float(score))
+    if not kept_masks:
+        height, width = np.asarray(masks).shape[-2:]
+        return (
+            np.empty((0, height, width), dtype=bool),
+            np.empty((0, 4), dtype=np.float32),
+            np.empty((0,), dtype=np.float32),
+        )
+    return (
+        np.stack(kept_masks, axis=0),
+        np.stack(kept_boxes, axis=0).astype(np.float32),
+        np.asarray(kept_scores, dtype=np.float32),
+    )
 
 
 def _merge(masks_parts, boxes_parts, scores_parts, labels, image_shape):

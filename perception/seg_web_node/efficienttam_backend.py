@@ -26,6 +26,7 @@ class EfficientTamTi512Backend(Sam2HieraTinyBackend):
         automatic_points_per_side: int = 8,
         max_masks: int = 12,
         central: dict[str, Any] | None = None,
+        depth_self_filter: dict[str, Any] | None = None,
     ) -> None:
         import torch
         from efficient_track_anything.automatic_mask_generator import EfficientTAMAutomaticMaskGenerator
@@ -68,23 +69,14 @@ class EfficientTamTi512Backend(Sam2HieraTinyBackend):
         self.central_center_px = tuple(float(v) for v in central.get("roi_center_px", [320, 200]))
         self.central_radius_px = tuple(float(v) for v in central.get("roi_radius_px", [220, 125]))
         self.central_spacing_px = float(central.get("prompt_spacing_px", 50))
-        self.central_lower_region_start_fraction = float(central.get("lower_region_start_fraction", 0.60))
-        self.central_lower_region_mask_fraction = float(central.get("lower_region_mask_fraction", 0.80))
-        self.central_merge_overlap_min_fraction = float(central.get("merge_overlap_min_fraction", 0.50))
         self.track_missing_ttl_frames = max(0, int(central.get("track_missing_ttl_frames", 3)))
         self.track_fallback_score_decay = float(central.get("track_fallback_score_decay", 0.985))
         self.reinitialize_match_iou = float(central.get("reinitialize_match_iou", 0.15))
-        robot_exclusion = dict(central.get("robot_exclusion", {}))
-        self.robot_static_bottom_fraction = float(robot_exclusion.get("static_bottom_fraction", 0.16))
-        self.robot_static_side_fraction = float(robot_exclusion.get("static_side_fraction", 0.035))
-        self.robot_min_remaining_fraction = float(robot_exclusion.get("min_remaining_fraction", 0.30))
+        self._init_depth_self_filter(depth_self_filter)
         self.frame_index = 0
         self.track_priors: list[dict[str, Any]] = []
         self.last_mode = "uninitialized"
         self.last_central_prompt_count = 0
-        self.robot_prompt_point = None
-        self.robot_exclusion_mask = None
-        self.last_robot_filter = {"dynamic": False, "removed_masks": 0, "trimmed_masks": 0}
 
     @property
     def metadata(self) -> dict[str, Any]:

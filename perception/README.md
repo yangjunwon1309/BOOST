@@ -127,16 +127,18 @@ EfficientViT and Segment Anything sources. Cache its public checkpoint once:
 ```
 
 `reinitialization: central` is the default. It runs automatic generic-mask
-discovery only from 30 point prompts in a configurable 640×360 central ellipse
-(`center=(320,200)`, `radius=(220,125)`, `spacing=50 px`), rejects masks that
-are too large or outside that ellipse, and then refines every discovered object
+discovery from a configurable 640×360 central ellipse (`center=(320,200)`,
+`radius=(220,125)`, `spacing=50 px`) and then refines every discovered object
 in one batched point/box-prompt decoder call. Each object keeps a local box
 prior; the RGB-D server assigns the persistent 3-D `object:trackNNNN` ID.
 
-`depth-only` remains available for diagnosis, but depth is deliberately not
-the normal segmentation proposal source. `all` uses the full-image grid and is
-useful only as an explicit broad scene reset because it creates periodic GPU
-bursts.
+Robot/self pixels are removed by the shared depth self-filter, not by
+image-region or wrist heuristics. The server uses synchronized LCM depth,
+camera intrinsics, camera extrinsics and `G1_ROBOT_STATE` to render padded FK
+collision primitives into a robot depth buffer, then vetoes segmentation pixels
+at or behind that depth with dual-margin hysteresis. `all` uses the full-image
+grid and is useful only as an explicit broad scene reset because it creates
+periodic GPU bursts.
 
 ```bash
 ./tools/run_thor.sh python -m seg_web_node.web_server \

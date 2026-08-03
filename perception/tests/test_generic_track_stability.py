@@ -1,5 +1,6 @@
 import numpy as np
 
+from seg_web_node.depth_based_filter import DepthBasedRobotFilter
 from seg_web_node.sam2_backend import Sam2HieraTinyBackend
 from seg_web_node.yolo11_backend import Yolo11SegBackend
 
@@ -18,11 +19,7 @@ def _backend() -> Sam2HieraTinyBackend:
     backend.track_missing_ttl_frames = 3
     backend.track_fallback_score_decay = 0.9
     backend.reinitialize_match_iou = 0.15
-    backend.robot_static_bottom_fraction = 0.0
-    backend.robot_static_side_fraction = 0.0
-    backend.robot_min_remaining_fraction = 0.30
-    backend.robot_exclusion_mask = None
-    backend.last_robot_filter = {"dynamic": False, "removed_masks": 0, "trimmed_masks": 0}
+    backend.depth_self_filter = DepthBasedRobotFilter({"enabled": False})
     backend.predictor = _PredictNothing()
     backend.track_priors = []
     return backend
@@ -56,18 +53,6 @@ def test_reinitialize_preserves_unmatched_track_until_ttl():
     assert backend.track_priors[0]["missing"] == 1
 
 
-def test_dynamic_robot_silhouette_removes_robot_only_mask():
-    backend = _backend()
-    robot = np.zeros((8, 8), dtype=bool)
-    robot[2:6, 2:6] = True
-    backend.set_robot_exclusion_mask(robot)
-    backend.last_robot_filter = {"dynamic": False, "removed_masks": 0, "trimmed_masks": 0}
-
-    assert backend._exclude_robot_pixels(robot) is None
-    assert backend.last_robot_filter["dynamic"] is True
-    assert backend.last_robot_filter["removed_masks"] == 1
-
-
 def test_yolo_association_keeps_a_missing_coco_instance_for_ttl():
     backend = Yolo11SegBackend.__new__(Yolo11SegBackend)
     backend.min_area_px = 4
@@ -76,12 +61,7 @@ def test_yolo_association_keeps_a_missing_coco_instance_for_ttl():
     backend.track_fallback_score_decay = 0.9
     backend.reinitialize_match_iou = 0.15
     backend.confidence = 0.8
-    backend.boundary_crop_px = 0
-    backend.robot_static_bottom_fraction = 0.0
-    backend.robot_static_side_fraction = 0.0
-    backend.robot_min_remaining_fraction = 0.30
-    backend.robot_exclusion_mask = None
-    backend.last_robot_filter = {"dynamic": False, "removed_masks": 0, "trimmed_masks": 0}
+    backend.depth_self_filter = DepthBasedRobotFilter({"enabled": False})
     mask = np.zeros((8, 8), dtype=bool)
     mask[2:6, 2:6] = True
     backend.track_priors = [{
@@ -106,12 +86,7 @@ def test_yolo_new_same_label_replaces_stale_viewpoint_mask_without_ghost():
     backend.track_fallback_score_decay = 0.985
     backend.reinitialize_match_iou = 0.15
     backend.confidence = 0.8
-    backend.boundary_crop_px = 0
-    backend.robot_static_bottom_fraction = 0.0
-    backend.robot_static_side_fraction = 0.0
-    backend.robot_min_remaining_fraction = 0.30
-    backend.robot_exclusion_mask = None
-    backend.last_robot_filter = {"dynamic": False, "removed_masks": 0, "trimmed_masks": 0}
+    backend.depth_self_filter = DepthBasedRobotFilter({"enabled": False})
     old = np.zeros((12, 12), dtype=bool); old[1:5, 1:5] = True
     new = np.zeros((12, 12), dtype=bool); new[7:11, 7:11] = True
     backend.track_priors = [{

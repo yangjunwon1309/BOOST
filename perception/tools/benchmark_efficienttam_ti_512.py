@@ -34,8 +34,7 @@ def main() -> int:
         reinitialization="central", reinitialize_interval_frames=1000000, max_masks=12,
         central={"reference_width_px": 640, "reference_height_px": 360,
                  "roi_center_px": [320, 200], "roi_radius_px": [220, 125],
-                 "prompt_spacing_px": 50, "lower_region_start_fraction": .60,
-                 "lower_region_mask_fraction": .80, "merge_overlap_min_fraction": .50},
+                 "prompt_spacing_px": 50},
     )
     import torch
     torch.cuda.synchronize(); started = time.perf_counter()

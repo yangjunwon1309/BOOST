@@ -34,7 +34,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", type=Path, default=Path("output/sam3_demo.jpg"))
     parser.add_argument("--weight", type=Path, default=Path("/models/efficientvit_sam/efficientvit_sam_l0.pt"))
-    parser.add_argument("--reinitialization", choices=("all", "depth-only", "central"), default="central")
+    parser.add_argument("--reinitialization", choices=("all", "central"), default="central")
     parser.add_argument("--reinitialize-interval", type=int, default=15)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=60)
@@ -60,10 +60,6 @@ def main() -> int:
     )
     import torch
 
-    # Initial point is the central viewing ray. The persistent projected-point
-    # path is then updated from each selected mask center, just as live robot
-    # state updates it in the server.
-    backend.set_robot_state_prompt([image.shape[1] * 0.5, image.shape[0] * 0.5])
     for _ in range(args.warmup):
         backend.infer(image, ["object"], depth_raw=depth, depth_scale_um=1000)
     torch.cuda.synchronize()
@@ -90,7 +86,6 @@ def main() -> int:
             point, pixel, count = center
             detections.append({"index": index, "label": labels[index], "center_goal_m": point})
             frame_tracks.append({"index": index, "center_camera_m": point.tolist(), "pixel_uv": list(pixel), "depth_points": count})
-            backend.set_robot_state_prompt(pixel, boxes[index])
         assignments = tracker.assign(detections)
         for entry in frame_tracks:
             entry["track_id"] = assignments.get(int(entry["index"]))

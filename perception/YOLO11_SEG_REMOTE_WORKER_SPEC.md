@@ -59,13 +59,20 @@ yolo11:
     missing_ttl_frames: 6
     fallback_score_decay: 0.985
     match_iou: 0.15
-    boundary_crop_px: 4
-  robot_exclusion:
-    arm_radius_px: 22
-    wrist_radius_px: 42
-    static_bottom_fraction: 0.16
-    static_side_fraction: 0.035
-    min_remaining_fraction: 0.30
+depth_self_filter:
+  enabled: true
+  margin_high_m: 0.055
+  margin_low_m: 0.030
+  temporal_alpha: 0.35
+  temporal_reset_threshold_m: 0.080
+  bilateral_diameter: 5
+  bilateral_sigma_depth_m: 0.040
+  bilateral_sigma_space_px: 4.0
+  padding_scale: 1.05
+  arm_radius_m: 0.055
+  wrist_radius_m: 0.075
+  torso_radius_m: 0.090
+  sample_step_m: 0.020
 ```
 
 Use Ultralytics YOLO11 segmentation with the COCO-80 pretrained
@@ -127,23 +134,15 @@ Apply post-processing in this exact order:
 2. Run YOLO11-seg with `conf >= 0.80`.
 3. Resize masks to RGB resolution with nearest-neighbor if needed.
 4. Drop excluded labels and labels outside `allowed_classes`.
-5. Subtract robot pixels using FK-projected robot arm/hand mask.
-6. Erode accepted masks inward by `boundary_crop_px = 4`.
-7. Drop masks whose remaining area is below `min_area_px`.
-8. Sort detections by detector score descending and keep at most `max_masks`.
-9. Associate current detections to previous tracks by same label plus mask IoU.
-10. Return only current-frame detections to RGB-D geometry and belief.
-
-The edge crop is implemented as one elliptical erosion:
-
-```python
-diameter = boundary_crop_px * 2 + 1
-kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (diameter, diameter))
-mask = cv2.erode(mask.astype(np.uint8), kernel, iterations=1).astype(bool)
-```
-
-This is important for depth.  YOLO mask boundaries often include background
-pixels; using those pixels can move the median 3-D center or contact estimate.
+5. Spatially filter the synchronized depth frame with the configured bilateral
+   filter, then apply the temporal IIR depth filter.
+6. Render padded G1 FK collision primitives to a robot depth buffer.
+7. Subtract robot pixels where the measured depth is at or behind the robot
+   depth, using dual-margin hysteresis.
+8. Drop masks whose remaining area is below `min_area_px`.
+9. Sort detections by detector score descending and keep at most `max_masks`.
+10. Associate current detections to previous tracks by same label plus mask IoU.
+11. Return only current-frame detections to RGB-D geometry and belief.
 
 ## Tracking And Ghost Prevention
 
@@ -171,38 +170,24 @@ the detector sees the same label at a new image location, drop the unmatched old
 same-label prior instead of publishing both old and new masks.  The old mask is
 a stale viewpoint hypothesis, not a second object.
 
-## Robot Arm And Hand Exclusion
+## Depth Self-Filter
 
 YOLO COCO has no robot class, so robot self-masks must be filtered separately.
-The Thor pipeline projects the current G1 arm/hand FK into the RGB image and
-creates a binary exclusion mask.
+The Thor and remote worker path now uses `seg_web_node.depth_based_filter`.
+For each synchronized RGB-D frame, pass the aligned depth image, color
+intrinsics, `T_goal_camera`, and timestamp-matched `G1_ROBOT_STATE.q` into the
+backend before inference. The backend renders padded FK link primitives into a
+robot depth buffer and removes mask pixels that satisfy the depth veto.
 
-Use the same radii:
-
-```text
-arm_radius_px = 22
-wrist_radius_px = 42
-```
-
-For each YOLO mask:
-
-```python
-remaining = mask & ~robot_exclusion_mask
-remaining_fraction = remaining.sum() / max(1, mask.sum())
-```
-
-If `remaining_fraction < min_remaining_fraction` (`0.30`), drop the whole mask.
-Otherwise keep the trimmed mask.
-
-The static fallback guards are:
+The veto is depth based, not image-region based:
 
 ```text
-static_bottom_fraction = 0.16
-static_side_fraction = 0.035
+enter robot pixel: depth_meas >= depth_robot - margin_low_m
+hold robot pixel:  depth_meas >= depth_robot - margin_high_m
 ```
 
-These are conservative image-border robot/body exclusion hints when dynamic FK
-exclusion is not available, but dynamic FK exclusion should be preferred.
+with `margin_high_m > margin_low_m`, so an already-robot pixel survives small
+depth jitter until it moves outside the wider hold margin.
 
 ## RGB-D Geometry
 

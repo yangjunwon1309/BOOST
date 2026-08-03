@@ -20,7 +20,6 @@ from seg_web_node.geometry import (
 )
 from seg_web_node.grip_candidates import GripCandidateConfig, generate_grip_candidates
 from seg_web_node.rgbd_sync import RgbdPair
-from seg_web_node.robot_geometry import g1_link_transforms
 from seg_web_node.yolo11_backend import Yolo11SegBackend
 
 from .protocol import make_empty_result, make_object
@@ -56,68 +55,6 @@ def load_config(path: Path | None) -> dict[str, Any]:
     return payload
 
 
-def projected_robot_arm_mask(
-    q: np.ndarray,
-    t_goal_cam: np.ndarray,
-    intrinsics: CameraIntrinsics,
-    *,
-    height: int,
-    width: int,
-    arm_radius_px: int,
-    wrist_radius_px: int,
-) -> np.ndarray:
-    """Rasterize the FK arm/hand chain into the RGB camera image."""
-    transforms = g1_link_transforms(q)
-    transform = np.asarray(t_goal_cam, dtype=np.float64)
-    rotation = transform[:3, :3]
-    translation = transform[:3, 3]
-    output = np.zeros((height, width), dtype=np.uint8)
-
-    def project(link_name: str) -> tuple[int, int] | None:
-        point_goal = transforms[link_name][:3, 3]
-        point_camera = rotation.T @ (point_goal - translation)
-        if not np.isfinite(point_camera).all() or point_camera[2] <= 0.05:
-            return None
-        u = intrinsics.fx * point_camera[0] / point_camera[2] + intrinsics.cx
-        v = intrinsics.fy * point_camera[1] / point_camera[2] + intrinsics.cy
-        if (
-            u < -wrist_radius_px
-            or u >= width + wrist_radius_px
-            or v < -wrist_radius_px
-            or v >= height + wrist_radius_px
-        ):
-            return None
-        return int(round(u)), int(round(v))
-
-    for side in ("left", "right"):
-        links = [
-            "torso_link",
-            f"{side}_shoulder_pitch_link",
-            f"{side}_shoulder_roll_link",
-            f"{side}_shoulder_yaw_link",
-            f"{side}_elbow_link",
-            f"{side}_wrist_roll_link",
-            f"{side}_wrist_pitch_link",
-            f"{side}_wrist_yaw_link",
-        ]
-        points = [project(link) for link in links]
-        for first, second in zip(points[:-1], points[1:]):
-            if first is not None and second is not None:
-                cv2.line(
-                    output,
-                    first,
-                    second,
-                    255,
-                    max(1, int(arm_radius_px) * 2),
-                    cv2.LINE_AA,
-                )
-        for index, point in enumerate(points):
-            if point is not None:
-                radius = wrist_radius_px if index >= len(points) - 3 else arm_radius_px
-                cv2.circle(output, point, max(1, int(radius)), 255, -1, cv2.LINE_AA)
-    return output.astype(bool)
-
-
 def masked_goal_points(
     xyz_camera: np.ndarray,
     mask: np.ndarray,
@@ -138,14 +75,14 @@ class RemoteYolo11Worker(RemoteSam3Worker):
         self,
         *,
         yolo_options: dict[str, Any],
-        robot_exclusion: dict[str, Any],
+        depth_self_filter: dict[str, Any],
         contact_candidates: bool,
         contact_config: GripCandidateConfig,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self.yolo_options = dict(yolo_options)
-        self.robot_exclusion_options = dict(robot_exclusion)
+        self.depth_self_filter_options = dict(depth_self_filter)
         self.contact_candidates_enabled = bool(contact_candidates)
         self.contact_config = contact_config
 
@@ -174,7 +111,9 @@ class RemoteYolo11Worker(RemoteSam3Worker):
                 track=dict(options.get("track", {})),
                 allowed_classes=list(options.get("allowed_classes", [])),
                 excluded_classes=list(options.get("excluded_classes", ["person"])),
-                robot_exclusion=dict(options.get("robot_exclusion", {})),
+                depth_self_filter=dict(
+                    options.get("depth_self_filter", self.depth_self_filter_options)
+                ),
             ),
             "yolo11_pytorch",
         )
@@ -187,11 +126,17 @@ class RemoteYolo11Worker(RemoteSam3Worker):
         intrinsics: CameraIntrinsics | None,
         pair: RgbdPair,
     ) -> None:
-        del depth
-        if not hasattr(backend, "set_robot_exclusion_mask"):
+        if not hasattr(backend, "set_depth_filter_context"):
             return
-        backend.set_robot_exclusion_mask(None)
         if intrinsics is None:
+            backend.set_depth_filter_context(
+                image_bgr=image_bgr,
+                depth_raw=depth,
+                depth_scale_um=pair.depth.depth_scale_um,
+                intrinsics=None,
+                t_goal_cam=None,
+                q=None,
+            )
             return
         try:
             t_goal_cam = self._goal_transform(pair.rgb.timestamp_us)
@@ -200,20 +145,34 @@ class RemoteYolo11Worker(RemoteSam3Worker):
                 self.robot_state_max_delta_ms,
             )
             if t_goal_cam is None or match is None:
+                backend.set_depth_filter_context(
+                    image_bgr=image_bgr,
+                    depth_raw=depth,
+                    depth_scale_um=pair.depth.depth_scale_um,
+                    intrinsics=intrinsics,
+                    t_goal_cam=None,
+                    q=None,
+                )
                 return
             state, _delta_ms = match
-            robot_mask = projected_robot_arm_mask(
-                state.q,
-                t_goal_cam,
-                intrinsics,
-                height=image_bgr.shape[0],
-                width=image_bgr.shape[1],
-                arm_radius_px=int(self.robot_exclusion_options.get("arm_radius_px", 22)),
-                wrist_radius_px=int(self.robot_exclusion_options.get("wrist_radius_px", 42)),
+            backend.set_depth_filter_context(
+                image_bgr=image_bgr,
+                depth_raw=depth,
+                depth_scale_um=pair.depth.depth_scale_um,
+                intrinsics=intrinsics,
+                t_goal_cam=t_goal_cam,
+                q=state.q,
             )
-            backend.set_robot_exclusion_mask(robot_mask)
         except Exception as error:
-            LOG.warning("robot exclusion FK unavailable: %s", error)
+            LOG.warning("depth self-filter context unavailable: %s", error)
+            backend.set_depth_filter_context(
+                image_bgr=image_bgr,
+                depth_raw=depth,
+                depth_scale_um=pair.depth.depth_scale_um,
+                intrinsics=None,
+                t_goal_cam=None,
+                q=None,
+            )
 
     def _build_result(
         self,
@@ -461,7 +420,12 @@ def main(argv: list[str] | None = None) -> int:
         t_torso_cam=load_extrinsics(extrinsics_path) if extrinsics_path else None,
         publish_overlay_jpeg=bool(args.publish_overlay_jpeg),
         yolo_options=yolo_options,
-        robot_exclusion=dict(yolo_options.get("robot_exclusion", {})),
+        depth_self_filter=dict(
+            yolo_options.get(
+                "depth_self_filter",
+                segmentation.get("depth_self_filter", {}),
+            )
+        ),
         contact_candidates=not bool(args.disable_contact_candidates),
         contact_config=GripCandidateConfig.from_dict(contact_config_data),
     )

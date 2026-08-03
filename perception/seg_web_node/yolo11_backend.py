@@ -50,7 +50,7 @@ class Yolo11SegBackend(Sam2HieraTinyBackend):
         track: dict[str, Any] | None = None,
         allowed_classes: list[str] | None = None,
         excluded_classes: list[str] | None = None,
-        robot_exclusion: dict[str, Any] | None = None,
+        depth_self_filter: dict[str, Any] | None = None,
     ) -> None:
         import torch
         from ultralytics import YOLO
@@ -95,18 +95,11 @@ class Yolo11SegBackend(Sam2HieraTinyBackend):
             for label in self.allowed_classes
             if label in self.class_ids_by_name and label not in self.excluded_classes
         }
-        robot_exclusion = dict(robot_exclusion or {})
-        self.robot_static_bottom_fraction = float(robot_exclusion.get("static_bottom_fraction", 0.16))
-        self.robot_static_side_fraction = float(robot_exclusion.get("static_side_fraction", 0.035))
-        self.robot_min_remaining_fraction = float(robot_exclusion.get("min_remaining_fraction", 0.30))
-        self.boundary_crop_px = max(0, int(track.get("boundary_crop_px", 4)))
-        self.robot_exclusion_mask: np.ndarray | None = None
-        self.last_robot_filter = {"dynamic": False, "removed_masks": 0, "trimmed_masks": 0}
+        self._init_depth_self_filter(depth_self_filter)
         self.track_priors: list[dict[str, Any]] = []
         self.frame_index = 0
         self.last_mode = "uninitialized"
         self.last_central_prompt_count = 0
-        self.robot_prompt_point = None
         self.last_requested_concepts: list[str] = []
         self.last_resolved_labels: list[str] = []
         self.last_unmatched_concepts: list[str] = []
@@ -123,7 +116,6 @@ class Yolo11SegBackend(Sam2HieraTinyBackend):
             "imgsz": self.imgsz,
             "quantize": self.quantize,
             "confidence": self.confidence,
-            "boundary_crop_px": self.boundary_crop_px,
             "iou_threshold": self.iou_threshold,
             "excluded_classes": sorted(self.excluded_classes),
             "allowed_classes": sorted(self.allowed_classes),
@@ -133,7 +125,7 @@ class Yolo11SegBackend(Sam2HieraTinyBackend):
             "last_mode": self.last_mode,
             "active_tracks": sum(int(track.get("missing", 0)) == 0 for track in self.track_priors),
             "fallback_tracks": sum(int(track.get("missing", 0)) > 0 for track in self.track_priors),
-            "robot_exclusion": dict(self.last_robot_filter),
+            "depth_self_filter": self._depth_self_filter_metadata(),
         }
 
     def _requested_class_ids(self, concepts: list[str]) -> list[int] | None:
@@ -209,26 +201,13 @@ class Yolo11SegBackend(Sam2HieraTinyBackend):
                 continue
             if self.allowed_classes and label not in self.allowed_classes:
                 continue
-            mask = self._exclude_robot_pixels(mask)
-            mask = self._crop_mask_boundary(mask)
+            mask = self._apply_depth_self_filter(mask)
             box = None if mask is None else _box_from_mask(mask)
             if box is None:
                 continue
             output.append({"label": label, "mask": mask, "box": box, "score": float(confidence), "missing": 0})
         output.sort(key=lambda item: float(item["score"]), reverse=True)
         return output[: self.max_masks]
-
-    def _crop_mask_boundary(self, mask: np.ndarray | None) -> np.ndarray | None:
-        """Erode an instance edge so RGB/depth boundary bleed is not a target."""
-        if mask is None:
-            return None
-        result = np.asarray(mask, dtype=bool)
-        if self.boundary_crop_px <= 0:
-            return result if int(result.sum()) >= self.min_area_px else None
-        diameter = self.boundary_crop_px * 2 + 1
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (diameter, diameter))
-        result = cv2.erode(result.astype(np.uint8), kernel, iterations=1).astype(bool)
-        return result if int(result.sum()) >= self.min_area_px else None
 
     def _update_tracks(self, detections: list[dict[str, Any]]) -> list[dict[str, Any]]:
         unmatched_previous = set(range(len(self.track_priors)))
@@ -257,9 +236,7 @@ class Yolo11SegBackend(Sam2HieraTinyBackend):
             missing = int(previous.get("missing", 0)) + 1
             if missing > self.track_missing_ttl_frames:
                 continue
-            fallback_mask = self._crop_mask_boundary(
-                self._exclude_robot_pixels(np.asarray(previous["mask"], dtype=bool))
-            )
+            fallback_mask = self._apply_depth_self_filter(np.asarray(previous["mask"], dtype=bool))
             fallback_box = None if fallback_mask is None else _box_from_mask(fallback_mask)
             if fallback_box is None:
                 continue
@@ -289,7 +266,6 @@ class Yolo11SegBackend(Sam2HieraTinyBackend):
         depth_scale_um: int | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
         del depth_raw, depth_scale_um
-        self.last_robot_filter = {"dynamic": False, "removed_masks": 0, "trimmed_masks": 0}
         tracks = self._update_tracks(self._detect(image_bgr, concepts))
         self.frame_index += 1
         self.last_mode = "yolo_detect_associate"

@@ -10,8 +10,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-import cv2
 import numpy as np
+
+from .depth_based_filter import DepthSelfFilterBackendMixin
 
 
 DEFAULT_WEIGHT_URL = (
@@ -71,78 +72,12 @@ def central_point_grid(
     return np.asarray(points, dtype=np.float32)
 
 
-def filter_and_merge_central_masks(
-    candidates: list[tuple[np.ndarray, float]],
-    *,
-    lower_region_start_fraction: float,
-    lower_region_mask_fraction: float,
-    merge_overlap_min_fraction: float,
-    max_masks: int,
-) -> list[tuple[np.ndarray, float]]:
-    """Reject lower-view masks and merge duplicate object proposals.
-
-    A floor/robot-body mask normally occupies most of the lower image.  A
-    candidate is rejected only when at least ``lower_region_mask_fraction`` of
-    *its own pixels* lie below ``lower_region_start_fraction`` of image height;
-    therefore objects extending slightly into the lower region remain valid.
-
-    SAM often returns nested masks for one object. IoU alone misses nested
-    pairs, so the graph edge is intersection / min(mask area). Connected
-    components of that graph are duplicate clusters; their masks are unioned.
-    ``scipy.sparse.csgraph`` is used rather than a slower pixel clustering pass.
-    """
-    if not candidates:
-        return []
-    height = candidates[0][0].shape[0]
-    lower_start = int(np.clip(round(height * lower_region_start_fraction), 0, height))
-    retained: list[tuple[np.ndarray, float]] = []
-    for mask, score in candidates:
-        area = int(mask.sum())
-        if area == 0:
-            continue
-        lower_coverage = float(mask[lower_start:, :].sum()) / area
-        if lower_coverage >= lower_region_mask_fraction:
-            continue
-        retained.append((mask, score))
-    if not retained:
-        return []
-
-    count = len(retained)
-    adjacency = np.eye(count, dtype=np.uint8)
-    areas = np.asarray([int(mask.sum()) for mask, _ in retained], dtype=np.float64)
-    for first in range(count):
-        for second in range(first + 1, count):
-            intersection = int(np.logical_and(retained[first][0], retained[second][0]).sum())
-            coverage = intersection / max(1.0, min(areas[first], areas[second]))
-            if coverage >= merge_overlap_min_fraction:
-                adjacency[first, second] = adjacency[second, first] = 1
-
-    # The candidate count is bounded (default 12), but sparse connected
-    # components makes the intended duplicate clustering explicit and scalable.
-    from scipy.sparse import csr_matrix
-    from scipy.sparse.csgraph import connected_components
-
-    _, cluster_ids = connected_components(csr_matrix(adjacency), directed=False)
-    merged: list[tuple[np.ndarray, float]] = []
-    for cluster_id in np.unique(cluster_ids):
-        indices = np.flatnonzero(cluster_ids == cluster_id)
-        union = np.zeros_like(retained[0][0], dtype=bool)
-        score = 0.0
-        for index in indices:
-            union |= retained[int(index)][0]
-            score = max(score, float(retained[int(index)][1]))
-        merged.append((union, score))
-    merged.sort(key=lambda item: (item[1], int(item[0].sum())), reverse=True)
-    return merged[:max_masks]
-
-
-class EfficientViTSamL0Backend:
+class EfficientViTSamL0Backend(DepthSelfFilterBackendMixin):
     """Prompted L0 backend with inexpensive tracking between reinitializations.
 
-    ``all`` runs SAM's automatic-mask generator periodically. ``depth-only``
-    obtains connected depth regions and refines each region using a point/box
-    SAM prompt. ``central`` is an all-mask generator whose point grid is
-    limited to the configured central camera-view ellipse.
+    ``all`` runs SAM's automatic-mask generator periodically. ``central`` is
+    an all-mask generator whose point grid is limited to the configured
+    central camera-view ellipse.
 
     Reinitialization discovers multiple generic objects. Between resets every
     discovered object retains its own box prior and is decoded in one batched
@@ -164,6 +99,7 @@ class EfficientViTSamL0Backend:
         automatic_points_per_side: int = 8,
         max_masks: int = 12,
         central: dict[str, Any] | None = None,
+        depth_self_filter: dict[str, Any] | None = None,
     ) -> None:
         import torch
         from efficientvit.models.efficientvit.sam import (
@@ -174,8 +110,8 @@ class EfficientViTSamL0Backend:
 
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is not available")
-        if reinitialization not in {"all", "depth-only", "central"}:
-            raise ValueError("reinitialization must be 'all', 'depth-only', or 'central'")
+        if reinitialization not in {"all", "central"}:
+            raise ValueError("reinitialization must be 'all' or 'central'")
         source = str(weight_path.expanduser().resolve()) if weight_path else weight_url
         self.torch = torch
         self.model = create_efficientvit_sam_model(
@@ -208,22 +144,11 @@ class EfficientViTSamL0Backend:
         self.central_center_px = tuple(float(v) for v in central.get("roi_center_px", [320, 200]))
         self.central_radius_px = tuple(float(v) for v in central.get("roi_radius_px", [220, 125]))
         self.central_spacing_px = float(central.get("prompt_spacing_px", 50))
-        self.central_max_mask_area_ratio = float(central.get("max_mask_area_ratio", 0.35))
-        self.central_lower_region_start_fraction = float(
-            central.get("lower_region_start_fraction", 0.60)
-        )
-        self.central_lower_region_mask_fraction = float(
-            central.get("lower_region_mask_fraction", 0.80)
-        )
-        self.central_merge_overlap_min_fraction = float(
-            central.get("merge_overlap_min_fraction", 0.50)
-        )
         self.track_missing_ttl_frames = max(0, int(central.get("track_missing_ttl_frames", 3)))
+        self._init_depth_self_filter(depth_self_filter)
         self.frame_index = 0
         self.track_priors: list[dict[str, Any]] = []
         self.last_central_prompt_count = 0
-        self.robot_prompt_point: np.ndarray | None = None
-        self.robot_prompt_box: np.ndarray | None = None
         self.last_mode = "uninitialized"
 
     @property
@@ -238,52 +163,8 @@ class EfficientViTSamL0Backend:
             "last_mode": self.last_mode,
             "active_prompt_tracks": sum(1 for track in self.track_priors if int(track["missing"]) == 0),
             "central_prompt_count": self.last_central_prompt_count,
-            "central_filter": {
-                "lower_region_start_fraction": self.central_lower_region_start_fraction,
-                "lower_region_mask_fraction": self.central_lower_region_mask_fraction,
-                "merge_overlap_min_fraction": self.central_merge_overlap_min_fraction,
-            },
+            "depth_self_filter": self._depth_self_filter_metadata(),
         }
-
-    def set_robot_state_prompt(
-        self, point_uv: np.ndarray | list[float] | None, box_xyxy: np.ndarray | list[float] | None = None
-    ) -> None:
-        """Set the next-frame projected wrist point/box prompt.
-
-        Values outside the image are rejected by :meth:`infer`, because an EE
-        behind the camera must not produce a synthetic prompt at an edge.
-        """
-        self.robot_prompt_point = (
-            None if point_uv is None else np.asarray(point_uv, dtype=np.float32).reshape(2)
-        )
-        self.robot_prompt_box = (
-            None if box_xyxy is None else np.asarray(box_xyxy, dtype=np.float32).reshape(4)
-        )
-
-    def _depth_proposals(self, depth_raw: np.ndarray | None, scale_um: int | None) -> list[tuple[np.ndarray, np.ndarray]]:
-        if depth_raw is None or scale_um is None or depth_raw.ndim != 2:
-            return []
-        depth_m = depth_raw.astype(np.float32) * (float(scale_um) / 1_000_000.0)
-        valid = (depth_m > 0.15) & (depth_m < 3.0)
-        proposals: list[tuple[np.ndarray, np.ndarray]] = []
-        # 8 cm slices avoid merging a foreground object with its background.
-        quantized = np.floor(depth_m / 0.08).astype(np.int32)
-        for bin_id in np.unique(quantized[valid]):
-            component_input = ((quantized == bin_id) & valid).astype(np.uint8)
-            count, labels, stats, centroids = cv2.connectedComponentsWithStats(component_input, 8)
-            for index in range(1, count):
-                area = int(stats[index, cv2.CC_STAT_AREA])
-                if area < self.min_area_px:
-                    continue
-                x, y, width, height, _ = stats[index]
-                if width * height > depth_raw.size * 0.85:
-                    continue
-                mask = labels == index
-                point = np.asarray(centroids[index], dtype=np.float32)
-                box = np.asarray([x, y, x + width, y + height], dtype=np.float32)
-                proposals.append((point, box))
-        proposals.sort(key=lambda proposal: float((proposal[1][2] - proposal[1][0]) * (proposal[1][3] - proposal[1][1])), reverse=True)
-        return proposals[: self.max_masks]
 
     def _prompt_mask(self, point: np.ndarray | None, box: np.ndarray | None) -> tuple[np.ndarray, float] | None:
         if point is None and box is None:
@@ -308,20 +189,12 @@ class EfficientViTSamL0Backend:
         if not live:
             return []
         boxes = np.stack([np.asarray(track["box"], dtype=np.float32) for track in live], axis=0)
-        robot_point = self.robot_prompt_point
-        robot_index: int | None = None
-        if robot_point is not None and 0 <= robot_point[0] < width and 0 <= robot_point[1] < height:
-            centers = 0.5 * (boxes[:, :2] + boxes[:, 2:])
-            robot_index = int(np.argmin(np.linalg.norm(centers - robot_point.reshape(1, 2), axis=1)))
 
         torch = self.torch
         transformed_boxes = self.predictor.apply_boxes(boxes)
         box_torch = torch.as_tensor(transformed_boxes, dtype=torch.float32, device=self.predictor.device)
         points = np.zeros((len(live), 1, 2), dtype=np.float32)
         point_labels = np.full((len(live), 1), -1, dtype=np.int32)
-        if robot_index is not None:
-            points[robot_index, 0] = self.predictor.apply_coords(robot_point.reshape(1, 2))[0]
-            point_labels[robot_index, 0] = 1
         with torch.inference_mode():
             point_torch = torch.as_tensor(points, dtype=torch.float32, device=self.predictor.device)
             label_torch = torch.as_tensor(point_labels, dtype=torch.int64, device=self.predictor.device)
@@ -344,7 +217,8 @@ class EfficientViTSamL0Backend:
         output: list[tuple[np.ndarray, float]] = []
         retained: list[dict[str, Any]] = []
         for track, mask, score in zip(live, masks_np, scores_np):
-            box = _box_from_mask(mask)
+            mask = self._apply_depth_self_filter(mask)
+            box = None if mask is None else _box_from_mask(mask)
             if box is not None and score >= self.threshold and int(mask.sum()) >= self.min_area_px:
                 retained.append({"box": box, "missing": 0})
                 output.append((mask, float(score)))
@@ -355,17 +229,6 @@ class EfficientViTSamL0Backend:
         # the same 3-D object again.
         self.track_priors = (retained + stale)[: self.max_masks]
         return output
-
-    def _mask_center_in_central_roi(self, mask: np.ndarray) -> bool:
-        height, width = mask.shape
-        ys, xs = np.nonzero(mask)
-        if not len(xs):
-            return False
-        sx, sy = width / self.central_reference_width, height / self.central_reference_height
-        cx, cy = self.central_center_px[0] * sx, self.central_center_px[1] * sy
-        rx, ry = self.central_radius_px[0] * sx, self.central_radius_px[1] * sy
-        x, y = float(np.median(xs)), float(np.median(ys))
-        return ((x - cx) / max(rx, 1.0)) ** 2 + ((y - cy) / max(ry, 1.0)) ** 2 <= 1.0
 
     def _automatic_masks(self, image_bgr: np.ndarray, *, central: bool = False) -> list[tuple[np.ndarray, float]]:
         if central:
@@ -387,27 +250,14 @@ class EfficientViTSamL0Backend:
             score = float(item["predicted_iou"])
             if mask.sum() < self.min_area_px or score < self.threshold:
                 continue
-            if central and (
-                mask.mean() > self.central_max_mask_area_ratio
-                or not self._mask_center_in_central_roi(mask)
-            ):
+            mask = self._apply_depth_self_filter(mask)
+            if mask is None:
                 continue
-            if not central and any(_mask_iou(mask, previous) >= 0.85 for previous, _ in output):
+            if any(_mask_iou(mask, previous) >= 0.85 for previous, _ in output):
                 continue
             output.append((mask, score))
-            # Keep extra central candidates until graph clustering collapses
-            # nested duplicate masks. Otherwise duplicates could consume all
-            # available slots before distinct objects are considered.
-            if len(output) >= (self.max_masks * 4 if central else self.max_masks):
+            if len(output) >= self.max_masks:
                 break
-        if central:
-            output = filter_and_merge_central_masks(
-                output,
-                lower_region_start_fraction=self.central_lower_region_start_fraction,
-                lower_region_mask_fraction=self.central_lower_region_mask_fraction,
-                merge_overlap_min_fraction=self.central_merge_overlap_min_fraction,
-                max_masks=self.max_masks,
-            )
         return output
 
     def infer(
@@ -420,6 +270,7 @@ class EfficientViTSamL0Backend:
         **_ignored: Any,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
         del concepts  # Generic masks intentionally have no semantic text prompt.
+        del depth_raw, depth_scale_um
         height, width = image_bgr.shape[:2]
         self.frame_index += 1
         self.predictor.set_image(image_bgr, image_format="BGR")
@@ -432,12 +283,6 @@ class EfficientViTSamL0Backend:
         if not reinitialize:
             results = self._tracked_masks(width, height)
             self.last_mode = "multi-object-track-prompts"
-        elif self.reinitialization == "depth-only":
-            for point, box in self._depth_proposals(depth_raw, depth_scale_um):
-                candidate = self._prompt_mask(point, box)
-                if candidate is not None:
-                    results.append(candidate)
-            self.last_mode = "depth-only-reinitialize"
         else:
             central = self.reinitialization == "central"
             results = self._automatic_masks(image_bgr, central=central)

@@ -150,6 +150,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--static-target-topic", default=STATIC_EE_TARGET_TOPIC)
     parser.add_argument("--static-target-timeout-sec", type=float, default=0.25)
     parser.add_argument(
+        "--static-target-auto-enter",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Automatically enter auto_planning when a new static EE target arrives. "
+            "Disabled by default so perception gateways can buffer targets without "
+            "moving the robot until the operator explicitly presses e."
+        ),
+    )
+    parser.add_argument(
         "--static-target-hold-sec",
         type=float,
         default=0.0,
@@ -2156,7 +2166,10 @@ def main() -> int:
                             arm_ik_cached_feasible = False
                             arm_ik_cached_source = "new_goal"
                             shared_control.reset()
-                            if current_state != "auto_planning":
+                            if (
+                                args.static_target_auto_enter
+                                and current_state != "auto_planning"
+                            ):
                                 apply_state_request(
                                     "auto_planning", "static EE target", tick_us
                                 )

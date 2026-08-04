@@ -1,0 +1,8 @@
+ARG BASE_IMAGE=g1-perception-sam3:thor-jp71
+FROM ${BASE_IMAGE}
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libusb-1.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python -m pip install --no-cache-dir pyrealsense2==2.58.3.10794

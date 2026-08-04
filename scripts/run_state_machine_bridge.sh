@@ -26,6 +26,7 @@ python -u path_streaming/path_state_machine_bridge.py \
   --static-target-bind "tcp://*:${PATH_STATIC_TARGET_PORT:-5564}" \
   --static-target-topic "${PATH_STATIC_TARGET_TOPIC:-path_static_ee_target}" \
   --static-target-timeout-sec "${PATH_STATIC_TARGET_TIMEOUT_SEC:-0.35}" \
+  $(if [[ "${PATH_STATIC_TARGET_AUTO_ENTER:-0}" == "1" ]]; then printf '%s' "--static-target-auto-enter"; else printf '%s' "--no-static-target-auto-enter"; fi) \
   --static-target-hold-sec "${PATH_STATIC_TARGET_HOLD_SEC:-0.0}" \
   --gravity-filter-cutoff-hz "${PATH_GRAVITY_FILTER_CUTOFF_HZ:-8.0}" \
   $(if [[ "${PATH_GRAVITY_ACCEL_BIAS_ENABLED:-1}" != "0" ]]; then printf '%s' "--gravity-accel-bias-enabled"; else printf '%s' "--no-gravity-accel-bias-enabled"; fi) \

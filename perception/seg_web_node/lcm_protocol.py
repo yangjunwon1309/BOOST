@@ -168,6 +168,70 @@ def decode_calibration(data: bytes) -> CameraCalibration:
     )
 
 
+def encode_robot_state(
+    *,
+    sequence: int,
+    lowstate_sequence: int,
+    timestamp_us: int,
+    mode_machine: int = 0,
+    base_quat_wxyz: np.ndarray | list[float] | tuple[float, ...] = (1.0, 0.0, 0.0, 0.0),
+    base_gyro: np.ndarray | list[float] | tuple[float, ...] = (0.0, 0.0, 0.0),
+    base_accel: np.ndarray | list[float] | tuple[float, ...] = (0.0, 0.0, 0.0),
+    torso_quat_wxyz: np.ndarray | list[float] | tuple[float, ...] = (1.0, 0.0, 0.0, 0.0),
+    torso_gyro: np.ndarray | list[float] | tuple[float, ...] = (0.0, 0.0, 0.0),
+    torso_accel: np.ndarray | list[float] | tuple[float, ...] = (0.0, 0.0, 0.0),
+    q: np.ndarray | list[float] | tuple[float, ...] = (),
+    dq: np.ndarray | list[float] | tuple[float, ...] = (),
+    tau: np.ndarray | list[float] | tuple[float, ...] = (),
+    has_torso_imu: bool = True,
+) -> bytes:
+    q_array = np.asarray(q, dtype=np.float64).reshape(-1)
+
+    def optional_29(value) -> np.ndarray:
+        if value is None:
+            return np.zeros(29, dtype=np.float64)
+        array = np.asarray(value, dtype=np.float64).reshape(-1)
+        return array if array.size else np.zeros(29, dtype=np.float64)
+
+    dq_array = optional_29(dq)
+    tau_array = optional_29(tau)
+    if q_array.shape[0] < 29 or dq_array.shape[0] < 29 or tau_array.shape[0] < 29:
+        raise ValueError("robot state q/dq/tau must contain at least 29 values")
+
+    def vector(value, length: int, name: str) -> np.ndarray:
+        array = np.asarray(value, dtype=np.float64).reshape(-1)
+        if array.shape[0] < length or not np.isfinite(array[:length]).all():
+            raise ValueError(f"{name} must contain {length} finite values")
+        return array[:length]
+
+    values = np.concatenate(
+        [
+            vector(base_quat_wxyz, 4, "base_quat_wxyz"),
+            vector(base_gyro, 3, "base_gyro"),
+            vector(base_accel, 3, "base_accel"),
+            vector(torso_quat_wxyz, 4, "torso_quat_wxyz"),
+            vector(torso_gyro, 3, "torso_gyro"),
+            vector(torso_accel, 3, "torso_accel"),
+            q_array[:29],
+            dq_array[:29],
+            tau_array[:29],
+        ]
+    ).astype(np.float32)
+    flags = ROBOT_STATE_HAS_TORSO_IMU if has_torso_imu else 0
+    return (
+        ROBOT_STATE_HEADER.pack(
+            ROBOT_STATE_MAGIC,
+            1,
+            flags,
+            int(sequence),
+            int(lowstate_sequence),
+            int(timestamp_us),
+            int(mode_machine) & 0xFF,
+        )
+        + ROBOT_STATE_FLOATS.pack(*values.tolist())
+    )
+
+
 def decode_robot_state(data: bytes) -> RobotState:
     expected = ROBOT_STATE_HEADER.size + ROBOT_STATE_FLOATS.size
     if len(data) != expected:

@@ -18,6 +18,7 @@ from .feature_cost import (
 from .grip_candidates import (
     GripCandidate,
     GripCandidateConfig,
+    PersistentCylinderSurfaceTracker,
     generate_grip_candidates,
 )
 
@@ -223,6 +224,7 @@ class HierarchicalTascBelief:
             else TascBeliefConfig.from_dict(config)
         )
         self.feature_cost = MultiFeatureCost(self.config.feature)
+        self.surface_tracker = PersistentCylinderSurfaceTracker(self.config.grip)
         self.object_ids: list[str] = []
         self.log_object_distribution = np.empty(0, dtype=np.float64)
         self.log_grip_distributions: dict[str, np.ndarray] = {}
@@ -475,12 +477,14 @@ class HierarchicalTascBelief:
             if np.isfinite(center).all():
                 valid_objects.append(obj)
         if not valid_objects:
+            self.surface_tracker.finish_frame(set())
             self.object_ids = []
             self.log_object_distribution = np.empty(0, dtype=np.float64)
             self.last_target = None
             self.last_telemetry = {"enabled": True, "objects": [], "target": None}
             return self.last_telemetry
         valid_object_ids = {obj.object_id for obj in valid_objects}
+        self.surface_tracker.finish_frame(valid_object_ids)
         for object_id in list(self.grip_tracks):
             if object_id not in valid_object_ids:
                 del self.grip_tracks[object_id]
@@ -546,11 +550,17 @@ class HierarchicalTascBelief:
         for obj_index, obj in enumerate(valid_objects):
             candidates = obj.grip_candidates
             if candidates is None:
-                candidates = (
-                    generate_grip_candidates(obj.points_goal_m, self.config.grip)
-                    if obj.points_goal_m is not None
-                    else []
-                )
+                candidates = []
+                if obj.points_goal_m is not None:
+                    candidates = self.surface_tracker.update(
+                        obj.object_id,
+                        obj.label,
+                        obj.points_goal_m,
+                    )
+                    if not candidates:
+                        candidates = generate_grip_candidates(
+                            obj.points_goal_m, self.config.grip
+                        )
             if not candidates:
                 candidates = [
                     GripCandidate(
@@ -646,6 +656,7 @@ class HierarchicalTascBelief:
                     "object_advantage_ema": float(object_advantages[obj_index]),
                     "object_advantage_standardized": float(object_update[obj_index]),
                     "object_feature_breakdown": object_feature_breakdowns[obj_index],
+                    "surface_model": self.surface_tracker.status(obj.object_id),
                     "generated_grip_candidate_count": int(generated_candidate_count),
                     "persistent_grip_candidate_count": int(len(candidates)),
                     "grip_track_ids": list(grip_ids),

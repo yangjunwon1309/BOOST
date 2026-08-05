@@ -4,7 +4,9 @@
 This tool bypasses perception and publishes directly to the state machine's
 static EE target input.  It is intended for validating e-mode shared control:
 the state machine receives a target position plus a confidence/belief value,
-while PICO continues to provide the live human wrist poses.
+and this message also carries neutral Q_READY left/right wrist poses.  A fresh
+live PICO stream takes priority; otherwise these wrist poses make the sender a
+self-contained shared-control input.
 
 Examples:
   # Stream a left-wrist target with belief 0.8.
@@ -34,6 +36,23 @@ import uuid
 import msgpack
 import numpy as np
 import zmq
+
+
+PICO_WAIST_FRAME = "pico_head_position_waist"
+
+# G1 29-DoF Q_READY FK at the PATH wrist-yaw + 5 cm EE frames.  These are the
+# neutral human wrist targets used when this standalone sender is run without
+# a live PICO stream.
+Q_READY_LEFT_EE_POSITION = [
+    0.24977428385080602,
+    0.1486521246660517,
+    0.09523008429534556,
+]
+Q_READY_RIGHT_EE_POSITION = [
+    0.24977428385080602,
+    -0.1486421246660517,
+    0.09523008429534556,
+]
 
 
 def parse_args() -> argparse.Namespace:
@@ -67,7 +86,10 @@ def parse_args() -> argparse.Namespace:
         type=float,
         required=True,
         metavar=("X", "Y", "Z"),
-        help="Initial pelvis-identity/pelvis-local target position in meters.",
+        help=(
+            "Initial object/contact target in the canonical PICO head-position "
+            "waist frame, in meters."
+        ),
     )
     parser.add_argument(
         "--quaternion",
@@ -98,6 +120,36 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--step-cm", type=float, default=1.0)
     parser.add_argument("--belief-step", type=float, default=0.05)
+    parser.add_argument(
+        "--left-wrist-position",
+        nargs=3,
+        type=float,
+        default=Q_READY_LEFT_EE_POSITION,
+        metavar=("X", "Y", "Z"),
+        help="Fallback left human wrist target in the canonical PICO waist frame.",
+    )
+    parser.add_argument(
+        "--right-wrist-position",
+        nargs=3,
+        type=float,
+        default=Q_READY_RIGHT_EE_POSITION,
+        metavar=("X", "Y", "Z"),
+        help="Fallback right human wrist target in the canonical PICO waist frame.",
+    )
+    parser.add_argument(
+        "--left-wrist-quaternion",
+        nargs=4,
+        type=float,
+        default=[1.0, 0.0, 0.0, 0.0],
+        metavar=("W", "X", "Y", "Z"),
+    )
+    parser.add_argument(
+        "--right-wrist-quaternion",
+        nargs=4,
+        type=float,
+        default=[1.0, 0.0, 0.0, 0.0],
+        metavar=("W", "X", "Y", "Z"),
+    )
     parser.add_argument("--print-period-sec", type=float, default=0.5)
     parser.add_argument("--workspace-mode", choices=("clamp", "reject", "none"), default="clamp")
     parser.add_argument("--workspace-x", nargs=2, type=float, default=[-0.15, 0.50])
@@ -156,6 +208,24 @@ def normalize_quat_wxyz(values: list[float] | np.ndarray) -> list[float]:
     if quat[0] < 0.0:
         quat = -quat
     return quat.tolist()
+
+
+def transform_from_position_quaternion(
+    position: list[float] | np.ndarray,
+    quaternion_wxyz: list[float] | np.ndarray,
+) -> np.ndarray:
+    w, x, y, z = normalize_quat_wxyz(quaternion_wxyz)
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, :3] = np.array(
+        [
+            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+            [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+            [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+        ],
+        dtype=np.float64,
+    )
+    transform[:3, 3] = np.asarray(position, dtype=np.float64).reshape(3)
+    return transform
 
 
 def target_link_for_side(side: str, explicit: str = "") -> str:
@@ -249,6 +319,14 @@ def make_payload(
 ) -> dict:
     belief = float(np.clip(float(belief), 0.0, 1.0))
     now_us = int(time.time_ns() // 1000)
+    left_wrist_transform = transform_from_position_quaternion(
+        args.left_wrist_position,
+        args.left_wrist_quaternion,
+    )
+    right_wrist_transform = transform_from_position_quaternion(
+        args.right_wrist_position,
+        args.right_wrist_quaternion,
+    )
     payload = {
         "goal_uid": goal_uid,
         "force_replan": False,
@@ -259,7 +337,13 @@ def make_payload(
         "position": np.asarray(position, dtype=np.float64).reshape(3).tolist(),
         "quaternion": normalize_quat_wxyz(args.quaternion),
         "source": "manual_shared_control_belief",
-        "coordinate_frame": "pelvis_identity_fk",
+        "coordinate_frame": PICO_WAIST_FRAME,
+        "target_position_frame": PICO_WAIST_FRAME,
+        "human_wrist_frame": PICO_WAIST_FRAME,
+        "human_left_wrist_transform": left_wrist_transform.reshape(-1).tolist(),
+        "human_right_wrist_transform": right_wrist_transform.reshape(-1).tolist(),
+        "human_left_wrist_position": left_wrist_transform[:3, 3].tolist(),
+        "human_right_wrist_position": right_wrist_transform[:3, 3].tolist(),
         "confidence": belief,
         "object_confidence": belief,
         "joint_confidence": belief,
@@ -274,6 +358,8 @@ def make_payload(
             "manual_side": side,
             "manual_target_link": target_link,
             "streaming_goal": True,
+            "coordinate_frame": PICO_WAIST_FRAME,
+            "human_wrist_source": "g1_q_ready_fk",
         },
     }
     if workspace_info:
@@ -300,6 +386,7 @@ def print_status(
         f"target={np.round(position, 4).tolist()} "
         f"belief={belief:.3f} hand={hand} "
         f"link={target_link or '<auto-nearest>'} "
+        f"frame={PICO_WAIST_FRAME} "
         f"workspace={workspace_reason} "
         f"topic={args.goal_topic} hz={args.stream_hz:.1f}",
         flush=True,

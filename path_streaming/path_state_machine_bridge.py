@@ -83,6 +83,18 @@ VALID_STATES = {"teleop", "intention", "auto_planning", "damped_return"}
 # remains under SONIC's locomotion policy in every state.
 SONIC_DEFAULT_STANDING_HEIGHT = -1.0
 
+# Canonical task-space contract used by PICO wrists, manual shared-control
+# targets, and the arm-only IPOPT FK.  PICO world poses are first expressed as
+# controller - headset + WAIST_OFFSET_XYZ by pico_manager_thread_server.py.
+PICO_WAIST_FRAME = "pico_head_position_waist"
+STATIC_TARGET_FRAME_ALIASES = {
+    PICO_WAIST_FRAME,
+    # Existing perception publishers already produce pelvis-identity robot
+    # coordinates.  They are numerically equivalent to the canonical waist
+    # frame and remain accepted while producers migrate their schema label.
+    "pelvis_identity_fk",
+}
+
 STREAM_MODE_OFF = 0
 STREAM_MODE_ALIGNING = 6
 STREAM_MODE_TRACKING = 7
@@ -560,6 +572,49 @@ class WaistWristTargets:
     valid: bool
 
 
+def _valid_wrist_transform(value) -> np.ndarray | None:
+    try:
+        transform = np.asarray(value, dtype=np.float64).reshape(4, 4)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(transform).all():
+        return None
+    if not np.allclose(transform[3], [0.0, 0.0, 0.0, 1.0], atol=1.0e-5):
+        return None
+    rotation = transform[:3, :3]
+    if not np.allclose(rotation.T @ rotation, np.eye(3), atol=2.0e-3):
+        return None
+    if abs(float(np.linalg.det(rotation)) - 1.0) > 2.0e-3:
+        return None
+    return transform.copy()
+
+
+def static_target_frame_is_supported(payload: dict | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    frame = str(
+        payload.get("target_position_frame", payload.get("coordinate_frame", ""))
+    ).strip()
+    return frame in STATIC_TARGET_FRAME_ALIASES
+
+
+def manual_wrist_targets_from_static_payload(
+    payload: dict | None,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    if not isinstance(payload, dict) or not bool(payload.get("target_valid", True)):
+        return None
+    if not static_target_frame_is_supported(payload):
+        return None
+    wrist_frame = str(payload.get("human_wrist_frame", "")).strip()
+    if wrist_frame != PICO_WAIST_FRAME:
+        return None
+    left = _valid_wrist_transform(payload.get("human_left_wrist_transform"))
+    right = _valid_wrist_transform(payload.get("human_right_wrist_transform"))
+    if left is None or right is None:
+        return None
+    return left, right
+
+
 def wrist_targets_from_message(
     raw: bytes,
     topic: str,
@@ -1028,7 +1083,11 @@ def ee_target_from_static_payload(
     *,
     received_us: int,
 ) -> EETarget | None:
-    if not payload:
+    if (
+        not payload
+        or not bool(payload.get("target_valid", True))
+        or not static_target_frame_is_supported(payload)
+    ):
         return None
     try:
         position = np.asarray(
@@ -2089,6 +2148,21 @@ def main() -> int:
                     target_link = str(incoming_target.get("target_link", "left_wrist_yaw_link"))
                     target_side = target_side_from_link(target_link)
                     target_valid = bool(incoming_target.get("target_valid", True))
+                    if target_valid and not static_target_frame_is_supported(
+                        incoming_target
+                    ):
+                        incoming_target = dict(incoming_target)
+                        incoming_target["target_valid"] = False
+                        incoming_target["failure_reason"] = (
+                            "unsupported_coordinate_frame:"
+                            + str(
+                                incoming_target.get(
+                                    "target_position_frame",
+                                    incoming_target.get("coordinate_frame", "missing"),
+                                )
+                            )
+                        )
+                        target_valid = False
                     position_value = incoming_target.get(
                         "position", incoming_target.get("target_position", None)
                     )
@@ -2308,6 +2382,8 @@ def main() -> int:
             )
             static_target_usable = (
                 latest_static_target is not None
+                and bool(latest_static_target.get("target_valid", True))
+                and static_target_frame_is_supported(latest_static_target)
                 and (
                     args.static_target_hold_sec <= 0.0
                     or static_target_age_sec <= args.static_target_hold_sec
@@ -2501,14 +2577,34 @@ def main() -> int:
                         else ""
                     )
                     requested_hand = target_side_from_link(requested_target_link)
+                    manual_human_targets = (
+                        manual_wrist_targets_from_static_payload(latest_static_target)
+                        if static_target_usable
+                        else None
+                    )
+                    human_left_tf: np.ndarray | None = None
+                    human_right_tf: np.ndarray | None = None
+                    human_wrist_source = "none"
+                    human_source_timestamp_us = 0
+                    human_frame_index = -1
+                    if pico_body_fresh and latest_wrist_targets is not None:
+                        human_left_tf = latest_wrist_targets.left_waist.copy()
+                        human_right_tf = latest_wrist_targets.right_waist.copy()
+                        human_wrist_source = "pico_live"
+                        human_source_timestamp_us = int(
+                            latest_wrist_targets.source_timestamp_us
+                        )
+                        human_frame_index = int(latest_wrist_targets.frame_index)
+                    elif manual_human_targets is not None:
+                        human_left_tf, human_right_tf = manual_human_targets
+                        human_wrist_source = "manual_q_ready_fk"
+                        human_source_timestamp_us = int(latest_static_target_us)
                     if (
-                        pico_body_fresh
-                        and latest_wrist_targets is not None
+                        human_left_tf is not None
+                        and human_right_tf is not None
                         and arm_nonlinear_ik is not None
                     ):
                         try:
-                            human_left_tf = latest_wrist_targets.left_waist.copy()
-                            human_right_tf = latest_wrist_targets.right_waist.copy()
                             p_human_left = human_left_tf[:3, 3].copy()
                             p_human_right = human_right_tf[:3, 3].copy()
                             q_measured_for_hand = (
@@ -2565,9 +2661,7 @@ def main() -> int:
                             )
                             last_plan_q = q_for_sonic.copy()
                             blended_q = q_for_sonic.copy()
-                            source_timestamp_us = int(
-                                latest_wrist_targets.source_timestamp_us
-                            )
+                            source_timestamp_us = human_source_timestamp_us
                             if not ik_result.success:
                                 hold_q = last_ipopt_or_measured_hold()
                                 qp_payload = ipopt_arm_sample_reference(
@@ -2585,7 +2679,7 @@ def main() -> int:
                                     ),
                                     bridge_timestamp_us=tick_us,
                                     smpl_source_timestamp_us=source_timestamp_us,
-                                    smpl_frame_index=int(latest_wrist_targets.frame_index),
+                                    smpl_frame_index=human_frame_index,
                                     smpl_target_reason="ipopt_failed_hold",
                                     smpl_target_held=True,
                                     arm_target_owner="casadi_ipopt_hold",
@@ -2600,6 +2694,8 @@ def main() -> int:
                                     ),
                                     arm_ik_status=str(ik_result.message),
                                     shared_gate_reason=result.gate_reason,
+                                    shared_human_wrist_source=human_wrist_source,
+                                    shared_coordinate_frame=PICO_WAIST_FRAME,
                                 )
                                 phase_mode = "ipopt_failed_hold"
                             elif active_target is None:
@@ -2617,7 +2713,7 @@ def main() -> int:
                                     tau_ff_ref=ik_result.tau_ff_ref,
                                     bridge_timestamp_us=tick_us,
                                     smpl_source_timestamp_us=source_timestamp_us,
-                                    smpl_frame_index=int(latest_wrist_targets.frame_index),
+                                    smpl_frame_index=human_frame_index,
                                     q_prior_source="ipopt_pico_controller_ee",
                                     arm_ik_solve_ms=float(ik_result.solve_time_ms),
                                     arm_ik_position_error_m=float(
@@ -2629,6 +2725,8 @@ def main() -> int:
                                     arm_ik_status=str(last_arm_ik_status),
                                     shared_control=True,
                                     shared_gate_reason=result.gate_reason,
+                                    shared_human_wrist_source=human_wrist_source,
+                                    shared_coordinate_frame=PICO_WAIST_FRAME,
                                 )
                                 phase_mode = "shared_control_wait"
                             else:
@@ -2647,7 +2745,7 @@ def main() -> int:
                                     tau_ff_ref=ik_result.tau_ff_ref,
                                     bridge_timestamp_us=tick_us,
                                     smpl_source_timestamp_us=source_timestamp_us,
-                                    smpl_frame_index=int(latest_wrist_targets.frame_index),
+                                    smpl_frame_index=human_frame_index,
                                     terminal_target_link=result.target_link,
                                     terminal_target_position=active_target.tolist(),
                                     terminal_capture_radius_m=float(
@@ -2695,11 +2793,21 @@ def main() -> int:
                                     shared_max_observed_confidence=float(
                                         shared_control.max_observed_confidence
                                     ),
+                                    shared_human_wrist_source=human_wrist_source,
+                                    shared_coordinate_frame=PICO_WAIST_FRAME,
                                 )
                                 phase_mode = "shared_control"
                             phase_sync_error_rad = float("nan")
                         except Exception as exc:
                             hold_q = last_ipopt_or_measured_hold()
+                            send_planner_command(
+                                sonic,
+                                hold_q,
+                                neutralize_waist=True,
+                                freeze_lower_body=True,
+                                left_hand_position=left_hand_cmd,
+                                right_hand_position=right_hand_cmd,
+                            )
                             qp_payload = ipopt_arm_sample_reference(
                                 hold_q,
                                 state="auto_planning",
@@ -2719,19 +2827,29 @@ def main() -> int:
                                 solver_backend="casadi_opti_ipopt_hold",
                                 arm_target_valid=True,
                                 shared_gate_reason=f"error:{exc}",
+                                shared_human_wrist_source=human_wrist_source,
+                                shared_coordinate_frame=PICO_WAIST_FRAME,
                             )
                             phase_mode = "shared_control_error_hold"
                             phase_sync_error_rad = float("nan")
                     else:
                         missing = []
-                        if not pico_body_fresh or latest_wrist_targets is None:
-                            missing.append("pico_target")
+                        if human_left_tf is None or human_right_tf is None:
+                            missing.append("human_wrist_target")
                         if arm_nonlinear_ik is None:
                             missing.append("ipopt_fk")
                         if target is None:
                             missing.append("target")
                         latest_shared_result = None
                         hold_q = last_ipopt_or_measured_hold()
+                        send_planner_command(
+                            sonic,
+                            hold_q,
+                            neutralize_waist=True,
+                            freeze_lower_body=True,
+                            left_hand_position=left_hand_cmd,
+                            right_hand_position=right_hand_cmd,
+                        )
                         qp_payload = ipopt_arm_sample_reference(
                             hold_q,
                             state="auto_planning",
@@ -2751,6 +2869,8 @@ def main() -> int:
                             solver_backend="casadi_opti_ipopt_hold",
                             arm_target_valid=True,
                             shared_gate_reason="missing_" + "_".join(missing),
+                            shared_human_wrist_source=human_wrist_source,
+                            shared_coordinate_frame=PICO_WAIST_FRAME,
                         )
                         phase_mode = "shared_control_input_hold"
                         phase_sync_error_rad = float("nan")
@@ -3292,6 +3412,7 @@ def main() -> int:
                         f"shared_gate={latest_shared_result.gate_reason} "
                         f"shared_obj={latest_shared_result.object_id or 'none'} "
                         f"shared_grip={latest_shared_result.grip_index}"
+                        f" human_src={qp_payload.get('shared_human_wrist_source', 'none') if qp_payload else 'none'}"
                     )
                 log(
                     f"state={current_state} pico_fresh={pico_body_fresh} "

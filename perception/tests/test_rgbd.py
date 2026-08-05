@@ -83,7 +83,12 @@ def test_path_goal_payload_and_reject_workspace():
         workspace_info=info,
     )
     assert payload["target_link"] == "left_wrist_yaw_link"
-    assert payload["coordinate_frame"] == "pelvis_identity_fk"
+    assert payload["coordinate_frame"] == "pico_head_position_waist"
+    assert payload["target_position_frame"] == "pico_head_position_waist"
+    assert payload["human_wrist_frame"] == "pico_head_position_waist"
+    assert len(payload["human_left_wrist_transform"]) == 16
+    assert len(payload["human_right_wrist_transform"]) == 16
+    assert payload["target_valid"] is True
     assert payload["position"] == [0.25, 0.12, 0.18]
     assert payload["duration_sec"] == 2.0
     assert payload["final_hold_sec"] == 1.0

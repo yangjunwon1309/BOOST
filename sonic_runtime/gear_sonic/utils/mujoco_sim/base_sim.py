@@ -18,6 +18,13 @@ from gear_sonic.utils.mujoco_sim.metric_utils import check_contact, check_height
 from gear_sonic.utils.mujoco_sim.sim_utils import get_subtree_body_names
 from gear_sonic.utils.mujoco_sim.unitree_sdk2py_bridge import ElasticBand, UnitreeSdk2Bridge
 from gear_sonic.utils.mujoco_sim.robot import Robot
+from gear_sonic.utils.mujoco_sim.hand_backends import (
+    DEX3_BACKEND,
+    REVO2_BACKEND,
+    REVO2_COMMAND_SUFFIXES,
+    REVO2_JOINT_SUFFIXES,
+    Revo2CommandAdapter,
+)
 
 GEAR_SONIC_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 
@@ -45,6 +52,19 @@ class DefaultEnv:
         self.robot = Robot(self.config)
         self.num_body_dof = self.robot.NUM_JOINTS
         self.num_hand_dof = self.robot.NUM_HAND_JOINTS
+        self.num_hand_motor = self.robot.NUM_HAND_MOTORS
+        self.hand_backend = self.robot.HAND_BACKEND
+        if self.hand_backend not in (DEX3_BACKEND, REVO2_BACKEND):
+            raise ValueError(f"Unsupported HAND_BACKEND: {self.hand_backend}")
+        self.revo2_adapter = Revo2CommandAdapter(
+            binary_open=tuple(self.config.get("BRAINCO_BINARY_OPEN", (0.0,) * 6)),
+            binary_close=tuple(
+                self.config.get("BRAINCO_BINARY_CLOSE", (0.70, 1.0, 1.0, 1.0, 1.0, 1.0))
+            ),
+            legacy_close_threshold=float(
+                self.config.get("BRAINCO_LEGACY_CLOSE_THRESHOLD", 0.10)
+            ),
+        )
         self.sim_dt = self.config["SIMULATE_DT"]
         self.obs = None
         self.torques = np.zeros(self.num_body_dof + self.num_hand_dof * 2)
@@ -174,16 +194,20 @@ class DefaultEnv:
         return np.array(body_joint_index, dtype=int)
 
     def _get_ordered_hand_joint_indices(self, side: str):
-        hand_order = [
-            "thumb_0",
-            "thumb_1",
-            "thumb_2",
-            "middle_0",
-            "middle_1",
-            "index_0",
-            "index_1",
-        ]
-        prefix = f"{side}_hand_"
+        if self.hand_backend == REVO2_BACKEND:
+            hand_order = REVO2_JOINT_SUFFIXES
+            prefix = f"{side}_"
+        else:
+            hand_order = (
+                "thumb_0_joint",
+                "thumb_1_joint",
+                "thumb_2_joint",
+                "middle_0_joint",
+                "middle_1_joint",
+                "index_0_joint",
+                "index_1_joint",
+            )
+            prefix = f"{side}_hand_"
         available = {
             self.mj_model.joint(i).name: i
             for i in range(self.mj_model.njnt)
@@ -196,7 +220,7 @@ class DefaultEnv:
 
         joint_indices, missing = [], []
         for suffix in hand_order:
-            joint_name = f"{prefix}{suffix}_joint"
+            joint_name = f"{prefix}{suffix}"
             joint_id = available.get(joint_name)
             if joint_id is None:
                 missing.append(joint_name)
@@ -208,6 +232,23 @@ class DefaultEnv:
                 f"missing={missing}, found={len(joint_indices)}, expected={self.num_hand_dof}"
             )
         return np.array(joint_indices, dtype=int)
+
+    def _get_ordered_hand_command_joint_indices(self, side: str, hand_joint_indices):
+        if self.hand_backend == DEX3_BACKEND:
+            return hand_joint_indices
+
+        available = {
+            self.mj_model.joint(i).name: i
+            for i in hand_joint_indices
+        }
+        names = [f"{side}_{suffix}" for suffix in REVO2_COMMAND_SUFFIXES]
+        missing = [name for name in names if name not in available]
+        if missing or len(names) != self.num_hand_motor:
+            raise ValueError(
+                f"Configured {side} REVO2 command joints do not match the MuJoCo model. "
+                f"missing={missing}, commands={len(names)}, expected={self.num_hand_motor}"
+            )
+        return np.asarray([available[name] for name in names], dtype=int)
 
     def _get_actuator_indices_for_joints(self, joint_indices):
         joint_to_actuator = {}
@@ -287,9 +328,19 @@ class DefaultEnv:
         self.body_joint_index = self._get_ordered_body_joint_indices()
         self.left_hand_index = self._get_ordered_hand_joint_indices("left")
         self.right_hand_index = self._get_ordered_hand_joint_indices("right")
+        self.left_hand_command_joint_index = self._get_ordered_hand_command_joint_indices(
+            "left", self.left_hand_index
+        )
+        self.right_hand_command_joint_index = self._get_ordered_hand_command_joint_indices(
+            "right", self.right_hand_index
+        )
         self.body_actuator_index = self._get_actuator_indices_for_joints(self.body_joint_index)
-        self.left_hand_actuator_index = self._get_actuator_indices_for_joints(self.left_hand_index)
-        self.right_hand_actuator_index = self._get_actuator_indices_for_joints(self.right_hand_index)
+        self.left_hand_actuator_index = self._get_actuator_indices_for_joints(
+            self.left_hand_command_joint_index
+        )
+        self.right_hand_actuator_index = self._get_actuator_indices_for_joints(
+            self.right_hand_command_joint_index
+        )
         self.torques = np.zeros(self.mj_model.nu)
         self.actuator_ctrllimited = self.mj_model.actuator_ctrllimited.astype(bool)
         self.actuator_ctrlrange = self.mj_model.actuator_ctrlrange.copy()
@@ -365,36 +416,62 @@ class DefaultEnv:
         return self.mj_data.qvel[:6]
 
     def compute_hand_torques(self) -> np.ndarray:
-        left_hand_torques = np.zeros(self.num_hand_dof)
-        right_hand_torques = np.zeros(self.num_hand_dof)
+        left_hand_torques = np.zeros(self.num_hand_motor)
+        right_hand_torques = np.zeros(self.num_hand_motor)
         if self.unitree_bridge is not None and self.unitree_bridge.low_cmd:
-            for i in range(self.unitree_bridge.num_hand_motor):
-                left_hand_torques[i] = (
-                    self.unitree_bridge.left_hand_cmd.motor_cmd[i].tau
-                    + self.unitree_bridge.left_hand_cmd.motor_cmd[i].kp
-                    * (
-                        self.unitree_bridge.left_hand_cmd.motor_cmd[i].q
-                        - self.mj_data.qpos[self.left_hand_index[i] + self.qpos_offset - 1]
-                    )
-                    + self.unitree_bridge.left_hand_cmd.motor_cmd[i].kd
-                    * (
-                        self.unitree_bridge.left_hand_cmd.motor_cmd[i].dq
-                        - self.mj_data.qvel[self.left_hand_index[i] + self.qvel_offset - 1]
-                    )
+            if self.hand_backend == REVO2_BACKEND:
+                left_target = self.revo2_adapter.normalized_to_actuated(
+                    self.unitree_bridge.get_hand_command_q(True)
                 )
-                right_hand_torques[i] = (
-                    self.unitree_bridge.right_hand_cmd.motor_cmd[i].tau
-                    + self.unitree_bridge.right_hand_cmd.motor_cmd[i].kp
-                    * (
-                        self.unitree_bridge.right_hand_cmd.motor_cmd[i].q
-                        - self.mj_data.qpos[self.right_hand_index[i] + self.qpos_offset - 1]
-                    )
-                    + self.unitree_bridge.right_hand_cmd.motor_cmd[i].kd
-                    * (
-                        self.unitree_bridge.right_hand_cmd.motor_cmd[i].dq
-                        - self.mj_data.qvel[self.right_hand_index[i] + self.qvel_offset - 1]
-                    )
+                right_target = self.revo2_adapter.normalized_to_actuated(
+                    self.unitree_bridge.get_hand_command_q(False)
                 )
+                kp = float(self.robot.HAND_MOTOR_KP)
+                kd = float(self.robot.HAND_MOTOR_KD)
+                left_q = self.mj_data.qpos[
+                    self.left_hand_command_joint_index + self.qpos_offset - 1
+                ]
+                left_dq = self.mj_data.qvel[
+                    self.left_hand_command_joint_index + self.qvel_offset - 1
+                ]
+                right_q = self.mj_data.qpos[
+                    self.right_hand_command_joint_index + self.qpos_offset - 1
+                ]
+                right_dq = self.mj_data.qvel[
+                    self.right_hand_command_joint_index + self.qvel_offset - 1
+                ]
+                left_hand_torques[:] = kp * (left_target - left_q) - kd * left_dq
+                right_hand_torques[:] = kp * (right_target - right_q) - kd * right_dq
+            else:
+                for i in range(self.unitree_bridge.num_hand_motor):
+                    left_command = self.unitree_bridge.left_hand_cmd.motor_cmd[i]
+                    right_command = self.unitree_bridge.right_hand_cmd.motor_cmd[i]
+                    left_hand_torques[i] = (
+                        left_command.tau
+                        + left_command.kp
+                        * (
+                            left_command.q
+                            - self.mj_data.qpos[self.left_hand_index[i] + self.qpos_offset - 1]
+                        )
+                        + left_command.kd
+                        * (
+                            left_command.dq
+                            - self.mj_data.qvel[self.left_hand_index[i] + self.qvel_offset - 1]
+                        )
+                    )
+                    right_hand_torques[i] = (
+                        right_command.tau
+                        + right_command.kp
+                        * (
+                            right_command.q
+                            - self.mj_data.qpos[self.right_hand_index[i] + self.qpos_offset - 1]
+                        )
+                        + right_command.kd
+                        * (
+                            right_command.dq
+                            - self.mj_data.qvel[self.right_hand_index[i] + self.qvel_offset - 1]
+                        )
+                    )
         return np.concatenate((left_hand_torques, right_hand_torques))
 
     def compute_body_qpos(self) -> np.ndarray:
@@ -407,9 +484,17 @@ class DefaultEnv:
     def compute_hand_qpos(self) -> np.ndarray:
         hand_qpos = np.zeros(self.num_hand_dof * 2)
         if self.unitree_bridge is not None and self.unitree_bridge.low_cmd:
-            for i in range(self.unitree_bridge.num_hand_motor):
-                hand_qpos[i] = self.unitree_bridge.left_hand_cmd.motor_cmd[i].q
-                hand_qpos[i + self.num_hand_dof] = self.unitree_bridge.right_hand_cmd.motor_cmd[i].q
+            if self.hand_backend == REVO2_BACKEND:
+                hand_qpos[: self.num_hand_dof] = self.revo2_adapter.normalized_to_all_joints(
+                    self.unitree_bridge.get_hand_command_q(True)
+                )
+                hand_qpos[self.num_hand_dof :] = self.revo2_adapter.normalized_to_all_joints(
+                    self.unitree_bridge.get_hand_command_q(False)
+                )
+            else:
+                for i in range(self.unitree_bridge.num_hand_motor):
+                    hand_qpos[i] = self.unitree_bridge.left_hand_cmd.motor_cmd[i].q
+                    hand_qpos[i + self.num_hand_dof] = self.unitree_bridge.right_hand_cmd.motor_cmd[i].q
         return hand_qpos
 
     def prepare_obs(self) -> Dict[str, any]:
@@ -487,8 +572,8 @@ class DefaultEnv:
         self.torques.fill(0.0)
         self.torques[self.body_actuator_index] = body_torques
         if self.num_hand_dof > 0:
-            self.torques[self.left_hand_actuator_index] = hand_torques[: self.num_hand_dof]
-            self.torques[self.right_hand_actuator_index] = hand_torques[self.num_hand_dof :]
+            self.torques[self.left_hand_actuator_index] = hand_torques[: self.num_hand_motor]
+            self.torques[self.right_hand_actuator_index] = hand_torques[self.num_hand_motor :]
 
         limited = self.actuator_ctrllimited
         self.torques[limited] = np.clip(

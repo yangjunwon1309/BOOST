@@ -1,0 +1,18 @@
+# Overlay applied on top of g1_29dof_sonic_model12.yaml.
+# The body policy remains 29-DoF; only the simulated hand backend changes.
+ROBOT_SCENE: "gear_sonic/data/robot_model/model_data/g1/scene_43dof_revo2.xml"
+HAND_BACKEND: "brainco_revo2"
+NUM_HAND_MOTORS: 6
+NUM_HAND_JOINTS: 11
+
+# Static joint-space PD used by the MuJoCo torque motors.  BrainCo DDS q/dq
+# remain normalized [0, 1]; q is converted to radians before this PD is run.
+HAND_MOTOR_KP: 30.0
+HAND_MOTOR_KD: 10.0
+
+# Keep the old rt/dex3/* command topics as an input-only compatibility path.
+# A 7-vector is reduced to binary open/close and mapped to the REVO2 pose.
+BRAINCO_ACCEPT_LEGACY_DEX3: true
+BRAINCO_LEGACY_CLOSE_THRESHOLD: 0.10
+BRAINCO_BINARY_OPEN: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+BRAINCO_BINARY_CLOSE: [0.70, 1.0, 1.0, 1.0, 1.0, 1.0]

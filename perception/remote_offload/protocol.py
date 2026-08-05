@@ -136,6 +136,7 @@ def make_object(
     valid_depth_points: int,
     target_contact_goal_m: list[float] | tuple[float, float, float] | None = None,
     contact_candidates: list[dict[str, Any]] | None = None,
+    surface_model: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     height, width = np.asarray(mask).shape
     result = {
@@ -157,6 +158,8 @@ def make_object(
         result["target_contact_goal_m"] = [float(v) for v in target_contact_goal_m]
     if contact_candidates is not None:
         result["contact_candidates"] = list(contact_candidates)
+    if surface_model is not None:
+        result["surface_model"] = dict(surface_model)
     return result
 
 
@@ -326,4 +329,23 @@ def validate_result(payload: dict[str, Any], context: ValidationContext) -> list
                 errors.append(f"{candidate_prefix}.track_id is invalid")
             if "source" in candidate and not isinstance(candidate.get("source"), str):
                 errors.append(f"{candidate_prefix}.source is invalid")
+        surface_model = obj.get("surface_model")
+        if surface_model is not None:
+            if not isinstance(surface_model, dict):
+                errors.append(f"{prefix}.surface_model must be a map")
+            else:
+                if surface_model.get("type") != "cylinder":
+                    errors.append(f"{prefix}.surface_model.type is invalid")
+                for key in ("center_goal_m", "axis_goal"):
+                    if not _finite_vector(surface_model.get(key), 3):
+                        errors.append(f"{prefix}.surface_model.{key} is invalid")
+                for key in (
+                    "radius_m",
+                    "height_m",
+                    "fit_rmse_m",
+                    "inlier_ratio",
+                    "angular_coverage",
+                ):
+                    if not _finite_number(surface_model.get(key)):
+                        errors.append(f"{prefix}.surface_model.{key} is invalid")
     return errors

@@ -609,7 +609,7 @@ class SegmentationRuntime:
                     "tracked_index": tracking.get("last_index") if tracking else None,
                     "missing_frames": self.target_tracking_missing_frames,
                     "publish_hz": self.target_auto_publish_hz,
-                    "goal_frame": "pelvis_identity_fk",
+                    "goal_frame": "pico_head_position_waist",
                     "target_link": self.target_link,
                     "bypass_checks": self.target_bypass_checks,
                     "blockers": blockers,
@@ -761,7 +761,8 @@ class SegmentationRuntime:
             "position": None,
             "quaternion": list(self.target_quaternion),
             "source": "sam3_tasc_belief_null",
-            "coordinate_frame": "pelvis_identity_fk",
+            "coordinate_frame": "pico_head_position_waist",
+            "target_position_frame": "pico_head_position_waist",
             "duration_sec": float(self.target_config.get("duration_sec", 2.0)),
             "final_hold_sec": float(self.target_config.get("final_hold_sec", 1.0)),
             "perception": {

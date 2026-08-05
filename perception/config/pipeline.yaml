@@ -213,4 +213,26 @@ tasc_belief:
     switch_dwell_frames: 2
     switch_margin: 0.0
     table_normal: [0.0, 0.0, 1.0]
+    # Persistent object-centric cylinder fitted with robust SciPy least squares.
+    # Failed/occluded updates retain the last valid surface for stale_ttl_frames;
+    # only an object with no valid cylinder falls back to the legacy PCA/FPS set.
+    surface_model:
+      enabled: true
+      labels: [bottle, can, cup]
+      min_points: 120
+      min_radius_m: 0.015
+      max_radius_m: 0.12
+      min_height_m: 0.04
+      max_height_m: 0.50
+      inlier_threshold_m: 0.015
+      min_inlier_ratio: 0.45
+      min_angular_coverage: 0.20
+      max_fit_rmse_m: 0.015
+      max_center_shift_m: 0.15
+      update_alpha: 0.35
+      stale_ttl_frames: 15
+      sample_spacing_m: 0.025
+      max_candidates: 24
+      max_nfev: 80
+      prior_weight: 2.0
 registry_dir: "registry_data"

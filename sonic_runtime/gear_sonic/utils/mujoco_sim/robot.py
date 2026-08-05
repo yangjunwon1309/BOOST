@@ -20,6 +20,9 @@ class Robot:
         self.NUM_JOINTS = config["NUM_JOINTS"]
         self.NUM_HAND_MOTORS = config.get("NUM_HAND_MOTORS", 0)  # only 43dof has hand
         self.NUM_HAND_JOINTS = config.get("NUM_HAND_JOINTS", 0)
+        self.HAND_BACKEND = config.get("HAND_BACKEND", "dex3")
+        self.HAND_MOTOR_KP = config.get("HAND_MOTOR_KP", 30.0)
+        self.HAND_MOTOR_KD = config.get("HAND_MOTOR_KD", 10.0)
         self.DEFAULT_DOF_ANGLES = config["DEFAULT_DOF_ANGLES"]
         self.DEFAULT_MOTOR_ANGLES = config["DEFAULT_MOTOR_ANGLES"]
         self.USE_SENSOR = config["USE_SENSOR"]

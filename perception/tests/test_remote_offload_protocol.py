@@ -52,6 +52,18 @@ def _payload():
                         "source": "pca_surface",
                     }
                 ],
+                "surface_model": {
+                    "type": "cylinder",
+                    "center_goal_m": [0.3, 0.1, 0.2],
+                    "axis_goal": [0.0, 0.0, 1.0],
+                    "radius_m": 0.04,
+                    "height_m": 0.20,
+                    "fit_rmse_m": 0.002,
+                    "inlier_ratio": 0.91,
+                    "angular_coverage": 0.50,
+                    "updates": 4,
+                    "stale_frames": 0,
+                },
             }
         ],
     }
@@ -65,4 +77,11 @@ def test_remote_perception_rejects_mask_dimension_mismatch():
     payload = _payload()
     payload["objects"][0]["mask_width"] = 320
     with pytest.raises(ValueError, match="mask dimensions"):
+        encode_perception_result(payload)
+
+
+def test_remote_perception_rejects_invalid_cylinder_surface():
+    payload = _payload()
+    payload["objects"][0]["surface_model"]["radius_m"] = float("nan")
+    with pytest.raises(ValueError, match="surface_model.radius_m"):
         encode_perception_result(payload)

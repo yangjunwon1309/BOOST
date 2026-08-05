@@ -1,0 +1,300 @@
+<mujoco model="g1_43dof scene">
+  <include file="g1_29dof_with_revo2.xml"/>
+  <!-- Note that the hand model in g1_29dof_with_hand.xml is not stable for simulation. -->
+
+  <statistic center="0 0.5 0.5" extent="2.5"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="-130" elevation="-20"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072"/>
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3"
+      markrgb="0.8 0.8 0.8" width="300" height="300"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
+
+    <!-- Wall material -->
+    <texture type="2d" name="wall_tex" builtin="flat" rgb1="0.8 0.78 0.72" width="100" height="100"/>
+    <material name="wall_mat" texture="wall_tex" texuniform="true" reflectance="0.05"/>
+
+    <!-- Lab table mesh + texture -->
+    <texture type="2d" name="lab_table_tex"
+      file="meshes/lab_table/textures/Image_0.png"/>
+    <material name="lab_table_mat" texture="lab_table_tex" specular="0.5" shininess="0.25"/>
+    <mesh name="lab_table_mesh"
+      file="lab_table/meshes/lab_table.obj"/>
+
+    <!-- Apple visual + collision meshes -->
+    <texture type="2d" name="apple_tex"
+      file="meshes/apple_0/visual/image0.png"/>
+    <material name="apple_mat" texture="apple_tex" specular="0.5" shininess="0.25"/>
+    <mesh name="apple_vis"
+      file="apple_0/visual/model_normalized_0.obj"
+      scale="0.075 0.075 0.075"/>
+    <mesh name="apple_col_0"
+      file="apple_0/collision/tmpm_h04v7s_collision_0.obj"
+      scale="0.075 0.075 0.075"/>
+    <mesh name="apple_col_1"
+      file="apple_0/collision/tmpm_h04v7s_collision_1.obj"
+      scale="0.075 0.075 0.075"/>
+    <mesh name="apple_col_2"
+      file="apple_0/collision/tmpm_h04v7s_collision_2.obj"
+      scale="0.075 0.075 0.075"/>
+    <mesh name="apple_col_3"
+      file="apple_0/collision/tmpm_h04v7s_collision_3.obj"
+      scale="0.075 0.075 0.075"/>
+    <mesh name="apple_col_4"
+      file="apple_0/collision/tmpm_h04v7s_collision_4.obj"
+      scale="0.075 0.075 0.075"/>
+
+    <!-- Plate visual + collision meshes -->
+    <material name="plate_mat" specular="0.5" shininess="0.36" rgba="0.8 0.8 0.8 1.0"/>
+    <mesh name="plate_vis"
+      file="plate_1/visual/model_normalized_0.obj"
+      scale="0.185 0.185 0.185"/>
+    <mesh name="plate_col_0"
+      file="plate_1/collision/tmpzdovka8d_collision_0.obj"
+      scale="0.185 0.185 0.185"/>
+    <mesh name="plate_col_1"
+      file="plate_1/collision/tmpzdovka8d_collision_1.obj"
+      scale="0.185 0.185 0.185"/>
+    <mesh name="plate_col_2"
+      file="plate_1/collision/tmpzdovka8d_collision_2.obj"
+      scale="0.185 0.185 0.185"/>
+    <mesh name="plate_col_3"
+      file="plate_1/collision/tmpzdovka8d_collision_3.obj"
+      scale="0.185 0.185 0.185"/>
+  </asset>
+
+  <worldbody>
+    <light pos="0 1 2.5" dir="0 -0.3 -1" directional="true" diffuse="0.8 0.8 0.8"/>
+    <light pos="0 1 2.5" dir="0 0.1 -1" directional="false" diffuse="0.4 0.4 0.4"/>
+    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
+
+    <!-- ── Walls ─────────────────────────────────────────────────── -->
+    <!-- Back wall (y=2.5, behind tables) -->
+    <geom name="wall_back"   type="box" size="0.05 3.0 1.5" pos="3.1 0 1.5"
+          material="wall_mat" contype="1" conaffinity="1"/>
+    <!-- Left wall (x=-2.0) -->
+    <geom name="wall_left"   type="box" size="3.0 0.05 1.5" pos="1.0 2.0 1.5"
+          material="wall_mat" contype="1" conaffinity="1"/>
+    <!-- Right wall (x=2.0) -->
+    <geom name="wall_right"  type="box" size="3.0 0.05 1.5" pos="1.0 -2.0 1.5"
+          material="wall_mat" contype="1" conaffinity="1"/>
+
+    <!-- ── Tables ─────────────────────────────────────────────────── -->
+    <!--
+      로봇 초기위치: (0, 0)  전방: +y
+      테이블 높이(top_site): 0.684m  → body pos z=0 이면 top이 z=0.684
+      테이블 폭(x): 1.163m / 2 = 0.58m  →  두 테이블 간격 15cm 유지
+        오른쪽 테이블 중심 x =  0.58 + 0.075 =  0.655  (간격 15cm → 각 7.5cm)
+        왼쪽  테이블 중심 x = -0.655
+      테이블 전면이 로봇에서 ~1m: top_site y=0 이 테이블 중심 → y=1.2
+    -->
+    <body name="table_right" pos="1.8 -0.282 0">
+      <geom material="lab_table_mat" mesh="lab_table_mesh" type="mesh"
+            contype="0" conaffinity="0" group="1"/>
+      <!-- collision boxes from model.xml -->
+      <geom name="tr_col0" type="box"
+            pos="0.4843686625509804 -0.000730093650563612 0.3342451038217457"
+            size="0.04263440320922718 0.04285815157647449 0.2785983345803944"
+            quat="0.005135747294760671 0.9998119259901994 0.0186999519307263 0.00022032993656703975"/>
+      <geom name="tr_col1" type="box" pos="0 0.003 0.658" size="0.587 0.368 0.026"/>
+      <geom name="tr_col2" type="box"
+            pos="-0.00954106500000005 0.0029612799999999993 0.62735063"
+            size="0.014453629999999995 0.05161405327501812 0.43084086355897366"
+            quat="9.14067532065674e-05 -0.7071067752785329 9.140675320652676e-05 0.7071067752785327"/>
+      <geom name="tr_col3" type="box"
+            pos="-0.490715503853547 0.002950882518163021 0.02401571"
+            size="0.0313436 0.039379695186117364 0.26608269445757937"
+            quat="0.4999840367343198 -0.5000159627560445 0.49998403673431996 0.5000159627560447"/>
+      <geom name="tr_col4" type="box"
+            pos="-0.48929601084175645 0.002471445296000595 0.333870825"
+            size="0.04208595265213852 0.04300403156756598 0.278456965"
+            quat="0.0 -0.9999450792382256 0.010480386789563123 0.0"/>
+      <geom name="tr_col5" type="box"
+            pos="0.4862727667260499 0.003058549031851817 0.024393834739060927"
+            size="0.03166195583702207 0.03920107069552364 0.2658917817754224"
+            quat="0.5006412500091809 0.5005636633450814 0.49929226103709484 -0.49950134714158967"/>
+      <geom name="tr_col6" type="box"
+            pos="0.48068282999999995 -0.001122674999999979 0.627093285"
+            size="0.014710975000000015 0.05939634999999996 0.24522559500000002"
+            quat="0.4999999999999999 -0.4999999999999998 -0.5000000000000001 -0.4999999999999997"/>
+      <geom name="tr_col7" type="box"
+            pos="-0.49178033000000004 0.00173824500000001 0.627093285"
+            size="0.014710975000000015 0.05140170000000002 0.243484215"
+            quat="0.4999999999999999 -0.4999999999999998 -0.5000000000000001 -0.4999999999999997"/>
+    </body>
+
+    <body name="table_left" pos="1.8 0.282 0">
+      <geom material="lab_table_mat" mesh="lab_table_mesh" type="mesh"
+            contype="0" conaffinity="0" group="1"/>
+      <geom name="tl_col0" type="box"
+            pos="0.4843686625509804 -0.000730093650563612 0.3342451038217457"
+            size="0.04263440320922718 0.04285815157647449 0.2785983345803944"
+            quat="0.005135747294760671 0.9998119259901994 0.0186999519307263 0.00022032993656703975"/>
+      <geom name="tl_col1" type="box" pos="0 0.003 0.658" size="0.587 0.368 0.026"/>
+      <geom name="tl_col2" type="box"
+            pos="-0.00954106500000005 0.0029612799999999993 0.62735063"
+            size="0.014453629999999995 0.05161405327501812 0.43084086355897366"
+            quat="9.14067532065674e-05 -0.7071067752785329 9.140675320652676e-05 0.7071067752785327"/>
+      <geom name="tl_col3" type="box"
+            pos="-0.490715503853547 0.002950882518163021 0.02401571"
+            size="0.0313436 0.039379695186117364 0.26608269445757937"
+            quat="0.4999840367343198 -0.5000159627560445 0.49998403673431996 0.5000159627560447"/>
+      <geom name="tl_col4" type="box"
+            pos="-0.48929601084175645 0.002471445296000595 0.333870825"
+            size="0.04208595265213852 0.04300403156756598 0.278456965"
+            quat="0.0 -0.9999450792382256 0.010480386789563123 0.0"/>
+      <geom name="tl_col5" type="box"
+            pos="0.4862727667260499 0.003058549031851817 0.024393834739060927"
+            size="0.03166195583702207 0.03920107069552364 0.2658917817754224"
+            quat="0.5006412500091809 0.5005636633450814 0.49929226103709484 -0.49950134714158967"/>
+      <geom name="tl_col6" type="box"
+            pos="0.48068282999999995 -0.001122674999999979 0.627093285"
+            size="0.014710975000000015 0.05939634999999996 0.24522559500000002"
+            quat="0.4999999999999999 -0.4999999999999998 -0.5000000000000001 -0.4999999999999997"/>
+      <geom name="tl_col7" type="box"
+            pos="-0.49178033000000004 0.00173824500000001 0.627093285"
+            size="0.014710975000000015 0.05140170000000002 0.243484215"
+            quat="0.4999999999999999 -0.4999999999999998 -0.5000000000000001 -0.4999999999999997"/>
+    </body>
+
+    <!-- ── Apple (오른쪽 테이블 위, 자유물체) ──────────────────────── -->
+    <!--
+      테이블 top_site z=0.684, 사과 반지름 ~0.037m
+      apple body pos: table_right 위치(0.655, 1.2) + 테이블 중앙(0, 0) + 높이 0.684+0.037
+      사과를 테이블 앞쪽 가운데에 배치
+    -->
+    <body name="apple" pos="1.4 -0.282 0.721">
+      <joint name="apple_joint" type="free"/>
+      <inertial pos="0 0 0" mass="0.15" diaginertia="0.0001 0.0001 0.0001"/>
+      <!-- visual -->
+      <geom type="mesh" mesh="apple_vis" conaffinity="0" contype="0" group="1"
+            material="apple_mat"/>
+      <!-- collision -->
+      <geom type="mesh" mesh="apple_col_0" condim="6" friction="1.0 0.1 0.01"
+            solimp="0.95 0.98 0.001" solref="0.004 1"/>
+      <geom type="mesh" mesh="apple_col_1" condim="6" friction="1.0 0.1 0.01"
+            solimp="0.95 0.98 0.001" solref="0.004 1"/>
+      <geom type="mesh" mesh="apple_col_2" condim="6" friction="1.0 0.1 0.01"
+            solimp="0.95 0.98 0.001" solref="0.004 1"/>
+      <geom type="mesh" mesh="apple_col_3" condim="6" friction="1.0 0.1 0.01"
+            solimp="0.95 0.98 0.001" solref="0.004 1"/>
+      <geom type="mesh" mesh="apple_col_4" condim="6" friction="1.0 0.1 0.01"
+            solimp="0.95 0.98 0.001" solref="0.004 1"/>
+    </body>
+
+    <!-- ── Plate (왼쪽 테이블 위, 자유물체) ───────────────────────── -->
+    <!--
+      plate top_site z=0.00554 → 두께 ~11mm, 중심 z=0
+      plate body pos: table_left 위치(-0.655, 1.2) + 테이블 위 높이 0.684+0.006
+    -->
+    <body name="plate" pos="1.4 0.282 0.690">
+      <joint name="plate_joint" type="free"/>
+      <inertial pos="0 0 0" mass="0.35" diaginertia="0.001 0.001 0.0005"/>
+      <!-- visual -->
+      <geom type="mesh" mesh="plate_vis" conaffinity="0" contype="0" group="1"
+            material="plate_mat"/>
+      <!-- collision -->
+      <geom type="mesh" mesh="plate_col_0" condim="6" friction="0.8 0.1 0.01"
+            solimp="0.95 0.98 0.001" solref="0.004 1"/>
+      <geom type="mesh" mesh="plate_col_1" condim="6" friction="0.8 0.1 0.01"
+            solimp="0.95 0.98 0.001" solref="0.004 1"/>
+      <geom type="mesh" mesh="plate_col_2" condim="6" friction="0.8 0.1 0.01"
+            solimp="0.95 0.98 0.001" solref="0.004 1"/>
+      <geom type="mesh" mesh="plate_col_3" condim="6" friction="0.8 0.1 0.01"
+            solimp="0.95 0.98 0.001" solref="0.004 1"/>
+    </body>
+
+
+    <!-- Additional apples around the table -->
+    <body name="apple_2" pos="1.6 -0.282 0.721">
+      <joint name="apple_2_joint" type="free"/>
+      <inertial pos="0 0 0" mass="0.15" diaginertia="0.0001 0.0001 0.0001"/>
+      <geom type="mesh" mesh="apple_vis" conaffinity="0" contype="0" group="1" material="apple_mat"/>
+      <geom type="mesh" mesh="apple_col_0" condim="6" friction="1.0 0.1 0.01" solimp="0.95 0.98 0.001" solref="0.004 1"/>
+      <geom type="mesh" mesh="apple_col_1" condim="6" friction="1.0 0.1 0.01" solimp="0.95 0.98 0.001" solref="0.004 1"/>
+      <geom type="mesh" mesh="apple_col_2" condim="6" friction="1.0 0.1 0.01" solimp="0.95 0.98 0.001" solref="0.004 1"/>
+      <geom type="mesh" mesh="apple_col_3" condim="6" friction="1.0 0.1 0.01" solimp="0.95 0.98 0.001" solref="0.004 1"/>
+      <geom type="mesh" mesh="apple_col_4" condim="6" friction="1.0 0.1 0.01" solimp="0.95 0.98 0.001" solref="0.004 1"/>
+    </body>
+
+    <body name="apple_3" pos="1.8 -0.282 0.721">
+      <joint name="apple_3_joint" type="free"/>
+      <inertial pos="0 0 0" mass="0.15" diaginertia="0.0001 0.0001 0.0001"/>
+      <geom type="mesh" mesh="apple_vis" conaffinity="0" contype="0" group="1" material="apple_mat"/>
+      <geom type="mesh" mesh="apple_col_0" condim="6" friction="1.0 0.1 0.01" solimp="0.95 0.98 0.001" solref="0.004 1"/>
+      <geom type="mesh" mesh="apple_col_1" condim="6" friction="1.0 0.1 0.01" solimp="0.95 0.98 0.001" solref="0.004 1"/>
+      <geom type="mesh" mesh="apple_col_2" condim="6" friction="1.0 0.1 0.01" solimp="0.95 0.98 0.001" solref="0.004 1"/>
+      <geom type="mesh" mesh="apple_col_3" condim="6" friction="1.0 0.1 0.01" solimp="0.95 0.98 0.001" solref="0.004 1"/>
+      <geom type="mesh" mesh="apple_col_4" condim="6" friction="1.0 0.1 0.01" solimp="0.95 0.98 0.001" solref="0.004 1"/>
+    </body>
+
+    <body name="apple_4" pos="1.4 -0.15 0.721">
+      <joint name="apple_4_joint" type="free"/>
+      <inertial pos="0 0 0" mass="0.15" diaginertia="0.0001 0.0001 0.0001"/>
+      <geom type="mesh" mesh="apple_vis" conaffinity="0" contype="0" group="1" material="apple_mat"/>
+      <geom type="mesh" mesh="apple_col_0" condim="6" friction="1.0 0.1 0.01" solimp="0.95 0.98 0.001" solref="0.004 1"/>
+      <geom type="mesh" mesh="apple_col_1" condim="6" friction="1.0 0.1 0.01" solimp="0.95 0.98 0.001" solref="0.004 1"/>
+      <geom type="mesh" mesh="apple_col_2" condim="6" friction="1.0 0.1 0.01" solimp="0.95 0.98 0.001" solref="0.004 1"/>
+      <geom type="mesh" mesh="apple_col_3" condim="6" friction="1.0 0.1 0.01" solimp="0.95 0.98 0.001" solref="0.004 1"/>
+      <geom type="mesh" mesh="apple_col_4" condim="6" friction="1.0 0.1 0.01" solimp="0.95 0.98 0.001" solref="0.004 1"/>
+    </body>
+
+    <body name="apple_5" pos="1.6 -0.15 0.721">
+      <joint name="apple_5_joint" type="free"/>
+      <inertial pos="0 0 0" mass="0.15" diaginertia="0.0001 0.0001 0.0001"/>
+      <geom type="mesh" mesh="apple_vis" conaffinity="0" contype="0" group="1" material="apple_mat"/>
+      <geom type="mesh" mesh="apple_col_0" condim="6" friction="1.0 0.1 0.01" solimp="0.95 0.98 0.001" solref="0.004 1"/>
+      <geom type="mesh" mesh="apple_col_1" condim="6" friction="1.0 0.1 0.01" solimp="0.95 0.98 0.001" solref="0.004 1"/>
+      <geom type="mesh" mesh="apple_col_2" condim="6" friction="1.0 0.1 0.01" solimp="0.95 0.98 0.001" solref="0.004 1"/>
+      <geom type="mesh" mesh="apple_col_3" condim="6" friction="1.0 0.1 0.01" solimp="0.95 0.98 0.001" solref="0.004 1"/>
+      <geom type="mesh" mesh="apple_col_4" condim="6" friction="1.0 0.1 0.01" solimp="0.95 0.98 0.001" solref="0.004 1"/>
+    </body>
+
+    <body name="apple_6" pos="1.8 -0.15 0.721">
+      <joint name="apple_6_joint" type="free"/>
+      <inertial pos="0 0 0" mass="0.15" diaginertia="0.0001 0.0001 0.0001"/>
+      <geom type="mesh" mesh="apple_vis" conaffinity="0" contype="0" group="1" material="apple_mat"/>
+      <geom type="mesh" mesh="apple_col_0" condim="6" friction="1.0 0.1 0.01" solimp="0.95 0.98 0.001" solref="0.004 1"/>
+      <geom type="mesh" mesh="apple_col_1" condim="6" friction="1.0 0.1 0.01" solimp="0.95 0.98 0.001" solref="0.004 1"/>
+      <geom type="mesh" mesh="apple_col_2" condim="6" friction="1.0 0.1 0.01" solimp="0.95 0.98 0.001" solref="0.004 1"/>
+      <geom type="mesh" mesh="apple_col_3" condim="6" friction="1.0 0.1 0.01" solimp="0.95 0.98 0.001" solref="0.004 1"/>
+      <geom type="mesh" mesh="apple_col_4" condim="6" friction="1.0 0.1 0.01" solimp="0.95 0.98 0.001" solref="0.004 1"/>
+    </body>
+
+    <body name="apple_7" pos="1.8 -0.40 0.721">
+      <joint name="apple_7_joint" type="free"/>
+      <inertial pos="0 0 0" mass="0.15" diaginertia="0.0001 0.0001 0.0001"/>
+      <geom type="mesh" mesh="apple_vis" conaffinity="0" contype="0" group="1" material="apple_mat"/>
+      <geom type="mesh" mesh="apple_col_0" condim="6" friction="1.0 0.1 0.01" solimp="0.95 0.98 0.001" solref="0.004 1"/>
+      <geom type="mesh" mesh="apple_col_1" condim="6" friction="1.0 0.1 0.01" solimp="0.95 0.98 0.001" solref="0.004 1"/>
+      <geom type="mesh" mesh="apple_col_2" condim="6" friction="1.0 0.1 0.01" solimp="0.95 0.98 0.001" solref="0.004 1"/>
+      <geom type="mesh" mesh="apple_col_3" condim="6" friction="1.0 0.1 0.01" solimp="0.95 0.98 0.001" solref="0.004 1"/>
+      <geom type="mesh" mesh="apple_col_4" condim="6" friction="1.0 0.1 0.01" solimp="0.95 0.98 0.001" solref="0.004 1"/>
+    </body>
+    <!-- Site markers -->
+    <site name="com_marker" pos="0.1 0 0" size="0.05" rgba="1 0 0 1" type="sphere"/>
+  </worldbody>
+
+  <default>
+    <geom friction="1.0"/>
+  </default>
+
+  <option timestep="0.001" cone="elliptic" impratio="5.0"/>
+
+  <keyframe>
+    <key name="home" qpos="0 0 0.793 0.7071 0 0 0.7071
+      -0.312 0 0 0.669 -0.363 0
+      -0.312 0 0 0.669 -0.363 0
+      0 0 0
+      0.2 0.2 0 0.6 0 0 0
+      0.2 -0.2 0 0.6 0 0 0
+      0 0 0 0 0 0 0
+      0 0 0 0 0 0 0"/>
+  </keyframe>
+</mujoco>

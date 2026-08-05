@@ -13,12 +13,32 @@ import numpy as np
 import scipy.spatial.transform
 from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber
 from unitree_sdk2py.idl.default import (
+    unitree_go_msg_dds__MotorCmd_,
+    unitree_go_msg_dds__MotorState_,
     unitree_go_msg_dds__WirelessController_,
     unitree_hg_msg_dds__HandCmd_ as HandCmd_default,
     unitree_hg_msg_dds__HandState_ as HandState_default,
 )
-from unitree_sdk2py.idl.unitree_go.msg.dds_ import WirelessController_
+from unitree_sdk2py.idl.unitree_go.msg.dds_ import (
+    MotorCmds_,
+    MotorStates_,
+    WirelessController_,
+)
 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import HandCmd_, HandState_, OdoState_
+
+from gear_sonic.utils.mujoco_sim.hand_backends import (
+    DEX3_BACKEND,
+    REVO2_BACKEND,
+    Revo2CommandAdapter,
+)
+
+
+def _new_brainco_command(count: int) -> MotorCmds_:
+    return MotorCmds_([unitree_go_msg_dds__MotorCmd_() for _ in range(count)])
+
+
+def _new_brainco_state(count: int) -> MotorStates_:
+    return MotorStates_([unitree_go_msg_dds__MotorState_() for _ in range(count)])
 
 
 class UnitreeSdk2Bridge:
@@ -57,7 +77,24 @@ class UnitreeSdk2Bridge:
 
         self.num_body_motor = config["NUM_MOTORS"]
         self.num_hand_motor = config.get("NUM_HAND_MOTORS", 0)
+        self.hand_backend = config.get("HAND_BACKEND", DEX3_BACKEND)
+        if self.hand_backend not in (DEX3_BACKEND, REVO2_BACKEND):
+            raise ValueError(f"Unsupported HAND_BACKEND: {self.hand_backend}")
+        self.revo2_adapter = Revo2CommandAdapter(
+            binary_open=tuple(config.get("BRAINCO_BINARY_OPEN", (0.0,) * 6)),
+            binary_close=tuple(
+                config.get("BRAINCO_BINARY_CLOSE", (0.70, 1.0, 1.0, 1.0, 1.0, 1.0))
+            ),
+            legacy_close_threshold=float(config.get("BRAINCO_LEGACY_CLOSE_THRESHOLD", 0.10)),
+        )
+        self.accept_legacy_dex3 = bool(config.get("BRAINCO_ACCEPT_LEGACY_DEX3", False))
         self.use_sensor = config["USE_SENSOR"]
+
+        # Subscribers can invoke callbacks as soon as Init returns, so locks
+        # must exist before any subscriber is initialized.
+        self.low_cmd_lock = threading.Lock()
+        self.left_hand_cmd_lock = threading.Lock()
+        self.right_hand_cmd_lock = threading.Lock()
 
         self.have_imu_ = False
         self.have_frame_sensor_ = False
@@ -79,26 +116,57 @@ class UnitreeSdk2Bridge:
         self.torso_imu_puber = ChannelPublisher("rt/secondary_imu", IMUState_)
         self.torso_imu_puber.Init()
 
-        self.left_hand_state = HandState_default()
-        self.left_hand_state_puber = ChannelPublisher("rt/dex3/left/state", HandState_)
-        self.left_hand_state_puber.Init()
-        self.right_hand_state = HandState_default()
-        self.right_hand_state_puber = ChannelPublisher("rt/dex3/right/state", HandState_)
-        self.right_hand_state_puber.Init()
+        if self.hand_backend == REVO2_BACKEND:
+            self.left_hand_state = _new_brainco_state(self.num_hand_motor)
+            self.left_hand_state_puber = ChannelPublisher(
+                "rt/brainco/left/state", MotorStates_
+            )
+            self.left_hand_state_puber.Init()
+            self.right_hand_state = _new_brainco_state(self.num_hand_motor)
+            self.right_hand_state_puber = ChannelPublisher(
+                "rt/brainco/right/state", MotorStates_
+            )
+            self.right_hand_state_puber.Init()
+        else:
+            self.left_hand_state = HandState_default()
+            self.left_hand_state_puber = ChannelPublisher("rt/dex3/left/state", HandState_)
+            self.left_hand_state_puber.Init()
+            self.right_hand_state = HandState_default()
+            self.right_hand_state_puber = ChannelPublisher("rt/dex3/right/state", HandState_)
+            self.right_hand_state_puber.Init()
 
         self.low_cmd_suber = ChannelSubscriber("rt/lowcmd", LowCmd_)
         self.low_cmd_suber.Init(self.LowCmdHandler, 1)
 
-        self.left_hand_cmd = HandCmd_default()
-        self.left_hand_cmd_suber = ChannelSubscriber("rt/dex3/left/cmd", HandCmd_)
-        self.left_hand_cmd_suber.Init(self.LeftHandCmdHandler, 1)
-        self.right_hand_cmd = HandCmd_default()
-        self.right_hand_cmd_suber = ChannelSubscriber("rt/dex3/right/cmd", HandCmd_)
-        self.right_hand_cmd_suber.Init(self.RightHandCmdHandler, 1)
-
-        self.low_cmd_lock = threading.Lock()
-        self.left_hand_cmd_lock = threading.Lock()
-        self.right_hand_cmd_lock = threading.Lock()
+        self.legacy_left_hand_cmd_suber = None
+        self.legacy_right_hand_cmd_suber = None
+        if self.hand_backend == REVO2_BACKEND:
+            self.left_hand_cmd = _new_brainco_command(self.num_hand_motor)
+            self.left_hand_cmd_suber = ChannelSubscriber(
+                "rt/brainco/left/cmd", MotorCmds_
+            )
+            self.left_hand_cmd_suber.Init(self.LeftHandCmdHandler, 1)
+            self.right_hand_cmd = _new_brainco_command(self.num_hand_motor)
+            self.right_hand_cmd_suber = ChannelSubscriber(
+                "rt/brainco/right/cmd", MotorCmds_
+            )
+            self.right_hand_cmd_suber.Init(self.RightHandCmdHandler, 1)
+            if self.accept_legacy_dex3:
+                self.legacy_left_hand_cmd_suber = ChannelSubscriber(
+                    "rt/dex3/left/cmd", HandCmd_
+                )
+                self.legacy_left_hand_cmd_suber.Init(self.LegacyLeftHandCmdHandler, 1)
+                self.legacy_right_hand_cmd_suber = ChannelSubscriber(
+                    "rt/dex3/right/cmd", HandCmd_
+                )
+                self.legacy_right_hand_cmd_suber.Init(self.LegacyRightHandCmdHandler, 1)
+        else:
+            self.left_hand_cmd = HandCmd_default()
+            self.left_hand_cmd_suber = ChannelSubscriber("rt/dex3/left/cmd", HandCmd_)
+            self.left_hand_cmd_suber.Init(self.LeftHandCmdHandler, 1)
+            self.right_hand_cmd = HandCmd_default()
+            self.right_hand_cmd_suber = ChannelSubscriber("rt/dex3/right/cmd", HandCmd_)
+            self.right_hand_cmd_suber.Init(self.RightHandCmdHandler, 1)
 
         self.wireless_controller = unitree_go_msg_dds__WirelessController_()
         self.wireless_controller_puber = ChannelPublisher(
@@ -148,15 +216,79 @@ class UnitreeSdk2Bridge:
 
     def LeftHandCmdHandler(self, msg):
         with self.left_hand_cmd_lock:
-            self.left_hand_cmd = msg
+            if self.hand_backend == REVO2_BACKEND:
+                if len(msg.cmds) != self.num_hand_motor:
+                    return
+                command = _new_brainco_command(self.num_hand_motor)
+                for index in range(self.num_hand_motor):
+                    command.cmds[index].q = float(np.clip(msg.cmds[index].q, 0.0, 1.0))
+                    command.cmds[index].dq = float(np.clip(msg.cmds[index].dq, 0.0, 1.0))
+                self.left_hand_cmd = command
+            else:
+                self.left_hand_cmd = msg
             self.left_hand_cmd_received = True
             self.new_left_hand_cmd = True
 
     def RightHandCmdHandler(self, msg):
         with self.right_hand_cmd_lock:
-            self.right_hand_cmd = msg
+            if self.hand_backend == REVO2_BACKEND:
+                if len(msg.cmds) != self.num_hand_motor:
+                    return
+                command = _new_brainco_command(self.num_hand_motor)
+                for index in range(self.num_hand_motor):
+                    command.cmds[index].q = float(np.clip(msg.cmds[index].q, 0.0, 1.0))
+                    command.cmds[index].dq = float(np.clip(msg.cmds[index].dq, 0.0, 1.0))
+                self.right_hand_cmd = command
+            else:
+                self.right_hand_cmd = msg
             self.right_hand_cmd_received = True
             self.new_right_hand_cmd = True
+
+    def _set_revo2_binary_command(self, is_left: bool, closed: bool):
+        if self.hand_backend != REVO2_BACKEND:
+            raise RuntimeError("binary REVO2 command requested while DEX3 backend is active")
+        target = self.revo2_adapter.binary_target(closed)
+        lock = self.left_hand_cmd_lock if is_left else self.right_hand_cmd_lock
+        with lock:
+            command = self.left_hand_cmd if is_left else self.right_hand_cmd
+            for index, value in enumerate(target):
+                command.cmds[index].q = float(value)
+                command.cmds[index].dq = 1.0
+            if is_left:
+                self.left_hand_cmd_received = True
+                self.new_left_hand_cmd = True
+            else:
+                self.right_hand_cmd_received = True
+                self.new_right_hand_cmd = True
+
+    def SetBinaryGrip(self, is_left: bool, closed: bool):
+        """Public binary-grip adapter used by tests and local sim controllers."""
+        self._set_revo2_binary_command(is_left, closed)
+
+    def _legacy_dex3_handler(self, msg, is_left: bool):
+        values = [msg.motor_cmd[i].q for i in range(7)]
+        self._set_revo2_binary_command(
+            is_left,
+            self.revo2_adapter.legacy_dex3_is_closed(values),
+        )
+
+    def LegacyLeftHandCmdHandler(self, msg):
+        self._legacy_dex3_handler(msg, True)
+
+    def LegacyRightHandCmdHandler(self, msg):
+        self._legacy_dex3_handler(msg, False)
+
+    def get_hand_command_q(self, is_left: bool) -> np.ndarray:
+        lock = self.left_hand_cmd_lock if is_left else self.right_hand_cmd_lock
+        with lock:
+            command = self.left_hand_cmd if is_left else self.right_hand_cmd
+            if self.hand_backend == REVO2_BACKEND:
+                values = [command.cmds[i].q for i in range(self.num_hand_motor)]
+                return self.revo2_adapter.clamp_normalized(values)
+            return np.asarray(
+                [command.motor_cmd[i].q for i in range(self.num_hand_motor)],
+                dtype=np.float64,
+            )
 
     def cmd_received(self):
         with self.low_cmd_lock:
@@ -207,25 +339,44 @@ class UnitreeSdk2Bridge:
 
         self.torso_imu_puber.Write(self.torso_imu_state)
 
-        # publish hand state
-        for i in range(self.num_hand_motor):
-            self.left_hand_state.motor_state[i].q = obs["left_hand_q"][i]
-            self.left_hand_state.motor_state[i].dq = obs["left_hand_dq"][i]
-        self.left_hand_state_puber.Write(self.left_hand_state)
-
-        for i in range(self.num_hand_motor):
-            self.right_hand_state.motor_state[i].q = obs["right_hand_q"][i]
-            self.right_hand_state.motor_state[i].dq = obs["right_hand_dq"][i]
-        self.right_hand_state_puber.Write(self.right_hand_state)
+        # Publish the active hand protocol.  BrainCo q/dq are normalized,
+        # whereas legacy DEX3 state remains in joint radians.
+        if self.num_hand_motor > 0:
+            if self.hand_backend == REVO2_BACKEND:
+                left_q = self.revo2_adapter.actuated_to_normalized(
+                    obs["left_hand_q"][: self.num_hand_motor]
+                )
+                right_q = self.revo2_adapter.actuated_to_normalized(
+                    obs["right_hand_q"][: self.num_hand_motor]
+                )
+                left_dq = self.revo2_adapter.normalized_velocity(
+                    obs["left_hand_dq"][: self.num_hand_motor]
+                )
+                right_dq = self.revo2_adapter.normalized_velocity(
+                    obs["right_hand_dq"][: self.num_hand_motor]
+                )
+                for i in range(self.num_hand_motor):
+                    self.left_hand_state.states[i].q = float(left_q[i])
+                    self.left_hand_state.states[i].dq = float(left_dq[i])
+                    self.left_hand_state.states[i].tau_est = float(obs["left_hand_tau_est"][i])
+                    self.right_hand_state.states[i].q = float(right_q[i])
+                    self.right_hand_state.states[i].dq = float(right_dq[i])
+                    self.right_hand_state.states[i].tau_est = float(obs["right_hand_tau_est"][i])
+            else:
+                for i in range(self.num_hand_motor):
+                    self.left_hand_state.motor_state[i].q = obs["left_hand_q"][i]
+                    self.left_hand_state.motor_state[i].dq = obs["left_hand_dq"][i]
+                    self.right_hand_state.motor_state[i].q = obs["right_hand_q"][i]
+                    self.right_hand_state.motor_state[i].dq = obs["right_hand_dq"][i]
+            self.left_hand_state_puber.Write(self.left_hand_state)
+            self.right_hand_state_puber.Write(self.right_hand_state)
 
     def GetAction(self) -> Tuple[np.ndarray, bool, bool]:
         with self.low_cmd_lock:
             body_q = [self.low_cmd.motor_cmd[i].q for i in range(self.num_body_motor)]
-        with self.left_hand_cmd_lock:
-            left_hand_q = [self.left_hand_cmd.motor_cmd[i].q for i in range(self.num_hand_motor)]
-        with self.right_hand_cmd_lock:
-            right_hand_q = [self.right_hand_cmd.motor_cmd[i].q for i in range(self.num_hand_motor)]
-        with self.low_cmd_lock and self.left_hand_cmd_lock and self.right_hand_cmd_lock:
+        left_hand_q = self.get_hand_command_q(True).tolist()
+        right_hand_q = self.get_hand_command_q(False).tolist()
+        with self.low_cmd_lock, self.left_hand_cmd_lock, self.right_hand_cmd_lock:
             is_new_action = self.new_low_cmd and self.new_left_hand_cmd and self.new_right_hand_cmd
             if is_new_action:
                 self.new_low_cmd = False

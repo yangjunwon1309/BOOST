@@ -18,7 +18,11 @@ from seg_web_node.geometry import (
     robust_mask_center,
     transform_points,
 )
-from seg_web_node.grip_candidates import GripCandidateConfig, generate_grip_candidates
+from seg_web_node.grip_candidates import (
+    GripCandidateConfig,
+    PersistentCylinderSurfaceTracker,
+    generate_grip_candidates,
+)
 from seg_web_node.rgbd_sync import RgbdPair
 from seg_web_node.yolo11_backend import Yolo11SegBackend
 
@@ -85,6 +89,7 @@ class RemoteYolo11Worker(RemoteSam3Worker):
         self.depth_self_filter_options = dict(depth_self_filter)
         self.contact_candidates_enabled = bool(contact_candidates)
         self.contact_config = contact_config
+        self.surface_tracker = PersistentCylinderSurfaceTracker(contact_config)
 
     def _backend_display_name(self) -> str:
         return "YOLO11"
@@ -223,6 +228,8 @@ class RemoteYolo11Worker(RemoteSam3Worker):
                 "median_depth_m": None,
                 "target_contact_goal_m": None,
                 "contact_candidates": [],
+                "surface_model": None,
+                "_points_goal_m": None,
             }
             valid_depth = (
                 mask_bool
@@ -248,32 +255,40 @@ class RemoteYolo11Worker(RemoteSam3Worker):
                         center_goal = transform_points(center_camera_array, t_goal_cam)
                         detection["center_goal_m"] = center_goal.tolist()
                         if self.contact_candidates_enabled:
-                            points_goal = masked_goal_points(
+                            detection["_points_goal_m"] = masked_goal_points(
                                 xyz_camera,
                                 mask_bool,
                                 t_goal_cam,
                                 max_points=self.contact_config.max_points,
                             )
-                            candidates = [
-                                candidate.to_dict()
-                                for candidate in generate_grip_candidates(
-                                    points_goal,
-                                    self.contact_config,
-                                )
-                            ]
-                            detection["contact_candidates"] = candidates
-                            if candidates:
-                                detection["target_contact_goal_m"] = candidates[0][
-                                    "center_goal_m"
-                                ]
             detections.append(detection)
 
         track_ids = self.tracker.assign(detections)
+        active_track_ids: set[str] = set()
         for index, (mask, box, score, label) in enumerate(zip(masks, boxes, scores, labels)):
             detection = detections[index]
+            track_id = track_ids.get(index, f"{label}:untracked{index:04d}")
+            active_track_ids.add(track_id)
+            points_goal = detection.pop("_points_goal_m", None)
+            if self.contact_candidates_enabled and points_goal is not None:
+                fitted_candidates = self.surface_tracker.update(
+                    track_id,
+                    str(label),
+                    points_goal,
+                )
+                if not fitted_candidates:
+                    fitted_candidates = generate_grip_candidates(
+                        points_goal,
+                        self.contact_config,
+                    )
+                candidates = [candidate.to_dict() for candidate in fitted_candidates]
+                detection["contact_candidates"] = candidates
+                detection["surface_model"] = self.surface_tracker.status(track_id)
+                if candidates:
+                    detection["target_contact_goal_m"] = candidates[0]["center_goal_m"]
             payload["objects"].append(
                 make_object(
-                    track_id=track_ids.get(index, f"{label}:untracked{index:04d}"),
+                    track_id=track_id,
                     label=str(label),
                     score=float(score),
                     box_xyxy=[float(value) for value in box],
@@ -285,8 +300,10 @@ class RemoteYolo11Worker(RemoteSam3Worker):
                     valid_depth_points=int(detection.get("valid_depth_points", 0)),
                     target_contact_goal_m=detection.get("target_contact_goal_m"),
                     contact_candidates=detection.get("contact_candidates"),
+                    surface_model=detection.get("surface_model"),
                 )
             )
+        self.surface_tracker.finish_frame(active_track_ids)
         return payload
 
 
@@ -350,6 +367,7 @@ def main(argv: list[str] | None = None) -> int:
     target_config = dict(config.get("ee_target", {}))
     tasc_config = dict(config.get("tasc_belief", {}))
     contact_config_data = dict(config.get("grip", {}))
+    contact_config_data.update(dict(tasc_config.get("grip", {})))
     contact_config_data["max_points"] = int(
         tasc_config.get(
             "object_max_points",

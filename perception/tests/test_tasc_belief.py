@@ -7,8 +7,11 @@ from seg_web_node.feature_cost import (
     robust_standardize,
 )
 from seg_web_node.grip_candidates import (
+    CylinderSurfaceConfig,
     GripCandidate,
     GripCandidateConfig,
+    PersistentCylinderSurfaceTracker,
+    fit_cylinder_surface,
     generate_grip_candidates,
     _merge_nearby_candidates,
 )
@@ -31,6 +34,27 @@ def box_points(center, size, n=9):
             grids[axis][...] = sign * 0.5 * size[axis]
             surfaces.append(np.stack(grids, axis=-1).reshape(-1, 3) + center)
     return np.concatenate(surfaces, axis=0)
+
+
+def cylinder_points(
+    center=np.array([0.4, 0.1, 0.2]),
+    radius=0.04,
+    height=0.20,
+    angles=48,
+    levels=20,
+):
+    center = np.asarray(center, dtype=np.float64)
+    theta = np.linspace(-0.75 * np.pi, 0.75 * np.pi, angles)
+    z = np.linspace(-0.5 * height, 0.5 * height, levels)
+    theta_grid, z_grid = np.meshgrid(theta, z, indexing="ij")
+    return np.stack(
+        [
+            center[0] + radius * np.cos(theta_grid),
+            center[1] + radius * np.sin(theta_grid),
+            center[2] + z_grid,
+        ],
+        axis=-1,
+    ).reshape(-1, 3)
 
 
 def test_huber_like_midpoint_convexity():
@@ -169,6 +193,82 @@ def test_grip_candidates_are_depth_surface_points_not_only_center():
     assert len(candidates) == 4
     assert all(np.min(np.linalg.norm(points - c.center, axis=1)) < 1.0e-9 for c in candidates)
     assert any(np.linalg.norm(c.center - center) > 0.02 for c in candidates)
+
+
+def test_robust_cylinder_fit_recovers_partial_surface_with_outliers():
+    rng = np.random.default_rng(12)
+    points = cylinder_points()
+    points += rng.normal(scale=0.0015, size=points.shape)
+    outliers = rng.uniform([0.30, 0.00, 0.08], [0.52, 0.20, 0.32], size=(80, 3))
+    model = fit_cylinder_surface(
+        np.concatenate([points, outliers]),
+        CylinderSurfaceConfig(min_points=100, min_angular_coverage=0.15),
+    )
+    assert model is not None
+    assert abs(model.radius - 0.04) < 0.008
+    assert abs(model.height - 0.20) < 0.025
+    assert abs(float(np.dot(model.axis, np.array([0.0, 0.0, 1.0])))) > 0.98
+    assert model.fit_rmse < 0.006
+
+
+def test_cylinder_tracker_retains_surface_during_short_occlusion():
+    config = GripCandidateConfig.from_dict(
+        {
+            "top_k": 4,
+            "surface_model": {
+                "min_points": 100,
+                "min_angular_coverage": 0.15,
+                "stale_ttl_frames": 2,
+                "max_candidates": 4,
+            },
+        }
+    )
+    tracker = PersistentCylinderSurfaceTracker(config)
+    first = tracker.update("bottle:track0000", "bottle", cylinder_points())
+    assert len(first) == 4
+    assert all(candidate.source == "cylinder_surface" for candidate in first)
+    first_centers = np.stack([candidate.center for candidate in first])
+
+    held = tracker.update(
+        "bottle:track0000", "bottle", np.empty((0, 3), dtype=np.float64)
+    )
+    assert len(held) == 4
+    np.testing.assert_allclose(
+        np.stack([candidate.center for candidate in held]), first_centers
+    )
+    assert tracker.status("bottle:track0000")["stale_frames"] == 1
+
+
+def test_tasc_uses_fitted_cylinder_surface_as_contact_domain():
+    belief = HierarchicalTascBelief(
+        {
+            "grip": {
+                "top_k": 4,
+                "surface_model": {
+                    "min_points": 100,
+                    "min_angular_coverage": 0.15,
+                    "max_candidates": 6,
+                },
+            }
+        }
+    )
+    telemetry = belief.update(
+        [
+            BeliefInputObject(
+                object_id="bottle:track0000",
+                label="bottle",
+                score=0.95,
+                center_goal_m=np.array([0.4, 0.1, 0.2]),
+                points_goal_m=cylinder_points(),
+            )
+        ],
+        eef_position_m=np.array([0.2, 0.1, 0.2]),
+    )
+    assert telemetry["target"] is not None
+    assert telemetry["objects"][0]["surface_model"]["type"] == "cylinder"
+    candidates = telemetry["objects"][0]["grip_candidates"]
+    assert len(candidates) == 6
+    assert all(candidate["source"] == "cylinder_surface" for candidate in candidates)
 
 
 

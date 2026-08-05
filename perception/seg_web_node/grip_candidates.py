@@ -2,12 +2,86 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
+from scipy.optimize import least_squares
 
 
 EPS = 1.0e-9
+
+
+@dataclass(frozen=True)
+class CylinderSurfaceConfig:
+    enabled: bool = True
+    labels: tuple[str, ...] = ("bottle", "can", "cup")
+    min_points: int = 120
+    min_radius_m: float = 0.015
+    max_radius_m: float = 0.12
+    min_height_m: float = 0.04
+    max_height_m: float = 0.50
+    inlier_threshold_m: float = 0.015
+    min_inlier_ratio: float = 0.45
+    min_angular_coverage: float = 0.20
+    max_fit_rmse_m: float = 0.015
+    max_center_shift_m: float = 0.15
+    update_alpha: float = 0.35
+    stale_ttl_frames: int = 15
+    sample_spacing_m: float = 0.025
+    max_candidates: int = 24
+    max_nfev: int = 80
+    prior_weight: float = 2.0
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "CylinderSurfaceConfig":
+        data = dict(data or {})
+        return cls(
+            enabled=bool(data.get("enabled", True)),
+            labels=tuple(str(v).strip().lower() for v in data.get("labels", cls.labels)),
+            min_points=int(data.get("min_points", 120)),
+            min_radius_m=float(data.get("min_radius_m", 0.015)),
+            max_radius_m=float(data.get("max_radius_m", 0.12)),
+            min_height_m=float(data.get("min_height_m", 0.04)),
+            max_height_m=float(data.get("max_height_m", 0.50)),
+            inlier_threshold_m=float(data.get("inlier_threshold_m", 0.015)),
+            min_inlier_ratio=float(data.get("min_inlier_ratio", 0.45)),
+            min_angular_coverage=float(data.get("min_angular_coverage", 0.20)),
+            max_fit_rmse_m=float(data.get("max_fit_rmse_m", 0.015)),
+            max_center_shift_m=float(data.get("max_center_shift_m", 0.15)),
+            update_alpha=float(data.get("update_alpha", 0.35)),
+            stale_ttl_frames=int(data.get("stale_ttl_frames", 15)),
+            sample_spacing_m=float(data.get("sample_spacing_m", 0.025)),
+            max_candidates=int(data.get("max_candidates", 24)),
+            max_nfev=int(data.get("max_nfev", 80)),
+            prior_weight=float(data.get("prior_weight", 2.0)),
+        )
+
+
+@dataclass
+class CylinderSurfaceModel:
+    center: np.ndarray
+    axis: np.ndarray
+    radius: float
+    height: float
+    fit_rmse: float
+    inlier_ratio: float
+    angular_coverage: float
+    updates: int = 1
+    stale_frames: int = 0
+
+    def to_dict(self) -> dict:
+        return {
+            "type": "cylinder",
+            "center_goal_m": np.asarray(self.center, dtype=np.float64).tolist(),
+            "axis_goal": np.asarray(self.axis, dtype=np.float64).tolist(),
+            "radius_m": float(self.radius),
+            "height_m": float(self.height),
+            "fit_rmse_m": float(self.fit_rmse),
+            "inlier_ratio": float(self.inlier_ratio),
+            "angular_coverage": float(self.angular_coverage),
+            "updates": int(self.updates),
+            "stale_frames": int(self.stale_frames),
+        }
 
 
 @dataclass(frozen=True)
@@ -36,6 +110,7 @@ class GripCandidateConfig:
     max_points: int = 8000
     table_normal: tuple[float, float, float] = (0.0, 0.0, 1.0)
     merge_distance_m: float = 0.03
+    surface: CylinderSurfaceConfig = field(default_factory=CylinderSurfaceConfig)
 
     @classmethod
     def from_dict(cls, data: dict | None) -> "GripCandidateConfig":
@@ -47,6 +122,7 @@ class GripCandidateConfig:
             max_points=int(data.get("max_points", data.get("object_max_points", 8000))),
             table_normal=tuple(float(v) for v in data.get("table_normal", [0, 0, 1])),
             merge_distance_m=float(data.get("merge_distance_m", 0.03)),
+            surface=CylinderSurfaceConfig.from_dict(data.get("surface_model")),
         )
 
 
@@ -100,6 +176,306 @@ def _farthest_points(points: np.ndarray, seed: np.ndarray, count: int) -> list[n
         output.append(candidate)
         min_dist = np.minimum(min_dist, np.linalg.norm(points - candidate, axis=1))
     return output
+
+
+def _axis_from_angles(azimuth: float, elevation: float) -> np.ndarray:
+    cos_elevation = np.cos(elevation)
+    return np.asarray(
+        [
+            cos_elevation * np.cos(azimuth),
+            cos_elevation * np.sin(azimuth),
+            np.sin(elevation),
+        ],
+        dtype=np.float64,
+    )
+
+
+def _axis_angles(axis: np.ndarray) -> tuple[float, float]:
+    unit_axis = _unit(axis, np.array([0.0, 0.0, 1.0]))
+    return (
+        float(np.arctan2(unit_axis[1], unit_axis[0])),
+        float(np.arctan2(unit_axis[2], np.linalg.norm(unit_axis[:2]))),
+    )
+
+
+def _radial_basis(axis: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    unit_axis = _unit(axis, np.array([0.0, 0.0, 1.0]))
+    reference = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    if abs(float(np.dot(unit_axis, reference))) > 0.90:
+        reference = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    first = _unit(np.cross(unit_axis, reference), np.array([0.0, 1.0, 0.0]))
+    second = _unit(np.cross(unit_axis, first), np.array([1.0, 0.0, 0.0]))
+    return first, second
+
+
+def _cylinder_geometry(
+    points: np.ndarray,
+    center: np.ndarray,
+    axis: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    delta = points - np.asarray(center, dtype=np.float64).reshape(3)
+    axial = delta @ np.asarray(axis, dtype=np.float64).reshape(3)
+    radial_vectors = delta - axial[:, None] * axis[None, :]
+    radial_distance = np.linalg.norm(radial_vectors, axis=1)
+    return axial, radial_vectors, radial_distance
+
+
+def fit_cylinder_surface(
+    points_goal: np.ndarray,
+    config: CylinderSurfaceConfig,
+    previous: CylinderSurfaceModel | None = None,
+) -> CylinderSurfaceModel | None:
+    """Fit a finite cylinder with robust nonlinear least squares.
+
+    The residual is the radial point-to-cylinder distance used by PCL's
+    cylinder model.  The previous fit is a weak temporal prior and the fitted
+    finite extent is recovered robustly from axial inlier quantiles.
+    """
+    points = _finite_points(points_goal, max(4 * config.min_points, 2000))
+    if points.shape[0] < config.min_points:
+        return None
+
+    median = np.median(points, axis=0)
+    demeaned = points - median
+    covariance = np.cov(demeaned.T)
+    if covariance.shape != (3, 3) or not np.isfinite(covariance).all():
+        return None
+    values, vectors = np.linalg.eigh(covariance)
+    pca_axis = _unit(vectors[:, int(np.argmax(values))], np.array([0.0, 0.0, 1.0]))
+    reference_axis = previous.axis if previous is not None else np.array([0.0, 0.0, 1.0])
+    if float(np.dot(pca_axis, reference_axis)) < 0.0:
+        pca_axis = -pca_axis
+    initial_axis = previous.axis.copy() if previous is not None else pca_axis
+    initial_center = previous.center.copy() if previous is not None else median
+
+    basis_u, basis_v = _radial_basis(initial_axis)
+    projections_u = demeaned @ basis_u
+    projections_v = demeaned @ basis_v
+    extent_radius = 0.25 * (
+        np.ptp(np.quantile(projections_u, [0.02, 0.98]))
+        + np.ptp(np.quantile(projections_v, [0.02, 0.98]))
+    )
+    initial_radius = previous.radius if previous is not None else extent_radius
+    initial_radius = float(
+        np.clip(initial_radius, config.min_radius_m, config.max_radius_m)
+    )
+    initial_azimuth, initial_elevation = _axis_angles(initial_axis)
+    x0 = np.asarray(
+        [*initial_center, initial_azimuth, initial_elevation, initial_radius],
+        dtype=np.float64,
+    )
+    center_bound = max(config.max_center_shift_m, 1.0e-3)
+    lower = np.asarray(
+        [
+            *(median - center_bound),
+            -np.pi,
+            -0.5 * np.pi + 1.0e-4,
+            config.min_radius_m,
+        ]
+    )
+    upper = np.asarray(
+        [
+            *(median + center_bound),
+            np.pi,
+            0.5 * np.pi - 1.0e-4,
+            config.max_radius_m,
+        ]
+    )
+    x0 = np.clip(x0, lower + 1.0e-8, upper - 1.0e-8)
+    prior_scale = np.sqrt(max(0.0, config.prior_weight))
+
+    def residual(parameters: np.ndarray) -> np.ndarray:
+        center = parameters[:3]
+        axis = _axis_from_angles(parameters[3], parameters[4])
+        _axial, _radial_vectors, radial_distance = _cylinder_geometry(
+            points, center, axis
+        )
+        values_out = [radial_distance - parameters[5]]
+        if previous is not None and prior_scale > 0.0:
+            values_out.extend(
+                [
+                    prior_scale * (center - previous.center),
+                    0.05 * prior_scale * (axis - previous.axis),
+                    prior_scale * np.asarray([parameters[5] - previous.radius]),
+                ]
+            )
+        return np.concatenate(values_out)
+
+    try:
+        result = least_squares(
+            residual,
+            x0,
+            bounds=(lower, upper),
+            method="trf",
+            loss="soft_l1",
+            f_scale=max(1.0e-4, config.inlier_threshold_m),
+            max_nfev=max(10, config.max_nfev),
+        )
+    except (ValueError, FloatingPointError):
+        return None
+    if not result.success or not np.isfinite(result.x).all():
+        return None
+
+    axis_point = result.x[:3]
+    axis = _axis_from_angles(result.x[3], result.x[4])
+    if float(np.dot(axis, reference_axis)) < 0.0:
+        axis = -axis
+    radius = float(result.x[5])
+    axial, radial_vectors, radial_distance = _cylinder_geometry(points, axis_point, axis)
+    radial_residual = radial_distance - radius
+    inlier = np.abs(radial_residual) <= config.inlier_threshold_m
+    if int(inlier.sum()) < config.min_points:
+        return None
+    inlier_ratio = float(np.mean(inlier))
+    fit_rmse = float(np.sqrt(np.mean(np.square(radial_residual[inlier]))))
+
+    axial_low, axial_high = np.quantile(axial[inlier], [0.02, 0.98])
+    height = float(axial_high - axial_low)
+    center = axis_point + 0.5 * float(axial_low + axial_high) * axis
+    basis_u, basis_v = _radial_basis(axis)
+    inlier_radial = radial_vectors[inlier]
+    angles = np.mod(
+        np.arctan2(inlier_radial @ basis_v, inlier_radial @ basis_u),
+        2.0 * np.pi,
+    )
+    occupied, _ = np.histogram(angles, bins=24, range=(0.0, 2.0 * np.pi))
+    angular_coverage = float(np.mean(occupied > 0))
+
+    if not (
+        config.min_radius_m <= radius <= config.max_radius_m
+        and config.min_height_m <= height <= config.max_height_m
+        and fit_rmse <= config.max_fit_rmse_m
+        and inlier_ratio >= config.min_inlier_ratio
+        and angular_coverage >= config.min_angular_coverage
+    ):
+        return None
+    return CylinderSurfaceModel(
+        center=center,
+        axis=axis,
+        radius=radius,
+        height=height,
+        fit_rmse=fit_rmse,
+        inlier_ratio=inlier_ratio,
+        angular_coverage=angular_coverage,
+    )
+
+
+def sample_cylinder_candidates(
+    model: CylinderSurfaceModel,
+    config: GripCandidateConfig,
+) -> list[GripCandidate]:
+    surface = config.surface
+    circumference_samples = max(
+        4,
+        int(np.ceil(2.0 * np.pi * model.radius / max(0.005, surface.sample_spacing_m))),
+    )
+    axial_count = max(
+        1,
+        int(
+            np.ceil(
+                0.5 * model.height / max(0.005, surface.sample_spacing_m)
+            )
+        ),
+    )
+    axial_positions = (
+        np.asarray([0.0])
+        if axial_count == 1
+        else np.linspace(-0.25 * model.height, 0.25 * model.height, axial_count)
+    )
+    basis_u, basis_v = _radial_basis(model.axis)
+    confidence = float(
+        np.clip(
+            model.inlier_ratio
+            * np.exp(-model.fit_rmse / max(EPS, surface.max_fit_rmse_m)),
+            0.0,
+            1.0,
+        )
+    )
+    candidates: list[GripCandidate] = []
+    for axial in axial_positions:
+        for angle_index in range(circumference_samples):
+            angle = 2.0 * np.pi * angle_index / circumference_samples
+            normal = np.cos(angle) * basis_u + np.sin(angle) * basis_v
+            center = model.center + float(axial) * model.axis + model.radius * normal
+            candidates.append(
+                GripCandidate(
+                    center=center,
+                    approach=-normal,
+                    width=2.0 * model.radius,
+                    geom_score=confidence * (1.0 - 0.25 * abs(float(axial)) / max(EPS, model.height)),
+                    source="cylinder_surface",
+                )
+            )
+    max_candidates = max(int(config.top_k), int(surface.max_candidates), 1)
+    if len(candidates) <= max_candidates:
+        return candidates
+    indices = np.linspace(0, len(candidates) - 1, max_candidates, dtype=np.int64)
+    return [candidates[int(index)] for index in indices]
+
+
+class PersistentCylinderSurfaceTracker:
+    """Maintain one temporally filtered finite-cylinder model per object ID."""
+
+    def __init__(self, config: GripCandidateConfig | None = None) -> None:
+        self.config = config or GripCandidateConfig()
+        self.models: dict[str, CylinderSurfaceModel] = {}
+
+    def _enabled_for_label(self, label: str) -> bool:
+        surface = self.config.surface
+        labels = set(surface.labels)
+        return surface.enabled and (not labels or str(label).strip().lower() in labels)
+
+    def update(
+        self,
+        object_id: str,
+        label: str,
+        points_goal: np.ndarray,
+    ) -> list[GripCandidate]:
+        if not self._enabled_for_label(label):
+            return []
+        previous = self.models.get(object_id)
+        fitted = fit_cylinder_surface(points_goal, self.config.surface, previous)
+        if fitted is not None:
+            if previous is not None:
+                alpha = float(np.clip(self.config.surface.update_alpha, 0.0, 1.0))
+                axis = fitted.axis.copy()
+                if float(np.dot(axis, previous.axis)) < 0.0:
+                    axis = -axis
+                filtered_axis = _unit(
+                    (1.0 - alpha) * previous.axis + alpha * axis,
+                    previous.axis,
+                )
+                fitted = CylinderSurfaceModel(
+                    center=(1.0 - alpha) * previous.center + alpha * fitted.center,
+                    axis=filtered_axis,
+                    radius=(1.0 - alpha) * previous.radius + alpha * fitted.radius,
+                    height=(1.0 - alpha) * previous.height + alpha * fitted.height,
+                    fit_rmse=fitted.fit_rmse,
+                    inlier_ratio=fitted.inlier_ratio,
+                    angular_coverage=fitted.angular_coverage,
+                    updates=previous.updates + 1,
+                    stale_frames=0,
+                )
+            self.models[object_id] = fitted
+        elif previous is not None:
+            previous.stale_frames += 1
+            if previous.stale_frames > self.config.surface.stale_ttl_frames:
+                del self.models[object_id]
+                return []
+        model = self.models.get(object_id)
+        return sample_cylinder_candidates(model, self.config) if model is not None else []
+
+    def finish_frame(self, active_object_ids: set[str]) -> None:
+        for object_id in list(self.models):
+            if object_id in active_object_ids:
+                continue
+            self.models[object_id].stale_frames += 1
+            if self.models[object_id].stale_frames > self.config.surface.stale_ttl_frames:
+                del self.models[object_id]
+
+    def status(self, object_id: str) -> dict | None:
+        model = self.models.get(object_id)
+        return None if model is None else model.to_dict()
 
 
 def _merge_candidate_cluster(cluster: list[GripCandidate]) -> GripCandidate:

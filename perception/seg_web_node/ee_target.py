@@ -12,6 +12,26 @@ import numpy as np
 import zmq
 
 
+PICO_WAIST_FRAME = "pico_head_position_waist"
+
+# G1 Q_READY FK at PATH's wrist-yaw + 5 cm EE frames.  Perception targets use
+# these neutral human wrist poses when no live PICO wrist stream is available.
+Q_READY_LEFT_EE_POSITION = np.array(
+    [0.24977428385080602, 0.1486521246660517, 0.09523008429534556],
+    dtype=np.float64,
+)
+Q_READY_RIGHT_EE_POSITION = np.array(
+    [0.24977428385080602, -0.1486421246660517, 0.09523008429534556],
+    dtype=np.float64,
+)
+
+
+def _neutral_wrist_transform(position: np.ndarray) -> list[float]:
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, 3] = np.asarray(position, dtype=np.float64).reshape(3)
+    return transform.reshape(-1).tolist()
+
+
 @dataclass(frozen=True)
 class Workspace:
     x: tuple[float, float] = (-0.15, 0.45)
@@ -78,7 +98,18 @@ def make_goal_payload(
         "position": point.tolist(),
         "quaternion": (quat / norm).tolist(),
         "source": "sam3_segment_center",
-        "coordinate_frame": "pelvis_identity_fk",
+        "coordinate_frame": PICO_WAIST_FRAME,
+        "target_position_frame": PICO_WAIST_FRAME,
+        "human_wrist_frame": PICO_WAIST_FRAME,
+        "human_left_wrist_transform": _neutral_wrist_transform(
+            Q_READY_LEFT_EE_POSITION
+        ),
+        "human_right_wrist_transform": _neutral_wrist_transform(
+            Q_READY_RIGHT_EE_POSITION
+        ),
+        "human_left_wrist_position": Q_READY_LEFT_EE_POSITION.tolist(),
+        "human_right_wrist_position": Q_READY_RIGHT_EE_POSITION.tolist(),
+        "target_valid": True,
         "duration_sec": float(duration_sec),
         "final_hold_sec": float(final_hold_sec),
     }

@@ -30,7 +30,7 @@ from seg_web_node.lcm_protocol import (
     decode_robot_state,
 )
 from seg_web_node.rgbd_sync import RgbdPair, RgbdSynchronizer, depth_at_rgb_size
-from seg_web_node.robot_geometry import RobotStateBuffer, pelvis_to_torso
+from seg_web_node.robot_geometry import RobotStateBuffer, camera_goal_transform
 from seg_web_node.sam3_backend import TensorRTSam3Backend, TorchSam3Backend
 from seg_web_node.visualization import render_segmented_rgbd
 
@@ -384,14 +384,13 @@ class RemoteSam3Worker:
         )
 
     def _goal_transform(self, timestamp_us: int) -> np.ndarray | None:
-        if self.t_torso_cam is None:
-            return None
-        match = self.state_buffer.nearest(timestamp_us, self.robot_state_max_delta_ms)
-        if match is None:
-            return None
-        state, _delta_ms = match
-        t_pelvis_torso, _metadata = pelvis_to_torso(state, self.torso_estimator)
-        return t_pelvis_torso @ self.t_torso_cam
+        return camera_goal_transform(
+            self.t_torso_cam,
+            self.torso_estimator,
+            self.state_buffer,
+            timestamp_us,
+            self.robot_state_max_delta_ms,
+        )
 
     def _build_result(
         self,

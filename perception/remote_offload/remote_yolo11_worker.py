@@ -21,6 +21,7 @@ from seg_web_node.grip_candidates import (
     PersistentCylinderSurfaceTracker,
     generate_grip_candidates,
 )
+from seg_web_node.geometry_fallback import LastValidGeometryFallback
 from seg_web_node.rgbd_sync import RgbdPair
 from seg_web_node.object_point_filter import (
     ObjectPointFilterConfig,
@@ -79,6 +80,21 @@ class RemoteYolo11Worker(RemoteSam3Worker):
         self.contact_candidates_enabled = bool(contact_candidates)
         self.contact_config = contact_config
         self.surface_tracker = PersistentCylinderSurfaceTracker(contact_config)
+        track_options = dict(self.yolo_options.get("track", {}))
+        fallback_ttl = int(
+            track_options.get(
+                "geometry_fallback_ttl_frames",
+                track_options.get("missing_ttl_frames", 6),
+            )
+        )
+        self.geometry_fallback = LastValidGeometryFallback(
+            fallback_ttl,
+            float(track_options.get("geometry_fallback_score_decay", 0.97)),
+        )
+        self.tracker.missing_ttl_frames = max(
+            int(self.tracker.missing_ttl_frames),
+            fallback_ttl,
+        )
 
     def _backend_display_name(self) -> str:
         return "YOLO11"
@@ -245,12 +261,13 @@ class RemoteYolo11Worker(RemoteSam3Worker):
 
         track_ids = self.tracker.assign(detections)
         active_track_ids: set[str] = set()
+        wire_objects: list[dict[str, Any]] = []
         for index, (mask, box, score, label) in enumerate(zip(masks, boxes, scores, labels)):
             detection = detections[index]
             track_id = track_ids.get(index, f"{label}:untracked{index:04d}")
-            active_track_ids.add(track_id)
             points_goal = detection.pop("_points_goal_m", None)
             if self.contact_candidates_enabled and points_goal is not None:
+                active_track_ids.add(track_id)
                 fitted_candidates = self.surface_tracker.update(
                     track_id,
                     str(label),
@@ -282,8 +299,14 @@ class RemoteYolo11Worker(RemoteSam3Worker):
                 surface_model=detection.get("surface_model"),
             )
             wire_object["point_filter"] = detection.get("point_filter")
-            payload["objects"].append(wire_object)
+            wire_objects.append(wire_object)
         self.surface_tracker.finish_frame(active_track_ids)
+        payload["objects"] = self.geometry_fallback.complete_frame(
+            wire_objects,
+            self.surface_tracker,
+            image_width=pair.rgb.width,
+            image_height=pair.rgb.height,
+        )
         return payload
 
 

@@ -249,6 +249,8 @@ class RemoteWebRuntime:
                     "contact_candidates": obj.get("contact_candidates", []),
                     "surface_model": obj.get("surface_model"),
                     "point_filter": obj.get("point_filter"),
+                    "geometry_fallback": obj.get("geometry_fallback", False),
+                    "missing_frames": obj.get("missing_frames", 0),
                 }
             )
         if masks:

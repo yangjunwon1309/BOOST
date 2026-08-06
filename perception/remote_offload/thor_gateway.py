@@ -814,6 +814,8 @@ class ThorRemoteGateway:
             "track_id": selected.get("track_id", object_id),
             "label": label,
             "score": float(selected.get("score", 0.0)),
+            "geometry_fallback": bool(selected.get("geometry_fallback", False)),
+            "missing_frames": int(selected.get("missing_frames", 0)),
             "center_camera_m": selected.get("center_camera_m"),
             "center_goal_m": selected.get("center_goal_m"),
             "target_contact_goal_m": position.tolist(),
@@ -943,6 +945,8 @@ class ThorRemoteGateway:
             "target_contact_goal_m": obj.get("target_contact_goal_m"),
             "selected_position_field": selection.position_field,
             "valid_depth_points": obj.get("valid_depth_points"),
+            "geometry_fallback": bool(obj.get("geometry_fallback", False)),
+            "missing_frames": int(obj.get("missing_frames", 0)),
             "streaming_goal": True,
         }
         payload_out = make_goal_payload(

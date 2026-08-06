@@ -227,3 +227,26 @@ def pelvis_to_torso(state: RobotState, mode: str = "dual_imu", max_disagreement_
         "max_waist_speed_rad_s": float(np.max(np.abs(state.dq[12:15]))),
     }
     return result, metadata
+
+
+def camera_goal_transform(
+    t_torso_cam: np.ndarray | None,
+    torso_estimator: str,
+    state_buffer: RobotStateBuffer,
+    timestamp_us: int,
+    max_delta_ms: float,
+) -> np.ndarray | None:
+    """Resolve T_goal_camera, avoiding an unnecessary state gate in identity mode."""
+    if t_torso_cam is None:
+        return None
+    camera = np.asarray(t_torso_cam, dtype=np.float64)
+    if camera.shape != (4, 4):
+        raise ValueError("T_torso_camera must be 4x4")
+    if torso_estimator == "identity":
+        return camera.copy()
+    match = state_buffer.nearest(timestamp_us, max_delta_ms)
+    if match is None:
+        return None
+    state, _delta_ms = match
+    t_pelvis_torso, _metadata = pelvis_to_torso(state, torso_estimator)
+    return t_pelvis_torso @ camera

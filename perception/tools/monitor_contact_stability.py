@@ -101,6 +101,8 @@ def _csv_row(sample: dict[str, Any]) -> dict[str, Any]:
         "height_m": sample["height_m"],
         "surface_updates": sample["surface_updates"],
         "surface_stale_frames": sample["surface_stale_frames"],
+        "geometry_fallback": sample["geometry_fallback"],
+        "missing_frames": sample["missing_frames"],
     }
     for prefix in ("center", "contact", "axis"):
         value = sample.get(prefix)
@@ -193,7 +195,8 @@ def main() -> int:
             f"fit_rmse={_format_metric(_median(window, 'fit_rmse_m', 1000.0), 'mm')} "
             f"axis_rms={_format_metric(_axis_jitter_deg(window), 'deg')} "
             f"radius={_format_metric(_median(window, 'radius_m', 1000.0), 'mm')} "
-            f"stale={latest['surface_stale_frames']}",
+            f"stale={latest['surface_stale_frames']} "
+            f"fallback={int(latest['geometry_fallback'])}/{latest['missing_frames']}",
             flush=True,
         )
 
@@ -260,6 +263,8 @@ def main() -> int:
             "height_m": surface.get("height_m"),
             "surface_updates": surface.get("updates"),
             "surface_stale_frames": int(surface.get("stale_frames", -1)),
+            "geometry_fallback": bool(selected.get("geometry_fallback", False)),
+            "missing_frames": int(selected.get("missing_frames", 0)),
             "point_filter": point_filter,
         }
         samples.append(sample)

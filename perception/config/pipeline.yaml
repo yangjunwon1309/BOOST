@@ -97,10 +97,13 @@ segmentation:
     excluded_classes: [person]
     track:
       # Retained internally only for a later IoU re-association. Missing
-      # tracks are never rendered or passed into belief/3-D geometry.
+      # detector frames republish the last verified 3-D cylinder/contact for a
+      # short bounded interval; no new geometry is inferred during the hold.
       missing_ttl_frames: 6
       fallback_score_decay: 0.985
       match_iou: 0.15
+      geometry_fallback_ttl_frames: 6
+      geometry_fallback_score_decay: 0.97
 cloud:
   workspace_lims: [-1.0, 1.0, -1.0, 1.0, 0.1, 1.5]
   voxel_size_m: 0.005

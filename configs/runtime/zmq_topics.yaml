@@ -20,14 +20,6 @@ path_qp_reference:
   bind: "tcp://*:5560"
   connect: "tcp://127.0.0.1:5560"
   topic: "path_qp_reference"
-curobo_plan:
-  bind: "tcp://*:5562"
-  connect: "tcp://127.0.0.1:5562"
-  topic: "curobo_plan"
-path_goal:
-  bind: "tcp://*:5561"
-  connect: "tcp://127.0.0.1:5561"
-  topic: "path_goal"
 path_state_command:
   bind: "tcp://*:5563"
   connect: "tcp://127.0.0.1:5563"

@@ -11,7 +11,7 @@ states:
     gripper: closed
   auto_planning:
     sonic_input: upper_joint_root_cmd
-    qp_reference: curobo_bspline
+    arm_target: shared_control_ipopt
     gripper: open_then_close
   damped_return:
     sonic_input: upper_joint_root_cmd

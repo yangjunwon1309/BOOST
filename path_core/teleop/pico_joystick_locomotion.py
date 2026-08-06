@@ -17,9 +17,9 @@ SONIC_DEFAULT_STANDING_HEIGHT = -1.0
 @dataclass(frozen=True)
 class PicoJoystickLocomotionConfig:
     deadzone: float = 0.18
-    forward_max_mps: float = 0.30
-    backward_max_mps: float = 0.15
-    lateral_max_mps: float = 0.18
+    forward_max_mps: float = 0.33
+    backward_max_mps: float = 0.165
+    lateral_max_mps: float = 0.198
     minimum_nonzero_speed_mps: float = 0.08
     maximum_yaw_rate_rad_s: float = 0.30
     linear_acceleration_limit_mps2: float = 0.35
@@ -58,7 +58,7 @@ def yaw_from_quaternion_wxyz(quaternion: Sequence[float]) -> float:
 
 
 class PicoButtonGestureInterpreter:
-    """Resolve individual X/Y releases without colliding with controller chords."""
+    """Resolve controller mode chords and explicit shared-control hand selection."""
 
     def __init__(self) -> None:
         self.previous = (False, False, False, False)
@@ -87,6 +87,13 @@ class PicoButtonGestureInterpreter:
             self.y_chorded = True
 
         events: list[str] = []
+        # A and B choose the arm that may receive a vision/shared-control
+        # Cartesian blend.  Only emit for an unchorded press so the existing
+        # A+X, B+Y, and A+B+X+Y gestures keep their original meaning.
+        if a and not pa and not (b or x or y):
+            events.append("select_left")
+        if b and not pb and not (a or x or y):
+            events.append("select_right")
         start_now = a and b and x and y
         start_previous = pa and pb and px and py
         ax_now = a and x

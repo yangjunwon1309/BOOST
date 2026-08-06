@@ -47,6 +47,17 @@ class PicoButtonGestureInterpreterTest(unittest.TestCase):
         self.assertNotIn("mode_q", events)
         self.assertNotIn("mode_e", events)
 
+    def test_a_and_b_select_shared_control_hands_only_when_unchorded(self) -> None:
+        gestures = PicoButtonGestureInterpreter()
+        self.assertIn("select_left", gestures.update((True, False, False, False)))
+        gestures.update((False, False, False, False))
+        self.assertIn("select_right", gestures.update((False, True, False, False)))
+
+        gestures = PicoButtonGestureInterpreter()
+        events = gestures.update((True, False, True, False))
+        self.assertIn("ax", events)
+        self.assertNotIn("select_left", events)
+
 
 class PicoJoystickLocomotionMapperTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -72,17 +83,17 @@ class PicoJoystickLocomotionMapperTest(unittest.TestCase):
     def test_forward_reverse_and_lateral_caps(self) -> None:
         forward = self.settle((0.0, 1.0))
         self.assertEqual(forward.mode, LOCOMOTION_MODE_SLOW_WALK)
-        self.assertAlmostEqual(forward.speed, 0.30, places=6)
+        self.assertAlmostEqual(forward.speed, 0.33, places=6)
         np.testing.assert_allclose(forward.movement, [1.0, 0.0, 0.0], atol=1e-6)
 
         self.mapper.reset(0.0)
         reverse = self.settle((0.0, -1.0))
-        self.assertAlmostEqual(reverse.speed, 0.15, places=6)
+        self.assertAlmostEqual(reverse.speed, 0.165, places=6)
         np.testing.assert_allclose(reverse.movement, [-1.0, 0.0, 0.0], atol=1e-6)
 
         self.mapper.reset(0.0)
         right = self.settle((1.0, 0.0))
-        self.assertAlmostEqual(right.speed, 0.18, places=6)
+        self.assertAlmostEqual(right.speed, 0.198, places=6)
         np.testing.assert_allclose(right.movement, [0.0, -1.0, 0.0], atol=1e-6)
 
     def test_linear_acceleration_limit(self) -> None:

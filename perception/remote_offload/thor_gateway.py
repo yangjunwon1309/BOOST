@@ -62,6 +62,12 @@ DEFAULT_EE_TARGET_TOPIC = os.environ.get(
     "PATH_EE_TARGET_TOPIC",
     os.environ.get("PATH_STATIC_TARGET_TOPIC", "path_static_ee_target"),
 )
+DEFAULT_SHARED_HAND_SELECTION_ENDPOINT = os.environ.get(
+    "PATH_SHARED_HAND_SELECTION_ENDPOINT", "tcp://127.0.0.1:5567"
+)
+DEFAULT_SHARED_HAND_SELECTION_TOPIC = os.environ.get(
+    "PATH_SHARED_HAND_SELECTION_TOPIC", "path_shared_control_hand"
+)
 
 
 def _topic_msgpack_unpack(raw: bytes, topic: str) -> dict[str, Any]:
@@ -346,6 +352,8 @@ class ThorRemoteGateway:
         belief_enabled: bool,
         belief_config: dict[str, Any],
         belief_ee_offset_m: float,
+        shared_hand_selection_endpoint: str,
+        shared_hand_selection_topic: str,
     ) -> None:
         if g1_lcm_url == wifi_lcm_url:
             raise ValueError("G1 and Wi-Fi LCM URLs must be distinct")
@@ -369,8 +377,19 @@ class ThorRemoteGateway:
         self.belief_enabled = bool(belief_enabled)
         self.tasc_belief = HierarchicalTascBelief(belief_config)
         self.belief_ee_offset_m = float(belief_ee_offset_m)
-        self.belief_last_eef_position: np.ndarray | None = None
-        self.belief_last_eef_timestamp_us: int | None = None
+        self.belief_last_eef_by_hand: dict[str, tuple[np.ndarray, int]] = {}
+        self.shared_hand_selection_endpoint = str(shared_hand_selection_endpoint)
+        self.shared_hand_selection_topic = str(shared_hand_selection_topic)
+        self.shared_hand_selection_socket = zmq.Context.instance().socket(zmq.SUB)
+        self.shared_hand_selection_socket.setsockopt(zmq.LINGER, 0)
+        self.shared_hand_selection_socket.setsockopt(zmq.CONFLATE, 1)
+        self.shared_hand_selection_socket.setsockopt_string(
+            zmq.SUBSCRIBE, self.shared_hand_selection_topic
+        )
+        self.shared_hand_selection_socket.connect(self.shared_hand_selection_endpoint)
+        self.belief_selected_hand = "none"
+        self.belief_selection_active = False
+        self.belief_selection_timestamp_us = 0
         self.ee_target_pub = (
             ZmqEeTargetPublisher(endpoint=ee_target_endpoint, topic=ee_target_topic)
             if self.ee_target_enabled
@@ -420,6 +439,9 @@ class ThorRemoteGateway:
             "belief_targets": 0,
             "belief_fallback_targets": 0,
             "last_belief": self.tasc_belief.last_telemetry,
+            "belief_selected_hand": "none",
+            "belief_selection_active": False,
+            "belief_selection_messages": 0,
             "sim_robot_state": 0,
             "sim_robot_state_errors": 0,
             "last_sim_robot_state": None,
@@ -460,6 +482,7 @@ class ThorRemoteGateway:
             self.ee_target_pub.close()
         if self.sim_state_socket is not None:
             self.sim_state_socket.close(0)
+        self.shared_hand_selection_socket.close(0)
 
     def _record_error(self, error: Exception | str) -> None:
         with self.lock:
@@ -721,29 +744,68 @@ class ThorRemoteGateway:
             )
         return inputs
 
+    def _drain_shared_hand_selection(self) -> None:
+        while True:
+            try:
+                raw = self.shared_hand_selection_socket.recv(zmq.NOBLOCK)
+            except zmq.Again:
+                return
+            try:
+                payload = _topic_msgpack_unpack(raw, self.shared_hand_selection_topic)
+                hand = str(payload.get("selected_hand", "none")).lower()
+                if hand not in {"left", "right", "none"}:
+                    continue
+                active = bool(payload.get("active", False)) and hand != "none"
+                timestamp_us = int(payload.get("timestamp_us", 0) or 0)
+                next_hand = hand if active else "none"
+                if next_hand != self.belief_selected_hand:
+                    # A_delta compares consecutive motion directions.  It must
+                    # never compare a left-arm sample to a right-arm sample.
+                    self.tasc_belief.feature_cost.previous_direction = None
+                self.belief_selected_hand = next_hand
+                self.belief_selection_active = active
+                self.belief_selection_timestamp_us = timestamp_us
+                with self.lock:
+                    self.stats["belief_selected_hand"] = self.belief_selected_hand
+                    self.stats["belief_selection_active"] = active
+                    self.stats["belief_selection_messages"] = int(
+                        self.stats.get("belief_selection_messages", 0)
+                    ) + 1
+            except Exception as error:
+                with self.lock:
+                    self.stats["last_belief_selection_error"] = str(error)
+
+    def _belief_target_link(self) -> str:
+        if self.belief_selection_active and self.belief_selected_hand in {"left", "right"}:
+            return f"{self.belief_selected_hand}_wrist_yaw_link"
+        return self.ee_target_link
+
     def _belief_state_features(
         self,
         record: ForwardedPairRecord | None,
     ) -> tuple[np.ndarray | None, np.ndarray | None]:
-        if record is None or record.robot_state is None:
+        if (
+            record is None
+            or record.robot_state is None
+            or self.belief_selected_hand not in {"left", "right"}
+        ):
             return None, None
         try:
             state = decode_robot_state(record.robot_state)
+            hand = self.belief_selected_hand
             position = g1_wrist_ee_position(
                 state.q,
-                self.ee_target_link,
+                f"{hand}_wrist_yaw_link",
                 self.belief_ee_offset_m,
             )
             velocity = None
-            if (
-                self.belief_last_eef_position is not None
-                and self.belief_last_eef_timestamp_us is not None
-            ):
-                dt = (state.timestamp_us - self.belief_last_eef_timestamp_us) / 1.0e6
+            previous = self.belief_last_eef_by_hand.get(hand)
+            if previous is not None:
+                previous_position, previous_timestamp_us = previous
+                dt = (state.timestamp_us - previous_timestamp_us) / 1.0e6
                 if 1.0e-4 <= dt <= 0.5:
-                    velocity = (position - self.belief_last_eef_position) / dt
-            self.belief_last_eef_position = position.copy()
-            self.belief_last_eef_timestamp_us = int(state.timestamp_us)
+                    velocity = (position - previous_position) / dt
+            self.belief_last_eef_by_hand[hand] = (position.copy(), int(state.timestamp_us))
             return position, velocity
         except Exception as error:
             with self.lock:
@@ -757,12 +819,34 @@ class ThorRemoteGateway:
     ) -> tuple[np.ndarray, dict[str, Any], str] | None:
         if not self.belief_enabled or not self.tasc_belief.config.enabled:
             return None
+        self._drain_shared_hand_selection()
+        if not self.belief_selection_active:
+            with self.lock:
+                self.stats["last_belief"] = {
+                    "enabled": True,
+                    "objects": [],
+                    "target": None,
+                    "reason": "waiting_for_A_or_B_hand_selection",
+                }
+            return None
         inputs = self._belief_inputs_from_result(payload)
         if not inputs:
             with self.lock:
                 self.stats["last_belief"] = {"enabled": True, "objects": [], "target": None}
             return None
         eef_position, eef_velocity = self._belief_state_features(record)
+        if eef_position is None:
+            with self.lock:
+                self.stats["last_belief"] = {
+                    "enabled": True,
+                    "objects": [],
+                    "target": None,
+                    "reason": "selected_hand_robot_state_unavailable",
+                    "selected_hand": self.belief_selected_hand,
+                }
+            return None
+        ray_origin = _finite_vec3(payload.get("camera_goal_origin_m"))
+        ray_direction = _finite_vec3(payload.get("camera_goal_forward_m"))
         controller_xyzw = np.asarray(
             [
                 self.ee_target_quaternion_wxyz[1],
@@ -776,9 +860,14 @@ class ThorRemoteGateway:
             inputs,
             eef_position_m=eef_position,
             user_translation_mps=eef_velocity,
-            ray_origin_m=None,
-            ray_direction=None,
+            ray_origin_m=ray_origin,
+            ray_direction=ray_direction,
             controller_orientation_xyzw=controller_xyzw,
+        )
+        telemetry["selected_hand"] = self.belief_selected_hand
+        telemetry["eef_target_link"] = self._belief_target_link()
+        telemetry["ray_source"] = (
+            "camera_optical_center" if ray_origin is not None and ray_direction is not None else "unavailable"
         )
         if self.tasc_belief.should_log():
             LOG.info(self.tasc_belief.format_log_line())
@@ -826,12 +915,16 @@ class ThorRemoteGateway:
             "streaming_goal": True,
             "target_valid": True,
             "belief_selected": True,
+            "belief_selected_hand": self.belief_selected_hand,
+            "belief_ee_target_link": self._belief_target_link(),
+            "belief_ray_origin_m": ray_origin.tolist() if ray_origin is not None else None,
+            "belief_ray_direction": ray_direction.tolist() if ray_direction is not None else None,
         }
         output = {
             "position": position,
             "metadata": metadata,
             "source": "remote_tasc_belief",
-            "goal_uid": f"remote_belief:{self.ee_target_link}:{object_id or label}",
+            "goal_uid": f"remote_belief:{self._belief_target_link()}:{object_id or label}",
             "confidence": float(target.get("object_confidence", 1.0)),
             "object_confidence": float(target.get("object_confidence", 1.0)),
             "joint_confidence": float(target.get("joint_confidence", 1.0)),
@@ -858,12 +951,14 @@ class ThorRemoteGateway:
                 }
             return
         belief_selection = self._belief_selection_from_result(payload, record)
+        target_link = self._belief_target_link()
+        target_side = _side_from_link(target_link)
         if belief_selection is not None:
             position, selected_output, selected_position_field = belief_selection
             payload_out = make_goal_payload(
                 position,
-                side=self.ee_target_side,
-                target_link=self.ee_target_link,
+                side=target_side,
+                target_link=target_link,
                 quaternion=self.ee_target_quaternion_wxyz,
                 duration_sec=self.ee_target_duration_sec,
                 final_hold_sec=self.ee_target_final_hold_sec,
@@ -899,7 +994,7 @@ class ThorRemoteGateway:
                     "label": selected_output["label"],
                     "score": selected_output["confidence"],
                     "joint_confidence": selected_output["joint_confidence"],
-                    "target_link": self.ee_target_link,
+                    "target_link": target_link,
                     "position": np.round(position, 4).tolist(),
                     "position_field": selected_position_field,
                 }
@@ -951,8 +1046,8 @@ class ThorRemoteGateway:
         }
         payload_out = make_goal_payload(
             selection.position,
-            side=self.ee_target_side,
-            target_link=self.ee_target_link,
+            side=target_side,
+            target_link=target_link,
             quaternion=self.ee_target_quaternion_wxyz,
             duration_sec=self.ee_target_duration_sec,
             final_hold_sec=self.ee_target_final_hold_sec,
@@ -990,7 +1085,7 @@ class ThorRemoteGateway:
                 "sequence": payload.get("sequence"),
                 "label": label,
                 "score": score,
-                "target_link": self.ee_target_link,
+                "target_link": target_link,
                 "position": np.round(selection.position, 4).tolist(),
                 "position_field": selection.position_field,
             }
@@ -1234,6 +1329,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "server before publishing EE targets."
         ),
     )
+    parser.add_argument(
+        "--shared-hand-selection-endpoint",
+        default=DEFAULT_SHARED_HAND_SELECTION_ENDPOINT,
+        help="ZMQ state-machine A/B hand-selection heartbeat endpoint.",
+    )
+    parser.add_argument(
+        "--shared-hand-selection-topic",
+        default=DEFAULT_SHARED_HAND_SELECTION_TOPIC,
+        help="ZMQ state-machine A/B hand-selection heartbeat topic.",
+    )
     parser.add_argument("--log-level", default="INFO")
     return parser
 
@@ -1274,6 +1379,8 @@ def main(argv: list[str] | None = None) -> int:
         belief_enabled=args.belief_inference,
         belief_config=belief_config,
         belief_ee_offset_m=float(belief_config.get("ee_offset_m", target_config.get("ee_offset_m", 0.05))),
+        shared_hand_selection_endpoint=args.shared_hand_selection_endpoint,
+        shared_hand_selection_topic=args.shared_hand_selection_topic,
     )
     gateway.start()
     if args.ee_target_publishing:

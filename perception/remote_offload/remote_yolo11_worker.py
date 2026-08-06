@@ -208,6 +208,16 @@ class RemoteYolo11Worker(RemoteSam3Worker):
             inference_ms=inference_ms,
         )
         t_goal_cam = self._goal_transform(pair.rgb.timestamp_us)
+        if t_goal_cam is not None:
+            # The optical +Z axis is the image-center ray in the common goal
+            # frame.  The Thor gateway uses it for the TASC ray feature.
+            payload["camera_goal_origin_m"] = (
+                np.asarray(t_goal_cam[:3, 3], dtype=np.float64).tolist()
+            )
+            payload["camera_goal_forward_m"] = (
+                np.asarray(t_goal_cam[:3, :3], dtype=np.float64)
+                @ np.array([0.0, 0.0, 1.0], dtype=np.float64)
+            ).tolist()
         depth_m = depth.astype(np.float32) * (pair.depth.depth_scale_um / 1_000_000.0)
 
         detections: list[dict[str, Any]] = []

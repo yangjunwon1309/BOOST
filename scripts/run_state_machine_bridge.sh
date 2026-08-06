@@ -16,13 +16,10 @@ python -u path_streaming/path_state_machine_bridge.py \
   --pico-hand-timeout-sec "${PATH_PICO_HAND_TIMEOUT_SEC:-0.35}" \
   --pico-body-gap-hold-ms "${PATH_PICO_BODY_GAP_HOLD_MS:-100}" \
   --arm-reference-mode head_position \
-  --phase-tracking-mode "${PATH_PHASE_TRACKING_MODE:-fixed_rate}" \
   --pico-endpoint "${PATH_PICO_INTERNAL_ENDPOINT:-tcp://127.0.0.1:5559}" \
   --pico-vr-endpoint "${PATH_PICO_VR_ENDPOINT:-tcp://127.0.0.1:5566}" \
   --button-endpoint "${PATH_PICO_BUTTON_ENDPOINT:-tcp://127.0.0.1:5565}" \
   --button-topic "${PATH_PICO_BUTTON_TOPIC:-pico_button_event}" \
-  --plan-endpoint "${PATH_PLAN_ENDPOINT:-tcp://127.0.0.1:5562}" \
-  --plan-topic "${PATH_PLAN_TOPIC:-curobo_plan}" \
   --static-target-bind "tcp://*:${PATH_STATIC_TARGET_PORT:-5564}" \
   --static-target-topic "${PATH_STATIC_TARGET_TOPIC:-path_static_ee_target}" \
   --static-target-timeout-sec "${PATH_STATIC_TARGET_TIMEOUT_SEC:-0.35}" \
@@ -34,7 +31,6 @@ python -u path_streaming/path_state_machine_bridge.py \
   --gravity-bias-max-deg "${PATH_GRAVITY_BIAS_MAX_DEG:-3.0}" \
   --gravity-accel-norm-tolerance "${PATH_GRAVITY_ACCEL_NORM_TOLERANCE:-0.50}" \
   --gravity-bias-gyro-gate-rad-s "${PATH_GRAVITY_BIAS_GYRO_GATE_RAD_S:-0.05}" \
-  --auto-planning-mode "${PATH_AUTO_PLANNING_MODE:-shared_control}" \
   --shared-rho1 "${PATH_SHARED_RHO1:-0.60}" \
   --shared-rho2 "${PATH_SHARED_RHO2:-0.90}" \
   --shared-alpha-rate-up "${PATH_SHARED_ALPHA_RATE_UP:-1.0}" \
@@ -52,6 +48,8 @@ python -u path_streaming/path_state_machine_bridge.py \
   --sonic-port "${PATH_SONIC_PORT:-5556}" \
   --qp-port "${PATH_REFERENCE_PORT:-5560}" \
   --qp-topic "${PATH_REFERENCE_TOPIC:-path_qp_reference}" \
+  --shared-hand-selection-bind "${PATH_SHARED_HAND_SELECTION_BIND:-tcp://*:${PATH_SHARED_HAND_SELECTION_PORT:-5567}}" \
+  --shared-hand-selection-topic "${PATH_SHARED_HAND_SELECTION_TOPIC:-path_shared_control_hand}" \
   --arm-nonlinear-ik-enabled \
   --arm-ik-urdf "${PATH_ARM_IK_URDF:-/home/url/00_workspace/xr_teleop/assets/g1/g1_body29_hand14.urdf}" \
   --arm-ik-model-dir "${PATH_ARM_IK_MODEL_DIR:-/home/url/00_workspace/xr_teleop/assets/g1}" \

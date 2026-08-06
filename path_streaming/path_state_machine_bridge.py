@@ -6,7 +6,6 @@ Other producers are subordinate inputs:
 
   Pico manager     -> tcp://127.0.0.1:5559/{pose,command,planner,manager_state}
   Pico buttons     -> tcp://127.0.0.1:5565/pico_button_event
-  cuRobo planner   -> tcp://127.0.0.1:5562/curobo_plan
   State command    -> tcp://*:5563/path_state_command
   SONIC policy     <- tcp://*:5556/{pose,command,planner,manager_state}
   EE-QP reference  <- tcp://*:5560/path_qp_reference
@@ -14,7 +13,11 @@ Other producers are subordinate inputs:
 State behavior:
   teleop/intention:
     Pass absolute PICO head-position-to-waist wrist poses directly to
-    CasADi/IPOPT. No anchor, gain, target hold, or SMPL wrist fallback exists.
+    CasADi/IPOPT while teleop_tracking is armed. A+X enters
+    teleop_wait_ready: IPOPT receives fixed FK(Q_READY) wrist SE(3) at 50 Hz,
+    PICO arm targets are ignored, and the last teleop root command is latched.
+    The next A+X requires measured Q_READY convergence before it resets the
+    joystick mapper and resumes live PICO targets.
   auto_planning:
     Blend the belief/object contact point with the same PICO controller
     wrist target. CasADi/IPOPT remains the sole owner of both arm commands.
@@ -33,7 +36,6 @@ from __future__ import annotations
 
 import argparse
 import atexit
-import copy
 from dataclasses import dataclass
 import json
 import os
@@ -64,12 +66,10 @@ from path_core.intention.action_blending import (
     explicit_orientation_wxyz,
 )
 from path_core.messaging.path_schema import (
-    CUROBO_PLAN_TOPIC,
     QP_REFERENCE_TOPIC,
     STATIC_EE_TARGET_TOPIC,
     ipopt_arm_sample_reference,
     now_us,
-    qp_bspline_reference,
     qp_cartesian_target_reference,
     qp_none_reference,
     qp_sample_reference,
@@ -110,6 +110,32 @@ STREAM_MODE_TRACKING = 7
 # G1 URDF zero pose: upper arms hang vertically from the shoulders while the
 # forearms point forward (+X), giving the requested geometric 90-degree elbow.
 Q_READY = np.zeros(29, dtype=np.float64)
+
+
+def copy_locomotion_command(
+    command: SonicLocomotionCommand,
+    *,
+    reason: str | None = None,
+) -> SonicLocomotionCommand:
+    """Copy a planner command before latching it across a control-mode change."""
+
+    return SonicLocomotionCommand(
+        mode=int(command.mode),
+        movement=np.asarray(command.movement, dtype=np.float64).reshape(3).copy(),
+        facing=np.asarray(command.facing, dtype=np.float64).reshape(3).copy(),
+        speed=float(command.speed),
+        height=float(command.height),
+        body_velocity_mps=(
+            None
+            if command.body_velocity_mps is None
+            else np.asarray(command.body_velocity_mps, dtype=np.float64)
+            .reshape(-1)
+            .copy()
+        ),
+        yaw_rate_rad_s=float(command.yaw_rate_rad_s),
+        active=bool(command.active),
+        reason=str(command.reason if reason is None else reason),
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -174,17 +200,15 @@ def parse_args() -> argparse.Namespace:
         help="Allow safe PICO locomotion conditioning in q/teleop state only.",
     )
     parser.add_argument("--joystick-deadzone", type=float, default=0.18)
-    parser.add_argument("--joystick-forward-max-mps", type=float, default=0.30)
-    parser.add_argument("--joystick-backward-max-mps", type=float, default=0.15)
-    parser.add_argument("--joystick-lateral-max-mps", type=float, default=0.18)
+    parser.add_argument("--joystick-forward-max-mps", type=float, default=0.33)
+    parser.add_argument("--joystick-backward-max-mps", type=float, default=0.165)
+    parser.add_argument("--joystick-lateral-max-mps", type=float, default=0.198)
     parser.add_argument("--joystick-min-speed-mps", type=float, default=0.08)
     parser.add_argument("--joystick-max-yaw-rate-rad-s", type=float, default=0.30)
     parser.add_argument("--joystick-linear-accel-mps2", type=float, default=0.35)
     parser.add_argument("--joystick-linear-decel-mps2", type=float, default=0.70)
     parser.add_argument("--joystick-yaw-accel-rad-s2", type=float, default=0.60)
     parser.add_argument("--joystick-stale-timeout-sec", type=float, default=0.15)
-    parser.add_argument("--plan-endpoint", default="tcp://127.0.0.1:5562")
-    parser.add_argument("--plan-topic", default=CUROBO_PLAN_TOPIC)
     parser.add_argument("--static-target-bind", default="tcp://*:5564")
     parser.add_argument("--static-target-topic", default=STATIC_EE_TARGET_TOPIC)
     parser.add_argument("--static-target-timeout-sec", type=float, default=0.25)
@@ -238,48 +262,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--qp-topic", default=QP_REFERENCE_TOPIC)
     parser.add_argument("--state-command-bind", default="tcp://*:5563")
     parser.add_argument("--state-command-topic", default="path_state_command")
+    parser.add_argument(
+        "--shared-hand-selection-bind",
+        default="tcp://*:5567",
+        help="PUB endpoint that reports the A/B-selected shared-control hand.",
+    )
+    parser.add_argument(
+        "--shared-hand-selection-topic",
+        default="path_shared_control_hand",
+        help="Topic carrying the A/B-selected shared-control hand heartbeat.",
+    )
 
     parser.add_argument("--command-period-sec", type=float, default=0.25)
     parser.add_argument("--damped-return-rate", type=float, default=3.0)
-    parser.add_argument("--plan-timeout-sec", type=float, default=1.00)
-    parser.add_argument(
-        "--phase-search-window-sec",
-        type=float,
-        default=0.50,
-        help="Search this much B-spline time around the previous phase for measured-state alignment.",
-    )
-    parser.add_argument("--phase-search-samples", type=int, default=41)
-    parser.add_argument(
-        "--phase-lookahead-sec",
-        type=float,
-        default=0.02,
-        help="Advance the measured-state-aligned B-spline phase by this prediction horizon.",
-    )
-    parser.add_argument(
-        "--phase-tracking-mode",
-        choices=("fixed_rate", "state_aligned", "wall_time"),
-        default="fixed_rate",
-        help=(
-            "How auto_planning advances along the cuRobo B-spline. "
-            "fixed_rate streams the spline at the bridge FPS independent of tracking error; "
-            "state_aligned projects measured q onto the spline; wall_time uses message t_start_us."
-        ),
-    )
     parser.add_argument(
         "--terminal-capture-radius-m",
         type=float,
         default=0.07,
         help="QP switches to the static terminal EE target once measured wrist is within this radius.",
-    )
-    parser.add_argument(
-        "--auto-planning-mode",
-        choices=("shared_control", "legacy"),
-        default="shared_control",
-        help=(
-            "Behavior of PATH auto_planning/e mode. shared_control blends SAM3/TASC "
-            "contact targets with GMR wrist FK and lets EE-QP solve the arms; legacy "
-            "keeps the older static-target/cuRobo path."
-        ),
     )
     parser.add_argument("--shared-rho1", type=float, default=0.60)
     parser.add_argument("--shared-rho2", type=float, default=0.90)
@@ -710,70 +710,6 @@ def wrist_targets_from_message(
         )
     except Exception:
         return None
-
-
-def bspline_eval(control_points: np.ndarray, dt: float, t_start_us: int, query_us: int) -> tuple[np.ndarray, float]:
-    cps = np.asarray(control_points, dtype=np.float64)
-    if cps.ndim != 2 or cps.shape[0] < 4 or cps.shape[1] != 29 or dt <= 0.0:
-        raise ValueError("invalid B-spline control points")
-    max_segment = float(cps.shape[0] - 4)
-    s = np.clip((query_us - int(t_start_us)) / (dt * 1.0e6), 0.0, max_segment)
-    return bspline_eval_s(cps, s)
-
-
-def bspline_eval_s(control_points: np.ndarray, s: float) -> tuple[np.ndarray, float]:
-    cps = np.asarray(control_points, dtype=np.float64)
-    if cps.ndim != 2 or cps.shape[0] < 4 or cps.shape[1] != 29:
-        raise ValueError("invalid B-spline control points")
-    max_segment = float(cps.shape[0] - 4)
-    s = float(np.clip(s, 0.0, max_segment))
-    i = int(np.clip(np.floor(s), 0, cps.shape[0] - 4))
-    u = float(np.clip(s - i, 0.0, 1.0))
-    omu = 1.0 - u
-    basis = np.array([
-        omu * omu * omu / 6.0,
-        (3.0 * u**3 - 6.0 * u**2 + 4.0) / 6.0,
-        (-3.0 * u**3 + 3.0 * u**2 + 3.0 * u + 1.0) / 6.0,
-        u**3 / 6.0,
-    ])
-    q = basis @ cps[i : i + 4]
-    phase = float(np.clip(s / max_segment, 0.0, 1.0)) if max_segment > 0.0 else 1.0
-    return q, phase
-
-
-def nearest_bspline_s(
-    control_points: np.ndarray,
-    q_current: np.ndarray,
-    previous_s: float | None,
-    dt_plan: float,
-    search_window_sec: float,
-    samples: int,
-) -> tuple[float, float]:
-    cps = np.asarray(control_points, dtype=np.float64)
-    q_current = np.asarray(q_current, dtype=np.float64).reshape(29)
-    max_segment = float(cps.shape[0] - 4)
-    if max_segment <= 0.0:
-        return 0.0, 0.0
-    if previous_s is None:
-        lo, hi = 0.0, max_segment
-    else:
-        half_window_s = max(0.0, search_window_sec) / max(dt_plan, 1.0e-6)
-        lo = max(0.0, previous_s - half_window_s)
-        hi = min(max_segment, previous_s + half_window_s)
-        if hi <= lo + 1.0e-9:
-            hi = min(max_segment, lo + 1.0)
-    grid = np.linspace(lo, hi, max(3, int(samples)))
-    current_upper = q_current[UPPER_BODY_PLANNER_INDICES]
-    best_s = float(grid[0])
-    best_error = float("inf")
-    for candidate_s in grid:
-        q_candidate, _ = bspline_eval_s(cps, float(candidate_s))
-        diff = q_candidate[UPPER_BODY_PLANNER_INDICES] - current_upper
-        error = float(np.sqrt(np.mean(diff * diff)))
-        if error < best_error:
-            best_error = error
-            best_s = float(candidate_s)
-    return best_s, best_error
 
 
 def upper_from_q29(q: np.ndarray) -> np.ndarray:
@@ -1378,32 +1314,6 @@ class OuterWaistPlanner:
         )
 
 
-def q_ik_prior_from_plan(
-    plan: dict | None,
-    target: dict | None,
-    target_link: str,
-    tick_us: int,
-    plan_timeout_sec: float,
-) -> tuple[np.ndarray | None, str]:
-    if not plan or not target or not bool(plan.get("feasible", False)):
-        return None, "none"
-    if (tick_us - int(plan.get("timestamp_us", 0))) > plan_timeout_sec * 1.0e6:
-        return None, "stale"
-    if str(plan.get("target_link", "")) != str(target_link):
-        return None, "link_mismatch"
-    target_uid = str(target.get("goal_uid", ""))
-    plan_uid = str(plan.get("goal_uid", ""))
-    if target_uid and plan_uid and target_uid != plan_uid:
-        return None, "uid_mismatch"
-    q_goal = plan.get("q_goal", plan.get("q_ik_ref", plan.get("ik_q_goal")))
-    if q_goal is None:
-        return None, "missing_q_goal"
-    q = np.asarray(q_goal, dtype=np.float64).reshape(-1)
-    if q.shape[0] < 29 or not np.isfinite(q[:29]).all():
-        return None, "invalid_q_goal"
-    return q[:29].copy(), f"curobo_ik_plan_{int(plan.get('plan_id', 0))}"
-
-
 def main() -> int:
     args = parse_args()
     if not args.arm_nonlinear_ik_enabled:
@@ -1415,11 +1325,6 @@ def main() -> int:
         raise RuntimeError(
             "PATH requires the CasADi/IPOPT arm reference stream in q/e modes; "
             "--qp-reference-disabled is not supported."
-        )
-    if args.auto_planning_mode != "shared_control":
-        raise RuntimeError(
-            "PATH e-mode requires shared_control position blending followed by "
-            "CasADi/IPOPT arm IK; legacy planner mode is disabled."
         )
     # PATH's arm ownership is invariant. The planner input keeps a neutral
     # waist reference while the deploy forwards SONIC's resulting waist
@@ -1473,12 +1378,6 @@ def main() -> int:
     controller_sub.setsockopt(zmq.RCVTIMEO, 1)
     controller_sub.connect(args.button_endpoint)
 
-    plan_sub = ctx.socket(zmq.SUB)
-    plan_sub.setsockopt(zmq.SUBSCRIBE, args.plan_topic.encode())
-    plan_sub.setsockopt(zmq.CONFLATE, 1)
-    plan_sub.setsockopt(zmq.RCVTIMEO, 1)
-    plan_sub.connect(args.plan_endpoint)
-
     static_target_sub = ctx.socket(zmq.SUB)
     static_target_sub.setsockopt(zmq.SUBSCRIBE, args.static_target_topic.encode())
     static_target_sub.setsockopt(zmq.CONFLATE, 1)
@@ -1507,6 +1406,11 @@ def main() -> int:
     qp.setsockopt(zmq.LINGER, 0)
     qp.bind(f"tcp://{args.qp_bind_host}:{args.qp_port}")
 
+    shared_hand_pub = ctx.socket(zmq.PUB)
+    shared_hand_pub.setsockopt(zmq.SNDHWM, 2)
+    shared_hand_pub.setsockopt(zmq.LINGER, 0)
+    shared_hand_pub.bind(args.shared_hand_selection_bind)
+
     log(f"Pico input SUB {args.pico_endpoint}/pose,command,planner,manager_state")
     log(
         f"Pico controller SUB {args.button_endpoint}/"
@@ -1516,12 +1420,15 @@ def main() -> int:
         "GMR input disabled: wrist targets use manager-calibrated PICO "
         "pelvis-frame SE(3) directly"
     )
-    log(f"cuRobo plan SUB {args.plan_endpoint}/{args.plan_topic}")
     log(f"static EE target SUB {args.static_target_bind}/{args.static_target_topic}")
     log(f"robot state SUB {args.robot_state_endpoint}/{args.robot_state_topic}")
     log(f"state command SUB {args.state_command_bind}/{args.state_command_topic}")
     log(f"SONIC output PUB tcp://{args.sonic_bind_host}:{args.sonic_port}")
     log(f"QP reference PUB tcp://{args.qp_bind_host}:{args.qp_port}/{args.qp_topic}")
+    log(
+        "shared-control hand PUB "
+        f"{args.shared_hand_selection_bind}/{args.shared_hand_selection_topic}"
+    )
     arm_nonlinear_ik: UnitreeG1ArmNonlinearIK | None = None
     if args.arm_nonlinear_ik_enabled:
         arm_nonlinear_ik = UnitreeG1ArmNonlinearIK(
@@ -1558,6 +1465,19 @@ def main() -> int:
             f"{args.arm_ik_output_velocity_limit_rad_s:.1f}rad/s@"
             f"{args.arm_ik_output_control_hz:.0f}Hz"
         )
+    if arm_nonlinear_ik is None:
+        raise RuntimeError(
+            "teleop_wait_ready requires the CasADi/IPOPT arm solver; "
+            "--no-arm-nonlinear-ik-enabled is not supported"
+        )
+    q_ready_left_wrist_tf, q_ready_right_wrist_tf = (
+        arm_nonlinear_ik.wrist_transforms_from_q29(Q_READY)
+    )
+    log(
+        "teleop_wait_ready fixed IPOPT target prepared from FK(Q_READY): "
+        f"L={q_ready_left_wrist_tf[:3, 3].round(4).tolist()} "
+        f"R={q_ready_right_wrist_tf[:3, 3].round(4).tolist()}"
+    )
     gravity_estimator = PelvisGravityEstimator(args)
     log(
         "50Hz arm-only RNEA enabled (waist feedforward zero): "
@@ -1571,8 +1491,6 @@ def main() -> int:
     # the Cartesian target blend sent to IPOPT.
     planner_lower_body_idle = True
     released_pose_frames = 0
-    latest_plan: dict | None = None
-    latest_plan_us = 0
     latest_static_target: dict | None = None
     latest_static_target_us = 0
     static_target_revision = 0
@@ -1581,9 +1499,6 @@ def main() -> int:
     static_target_hold_q: np.ndarray | None = None
     static_target_hold_plan_id = -1
     static_target_hold_side = ""
-    active_plan: dict | None = None
-    active_plan_us = 0
-    active_plan_s: float | None = None
     latest_robot_q: np.ndarray | None = None
     latest_robot_dq: np.ndarray | None = None
     latest_robot_base_quat = np.array(
@@ -1632,6 +1547,13 @@ def main() -> int:
         )
     )
     joystick_mapper.reset(yaw_from_quaternion_wxyz(latest_robot_base_quat))
+    # Keep the most recently dispatched tracking command so A+X can freeze
+    # the root planner input while the arms transition to Q_READY.
+    last_tracking_locomotion = joystick_mapper.idle(
+        yaw_rad=yaw_from_quaternion_wxyz(latest_robot_base_quat),
+        reason="startup_idle",
+    )
+    wait_locomotion: SonicLocomotionCommand | None = None
     phase_mode = "none"
     phase_sync_error_rad = float("nan")
     last_arm_ik_solve_ms = float("nan")
@@ -1651,7 +1573,6 @@ def main() -> int:
     next_mode_command = 0.0
     last_tick = time.monotonic()
     last_log = 0.0
-    completed_plan_ids: set[int] = set()
     period = 1.0 / max(args.fps, 1.0e-6)
     keyboard = KeyboardController(enabled=not args.no_keyboard)
     outer_waist = OuterWaistPlanner(args)
@@ -1674,14 +1595,18 @@ def main() -> int:
     )
     shared_control = TaskSpaceBlender(shared_config)
     latest_shared_result = None
+    # In e/shared-control mode, a perception target never chooses an arm on
+    # its own.  The operator explicitly arms the left/right blend with A/B.
+    shared_selected_hand = "none"
+    shared_hand_selection_revision = 0
+    next_shared_hand_publish = 0.0
     log(
         "PICO absolute waist-frame controller targets enabled: "
         f"topic={args.pico_vr_endpoint}/vr_pose_debug "
         "mode=head_position, anchor=none, gain=none; waiting for Q_READY/A+X"
     )
     log(
-        "auto_planning mode="
-        f"{args.auto_planning_mode} shared_control="
+        "auto_planning shared_control="
         f"rho=[{args.shared_rho1:.2f},{args.shared_rho2:.2f}] "
         f"v_transfer={args.shared_v_transfer_max:.2f}m/s "
         f"startup_hold={args.shared_startup_hold_sec:.2f}s"
@@ -1759,32 +1684,6 @@ def main() -> int:
         hold[:15] = 0.0
         return hold
 
-    def latest_plan_ready(tick_us: int) -> bool:
-        if not latest_plan or not latest_plan.get("feasible", False):
-            return False
-        if int(latest_plan.get("plan_id", 0)) in completed_plan_ids:
-            return False
-        total_duration_sec = float(latest_plan.get("total_duration_sec", 0.0))
-        t_start_us = int(latest_plan.get("t_start_us", latest_plan.get("timestamp_us", tick_us)))
-        if total_duration_sec > 0.0 and (tick_us - t_start_us) > (total_duration_sec + 0.25) * 1.0e6:
-            return False
-        return bool(
-            (tick_us - latest_plan_us) <= args.plan_timeout_sec * 1.0e6
-        )
-
-    def active_plan_target_distance() -> float:
-        if active_plan is None or latest_robot_q is None or wrist_fk is None:
-            return float("nan")
-        target_link = str(active_plan.get("target_link", "left_wrist_yaw_link"))
-        target_position = np.asarray(
-            active_plan.get("target_position", [np.nan, np.nan, np.nan]),
-            dtype=np.float64,
-        ).reshape(3)
-        if not np.isfinite(target_position).all():
-            return float("nan")
-        current = wrist_fk.wrist_position(latest_robot_q, target_link)
-        return float(np.linalg.norm(current - target_position))
-
     def remember_pico_hand_fields(raw: bytes, topic: str, rx_us: int) -> None:
         nonlocal latest_left_hand_joints, latest_right_hand_joints
         nonlocal latest_hand_us, latest_hand_meta
@@ -1812,43 +1711,7 @@ def main() -> int:
         # command exactly when PICO changes stream mode.
         return latest_left_hand_joints, latest_right_hand_joints, fresh
 
-    def clear_active_plan(reason: str) -> None:
-        nonlocal active_plan, active_plan_us, active_plan_s, phase_mode, phase_sync_error_rad
-        plan_id = int(active_plan.get("plan_id", 0)) if active_plan else 0
-        log(f"clearing active plan id={plan_id}: {reason}")
-        if plan_id:
-            completed_plan_ids.add(plan_id)
-        active_plan = None
-        active_plan_us = 0
-        active_plan_s = None
-        phase_mode = "none"
-        phase_sync_error_rad = float("nan")
-
-    def latch_latest_plan(source: str, tick_us: int) -> bool:
-        nonlocal active_plan, active_plan_us, active_plan_s, phase_mode, phase_sync_error_rad
-        if not latest_plan_ready(tick_us):
-            active_plan = None
-            active_plan_us = 0
-            active_plan_s = None
-            phase_mode = "none"
-            phase_sync_error_rad = float("nan")
-            log(f"{source}: no fresh feasible plan to latch")
-            return False
-        active_plan = copy.deepcopy(latest_plan)
-        active_plan_us = tick_us
-        active_plan_s = 0.0
-        phase_mode = "latched"
-        phase_sync_error_rad = float("nan")
-        log(
-            f"{source}: latched active plan id={active_plan.get('plan_id', 0)} "
-            f"cps={len(active_plan.get('control_points', []))} "
-            f"phase_mode={args.phase_tracking_mode}"
-        )
-        return True
-
     def shared_target_available(tick_us: int) -> bool:
-        if args.auto_planning_mode != "shared_control":
-            return False
         if latest_static_target is None:
             return False
         if not bool(latest_static_target.get("target_valid", True)):
@@ -1888,8 +1751,9 @@ def main() -> int:
         return True
 
     def apply_state_request(requested: str, source: str, tick_us: int | None = None) -> None:
-        nonlocal current_state, next_mode_command, blended_q, active_plan, active_plan_us
-        nonlocal active_plan_s, phase_mode, phase_sync_error_rad
+        nonlocal current_state, next_mode_command, blended_q
+        nonlocal phase_mode, phase_sync_error_rad
+        nonlocal shared_selected_hand, shared_hand_selection_revision
         if tick_us is None:
             tick_us = now_us()
         if requested not in VALID_STATES:
@@ -1906,9 +1770,9 @@ def main() -> int:
         current_state = requested
         if requested in {"teleop", "intention"}:
             shared_control.reset()
-            active_plan = None
-            active_plan_us = 0
-            active_plan_s = None
+            if shared_selected_hand != "none":
+                shared_selected_hand = "none"
+                shared_hand_selection_revision += 1
             phase_mode = "none"
             phase_sync_error_rad = float("nan")
             send_mode_command(sonic, planner=True)
@@ -1919,27 +1783,24 @@ def main() -> int:
             if requested == "auto_planning":
                 if previous_state != "auto_planning":
                     shared_control.reset()
-                if args.auto_planning_mode == "shared_control":
-                    active_plan = None
-                    active_plan_us = 0
-                    active_plan_s = None
-                    phase_mode = "shared_control_wait"
-                    phase_sync_error_rad = float("nan")
-                    log(
-                        f"{source}: shared_control auto_planning entered; "
-                        f"target={'available' if shared_target_available(tick_us) else 'waiting'}"
-                    )
-                else:
-                    latch_latest_plan(source, tick_us)
+                    if shared_selected_hand != "none":
+                        shared_selected_hand = "none"
+                        shared_hand_selection_revision += 1
+                phase_mode = "shared_control_wait"
+                phase_sync_error_rad = float("nan")
+                log(
+                    f"{source}: shared_control auto_planning entered; "
+                    f"target={'available' if shared_target_available(tick_us) else 'waiting'}"
+                )
                 blended_q = None
             elif requested == "damped_return":
                 shared_control.reset()
 
     def set_pico_tracking_armed(enabled: bool, source: str) -> None:
-        """Arm/disarm absolute controller tracking without changing SONIC mode."""
+        """Switch between live PICO tracking and fixed-FK(Q_READY) IPOPT."""
 
         nonlocal pico_tracking_armed
-        nonlocal last_ipopt_q_ref, last_ipopt_tau_ff, blended_q
+        nonlocal blended_q, wait_locomotion
         enabled = bool(enabled)
         if enabled:
             ready_error_rad = (
@@ -1973,14 +1834,32 @@ def main() -> int:
                 f"{'armed' if enabled else 'disarmed'}"
             )
             return
-        last_ipopt_q_ref = None
-        last_ipopt_tau_ff = None
         blended_q = None
         pico_tracking_armed = enabled
         if enabled:
-            log(f"{source}: absolute PICO tracking armed")
+            # Entering tracking must not integrate the stick displacement that
+            # occurred during the fixed-arm transition. Start its rate limiter
+            # from the actual base yaw, then react to only subsequent samples.
+            joystick_mapper.reset(
+                yaw_from_quaternion_wxyz(latest_robot_base_quat)
+            )
+            wait_locomotion = None
+            log(
+                f"{source}: teleop_tracking armed after Q_READY confirmation; "
+                "PICO wrist targets re-enabled and joystick reset"
+            )
         else:
-            log(f"{source}: absolute PICO tracking disarmed; Q_READY active")
+            # Preserve the last planner command exactly while moving both arms
+            # to Q_READY. Do not clear IPOPT's previous solution: it is the
+            # next solve's warm start and prevents a numerical discontinuity.
+            wait_locomotion = copy_locomotion_command(
+                last_tracking_locomotion,
+                reason="wait_ready_latched",
+            )
+            log(
+                f"{source}: teleop_wait_ready active; fixed FK(Q_READY) "
+                "wrist SE(3), PICO arm targets ignored, root command latched"
+            )
 
     def set_qp_reference_enabled(enabled: bool, source: str) -> None:
         nonlocal qp_reference_enabled
@@ -2087,7 +1966,8 @@ def main() -> int:
                     dedicated_button_events_seen = True
                     event_name = str(event.get("event", ""))
                     if event_name not in {
-                        "start_combo", "ax", "by", "mode_q", "mode_e"
+                        "start_combo", "ax", "by", "mode_q", "mode_e",
+                        "select_left", "select_right",
                     }:
                         continue
                     bridge_receive_us = now_us()
@@ -2106,12 +1986,42 @@ def main() -> int:
                                 yaw_from_quaternion_wxyz(latest_robot_base_quat)
                             )
                     elif event_name == "ax":
-                        set_pico_tracking_armed(
-                            not pico_tracking_armed, "Pico A+X"
-                        )
+                        if current_state != "teleop":
+                            log(
+                                "Pico A+X ignored outside q/teleop; "
+                                f"state={current_state}"
+                            )
+                        else:
+                            set_pico_tracking_armed(
+                                not pico_tracking_armed, "Pico A+X"
+                            )
                         planner = True
                     elif event_name == "by":
                         planner = True
+                    elif event_name == "select_left":
+                        if current_state == "auto_planning":
+                            if shared_selected_hand != "left":
+                                shared_selected_hand = "left"
+                                shared_hand_selection_revision += 1
+                            shared_control.reset()
+                            log("Pico A: shared-control left arm selected")
+                        else:
+                            log(
+                                "Pico A shared-control selection ignored outside e/auto_planning; "
+                                f"state={current_state}"
+                            )
+                    elif event_name == "select_right":
+                        if current_state == "auto_planning":
+                            if shared_selected_hand != "right":
+                                shared_selected_hand = "right"
+                                shared_hand_selection_revision += 1
+                            shared_control.reset()
+                            log("Pico B: shared-control right arm selected")
+                        else:
+                            log(
+                                "Pico B shared-control selection ignored outside e/auto_planning; "
+                                f"state={current_state}"
+                            )
                     elif event_name == "mode_q":
                         apply_state_request("teleop", "Pico X", tick_us)
                         planner = True
@@ -2162,9 +2072,16 @@ def main() -> int:
 
                         if planner_requested:
                             if not start:
-                                set_pico_tracking_armed(
-                                    not pico_tracking_armed, "Pico A+X legacy"
-                                )
+                                if current_state != "teleop":
+                                    log(
+                                        "Pico A+X legacy ignored outside "
+                                        f"q/teleop; state={current_state}"
+                                    )
+                                else:
+                                    set_pico_tracking_armed(
+                                        not pico_tracking_armed,
+                                        "Pico A+X legacy",
+                                    )
                             sonic.send(
                                 build_command_message(
                                     start=start, stop=False, planner=True
@@ -2243,39 +2160,6 @@ def main() -> int:
 
             try:
                 while True:
-                    incoming_plan = unpack_topic(plan_sub.recv(zmq.NOBLOCK), args.plan_topic)
-                    incoming_feasible = bool(incoming_plan.get("feasible", False))
-                    incoming_plan_id = int(incoming_plan.get("plan_id", 0))
-                    incoming_cps = len(incoming_plan.get("control_points", []))
-                    if incoming_feasible and incoming_cps >= 4:
-                        latest_plan = incoming_plan
-                        latest_plan_us = tick_us
-                        if current_state == "auto_planning":
-                            active_plan_id = int(active_plan.get("plan_id", 0)) if active_plan else 0
-                            if active_plan is None or incoming_plan_id != active_plan_id:
-                                latch_latest_plan("auto_planning/plan_update", tick_us)
-                    else:
-                        # Infeasible/expired planner heartbeats are status
-                        # messages, not executable references. Do not let them
-                        # overwrite the last feasible plan before the bridge has
-                        # a chance to latch it on an A+X/e transition.
-                        reason = str(incoming_plan.get("failure_reason", ""))
-                        if (
-                            reason == "plan_expired"
-                            and active_plan is not None
-                            and int(active_plan.get("plan_id", 0)) == incoming_plan_id
-                        ):
-                            clear_active_plan("server plan_expired")
-                    log(
-                        "plan update "
-                        f"id={incoming_plan_id} feasible={incoming_plan.get('feasible')} "
-                        f"cps={incoming_cps}"
-                    )
-            except zmq.Again:
-                pass
-
-            try:
-                while True:
                     incoming_target = unpack_topic(
                         static_target_sub.recv(zmq.NOBLOCK), args.static_target_topic)
                     incoming_uid = str(incoming_target.get("goal_uid", ""))
@@ -2312,14 +2196,6 @@ def main() -> int:
                             incoming_uid and incoming_uid != latest_static_target_uid
                         ):
                             latest_static_target_uid = incoming_uid
-                            static_target_hold_q = None
-                            static_target_hold_plan_id = -1
-                            static_target_hold_side = ""
-                            arm_ik_cached_revision = -1
-                            arm_ik_cached_q_ref = None
-                            arm_ik_cached_tau_ff = None
-                            arm_ik_cached_feasible = False
-                            arm_ik_cached_source = "null_target"
                             shared_control.reset()
                         continue
                     position = np.asarray(position_value, dtype=np.float64).reshape(-1)
@@ -2340,19 +2216,9 @@ def main() -> int:
                             latest_static_target is None
                             or explicit_reset
                             or (
-                                args.auto_planning_mode != "shared_control"
-                                and incoming_uid
-                                and incoming_uid != latest_static_target_uid
-                            )
-                            or (
-                                args.auto_planning_mode == "shared_control"
-                                and incoming_object_id
+                                incoming_object_id
                                 and previous_object_id
                                 and incoming_object_id != previous_object_id
-                            )
-                            or (
-                                args.auto_planning_mode != "shared_control"
-                                and target_side != static_target_hold_side
                             )
                         )
                         latest_static_target = incoming_target
@@ -2361,18 +2227,6 @@ def main() -> int:
                         if is_new_goal:
                             latest_static_target_uid = incoming_uid
                             static_target_plan_id += 1
-                            static_target_hold_q = None
-                            static_target_hold_plan_id = -1
-                            static_target_hold_side = (
-                                target_side
-                                if args.auto_planning_mode == "shared_control"
-                                else ""
-                            )
-                            arm_ik_cached_revision = -1
-                            arm_ik_cached_q_ref = None
-                            arm_ik_cached_tau_ff = None
-                            arm_ik_cached_feasible = False
-                            arm_ik_cached_source = "new_goal"
                             shared_control.reset()
                             if (
                                 args.static_target_auto_enter
@@ -2520,10 +2374,22 @@ def main() -> int:
             joystick_enabled = bool(
                 args.joystick_locomotion
                 and current_state == "teleop"
+                and pico_tracking_armed
                 and policy_started
                 and controller_fresh
             )
-            if joystick_enabled:
+            if current_state == "teleop" and not pico_tracking_armed:
+                # teleop_wait_ready: freeze exactly the command that was last
+                # accepted in teleop_tracking. Do not consume PICO stick
+                # samples or advance the mapper while arm Q_READY is solved.
+                if wait_locomotion is not None:
+                    joystick_command = copy_locomotion_command(wait_locomotion)
+                else:
+                    joystick_command = joystick_mapper.idle(
+                        yaw_rad=current_base_yaw,
+                        reason="wait_ready_no_latched_root",
+                    )
+            elif joystick_enabled:
                 joystick_command = joystick_mapper.update(
                     latest_controller_left_axis,
                     latest_controller_right_axis,
@@ -2546,55 +2412,75 @@ def main() -> int:
                     yaw_rad=current_base_yaw,
                     reason=joystick_reason,
                 )
-            plan_fresh = latest_plan is not None and (tick_us - latest_plan_us) <= args.plan_timeout_sec * 1.0e6
-            static_target_age_sec = (
-                (tick_us - latest_static_target_us) / 1.0e6
-                if latest_static_target is not None
-                else float("inf")
-            )
-            static_target_fresh = (
-                latest_static_target is not None
-                and static_target_age_sec <= args.static_target_timeout_sec
-            )
-            static_target_usable = (
-                latest_static_target is not None
-                and bool(latest_static_target.get("target_valid", True))
-                and static_target_frame_is_supported(latest_static_target)
-                and (
-                    args.static_target_hold_sec <= 0.0
-                    or static_target_age_sec <= args.static_target_hold_sec
+            if current_state == "teleop" and pico_tracking_armed:
+                last_tracking_locomotion = copy_locomotion_command(
+                    joystick_command,
+                    reason="tracking_last",
                 )
-            )
-            if active_plan is not None:
-                elapsed_sec = (tick_us - active_plan_us) / 1.0e6
-                move_duration_sec = float(active_plan.get("duration_sec", 0.0))
-                active_total_sec = float(active_plan.get("total_duration_sec", 0.0))
-                if move_duration_sec > 0.0 and elapsed_sec >= move_duration_sec:
-                    target_distance_m = active_plan_target_distance()
-                    if (
-                        args.auto_clear_on_target_reached and
-                        np.isfinite(target_distance_m)
-                        and target_distance_m <= args.plan_complete_radius_m
-                    ):
-                        clear_active_plan(
-                            f"target reached d={100.0 * target_distance_m:.1f}cm "
-                            f"<= {100.0 * args.plan_complete_radius_m:.1f}cm"
-                        )
-                if (
-                    active_plan is not None
-                    and args.clear_plan_after_total_duration
-                    and active_total_sec > 0.0
-                    and elapsed_sec >= active_total_sec + 0.25
-                ):
-                    clear_active_plan("duration+hold elapsed")
-            if current_state == "auto_planning" and active_plan is None and latest_plan_ready(tick_us):
-                latch_latest_plan("auto_planning/pending", tick_us)
-
             qp_payload: dict | None = None
             if current_state in {"teleop", "intention"}:
                 if planner_lower_body_idle:
                     pose_to_send = None
-                if pico_body_fresh and latest_wrist_targets is not None:
+                if current_state == "teleop" and not pico_tracking_armed:
+                    # A+X enters teleop_wait_ready.  It is deliberately a
+                    # Cartesian IPOPT task, not a direct q=0 command: FK of
+                    # Q_READY provides both fixed wrist positions and fixed
+                    # orientations every 50 Hz.
+                    ready_result = solve_authoritative_ipopt_transforms(
+                        q_ready_left_wrist_tf,
+                        q_ready_right_wrist_tf,
+                    )
+                    q_for_sonic = (
+                        ready_result.q_ref.copy()
+                        if ready_result.success
+                        else last_ipopt_or_measured_hold()
+                    )
+                    q_for_sonic[:15] = 0.0
+                    if policy_started:
+                        send_planner_command(
+                            sonic,
+                            q_for_sonic,
+                            neutralize_waist=True,
+                            freeze_lower_body=True,
+                            left_hand_position=left_hand_cmd,
+                            right_hand_position=right_hand_cmd,
+                            locomotion=joystick_command,
+                        )
+                    qp_payload = ipopt_arm_sample_reference(
+                        q_for_sonic,
+                        state="teleop",
+                        source="pico_wait_ready_fk",
+                        control_mode="teleop_wait_ready",
+                        feasible=bool(ready_result.success),
+                        plan_id=0,
+                        timestamp_us=tick_us,
+                        tau_ff_ref=(
+                            ready_result.tau_ff_ref
+                            if ready_result.success
+                            else (
+                                last_ipopt_tau_ff
+                                if last_ipopt_tau_ff is not None
+                                else np.zeros(29, dtype=np.float64)
+                            )
+                        ),
+                        bridge_timestamp_us=tick_us,
+                        smpl_target_reason="fixed_fk_q_ready",
+                        smpl_target_held=True,
+                        smpl_left_target_position=q_ready_left_wrist_tf[:3, 3].tolist(),
+                        smpl_right_target_position=q_ready_right_wrist_tf[:3, 3].tolist(),
+                        q_prior_source="ipopt_fixed_q_ready_fk",
+                        belief_enabled=False,
+                        shared_control=False,
+                        teleop_qp_bimanual=True,
+                        teleop_waist_locked=True,
+                        arm_ik_solve_ms=float(ready_result.solve_time_ms),
+                        arm_ik_position_error_m=float(ready_result.position_error_m),
+                        arm_ik_rotation_error_rad=float(
+                            ready_result.rotation_error_rad
+                        ),
+                        arm_ik_status=str(last_arm_ik_status),
+                    )
+                elif pico_body_fresh and latest_wrist_targets is not None:
                     ik_result = solve_authoritative_ipopt_transforms(
                         latest_wrist_targets.left_waist,
                         latest_wrist_targets.right_waist,
@@ -2735,7 +2621,7 @@ def main() -> int:
                         arm_target_valid=True,
                     )
             elif current_state == "auto_planning":
-                if args.auto_planning_mode == "shared_control":
+                if True:  # shared-control is the only auto-planning path.
                     tau_ff_ref = np.zeros(29, dtype=np.float64)
                     target = (
                         ee_target_from_static_payload(
@@ -2749,12 +2635,14 @@ def main() -> int:
                         if static_target_usable
                         else None
                     )
+                    # Perception's target_link is metadata only.  A/B is the
+                    # sole authority for which arm receives the blend.
                     requested_target_link = str(
                         latest_static_target.get("target_link", "")
                         if latest_static_target
                         else ""
                     )
-                    requested_hand = target_side_from_link(requested_target_link)
+                    requested_hand = shared_selected_hand
                     manual_human_targets = (
                         manual_wrist_targets_from_static_payload(latest_static_target)
                         if static_target_usable
@@ -2805,11 +2693,14 @@ def main() -> int:
                                 p_measured_right=p_measured_right,
                                 now_us=tick_us,
                                 dt=dt,
-                                blending_enabled=True,
+                                blending_enabled=requested_hand in {"left", "right"},
                                 preferred_hand=requested_hand,
                             )
                             latest_shared_result = result
-                            active_target = result.active_p_ref
+                            blend_armed = requested_hand in {"left", "right"}
+                            active_target = (
+                                result.active_p_ref if blend_armed else None
+                            )
                             left_target_tf = human_left_tf.copy()
                             right_target_tf = human_right_tf.copy()
                             if active_target is not None and result.hand == "left":
@@ -2971,6 +2862,10 @@ def main() -> int:
                                     shared_gap_m=float(result.gap_m),
                                     shared_confidence=float(result.confidence),
                                     shared_hand=str(result.hand),
+                                    shared_selected_hand=str(shared_selected_hand),
+                                    shared_selection_armed=bool(
+                                        shared_selected_hand in {"left", "right"}
+                                    ),
                                     shared_requested_hand=str(requested_hand),
                                     shared_requested_target_link=str(requested_target_link),
                                     shared_gate_reason=str(result.gate_reason),
@@ -3080,328 +2975,6 @@ def main() -> int:
                         )
                         phase_mode = "shared_control_input_hold"
                         phase_sync_error_rad = float("nan")
-                elif static_target_usable:
-                    target_link = str(latest_static_target.get("target_link", "left_wrist_yaw_link"))
-                    target_position = np.asarray(
-                        latest_static_target.get(
-                            "terminal_target_position",
-                            latest_static_target.get("position", [0.0, 0.0, 0.0]),
-                        ),
-                        dtype=np.float64,
-                    ).reshape(3)
-                    q_hold = (
-                        latest_robot_q.copy()
-                        if latest_robot_q is not None
-                        else np.zeros(29, dtype=np.float64)
-                    )
-                    q_hold = frozen_planner_q29(
-                        q_hold,
-                        freeze_lower_body=bool(args.freeze_planner_lower_body),
-                        freeze_waist=bool(args.freeze_planner_waist),
-                    )
-                    target_side = target_side_from_link(target_link)
-                    q_hold[12:15] = 0.0
-                    if (
-                        static_target_hold_q is None
-                        or static_target_hold_plan_id != static_target_plan_id
-                        or static_target_hold_side != target_side
-                    ):
-                        static_target_hold_q = q_hold.copy()
-                        static_target_hold_plan_id = static_target_plan_id
-                        static_target_hold_side = target_side
-                        log(
-                            "latched inactive-arm hold "
-                            f"plan={static_target_plan_id} side={target_side or 'unknown'}"
-                        )
-                    outer_waist.maybe_reset(q_hold, static_target_plan_id, target_side)
-                    q_command = hold_inactive_arm_for_single_target(
-                        q_hold, static_target_hold_q, target_side)
-                    q_command = frozen_planner_q29(
-                        q_command,
-                        freeze_lower_body=bool(args.freeze_planner_lower_body),
-                        freeze_waist=bool(args.freeze_planner_waist),
-                    )
-                    q_ik_prior, q_ik_prior_source = q_ik_prior_from_plan(
-                        latest_plan,
-                        latest_static_target,
-                        target_link,
-                        tick_us,
-                        args.plan_timeout_sec,
-                    )
-                    q_prior = target_arm_prior_from_ik(
-                        q_command,
-                        q_ik_prior,
-                        target_side,
-                    )
-                    q_prior = hold_inactive_arm_for_single_target(
-                        q_prior, static_target_hold_q, target_side)
-                    q_prior = frozen_planner_q29(
-                        q_prior,
-                        freeze_lower_body=bool(args.freeze_planner_lower_body),
-                        freeze_waist=bool(args.freeze_planner_waist),
-                    )
-                    tau_ff_ref = np.zeros(29, dtype=np.float64)
-                    arm_ik_feasible = True
-                    if arm_nonlinear_ik is not None:
-                        if (
-                            arm_ik_cached_revision != static_target_revision
-                            or arm_ik_cached_q_ref is None
-                            or arm_ik_cached_tau_ff is None
-                        ):
-                            target_quat = np.asarray(
-                                latest_static_target.get(
-                                    "quaternion",
-                                    latest_static_target.get("target_quaternion", [1.0, 0.0, 0.0, 0.0]),
-                                ),
-                                dtype=np.float64,
-                            ).reshape(4)
-                            ik_seed = (
-                                latest_robot_q.copy()
-                                if latest_robot_q is not None
-                                else q_hold.copy()
-                            )
-                            ik_result = arm_nonlinear_ik.solve_single_target(
-                                target_link=target_link,
-                                target_position=target_position,
-                                target_quaternion_wxyz=target_quat,
-                                q_seed29=ik_seed,
-                                q_hold29=static_target_hold_q,
-                                hard_lock_inactive_arm=args.arm_ik_hard_lock_inactive_arm,
-                                base_quaternion_wxyz=latest_robot_base_quat,
-                            )
-                            last_arm_ik_solve_ms = ik_result.solve_time_ms
-                            last_arm_ik_error_m = ik_result.position_error_m
-                            last_arm_ik_rot_error_rad = ik_result.rotation_error_rad
-                            last_arm_ik_status = (
-                                f"{ik_result.message} "
-                                f"L/R={100.0 * ik_result.left_position_error_m:.1f}/"
-                                f"{100.0 * ik_result.right_position_error_m:.1f}cm "
-                                f"ori_w={ik_result.left_orientation_weight_scale:.3f}/"
-                                f"{ik_result.right_orientation_weight_scale:.3f} "
-                                f"projected={int(ik_result.target_projected)}"
-                            )
-                            arm_ik_cached_revision = static_target_revision
-                            arm_ik_cached_feasible = bool(ik_result.success)
-                            arm_ik_cached_source = (
-                                f"unitree_ipopt_arm_ik:{ik_result.solve_time_ms:.2f}ms/"
-                                f"{100.0 * ik_result.position_error_m:.2f}cm/"
-                                f"{ik_result.rotation_error_rad:.3f}rad"
-                            )
-                            if ik_result.success:
-                                arm_ik_cached_q_ref = hold_inactive_arm_for_single_target(
-                                    ik_result.q_ref.copy(), static_target_hold_q, target_side)
-                                arm_ik_cached_q_ref = frozen_planner_q29(
-                                    arm_ik_cached_q_ref,
-                                    freeze_lower_body=bool(args.freeze_planner_lower_body),
-                                    freeze_waist=bool(args.freeze_planner_waist),
-                                )
-                                arm_ik_cached_tau_ff = ik_result.tau_ff_ref.copy()
-                            else:
-                                arm_ik_cached_q_ref = hold_inactive_arm_for_single_target(
-                                    q_command, static_target_hold_q, target_side)
-                                arm_ik_cached_q_ref = frozen_planner_q29(
-                                    arm_ik_cached_q_ref,
-                                    freeze_lower_body=bool(args.freeze_planner_lower_body),
-                                    freeze_waist=bool(args.freeze_planner_waist),
-                                )
-                                arm_ik_cached_tau_ff = np.zeros(29, dtype=np.float64)
-                        elif arm_ik_cached_feasible:
-                            last_arm_ik_status = "cached_ok"
-
-                        arm_ik_feasible = bool(arm_ik_cached_feasible)
-                        q_prior = hold_inactive_arm_for_single_target(
-                            arm_ik_cached_q_ref.copy(), static_target_hold_q, target_side)
-                        q_prior = frozen_planner_q29(
-                            q_prior,
-                            freeze_lower_body=bool(args.freeze_planner_lower_body),
-                            freeze_waist=bool(args.freeze_planner_waist),
-                        )
-                        tau_ff_ref = arm_ik_cached_tau_ff.copy()
-                        q_ik_prior_source = arm_ik_cached_source
-                    terminal_error_m = float("nan")
-                    if wrist_fk is not None:
-                        try:
-                            q_for_error = (
-                                latest_robot_q
-                                if latest_robot_q is not None
-                                else q_hold
-                            )
-                            terminal_error_m = float(np.linalg.norm(
-                                wrist_fk.wrist_position(q_for_error, target_link)
-                                - target_position
-                            ))
-                        except Exception:
-                            terminal_error_m = float("nan")
-                    q_command = frozen_planner_q29(
-                        q_command,
-                        freeze_lower_body=bool(args.freeze_planner_lower_body),
-                        freeze_waist=bool(args.freeze_planner_waist),
-                    )
-                    q_prior = frozen_planner_q29(
-                        q_prior,
-                        freeze_lower_body=bool(args.freeze_planner_lower_body),
-                        freeze_waist=bool(args.freeze_planner_waist),
-                    )
-                    q_prior = hold_inactive_arm_for_single_target(
-                        q_prior, static_target_hold_q, target_side)
-                    q_prior = frozen_planner_q29(
-                        q_prior,
-                        freeze_lower_body=bool(args.freeze_planner_lower_body),
-                        freeze_waist=bool(args.freeze_planner_waist),
-                    )
-                    send_planner_command(
-                        sonic,
-                        q_command,
-                        neutralize_waist=True,
-                        freeze_lower_body=bool(args.freeze_planner_lower_body),
-                        left_hand_position=left_hand_cmd,
-                        right_hand_position=right_hand_cmd,
-                        locomotion=joystick_command,
-                    )
-                    last_plan_q = q_command.copy()
-                    blended_q = q_prior.copy()
-                    qp_payload = qp_cartesian_target_reference(
-                        target_link=target_link,
-                        target_position=target_position,
-                        q_ref=q_prior,
-                        state="auto_planning",
-                        source="cartesian_servo",
-                        control_mode="plan_exec",
-                        feasible=arm_ik_feasible,
-                        plan_id=static_target_plan_id,
-                        timestamp_us=tick_us,
-                        terminal_capture_radius_m=float(args.terminal_capture_radius_m),
-                        tau_ff_ref=tau_ff_ref,
-                        target_source=str(latest_static_target.get("source", "manual_static_target")),
-                        q_prior_source=q_ik_prior_source,
-                        has_q_ik_prior=(q_ik_prior is not None) or (arm_nonlinear_ik is not None and arm_ik_feasible),
-                        arm_ik_mode="unitree_ipopt" if arm_nonlinear_ik is not None else "external_plan_prior",
-                        arm_ik_solve_ms=float(last_arm_ik_solve_ms),
-                        arm_ik_position_error_m=float(last_arm_ik_error_m),
-                        arm_ik_rotation_error_rad=float(last_arm_ik_rot_error_rad),
-                        arm_ik_status=str(last_arm_ik_status),
-                    )
-                    phase_mode = "cartesian_target"
-                    phase_sync_error_rad = float("nan")
-                else:
-                  plan = active_plan
-                  feasible_plan = bool(plan and plan.get("feasible", False))
-                  if feasible_plan:
-                    cps = np.asarray(plan.get("control_points", []), dtype=np.float64)
-                    if cps.ndim == 2 and cps.shape[1] == 29:
-                        cps = np.vstack([
-                            frozen_planner_q29(
-                                row,
-                                freeze_lower_body=bool(args.freeze_planner_lower_body),
-                                freeze_waist=bool(args.freeze_planner_waist),
-                            )
-                            for row in cps
-                        ])
-                    dt_plan = float(plan.get("control_dt_sec", 0.02))
-                    t0 = int(plan.get("t_start_us", plan.get("timestamp_us", tick_us)))
-                    try:
-                        robot_fresh = (
-                            latest_robot_q is not None
-                            and (tick_us - latest_robot_state_us) <= 0.25 * 1.0e6
-                        )
-                        max_segment = float(cps.shape[0] - 4)
-                        if args.phase_tracking_mode == "fixed_rate":
-                            elapsed_sec = max(0.0, (tick_us - active_plan_us) / 1.0e6)
-                            query_s = (elapsed_sec + max(0.0, args.phase_lookahead_sec)) / max(
-                                dt_plan, 1.0e-6
-                            )
-                            active_plan_s = float(np.clip(query_s, 0.0, max_segment))
-                            q_plan, phase = bspline_eval_s(cps, active_plan_s)
-                            phase_mode = "fixed_rate"
-                            phase_sync_error_rad = float("nan")
-                        elif args.phase_tracking_mode == "state_aligned" and robot_fresh:
-                            best_s, phase_sync_error_rad = nearest_bspline_s(
-                                cps,
-                                latest_robot_q,
-                                active_plan_s,
-                                dt_plan,
-                                args.phase_search_window_sec,
-                                args.phase_search_samples,
-                            )
-                            advance_s = (dt + max(0.0, args.phase_lookahead_sec)) / max(dt_plan, 1.0e-6)
-                            if active_plan_s is None:
-                                query_s = best_s + advance_s
-                            else:
-                                query_s = max(active_plan_s, best_s) + advance_s
-                            active_plan_s = float(np.clip(query_s, 0.0, max_segment))
-                            q_plan, phase = bspline_eval_s(cps, active_plan_s)
-                            phase_mode = "state_aligned"
-                        else:
-                            wall_t0 = active_plan_us if args.phase_tracking_mode == "wall_time" else t0
-                            q_plan, phase = bspline_eval(cps, dt_plan, wall_t0, tick_us)
-                            active_plan_s = phase * max_segment
-                            phase_mode = "wall_time"
-                            phase_sync_error_rad = float("nan")
-                        q_plan = frozen_planner_q29(
-                            q_plan,
-                            freeze_lower_body=bool(args.freeze_planner_lower_body),
-                            freeze_waist=bool(args.freeze_planner_waist),
-                        )
-                        last_plan_q = q_plan.copy()
-                        blended_q = q_plan.copy()
-                        send_planner_command(
-                            sonic,
-                            q_plan,
-                            neutralize_waist=True,
-                            freeze_lower_body=bool(args.freeze_planner_lower_body),
-                            left_hand_position=left_hand_cmd,
-                            right_hand_position=right_hand_cmd,
-                            locomotion=joystick_command,
-                        )
-                        # Publish the same cuRobo spline that produced SONIC's
-                        # q_plan. Re-anchor t_start every tick to the
-                        # state-aligned phase so the deploy-side QP provider
-                        # evaluates the active reference from the same plan,
-                        # instead of consuming a separate stale sample stream.
-                        aligned_t_start_us = int(
-                            tick_us - active_plan_s * dt_plan * 1.0e6
-                        )
-                        qp_payload = qp_bspline_reference(
-                            cps.tolist(),
-                            control_dt_sec=dt_plan,
-                            t_start_us=aligned_t_start_us,
-                            state="auto_planning",
-                            source="curobo",
-                            control_mode="plan_exec",
-                            feasible=True,
-                            plan_id=int(plan.get("plan_id", 0)),
-                            phase=phase,
-                            timestamp_us=tick_us,
-                            terminal_target_link=str(plan.get("target_link", "left_wrist_yaw_link")),
-                            terminal_target_position=list(
-                                plan.get(
-                                    "terminal_target_position",
-                                    plan.get("target_position", [0.0, 0.0, 0.0]),
-                                )
-                            ),
-                            terminal_capture_radius_m=float(args.terminal_capture_radius_m),
-                            phase_mode=phase_mode,
-                            phase_sync_error_rad=float(phase_sync_error_rad),
-                        )
-                    except Exception as exc:
-                        log(f"invalid active plan: {exc}")
-                        qp_payload = qp_none_reference(
-                            state="auto_planning",
-                            source="curobo",
-                            control_mode="plan_pending",
-                            feasible=False,
-                            plan_id=int(plan.get("plan_id", 0)) if plan else 0,
-                            timestamp_us=tick_us,
-                        )
-                  else:
-                    qp_payload = qp_none_reference(
-                        state="auto_planning",
-                        source="curobo",
-                        control_mode="plan_pending",
-                        feasible=False,
-                        plan_id=int(active_plan.get("plan_id", 0)) if active_plan else 0,
-                        timestamp_us=tick_us,
-                    )
             else:  # damped_return
                 if pico_body_fresh and latest_wrist_targets is not None:
                     return_result = solve_authoritative_ipopt_transforms(
@@ -3447,7 +3020,7 @@ def main() -> int:
                         source="pico_body_damped_return",
                         control_mode="blend_back",
                         feasible=bool(return_result.success),
-                        plan_id=int(latest_plan.get("plan_id", 0)) if latest_plan else 0,
+                        plan_id=0,
                         timestamp_us=tick_us,
                         smpl_source_timestamp_us=int(
                             latest_wrist_targets.source_timestamp_us
@@ -3533,7 +3106,7 @@ def main() -> int:
                     else (
                         "waiting_fresh_absolute_target"
                         if pico_tracking_armed
-                        else "waiting_q_ready_ax"
+                        else "teleop_wait_ready_fixed_fk"
                     )
                 )
                 qp_payload["pico_body_frame_index"] = pico_frame
@@ -3594,6 +3167,27 @@ def main() -> int:
             if pose_to_send is not None:
                 sonic.send(pose_to_send)
 
+            # PUB/SUB has no retained state.  A short heartbeat makes the
+            # A/B selection available to a gateway that starts later too.
+            if now >= next_shared_hand_publish:
+                shared_hand_pub.send(
+                    pack_topic(
+                        args.shared_hand_selection_topic,
+                        {
+                            "schema": "path.shared_control_hand.v1",
+                            "timestamp_us": int(tick_us),
+                            "state": current_state,
+                            "selected_hand": shared_selected_hand,
+                            "active": bool(
+                                current_state == "auto_planning"
+                                and shared_selected_hand in {"left", "right"}
+                            ),
+                            "revision": int(shared_hand_selection_revision),
+                        },
+                    )
+                )
+                next_shared_hand_publish = now + 0.1
+
             if now - last_log > 1.0:
                 shared_log = "shared=none"
                 pico_position_log = "pico_L/R=missing"
@@ -3618,6 +3212,7 @@ def main() -> int:
                         f"shared_gap={latest_shared_result.gap_m if np.isfinite(latest_shared_result.gap_m) else float('nan'):.3f}m "
                         f"shared_conf={latest_shared_result.confidence:.3f} "
                         f"shared_hand={latest_shared_result.hand} "
+                        f"shared_select={shared_selected_hand} "
                         f"shared_gate={latest_shared_result.gate_reason} "
                         f"shared_obj={latest_shared_result.object_id or 'none'} "
                         f"shared_grip={latest_shared_result.grip_index}"
@@ -3626,12 +3221,11 @@ def main() -> int:
                 log(
                     f"state={current_state} pico_fresh={pico_body_fresh} "
                     f"pico_session={latest_pico_session_id}/"
-                    f"{'armed' if pico_tracking_armed else 'wait_ax'} "
-                    f"smpl_lower_fresh={smpl_fresh} plan_fresh={plan_fresh} "
+                    f"{'teleop_tracking' if pico_tracking_armed else 'teleop_wait_ready'} "
+                    f"smpl_lower_fresh={smpl_fresh} "
                     f"static_target={'fresh' if static_target_fresh else 'held' if static_target_usable else 'missing'} "
                     f"static_age={static_target_age_sec if np.isfinite(static_target_age_sec) else float('nan'):.2f}s "
                     f"static_rev={static_target_revision} "
-                    f"active_plan={active_plan.get('plan_id', 0) if active_plan else 0} "
                     f"qp_gate={'on' if qp_reference_enabled else 'off'} "
                     f"lower_src={'idle_planner' if planner_lower_body_idle else 'raw_smpl'} "
                     f"freeze_lower={bool(args.freeze_planner_lower_body)} "
@@ -3691,11 +3285,11 @@ def main() -> int:
         pico_manager.close()
         button_sub.close()
         controller_sub.close()
-        plan_sub.close()
         robot_state.close()
         state_sub.close()
         sonic.close()
         qp.close()
+        shared_hand_pub.close()
         keyboard.close()
 
 

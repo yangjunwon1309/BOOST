@@ -125,7 +125,42 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--calibration-resend-sec", type=float, default=1.0)
     parser.add_argument("--report-sec", type=float, default=5.0)
+    parser.add_argument(
+        "--disable-depth-postprocess",
+        action="store_true",
+        help="Publish raw SDK depth without disparity/spatial/temporal filtering.",
+    )
+    parser.add_argument("--filter-min-depth-m", type=float, default=0.15)
+    parser.add_argument("--filter-max-depth-m", type=float, default=3.0)
+    parser.add_argument("--spatial-alpha", type=float, default=0.50)
+    parser.add_argument("--spatial-delta", type=float, default=20.0)
+    parser.add_argument("--temporal-alpha", type=float, default=0.40)
+    parser.add_argument("--temporal-delta", type=float, default=20.0)
+    parser.add_argument("--temporal-persistence", type=float, default=3.0)
     return parser.parse_args()
+
+
+def _make_depth_postprocess(rs, args: argparse.Namespace) -> list:
+    if args.disable_depth_postprocess:
+        return []
+    threshold = rs.threshold_filter()
+    threshold.set_option(rs.option.min_distance, float(args.filter_min_depth_m))
+    threshold.set_option(rs.option.max_distance, float(args.filter_max_depth_m))
+    spatial = rs.spatial_filter()
+    spatial.set_option(rs.option.filter_smooth_alpha, float(args.spatial_alpha))
+    spatial.set_option(rs.option.filter_smooth_delta, float(args.spatial_delta))
+    spatial.set_option(rs.option.holes_fill, 0.0)
+    temporal = rs.temporal_filter()
+    temporal.set_option(rs.option.filter_smooth_alpha, float(args.temporal_alpha))
+    temporal.set_option(rs.option.filter_smooth_delta, float(args.temporal_delta))
+    temporal.set_option(rs.option.holes_fill, float(args.temporal_persistence))
+    return [
+        threshold,
+        rs.disparity_transform(True),
+        spatial,
+        temporal,
+        rs.disparity_transform(False),
+    ]
 
 
 def main() -> int:
@@ -154,6 +189,7 @@ def main() -> int:
     depth_sensor = profile.get_device().first_depth_sensor()
     depth_scale_um = max(1, int(round(float(depth_sensor.get_depth_scale()) * 1_000_000)))
     align = None if args.raw_depth_optical else rs.align(rs.stream.color)
+    depth_postprocess = _make_depth_postprocess(rs, args)
     bus = lcm.LCM(args.lcm_url)
 
     color_profile = profile.get_stream(rs.stream.color).as_video_stream_profile()
@@ -174,7 +210,8 @@ def main() -> int:
     print(
         f"[thor-d435i-lcm] {args.width}x{args.height}@{args.fps} "
         f"depth_scale={depth_scale_um}um source="
-        f"{'raw_depth_optical' if args.raw_depth_optical else 'aligned_to_color'}"
+        f"{'raw_depth_optical' if args.raw_depth_optical else 'aligned_to_color'} "
+        f"postprocess={'off' if not depth_postprocess else 'disparity+spatial+temporal'}"
     )
 
     try:
@@ -185,6 +222,12 @@ def main() -> int:
             color_frame = frames.get_color_frame()
             depth_frame = frames.get_depth_frame()
             if not color_frame or not depth_frame:
+                errors += 1
+                continue
+            for depth_filter in depth_postprocess:
+                depth_frame = depth_filter.process(depth_frame)
+            depth_frame = depth_frame.as_depth_frame()
+            if not depth_frame:
                 errors += 1
                 continue
 

@@ -25,8 +25,6 @@ from .ee_target import GoalPublisher, Workspace, make_goal_payload
 from .depth_alignment import align_depth_to_color
 from .geometry import (
     CameraIntrinsics,
-    deproject,
-    robust_mask_center,
     transform_points,
 )
 from .lcm_protocol import (
@@ -43,6 +41,10 @@ from .robot_geometry import (
     pelvis_to_torso,
 )
 from .rgbd_sync import RgbdPair, RgbdSynchronizer, depth_at_rgb_size
+from .object_point_filter import (
+    ObjectPointFilterConfig,
+    extract_filtered_object_cloud,
+)
 from .sam2_backend import Sam2HieraTinyBackend
 from .efficienttam_backend import EfficientTamTi512Backend
 from .yolo11_backend import Yolo11SegBackend
@@ -320,23 +322,6 @@ def select_tracking_candidate(
     return selected, "ok"
 
 
-def masked_goal_points(
-    xyz_camera: np.ndarray,
-    mask: np.ndarray,
-    t_goal_cam: np.ndarray,
-    *,
-    max_points: int,
-) -> np.ndarray:
-    valid = mask.astype(bool) & np.isfinite(xyz_camera).all(axis=2)
-    points = xyz_camera[valid]
-    if points.size == 0:
-        return np.empty((0, 3), dtype=np.float64)
-    if points.shape[0] > max_points:
-        step = int(np.ceil(points.shape[0] / max(1, int(max_points))))
-        points = points[::step][:max_points]
-    return transform_points(points, t_goal_cam)
-
-
 def draw_belief_highlight(
     overlay: np.ndarray,
     objects: list[dict[str, Any]],
@@ -413,6 +398,7 @@ class SegmentationRuntime:
         efficienttam_config: dict[str, Any],
         yolo11_config: dict[str, Any],
         depth_self_filter_config: dict[str, Any],
+        object_point_filter_config: dict[str, Any],
         intrinsics: CameraIntrinsics | None,
         t_torso_cam: np.ndarray | None,
         static_t_goal_cam: np.ndarray | None,
@@ -440,6 +426,9 @@ class SegmentationRuntime:
         self.efficienttam_config = efficienttam_config
         self.yolo11_config = yolo11_config
         self.depth_self_filter_config = dict(depth_self_filter_config)
+        self.object_point_filter = ObjectPointFilterConfig.from_dict(
+            object_point_filter_config
+        )
         self.intrinsics = intrinsics
         self.t_torso_cam = t_torso_cam
         self.static_t_goal_cam = static_t_goal_cam
@@ -1324,37 +1313,40 @@ class SegmentationRuntime:
                     tasc_inputs: list[BeliefInputObject] = []
                     pending_tasc_inputs: list[dict[str, Any]] = []
                     try:
-                        xyz_camera = deproject(
-                            depth,
-                            frame_intrinsics,
-                            pair.depth.depth_scale_um,
-                            self.min_depth_m,
-                            self.max_depth_m,
+                        depth_m = depth.astype(np.float32) * (
+                            pair.depth.depth_scale_um / 1_000_000.0
                         )
                         for index, mask in enumerate(masks):
-                            center = robust_mask_center(
-                                xyz_camera,
+                            cloud = extract_filtered_object_cloud(
+                                depth_m,
                                 mask,
+                                frame_intrinsics,
+                                self.object_point_filter,
+                                min_depth_m=self.min_depth_m,
+                                max_depth_m=self.max_depth_m,
                                 min_valid_points=self.target_min_depth_points,
+                                max_points=self.tasc_pointcloud_max_points,
                             )
                             objects[index]["center_camera_m"] = None
                             objects[index]["center_goal_m"] = None
                             objects[index]["center_pixel_uv"] = None
                             objects[index]["valid_depth_points"] = 0
-                            if center is None:
+                            objects[index]["point_filter"] = None
+                            if cloud is None:
                                 continue
-                            point_camera, pixel_uv, valid_count = center
+                            point_camera = cloud.center_camera_m
+                            pixel_uv = cloud.center_pixel_uv
                             objects[index]["center_camera_m"] = point_camera.tolist()
                             objects[index]["center_pixel_uv"] = list(pixel_uv)
-                            objects[index]["valid_depth_points"] = valid_count
+                            objects[index]["valid_depth_points"] = cloud.valid_depth_points
+                            objects[index]["median_depth_m"] = cloud.median_depth_m
+                            objects[index]["point_filter"] = cloud.stats
                             if t_goal_cam is not None:
                                 point_goal = transform_points(point_camera, t_goal_cam)
                                 objects[index]["center_goal_m"] = point_goal.tolist()
-                                points_goal = masked_goal_points(
-                                    xyz_camera,
-                                    mask,
+                                points_goal = transform_points(
+                                    cloud.points_camera_m,
                                     t_goal_cam,
-                                    max_points=self.tasc_pointcloud_max_points,
                                 )
                                 pending_tasc_inputs.append(
                                     {
@@ -1690,6 +1682,7 @@ def main() -> int:
     efficienttam_config = dict(segmentation_config.get("efficienttam", {}))
     yolo11_config = dict(segmentation_config.get("yolo11", {}))
     depth_self_filter_config = dict(segmentation_config.get("depth_self_filter", {}))
+    object_point_filter_config = dict(config.get("cloud", {}).get("object_filter", {}))
     target_config = config.get("ee_target", {})
     belief_config = config.get("tasc_belief", {})
     concepts = segmentation_config.get("concepts") or []
@@ -1752,6 +1745,7 @@ def main() -> int:
         efficienttam_config=efficienttam_config,
         yolo11_config=yolo11_config,
         depth_self_filter_config=depth_self_filter_config,
+        object_point_filter_config=object_point_filter_config,
         intrinsics=intrinsics,
         t_torso_cam=t_torso_cam,
         static_t_goal_cam=static_t_goal_cam,

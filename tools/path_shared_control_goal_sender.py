@@ -17,6 +17,7 @@ Examples:
 
 Keys in --interactive mode:
   w/s: x +/-   a/d: y +/-   e/q: z +/-   ]/[: belief +/-
+  u/i: local EE roll CCW/CW   o/p: local EE yaw CCW/CW (5 deg default)
   l/r: force left/right hand   n: nearest-hand auto   0/1: belief 0/1
   c: publish invalid target once   Ctrl+C: stop
 """
@@ -25,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import math
 import os
 import select
 import sys
@@ -97,7 +99,7 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=[1.0, 0.0, 0.0, 0.0],
         metavar=("W", "X", "Y", "Z"),
-        help="Target quaternion in wxyz. The current shared-control path mainly uses position.",
+        help="Explicit IPOPT EE target quaternion in the canonical waist frame (wxyz).",
     )
     parser.add_argument(
         "--belief",
@@ -119,6 +121,12 @@ def parse_args() -> argparse.Namespace:
         help="Continuously stream and accept keyboard edits.",
     )
     parser.add_argument("--step-cm", type=float, default=1.0)
+    parser.add_argument(
+        "--orientation-step-deg",
+        type=float,
+        default=5.0,
+        help="Interactive U/I roll and O/P yaw increment in degrees (default: 5).",
+    )
     parser.add_argument("--belief-step", type=float, default=0.05)
     parser.add_argument(
         "--left-wrist-position",
@@ -208,6 +216,36 @@ def normalize_quat_wxyz(values: list[float] | np.ndarray) -> list[float]:
     if quat[0] < 0.0:
         quat = -quat
     return quat.tolist()
+
+
+def quat_multiply_wxyz(
+    left: list[float] | np.ndarray,
+    right: list[float] | np.ndarray,
+) -> np.ndarray:
+    """Hamilton product for wxyz quaternions, returned normalized."""
+    aw, ax, ay, az = normalize_quat_wxyz(left)
+    bw, bx, by, bz = normalize_quat_wxyz(right)
+    return np.asarray(
+        normalize_quat_wxyz(
+            [
+                aw * bw - ax * bx - ay * by - az * bz,
+                aw * bx + ax * bw + ay * bz - az * by,
+                aw * by - ax * bz + ay * bw + az * bx,
+                aw * bz + ax * by - ay * bx + az * bw,
+            ]
+        ),
+        dtype=np.float64,
+    )
+
+
+def local_x_roll_quaternion(delta_rad: float) -> np.ndarray:
+    half = 0.5 * float(delta_rad)
+    return np.array([math.cos(half), math.sin(half), 0.0, 0.0], dtype=np.float64)
+
+
+def local_z_yaw_quaternion(delta_rad: float) -> np.ndarray:
+    half = 0.5 * float(delta_rad)
+    return np.array([math.cos(half), 0.0, 0.0, math.sin(half)], dtype=np.float64)
 
 
 def transform_from_position_quaternion(
@@ -310,6 +348,7 @@ def make_payload(
     args: argparse.Namespace,
     *,
     position: np.ndarray,
+    quaternion: list[float] | np.ndarray,
     side: str,
     target_link: str,
     belief: float,
@@ -335,7 +374,8 @@ def make_payload(
         "target_link": str(target_link),
         "side": str(side),
         "position": np.asarray(position, dtype=np.float64).reshape(3).tolist(),
-        "quaternion": normalize_quat_wxyz(args.quaternion),
+        "quaternion": normalize_quat_wxyz(quaternion),
+        "orientation_valid": True,
         "source": "manual_shared_control_belief",
         "coordinate_frame": PICO_WAIST_FRAME,
         "target_position_frame": PICO_WAIST_FRAME,
@@ -357,6 +397,7 @@ def make_payload(
             "manual_belief": belief,
             "manual_side": side,
             "manual_target_link": target_link,
+            "orientation_valid": True,
             "streaming_goal": True,
             "coordinate_frame": PICO_WAIST_FRAME,
             "human_wrist_source": "g1_q_ready_fk",
@@ -375,6 +416,7 @@ def print_status(
     *,
     args: argparse.Namespace,
     position: np.ndarray,
+    quaternion: list[float] | np.ndarray,
     belief: float,
     side: str,
     target_link: str,
@@ -384,6 +426,7 @@ def print_status(
     print(
         "[PATH-shared-goal] "
         f"target={np.round(position, 4).tolist()} "
+        f"quat={np.round(normalize_quat_wxyz(quaternion), 4).tolist()} "
         f"belief={belief:.3f} hand={hand} "
         f"link={target_link or '<auto-nearest>'} "
         f"frame={PICO_WAIST_FRAME} "
@@ -399,6 +442,8 @@ def interactive_loop(args: argparse.Namespace, socket: zmq.Socket) -> None:
     belief_step = max(0.0, float(args.belief_step))
     period = 1.0 / max(1.0e-6, float(args.stream_hz))
     position = np.asarray(args.position, dtype=np.float64).reshape(3).copy()
+    quaternion = np.asarray(normalize_quat_wxyz(args.quaternion), dtype=np.float64)
+    orientation_step = math.radians(max(0.0, float(args.orientation_step_deg)))
     side = str(args.side)
     belief = float(np.clip(float(args.belief), 0.0, 1.0))
     goal_uid = f"manual_shared:{uuid.uuid4().hex}"
@@ -406,6 +451,7 @@ def interactive_loop(args: argparse.Namespace, socket: zmq.Socket) -> None:
     print(
         "[PATH-shared-goal] interactive: "
         "w/s=x +/- a/d=y +/- e/q=z +/- ]/[=belief +/- "
+        "u/i=roll CCW/CW o/p=yaw CCW/CW "
         "l=left r=right n=nearest 0/1=belief c=clear Ctrl+C=stop"
     )
     try:
@@ -414,6 +460,22 @@ def interactive_loop(args: argparse.Namespace, socket: zmq.Socket) -> None:
             publish_valid = True
             if key in TerminalKeys.DELTAS:
                 position = position + step * TerminalKeys.DELTAS[key]
+            elif key == "u":
+                quaternion = quat_multiply_wxyz(
+                    quaternion, local_x_roll_quaternion(+orientation_step)
+                )
+            elif key == "i":
+                quaternion = quat_multiply_wxyz(
+                    quaternion, local_x_roll_quaternion(-orientation_step)
+                )
+            elif key == "o":
+                quaternion = quat_multiply_wxyz(
+                    quaternion, local_z_yaw_quaternion(+orientation_step)
+                )
+            elif key == "p":
+                quaternion = quat_multiply_wxyz(
+                    quaternion, local_z_yaw_quaternion(-orientation_step)
+                )
             elif key == "]":
                 belief = min(1.0, belief + belief_step)
             elif key == "[":
@@ -451,6 +513,7 @@ def interactive_loop(args: argparse.Namespace, socket: zmq.Socket) -> None:
             payload = make_payload(
                 args,
                 position=position,
+                quaternion=quaternion,
                 side=side,
                 target_link=target_link,
                 belief=belief,
@@ -464,6 +527,7 @@ def interactive_loop(args: argparse.Namespace, socket: zmq.Socket) -> None:
                 print_status(
                     args=args,
                     position=position,
+                    quaternion=quaternion,
                     belief=belief,
                     side=side,
                     target_link=target_link,
@@ -477,6 +541,7 @@ def interactive_loop(args: argparse.Namespace, socket: zmq.Socket) -> None:
             payload = make_payload(
                 args,
                 position=position,
+                quaternion=quaternion,
                 side=side,
                 target_link=target_link_for_side(side, args.target_link),
                 belief=0.0,
@@ -507,6 +572,7 @@ def main() -> int:
     payload = make_payload(
         args,
         position=position,
+        quaternion=args.quaternion,
         side=args.side,
         target_link=target_link,
         belief=args.belief,
@@ -520,6 +586,7 @@ def main() -> int:
     print_status(
         args=args,
         position=position,
+        quaternion=args.quaternion,
         belief=float(args.belief),
         side=args.side,
         target_link=target_link,

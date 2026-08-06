@@ -32,6 +32,7 @@ class SharedControlConfig:
 class EETarget:
     position: np.ndarray
     confidence: float
+    orientation_wxyz: np.ndarray | None = None
     object_id: str = ""
     grip_index: int = -1
     goal_uid: str = ""
@@ -103,6 +104,70 @@ def _finite_vec3(values: np.ndarray | list[float] | tuple[float, ...] | None) ->
     if not np.isfinite(arr).all():
         return None
     return arr
+
+
+def explicit_orientation_wxyz(payload: dict | None) -> np.ndarray | None:
+    """Return a normalized explicit target orientation, or None if unspecified.
+
+    Perception targets historically include an identity quaternion even when
+    they do not estimate object/EE orientation.  Requiring orientation_valid
+    prevents such placeholders from overriding the live operator wrist pose.
+    """
+
+    if not isinstance(payload, dict) or payload.get("orientation_valid") is not True:
+        return None
+    value = payload.get("quaternion", payload.get("target_quaternion"))
+    try:
+        quat = np.asarray(value, dtype=np.float64).reshape(4)
+    except (TypeError, ValueError):
+        return None
+    norm = float(np.linalg.norm(quat))
+    if not np.isfinite(quat).all() or norm <= 1.0e-12:
+        return None
+    quat = quat / norm
+    if quat[0] < 0.0:
+        quat = -quat
+    return quat
+
+
+def quaternion_wxyz_to_rotation_matrix(
+    quaternion_wxyz: np.ndarray | list[float] | tuple[float, ...],
+) -> np.ndarray:
+    quat = explicit_orientation_wxyz(
+        {"orientation_valid": True, "quaternion": quaternion_wxyz}
+    )
+    if quat is None:
+        raise ValueError("invalid explicit target quaternion")
+    w, x, y, z = quat
+    return np.array(
+        [
+            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+            [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+            [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+        ],
+        dtype=np.float64,
+    )
+
+
+def apply_explicit_orientation_to_wrist_targets(
+    left_target_tf: np.ndarray,
+    right_target_tf: np.ndarray,
+    *,
+    selected_hand: str,
+    orientation_wxyz: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray, str]:
+    """Apply an explicit waist-frame EE orientation to only the selected hand."""
+
+    left = np.asarray(left_target_tf, dtype=np.float64).reshape(4, 4).copy()
+    right = np.asarray(right_target_tf, dtype=np.float64).reshape(4, 4).copy()
+    if orientation_wxyz is None or selected_hand not in {"left", "right"}:
+        return left, right, "human_wrist_prior"
+    rotation = quaternion_wxyz_to_rotation_matrix(orientation_wxyz)
+    if selected_hand == "left":
+        left[:3, :3] = rotation
+    else:
+        right[:3, :3] = rotation
+    return left, right, "explicit_static_target"
 
 
 @dataclass

@@ -60,6 +60,8 @@ from path_core.intention.action_blending import (
     RIGHT_WRIST_LINK,
     SharedControlConfig,
     TaskSpaceBlender,
+    apply_explicit_orientation_to_wrist_targets,
+    explicit_orientation_wxyz,
 )
 from path_core.messaging.path_schema import (
     CUROBO_PLAN_TOPIC,
@@ -73,6 +75,12 @@ from path_core.messaging.path_schema import (
     qp_sample_reference,
 )
 from path_core.messaging.zmq_bus import pack_topic, unpack_topic
+from path_core.teleop.pico_joystick_locomotion import (
+    PicoJoystickLocomotionConfig,
+    PicoJoystickLocomotionMapper,
+    SonicLocomotionCommand,
+    yaw_from_quaternion_wxyz,
+)
 from path_planning.unitree_arm_nonlinear_ik import UnitreeG1ArmNonlinearIK
 from path_streaming.path_smpl_thread_server import UPPER_BODY_PLANNER_INDICES
 
@@ -156,6 +164,25 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--button-endpoint", default="tcp://127.0.0.1:5565")
     parser.add_argument("--button-topic", default="pico_button_event")
+    parser.add_argument(
+        "--controller-state-topic", default="pico_controller_state"
+    )
+    parser.add_argument(
+        "--joystick-locomotion",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Allow safe PICO locomotion conditioning in q/teleop state only.",
+    )
+    parser.add_argument("--joystick-deadzone", type=float, default=0.18)
+    parser.add_argument("--joystick-forward-max-mps", type=float, default=0.30)
+    parser.add_argument("--joystick-backward-max-mps", type=float, default=0.15)
+    parser.add_argument("--joystick-lateral-max-mps", type=float, default=0.18)
+    parser.add_argument("--joystick-min-speed-mps", type=float, default=0.08)
+    parser.add_argument("--joystick-max-yaw-rate-rad-s", type=float, default=0.30)
+    parser.add_argument("--joystick-linear-accel-mps2", type=float, default=0.35)
+    parser.add_argument("--joystick-linear-decel-mps2", type=float, default=0.70)
+    parser.add_argument("--joystick-yaw-accel-rad-s2", type=float, default=0.60)
+    parser.add_argument("--joystick-stale-timeout-sec", type=float, default=0.15)
     parser.add_argument("--plan-endpoint", default="tcp://127.0.0.1:5562")
     parser.add_argument("--plan-topic", default=CUROBO_PLAN_TOPIC)
     parser.add_argument("--static-target-bind", default="tcp://*:5564")
@@ -787,6 +814,7 @@ def send_planner_command(
     freeze_lower_body: bool = True,
     left_hand_position: np.ndarray | list[float] | None = None,
     right_hand_position: np.ndarray | list[float] | None = None,
+    locomotion: SonicLocomotionCommand | None = None,
 ) -> None:
     q_for_command = np.asarray(q29, dtype=np.float64).reshape(29).copy()
     if freeze_lower_body:
@@ -804,17 +832,34 @@ def send_planner_command(
         if right_hand_position is not None
         else np.zeros(7, dtype=np.float32)
     )
+    locomotion_mode = 0 if locomotion is None else int(locomotion.mode)
+    movement = (
+        [0.0, 0.0, 0.0]
+        if locomotion is None
+        else np.asarray(locomotion.movement, dtype=np.float32).reshape(3).tolist()
+    )
+    facing = (
+        [1.0, 0.0, 0.0]
+        if locomotion is None
+        else np.asarray(locomotion.facing, dtype=np.float32).reshape(3).tolist()
+    )
+    speed = -1.0 if locomotion is None else float(locomotion.speed)
+    height = (
+        SONIC_DEFAULT_STANDING_HEIGHT
+        if locomotion is None
+        else float(locomotion.height)
+    )
     socket.send(
         build_planner_message(
-            0,
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            speed=-1.0,
+            locomotion_mode,
+            movement,
+            facing,
+            speed=speed,
             # Do not inject a root/base-height target from PATH.  -1 is the
             # protocol's use-trained-default sentinel, not a zero-height
             # command.  The remaining locomotion command is intentionally
             # static as well.
-            height=SONIC_DEFAULT_STANDING_HEIGHT,
+            height=height,
             upper_body_position=upper.tolist(),
             upper_body_velocity=np.zeros(17, dtype=np.float32).tolist(),
             left_hand_position=left_hand.tolist(),
@@ -1123,9 +1168,11 @@ def ee_target_from_static_payload(
         "object_index",
         default=-1,
     )
+    orientation_wxyz = explicit_orientation_wxyz(payload)
     return EETarget(
         position=position,
         confidence=confidence,
+        orientation_wxyz=orientation_wxyz,
         object_id=object_id,
         grip_index=grip_index,
         goal_uid=str(payload.get("goal_uid", "")),
@@ -1418,6 +1465,14 @@ def main() -> int:
     button_sub.setsockopt(zmq.RCVTIMEO, 1)
     button_sub.connect(args.button_endpoint)
 
+    controller_sub = ctx.socket(zmq.SUB)
+    controller_sub.setsockopt(
+        zmq.SUBSCRIBE, args.controller_state_topic.encode()
+    )
+    controller_sub.setsockopt(zmq.CONFLATE, 1)
+    controller_sub.setsockopt(zmq.RCVTIMEO, 1)
+    controller_sub.connect(args.button_endpoint)
+
     plan_sub = ctx.socket(zmq.SUB)
     plan_sub.setsockopt(zmq.SUBSCRIBE, args.plan_topic.encode())
     plan_sub.setsockopt(zmq.CONFLATE, 1)
@@ -1453,7 +1508,10 @@ def main() -> int:
     qp.bind(f"tcp://{args.qp_bind_host}:{args.qp_port}")
 
     log(f"Pico input SUB {args.pico_endpoint}/pose,command,planner,manager_state")
-    log(f"Pico ABXY SUB {args.button_endpoint}/{args.button_topic}")
+    log(
+        f"Pico controller SUB {args.button_endpoint}/"
+        f"{args.button_topic},{args.controller_state_topic}"
+    )
     log(
         "GMR input disabled: wrist targets use manager-calibrated PICO "
         "pelvis-frame SE(3) directly"
@@ -1555,6 +1613,25 @@ def main() -> int:
     latest_right_hand_joints: np.ndarray | None = None
     latest_hand_us = 0
     latest_hand_meta: dict[str, float] = {}
+    latest_controller_left_axis = np.zeros(2, dtype=np.float64)
+    latest_controller_right_axis = np.zeros(2, dtype=np.float64)
+    latest_controller_state_us = 0
+    latest_controller_sequence = 0
+    joystick_mapper = PicoJoystickLocomotionMapper(
+        PicoJoystickLocomotionConfig(
+            deadzone=float(args.joystick_deadzone),
+            forward_max_mps=float(args.joystick_forward_max_mps),
+            backward_max_mps=float(args.joystick_backward_max_mps),
+            lateral_max_mps=float(args.joystick_lateral_max_mps),
+            minimum_nonzero_speed_mps=float(args.joystick_min_speed_mps),
+            maximum_yaw_rate_rad_s=float(args.joystick_max_yaw_rate_rad_s),
+            linear_acceleration_limit_mps2=float(args.joystick_linear_accel_mps2),
+            linear_deceleration_limit_mps2=float(args.joystick_linear_decel_mps2),
+            yaw_acceleration_limit_rad_s2=float(args.joystick_yaw_accel_rad_s2),
+            input_stale_timeout_sec=float(args.joystick_stale_timeout_sec),
+        )
+    )
+    joystick_mapper.reset(yaw_from_quaternion_wxyz(latest_robot_base_quat))
     phase_mode = "none"
     phase_sync_error_rad = float("nan")
     last_arm_ik_solve_ms = float("nan")
@@ -1821,6 +1898,9 @@ def main() -> int:
         previous_state = current_state
         if requested != current_state:
             log(f"{source} state command: {current_state} -> {requested}")
+            joystick_mapper.reset(
+                yaw_from_quaternion_wxyz(latest_robot_base_quat)
+            )
         else:
             log(f"{source} state command: staying in {requested}")
         current_state = requested
@@ -1942,6 +2022,18 @@ def main() -> int:
         f"freeze_waist={bool(args.freeze_planner_waist)} "
         "root=idle/movement=0/speed=default/height=default"
     )
+    log(
+        "PICO joystick locomotion: "
+        f"{'q-only enabled' if args.joystick_locomotion else 'disabled'}; "
+        f"deadzone={args.joystick_deadzone:.2f} "
+        f"v_fwd/rev/lat={args.joystick_forward_max_mps:.2f}/"
+        f"{args.joystick_backward_max_mps:.2f}/"
+        f"{args.joystick_lateral_max_mps:.2f}m/s "
+        f"v_min={args.joystick_min_speed_mps:.2f}m/s "
+        f"yaw_max={args.joystick_max_yaw_rate_rad_s:.2f}rad/s "
+        f"stale={args.joystick_stale_timeout_sec:.2f}s "
+        "mode=SLOW_WALK height=-1"
+    )
 
     next_deadline = time.monotonic()
     try:
@@ -1951,11 +2043,42 @@ def main() -> int:
             dt = max(1.0e-4, now - last_tick)
             last_tick = now
 
-            # ABXY has a dedicated 100Hz source so pose/FK/IK work cannot delay
-            # mode commands. The timestamps are carried all the way to g1_debug.
+            # Raw controller state is conflated independently of discrete
+            # button events.  This prevents an IPOPT-heavy tick from replaying
+            # stale locomotion samples out of a shared queue.
+            try:
+                controller_raw = controller_sub.recv(zmq.NOBLOCK)
+                controller = unpack_prefixed_msgpack(
+                    controller_raw, args.controller_state_topic
+                )
+                controller_sequence = int(controller.get("sequence", 0))
+                left_axis = np.asarray(
+                    controller.get("left_axis", []), dtype=np.float64
+                ).reshape(-1)
+                right_axis = np.asarray(
+                    controller.get("right_axis", []), dtype=np.float64
+                ).reshape(-1)
+                if (
+                    controller_sequence > latest_controller_sequence
+                    and left_axis.size >= 2
+                    and right_axis.size >= 2
+                    and np.isfinite(left_axis[:2]).all()
+                    and np.isfinite(right_axis[:2]).all()
+                ):
+                    latest_controller_left_axis = left_axis[:2].copy()
+                    latest_controller_right_axis = right_axis[:2].copy()
+                    latest_controller_state_us = tick_us
+                    latest_controller_sequence = controller_sequence
+            except zmq.Again:
+                pass
+
+            # ABXY has a dedicated 100Hz event queue so pose/FK/IK work cannot
+            # delay mode commands. The timestamps reach g1_debug unchanged.
             try:
                 while True:
                     event_raw = button_sub.recv(zmq.NOBLOCK)
+                    if not starts(event_raw, args.button_topic):
+                        continue
                     event = unpack_prefixed_msgpack(event_raw, args.button_topic)
                     sequence = int(event.get("sequence", 0))
                     if sequence <= last_button_sequence:
@@ -1963,7 +2086,9 @@ def main() -> int:
                     last_button_sequence = sequence
                     dedicated_button_events_seen = True
                     event_name = str(event.get("event", ""))
-                    if event_name not in {"start_combo", "ax", "by"}:
+                    if event_name not in {
+                        "start_combo", "ax", "by", "mode_q", "mode_e"
+                    }:
                         continue
                     bridge_receive_us = now_us()
                     start = False
@@ -1977,12 +2102,21 @@ def main() -> int:
                         set_pico_tracking_armed(False, "Pico start/stop")
                         if stop:
                             current_state = "teleop"
+                            joystick_mapper.reset(
+                                yaw_from_quaternion_wxyz(latest_robot_base_quat)
+                            )
                     elif event_name == "ax":
                         set_pico_tracking_armed(
                             not pico_tracking_armed, "Pico A+X"
                         )
                         planner = True
                     elif event_name == "by":
+                        planner = True
+                    elif event_name == "mode_q":
+                        apply_state_request("teleop", "Pico X", tick_us)
+                        planner = True
+                    elif event_name == "mode_e":
+                        apply_state_request("auto_planning", "Pico Y", tick_us)
                         planner = True
                     bridge_forward_us = now_us()
                     sonic.send(
@@ -2370,6 +2504,48 @@ def main() -> int:
             )
 
             left_hand_cmd, right_hand_cmd, hand_fresh = current_pico_hand_joints(tick_us)
+            controller_age_sec = (
+                (tick_us - latest_controller_state_us) / 1.0e6
+                if latest_controller_state_us > 0
+                else float("inf")
+            )
+            controller_fresh = (
+                latest_controller_state_us > 0
+                and controller_age_sec
+                <= float(args.joystick_stale_timeout_sec)
+            )
+            current_base_yaw = yaw_from_quaternion_wxyz(
+                latest_robot_base_quat
+            )
+            joystick_enabled = bool(
+                args.joystick_locomotion
+                and current_state == "teleop"
+                and policy_started
+                and controller_fresh
+            )
+            if joystick_enabled:
+                joystick_command = joystick_mapper.update(
+                    latest_controller_left_axis,
+                    latest_controller_right_axis,
+                    dt,
+                    current_yaw_rad=current_base_yaw,
+                )
+            else:
+                if not args.joystick_locomotion:
+                    joystick_reason = "disabled"
+                elif current_state != "teleop":
+                    joystick_reason = f"state_{current_state}"
+                elif not policy_started:
+                    joystick_reason = "policy_stopped"
+                else:
+                    joystick_reason = "stale"
+                # State exit, policy stop, and stale input are hard safety
+                # gates: zero immediately rather than applying the normal
+                # deceleration ramp to an uncommanded motion.
+                joystick_command = joystick_mapper.idle(
+                    yaw_rad=current_base_yaw,
+                    reason=joystick_reason,
+                )
             plan_fresh = latest_plan is not None and (tick_us - latest_plan_us) <= args.plan_timeout_sec * 1.0e6
             static_target_age_sec = (
                 (tick_us - latest_static_target_us) / 1.0e6
@@ -2438,6 +2614,7 @@ def main() -> int:
                             freeze_lower_body=True,
                             left_hand_position=left_hand_cmd,
                             right_hand_position=right_hand_cmd,
+                            locomotion=joystick_command,
                         )
                     source_timestamp_us = int(latest_wrist_targets.source_timestamp_us)
                     if ik_result.success:
@@ -2518,6 +2695,7 @@ def main() -> int:
                             freeze_lower_body=True,
                             left_hand_position=left_hand_cmd,
                             right_hand_position=right_hand_cmd,
+                            locomotion=joystick_command,
                         )
                     # Q_READY is used only before tracking is armed. Once A+X
                     # completes the one-shot alignment, transient source gaps
@@ -2638,6 +2816,22 @@ def main() -> int:
                                 left_target_tf[:3, 3] = active_target
                             if active_target is not None and result.hand == "right":
                                 right_target_tf[:3, 3] = active_target
+                            (
+                                left_target_tf,
+                                right_target_tf,
+                                shared_orientation_source,
+                            ) = apply_explicit_orientation_to_wrist_targets(
+                                left_target_tf,
+                                right_target_tf,
+                                selected_hand=(
+                                    result.hand if active_target is not None else "none"
+                                ),
+                                orientation_wxyz=(
+                                    None
+                                    if target is None
+                                    else target.orientation_wxyz
+                                ),
+                            )
                             ik_result = solve_authoritative_ipopt_transforms(
                                 left_target_tf,
                                 right_target_tf,
@@ -2658,6 +2852,7 @@ def main() -> int:
                                 freeze_lower_body=True,
                                 left_hand_position=left_hand_cmd,
                                 right_hand_position=right_hand_cmd,
+                                locomotion=joystick_command,
                             )
                             last_plan_q = q_for_sonic.copy()
                             blended_q = q_for_sonic.copy()
@@ -2695,6 +2890,7 @@ def main() -> int:
                                     arm_ik_status=str(ik_result.message),
                                     shared_gate_reason=result.gate_reason,
                                     shared_human_wrist_source=human_wrist_source,
+                                    shared_orientation_source=shared_orientation_source,
                                     shared_coordinate_frame=PICO_WAIST_FRAME,
                                 )
                                 phase_mode = "ipopt_failed_hold"
@@ -2726,6 +2922,7 @@ def main() -> int:
                                     shared_control=True,
                                     shared_gate_reason=result.gate_reason,
                                     shared_human_wrist_source=human_wrist_source,
+                                    shared_orientation_source=shared_orientation_source,
                                     shared_coordinate_frame=PICO_WAIST_FRAME,
                                 )
                                 phase_mode = "shared_control_wait"
@@ -2795,6 +2992,13 @@ def main() -> int:
                                     ),
                                     shared_human_wrist_source=human_wrist_source,
                                     shared_coordinate_frame=PICO_WAIST_FRAME,
+                                    shared_orientation_source=shared_orientation_source,
+                                    shared_target_quaternion_wxyz=(
+                                        None
+                                        if target is None
+                                        or target.orientation_wxyz is None
+                                        else target.orientation_wxyz.tolist()
+                                    ),
                                 )
                                 phase_mode = "shared_control"
                             phase_sync_error_rad = float("nan")
@@ -2807,6 +3011,7 @@ def main() -> int:
                                 freeze_lower_body=True,
                                 left_hand_position=left_hand_cmd,
                                 right_hand_position=right_hand_cmd,
+                                locomotion=joystick_command,
                             )
                             qp_payload = ipopt_arm_sample_reference(
                                 hold_q,
@@ -2849,6 +3054,7 @@ def main() -> int:
                             freeze_lower_body=True,
                             left_hand_position=left_hand_cmd,
                             right_hand_position=right_hand_cmd,
+                            locomotion=joystick_command,
                         )
                         qp_payload = ipopt_arm_sample_reference(
                             hold_q,
@@ -3050,6 +3256,7 @@ def main() -> int:
                         freeze_lower_body=bool(args.freeze_planner_lower_body),
                         left_hand_position=left_hand_cmd,
                         right_hand_position=right_hand_cmd,
+                        locomotion=joystick_command,
                     )
                     last_plan_q = q_command.copy()
                     blended_q = q_prior.copy()
@@ -3144,6 +3351,7 @@ def main() -> int:
                             freeze_lower_body=bool(args.freeze_planner_lower_body),
                             left_hand_position=left_hand_cmd,
                             right_hand_position=right_hand_cmd,
+                            locomotion=joystick_command,
                         )
                         # Publish the same cuRobo spline that produced SONIC's
                         # q_plan. Re-anchor t_start every tick to the
@@ -3230,6 +3438,7 @@ def main() -> int:
                         freeze_lower_body=bool(args.freeze_planner_lower_body),
                         left_hand_position=left_hand_cmd,
                         right_hand_position=right_hand_cmd,
+                        locomotion=joystick_command,
                     )
                     qp_payload = ipopt_arm_sample_reference(
                         blended_q,
@@ -3441,6 +3650,14 @@ def main() -> int:
                     f"released={released_pose_frame}/{released_pose_frames} "
                     f"pose_frame={latest_smpl_frame} "
                     f"button_seq={last_button_sequence} "
+                    f"joy_seq={latest_controller_sequence} "
+                    f"joy_age={1000.0 * controller_age_sec if np.isfinite(controller_age_sec) else -1.0:.1f}ms "
+                    f"joy_L=({latest_controller_left_axis[0]:+.2f},"
+                    f"{latest_controller_left_axis[1]:+.2f}) "
+                    f"joy_Rx={latest_controller_right_axis[0]:+.2f} "
+                    f"loco={joystick_command.reason}/m{joystick_command.mode} "
+                    f"v={joystick_command.speed if joystick_command.speed >= 0.0 else 0.0:.2f}m/s "
+                    f"yaw_rate={joystick_command.yaw_rate_rad_s:+.2f}rad/s "
                     f"control={qp_payload.get('control_mode', 'none') if qp_payload else 'none'} "
                     f"plan={qp_payload.get('plan_id', 0) if qp_payload else 0} "
                     f"phase={float(qp_payload.get('phase', 0.0)) if qp_payload else 0.0:.2f} "
@@ -3473,6 +3690,7 @@ def main() -> int:
         pico_planner.close()
         pico_manager.close()
         button_sub.close()
+        controller_sub.close()
         plan_sub.close()
         robot_state.close()
         state_sub.close()

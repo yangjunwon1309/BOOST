@@ -105,6 +105,17 @@ cloud:
   workspace_lims: [-1.0, 1.0, -1.0, 1.0, 0.1, 1.5]
   voxel_size_m: 0.005
   object_max_points: 8000
+  # Common geometry input for object center, cylinder fitting and contact
+  # generation. These gates run after the robot self-mask has been removed.
+  object_filter:
+    enabled: true
+    erosion_px: 2
+    depth_edge_threshold_m: 0.030
+    mad_scale: 3.5
+    min_depth_band_m: 0.020
+    voxel_size_m: 0.005
+    radius_outlier_m: 0.018
+    min_radius_neighbors: 3
 grip:
   h_th_m: 0.12
   finger_clearance_m: 0.005

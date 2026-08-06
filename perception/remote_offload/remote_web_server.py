@@ -247,6 +247,8 @@ class RemoteWebRuntime:
                     "center_goal_m": obj.get("center_goal_m"),
                     "target_contact_goal_m": obj.get("target_contact_goal_m"),
                     "contact_candidates": obj.get("contact_candidates", []),
+                    "surface_model": obj.get("surface_model"),
+                    "point_filter": obj.get("point_filter"),
                 }
             )
         if masks:

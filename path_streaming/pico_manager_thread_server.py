@@ -57,6 +57,9 @@ from gear_sonic.trl.utils.torch_transform import (
     quaternion_to_angle_axis,
     quaternion_to_rotation_matrix,
 )
+from path_core.teleop.pico_joystick_locomotion import (
+    PicoButtonGestureInterpreter,
+)
 
 try:
     from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
@@ -830,7 +833,12 @@ def get_abxy_buttons():
 
 
 class PicoButtonEventPublisher:
-    """Poll ABXY independently from body/FK work and publish rising edges."""
+    """Poll controller input independently from body/FK work.
+
+    ABXY gestures are emitted as discrete events.  Raw thumbstick state is
+    published at the polling rate so the PATH state machine owns all safety
+    limits and the q-only locomotion gate.
+    """
 
     def __init__(self, *, port: int = 5565, poll_hz: float = 100.0):
         self.port = int(port)
@@ -839,6 +847,7 @@ class PicoButtonEventPublisher:
         self._lock = threading.Lock()
         self._latest = (False, False, False, False)
         self._sequence = 0
+        self._controller_sequence = 0
         self._thread = threading.Thread(
             target=self._run, name="pico-abxy-poller", daemon=True
         )
@@ -862,29 +871,43 @@ class PicoButtonEventPublisher:
         socket.bind(f"tcp://*:{self.port}")
         print(
             f"[PicoButtons] polling ABXY at {self.poll_hz:.0f}Hz; "
-            f"publishing tcp://*:{self.port}/pico_button_event",
+            f"publishing tcp://*:{self.port}/pico_button_event + "
+            "pico_controller_state",
             flush=True,
         )
-        previous = (False, False, False, False)
+        gestures = PicoButtonGestureInterpreter()
         period = 1.0 / self.poll_hz
         deadline = time.monotonic()
         try:
             while not self._stop.is_set():
                 buttons = get_abxy_buttons()
+                lx, ly, rx, ry = get_controller_axes()
+                left_axis_click, right_axis_click = get_axis_clicks()
                 read_timestamp_us = time.monotonic_ns() // 1000
                 with self._lock:
                     self._latest = buttons
                 a, b, x, y = buttons
-                pa, pb, px, py = previous
-                events: list[str] = []
-                if a and b and x and y and not (pa and pb and px and py):
-                    events.append("start_combo")
-                elif a and x and not (pa and px):
-                    events.append("ax")
-                elif b and y and not (pb and py):
-                    events.append("by")
-                if buttons != previous:
-                    events.append("button_state")
+                self._controller_sequence += 1
+                controller_payload = {
+                    "schema": "path.pico_controller_state.v1",
+                    "sequence": self._controller_sequence,
+                    "controller_read_timestamp_us": int(read_timestamp_us),
+                    "publish_timestamp_us": int(time.monotonic_ns() // 1000),
+                    "left_axis": [float(lx), float(ly)],
+                    "right_axis": [float(rx), float(ry)],
+                    "left_axis_click": bool(left_axis_click),
+                    "right_axis_click": bool(right_axis_click),
+                    "a": bool(a),
+                    "b": bool(b),
+                    "x": bool(x),
+                    "y": bool(y),
+                }
+                socket.send(
+                    b"pico_controller_state"
+                    + msgpack.packb(controller_payload, use_bin_type=True)
+                )
+
+                events = gestures.update(buttons)
                 for event in events:
                     self._sequence += 1
                     payload = {
@@ -902,7 +925,6 @@ class PicoButtonEventPublisher:
                         b"pico_button_event"
                         + msgpack.packb(payload, use_bin_type=True)
                     )
-                previous = buttons
                 deadline += period
                 delay = deadline - time.monotonic()
                 if delay > 0.0:

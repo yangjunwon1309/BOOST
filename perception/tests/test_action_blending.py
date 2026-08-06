@@ -6,15 +6,25 @@ from path_core.intention.action_blending import (
     EETarget,
     SharedControlConfig,
     TaskSpaceBlender,
+    apply_explicit_orientation_to_wrist_targets,
     confidence_to_alpha,
+    explicit_orientation_wxyz,
+    quaternion_wxyz_to_rotation_matrix,
 )
 
 
-def _target(position=(0.4, 0.1, 0.2), confidence=0.9, uid="a", grip=0, ts=0):
+def _target(
+    position=(0.4, 0.1, 0.2),
+    confidence=0.9,
+    uid="a",
+    grip=0,
+    ts=0,
+    object_id="bottle",
+):
     return EETarget(
         position=np.asarray(position, dtype=np.float64),
         confidence=float(confidence),
-        object_id="bottle",
+        object_id=object_id,
         grip_index=grip,
         goal_uid=uid,
         timestamp_us=ts,
@@ -25,6 +35,63 @@ def test_confidence_piecewise_alpha_mapping():
     assert confidence_to_alpha(0.54, 0.55, 0.85) == 0.0
     assert confidence_to_alpha(0.85, 0.55, 0.85) == 1.0
     assert np.isclose(confidence_to_alpha(0.70, 0.55, 0.85), 0.5)
+
+
+def test_explicit_orientation_requires_valid_flag_and_normalizes_wxyz():
+    quaternion = [2.0, 0.0, 0.0, 0.0]
+    assert explicit_orientation_wxyz({"quaternion": quaternion}) is None
+    parsed = explicit_orientation_wxyz(
+        {"orientation_valid": True, "quaternion": quaternion}
+    )
+    assert np.allclose(parsed, [1.0, 0.0, 0.0, 0.0])
+    assert explicit_orientation_wxyz(
+        {"orientation_valid": True, "quaternion": [0.0, 0.0, 0.0, 0.0]}
+    ) is None
+
+
+def test_explicit_orientation_replaces_only_selected_ipopt_wrist_rotation():
+    left = np.eye(4, dtype=np.float64)
+    right = np.eye(4, dtype=np.float64)
+    right[:3, :3] = quaternion_wxyz_to_rotation_matrix(
+        [np.cos(np.pi / 8.0), 0.0, np.sin(np.pi / 8.0), 0.0]
+    )
+    target_quaternion = np.array(
+        [np.cos(np.pi / 4.0), 0.0, 0.0, np.sin(np.pi / 4.0)],
+        dtype=np.float64,
+    )
+    updated_left, updated_right, source = (
+        apply_explicit_orientation_to_wrist_targets(
+            left,
+            right,
+            selected_hand="left",
+            orientation_wxyz=target_quaternion,
+        )
+    )
+    assert source == "explicit_static_target"
+    assert np.allclose(
+        updated_left[:3, :3],
+        quaternion_wxyz_to_rotation_matrix(target_quaternion),
+    )
+    assert np.allclose(updated_right, right)
+
+
+def test_missing_explicit_orientation_preserves_both_human_wrist_rotations():
+    left = np.eye(4, dtype=np.float64)
+    right = np.eye(4, dtype=np.float64)
+    left[:3, :3] = quaternion_wxyz_to_rotation_matrix(
+        [np.cos(np.pi / 12.0), np.sin(np.pi / 12.0), 0.0, 0.0]
+    )
+    updated_left, updated_right, source = (
+        apply_explicit_orientation_to_wrist_targets(
+            left,
+            right,
+            selected_hand="left",
+            orientation_wxyz=None,
+        )
+    )
+    assert source == "human_wrist_prior"
+    assert np.allclose(updated_left, left)
+    assert np.allclose(updated_right, right)
 
 
 def test_adaptive_alpha_rate_bounds_transfer_velocity():
@@ -142,7 +209,12 @@ def test_target_switch_resets_alpha_and_lpf():
     )
     assert blender.alpha > 0.0
     result = blender.update(
-        target=_target(position=(0.8, 0.0, 0.0), confidence=1.0, uid="new"),
+        target=_target(
+            position=(0.8, 0.0, 0.0),
+            confidence=1.0,
+            uid="new",
+            object_id="box",
+        ),
         p_human_left=left,
         p_human_right=right,
         p_measured_left=left,

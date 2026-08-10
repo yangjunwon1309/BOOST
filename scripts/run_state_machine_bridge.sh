@@ -10,9 +10,6 @@ exec taskset -c "${PATH_CONTROL_CPUSET:-6-7}" \
 python -u path_streaming/path_state_machine_bridge.py \
   --state "${PATH_STATE:-teleop}" \
   --fps "${PATH_FPS:-50}" \
-  $(if [[ "${PATH_PLANNER_LOWER_BODY_IDLE_DEFAULT:-${PATH_TELEOP_GMR_ARMS_ONLY_DEFAULT:-1}}" != "0" ]]; then printf '%s' "--planner-lower-body-idle-default"; else printf '%s' "--no-planner-lower-body-idle-default"; fi) \
-  $(if [[ "${PATH_FREEZE_PLANNER_LOWER_BODY:-1}" != "0" ]]; then printf '%s' "--freeze-planner-lower-body"; else printf '%s' "--no-freeze-planner-lower-body"; fi) \
-  $(if [[ "${PATH_FREEZE_PLANNER_WAIST:-1}" != "0" ]]; then printf '%s' "--freeze-planner-waist"; else printf '%s' "--no-freeze-planner-waist"; fi) \
   --pico-hand-timeout-sec "${PATH_PICO_HAND_TIMEOUT_SEC:-0.35}" \
   --pico-body-gap-hold-ms "${PATH_PICO_BODY_GAP_HOLD_MS:-100}" \
   --arm-reference-mode head_position \
@@ -36,16 +33,18 @@ python -u path_streaming/path_state_machine_bridge.py \
   --shared-alpha-rate-up "${PATH_SHARED_ALPHA_RATE_UP:-1.0}" \
   --shared-alpha-rate-down "${PATH_SHARED_ALPHA_RATE_DOWN:-3.0}" \
   --shared-v-transfer-max "${PATH_SHARED_V_TRANSFER_MAX:-0.25}" \
-  --shared-startup-hold-sec "${PATH_SHARED_STARTUP_HOLD_SEC:-2.0}" \
+  --shared-startup-hold-sec "${PATH_SHARED_STARTUP_HOLD_SEC:-0.0}" \
   --shared-stale-after-sec "${PATH_SHARED_STALE_AFTER_SEC:-0.3}" \
   --shared-d-max-m "${PATH_SHARED_D_MAX_M:-0.9}" \
   --shared-ref-lpf-alpha "${PATH_SHARED_REF_LPF_ALPHA:-0.3}" \
   --shared-hand-h-margin-m "${PATH_SHARED_HAND_H_MARGIN_M:-0.05}" \
   --shared-hand-switch-confirm-n "${PATH_SHARED_HAND_SWITCH_CONFIRM_N:-10}" \
   --shared-orientation-mode "${PATH_SHARED_ORIENTATION_MODE:-gmr_prior}" \
-  --shared-waist-mode "${PATH_SHARED_WAIST_MODE:-sonic_passthrough}" \
   $(if [[ "${PATH_SHARED_LOCK_INACTIVE_ARM_Q_PRIOR:-1}" != "0" ]]; then printf '%s' "--shared-lock-inactive-arm-q-prior"; else printf '%s' "--no-shared-lock-inactive-arm-q-prior"; fi) \
-  --sonic-port "${PATH_SONIC_PORT:-5556}" \
+  --direct-lcm-url "${PATH_LCM_URL:-udpm://239.255.76.67:7667?ttl=1}" \
+  --direct-upper-command-channel "${PATH_DIRECT_UPPER_CHANNEL:-G1_PATH_UPPER_COMMAND}" \
+  --direct-state-channel "${PATH_LCM_STATE_CHANNEL:-G1_ROBOT_STATE}" \
+  --direct-lcm-state \
   --qp-port "${PATH_REFERENCE_PORT:-5560}" \
   --qp-topic "${PATH_REFERENCE_TOPIC:-path_qp_reference}" \
   --shared-hand-selection-bind "${PATH_SHARED_HAND_SELECTION_BIND:-tcp://*:${PATH_SHARED_HAND_SELECTION_PORT:-5567}}" \

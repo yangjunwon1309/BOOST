@@ -108,13 +108,9 @@ class PicoButtonGestureInterpreter:
             events.append("by")
 
         if px and not x:
-            if self.x_active and not self.x_chorded:
-                events.append("mode_q")
             self.x_active = False
             self.x_chorded = False
         if py and not y:
-            if self.y_active and not self.y_chorded:
-                events.append("mode_e")
             self.y_active = False
             self.y_chorded = False
 

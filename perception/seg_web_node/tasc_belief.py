@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import logging
 import time
 from typing import Any
 
@@ -18,12 +19,16 @@ from .feature_cost import (
 from .grip_candidates import (
     GripCandidate,
     GripCandidateConfig,
+    PseudoContactConfig,
+    PseudoContactPoint,
     PersistentCylinderSurfaceTracker,
+    extract_pseudo_contacts,
     generate_grip_candidates,
 )
 
 
 EPS = 1.0e-9
+LOG = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -34,6 +39,7 @@ class BeliefInputObject:
     center_goal_m: np.ndarray
     points_goal_m: np.ndarray | None = None
     grip_candidates: list[GripCandidate] | None = None
+    pseudo_contacts: list[PseudoContactPoint] | None = None
 
 
 @dataclass(frozen=True)
@@ -47,6 +53,70 @@ class EETarget:
 
 
 @dataclass(frozen=True)
+class OrientationCandidate:
+    object_id: str
+    pseudo_index: int
+    relation: str
+    position: np.ndarray
+    normal: np.ndarray
+    fit_quality: float
+    track_id: str = ""
+    label: str = ""
+
+
+@dataclass(frozen=True)
+class OrientationTarget:
+    quaternion_xyzw: np.ndarray
+    axis_world: np.ndarray
+    relation: str
+    object_id: str
+    confidence: float
+    source_position: np.ndarray
+
+
+@dataclass
+class HandBeliefState:
+    """Independent posterior state for one hand in parallel inference."""
+
+    side: str
+    log_object: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float64))
+    log_contact: dict[str, np.ndarray] = field(default_factory=dict)
+    log_orientation: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float64))
+    ema_adv_object: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float64))
+    ema_adv_contact: dict[str, np.ndarray] = field(default_factory=dict)
+    ema_adv_orientation: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float64))
+    armed: bool = False
+    beta_current: float = 0.0
+    lambda0_current: float = 0.0
+    alpha: float = 0.0
+    switch_dwell: int = 0
+    quadratic_variation: float = 0.0
+
+
+@dataclass(frozen=True)
+class SharedGeometry:
+    """Immutable hand-independent geometry cache for parallel belief updates."""
+
+    objects: list[BeliefInputObject]
+    grip_candidates: dict[str, list[GripCandidate]]
+    pseudo_contacts: dict[str, list[PseudoContactPoint]]
+    orientation_candidates: list[OrientationCandidate]
+    ray_origin: np.ndarray | None
+    ray_direction: np.ndarray | None
+    stamp_us: int
+
+
+@dataclass(frozen=True)
+class HandInput:
+    eef_position: np.ndarray
+    user_translation: np.ndarray | None
+    hand_rotation: np.ndarray | None
+    hand_axis: np.ndarray | None
+    angular_velocity: np.ndarray | None
+    button_pressed: bool
+
+
+@dataclass(frozen=True)
 class TascBeliefConfig:
     enabled: bool = True
     beta: float = 1.0
@@ -54,6 +124,13 @@ class TascBeliefConfig:
     max_prob_any_goal: float = 0.99
     leak_kappa0: float = 0.3
     leak_gamma: float = 5.0
+    jump_enabled: bool = True
+    jump_lambda0: float = 0.05
+    jump_kappa: float = 2.0
+    jump_switch_sigma_d: float = 0.15
+    # Uniform-drift probability at one configured belief tick. The prediction
+    # converts this to elapsed wall time so callback jitter cannot alter drift.
+    persist_leak: float = 0.02
     grip_update_hz: float = 10.0
     w_geom_prior: float = 1.0
     feature_ema_alpha: float = 0.25
@@ -66,6 +143,49 @@ class TascBeliefConfig:
     robust_scale_floor: float = 0.01
     robust_clip: float = 2.0
     log_every_sec: float = 1.0
+    orientation_enabled: bool = True
+    orientation_beta: float = 1.0
+    orientation_w_sc: float = 0.95
+    orientation_max_prob: float = 0.99
+    orientation_ema_alpha: float = 0.25
+    orientation_switch_gamma: float = 4.0
+    orientation_relations: tuple[str, ...] = ("parallel", "perpendicular")
+    hand_axis_local: tuple[float, float, float] = (0.0, 1.0, 0.0)
+    orientation_switch_dwell_frames: int = 2
+    pseudo: PseudoContactConfig = field(default_factory=PseudoContactConfig)
+    role_hard_filter: bool = False
+    label_role_keywords: dict[str, tuple[str, ...]] = field(default_factory=lambda: {
+        "held": ("stick", "leg", "rod", "bar", "pole"),
+        "target": ("hole", "circle", "surface", "top", "plate", "board"),
+    })
+    label_relation_prior: dict[str, dict[str, float]] = field(default_factory=lambda: {
+        "hole": {"parallel": 1.0, "perpendicular": -0.5},
+        "circle": {"parallel": 1.0, "perpendicular": -0.5},
+        "surface": {"parallel": -0.5, "perpendicular": 1.0},
+        "top": {"parallel": -0.5, "perpendicular": 1.0},
+        "board": {"parallel": -0.5, "perpendicular": 1.0},
+    })
+    label_prior_scale: float = 1.0
+    per_hand_parallel: bool = True
+    beta_armed: float = 1.0
+    beta_idle: float = 0.2
+    lambda0_armed: float = 0.05
+    lambda0_idle: float = 0.30
+    beta_ramp_tau_s: float = 0.2
+    commit_boost_enabled: bool = False
+    commit_boost_s: float = 0.3
+    commit_boost_scale: float = 1.5
+    dual_hand_exclusive: bool = False
+    ori_switch_gamma_h: float = 3.0
+    ori_switch_gamma_omega: float = 1.0
+    ori_switch_omega_ref: float = 0.5
+    pos_switch_sigma_d: float = 0.15
+    pos_switch_gamma_u: float = 2.0
+    geometry_update_hz: float = 8.0
+    belief_update_hz: float = 30.0
+    max_objects: int = 10
+    max_contacts_per_object: int = 6
+    max_orientation_candidates: int = 96
     feature: FeatureConfig = field(default_factory=FeatureConfig)
     grip: GripCandidateConfig = field(default_factory=GripCandidateConfig)
 
@@ -74,6 +194,13 @@ class TascBeliefConfig:
         data = dict(data or {})
         leak = dict(data.get("leak", {}))
         grip = dict(data.get("grip", {}))
+        jump = dict(data.get("jump", {}))
+        orientation = dict(data.get("orientation", {}))
+        legacy_leak = "kappa0" in leak or "gamma" in leak or "leak_kappa0" in data or "leak_gamma" in data
+        if legacy_leak and "persist_leak" not in jump and "persist_leak" not in data:
+            LOG.warning("tasc_belief leak_kappa0/leak_gamma are deprecated; mapping kappa0 to persist_leak")
+        role_keywords = dict(orientation.get("label_role_keywords", data.get("label_role_keywords", {})))
+        relation_prior = dict(orientation.get("label_relation_prior", data.get("label_relation_prior", {})))
         return cls(
             enabled=bool(data.get("enabled", True)),
             beta=float(data.get("beta", 1.0)),
@@ -81,6 +208,11 @@ class TascBeliefConfig:
             max_prob_any_goal=float(data.get("max_prob_any_goal", 0.99)),
             leak_kappa0=float(leak.get("kappa0", data.get("leak_kappa0", 0.3))),
             leak_gamma=float(leak.get("gamma", data.get("leak_gamma", 5.0))),
+            jump_enabled=bool(jump.get("enabled", data.get("jump_enabled", True))),
+            jump_lambda0=float(jump.get("lambda0", data.get("jump_lambda0", 0.05))),
+            jump_kappa=float(jump.get("kappa", data.get("jump_kappa", 2.0))),
+            jump_switch_sigma_d=float(jump.get("switch_sigma_d", data.get("jump_switch_sigma_d", 0.15))),
+            persist_leak=float(jump.get("persist_leak", data.get("persist_leak", leak.get("kappa0", data.get("leak_kappa0", 0.02))))),
             grip_update_hz=float(
                 grip.get("grip_update_hz", data.get("grip_update_hz", 10.0))
             ),
@@ -126,6 +258,41 @@ class TascBeliefConfig:
                 )
             ),
             log_every_sec=float(data.get("log_every_sec", 1.0)),
+            orientation_enabled=bool(orientation.get("enabled", data.get("orientation_enabled", True))),
+            orientation_beta=float(orientation.get("beta", data.get("orientation_beta", 1.0))),
+            orientation_w_sc=float(orientation.get("w_sc", data.get("orientation_w_sc", 0.95))),
+            orientation_max_prob=float(orientation.get("max_prob", data.get("orientation_max_prob", 0.99))),
+            orientation_ema_alpha=float(orientation.get("ema_alpha", data.get("orientation_ema_alpha", 0.25))),
+            orientation_switch_gamma=float(orientation.get("switch_gamma", data.get("orientation_switch_gamma", 4.0))),
+            orientation_relations=tuple(str(v).lower() for v in orientation.get("relations", data.get("orientation_relations", ("parallel", "perpendicular")))),
+            hand_axis_local=tuple(float(v) for v in orientation.get("hand_axis_local", data.get("hand_axis_local", (0.0, 1.0, 0.0)))),
+            orientation_switch_dwell_frames=int(orientation.get("switch_dwell_frames", data.get("orientation_switch_dwell_frames", 2))),
+            pseudo=PseudoContactConfig.from_dict(orientation.get("pseudo", data.get("pseudo"))),
+            role_hard_filter=bool(orientation.get("role_hard_filter", data.get("role_hard_filter", False))),
+            label_role_keywords={str(k): tuple(str(v) for v in values) for k, values in (role_keywords or {
+                "held": ("stick", "leg", "rod", "bar", "pole"),
+                "target": ("hole", "circle", "surface", "top", "plate", "board"),
+            }).items()},
+            label_relation_prior={str(k): {str(r): float(x) for r, x in values.items()} for k, values in (relation_prior or {
+                "hole": {"parallel": 1.0, "perpendicular": -0.5},
+                "circle": {"parallel": 1.0, "perpendicular": -0.5},
+                "surface": {"parallel": -0.5, "perpendicular": 1.0},
+                "top": {"parallel": -0.5, "perpendicular": 1.0},
+                "board": {"parallel": -0.5, "perpendicular": 1.0},
+            }).items()},
+            label_prior_scale=float(orientation.get("label_prior_scale", data.get("label_prior_scale", 1.0))),
+            per_hand_parallel=bool(data.get("per_hand_parallel", True)),
+            beta_armed=float(data.get("beta_armed", 1.0)), beta_idle=float(data.get("beta_idle", 0.2)),
+            lambda0_armed=float(data.get("lambda0_armed", 0.05)), lambda0_idle=float(data.get("lambda0_idle", 0.30)),
+            beta_ramp_tau_s=float(data.get("beta_ramp_tau_s", 0.2)),
+            commit_boost_enabled=bool(data.get("commit_boost_enabled", False)), commit_boost_s=float(data.get("commit_boost_s", 0.3)), commit_boost_scale=float(data.get("commit_boost_scale", 1.5)),
+            dual_hand_exclusive=bool(data.get("dual_hand_exclusive", False)),
+            ori_switch_gamma_h=float(orientation.get("switch_gamma_h", data.get("ori_switch_gamma_h", 3.0))),
+            ori_switch_gamma_omega=float(orientation.get("switch_gamma_omega", data.get("ori_switch_gamma_omega", 1.0))),
+            ori_switch_omega_ref=float(orientation.get("switch_omega_ref", data.get("ori_switch_omega_ref", 0.5))),
+            pos_switch_sigma_d=float(data.get("pos_switch_sigma_d", 0.15)), pos_switch_gamma_u=float(data.get("pos_switch_gamma_u", 2.0)),
+            geometry_update_hz=float(data.get("geometry_update_hz", 8.0)), belief_update_hz=float(data.get("belief_update_hz", 30.0)),
+            max_objects=int(data.get("max_objects", 10)), max_contacts_per_object=int(data.get("max_contacts_per_object", 6)), max_orientation_candidates=int(data.get("max_orientation_candidates", 96)),
             feature=FeatureConfig.from_dict(data),
             grip=GripCandidateConfig.from_dict(grip),
         )
@@ -150,6 +317,67 @@ def _view_direction(target: np.ndarray, ray_origin: np.ndarray | None) -> np.nda
         np.asarray(target, dtype=np.float64).reshape(3)
         - np.asarray(ray_origin, dtype=np.float64).reshape(3)
     )
+
+
+def _unit(vector: np.ndarray | None) -> np.ndarray | None:
+    if vector is None:
+        return None
+    arr = np.asarray(vector, dtype=np.float64).reshape(3)
+    norm = float(np.linalg.norm(arr))
+    return None if not np.isfinite(norm) or norm <= EPS else arr / norm
+
+
+def _quat_xyzw_to_mat(quaternion: np.ndarray) -> np.ndarray | None:
+    q = np.asarray(quaternion, dtype=np.float64).reshape(4)
+    norm = float(np.linalg.norm(q))
+    if not np.isfinite(norm) or norm <= EPS:
+        return None
+    x, y, z, w = q / norm
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ], dtype=np.float64)
+
+
+def _mat_to_quat_xyzw(rotation: np.ndarray) -> np.ndarray:
+    r = np.asarray(rotation, dtype=np.float64).reshape(3, 3)
+    trace = float(np.trace(r))
+    if trace > 0.0:
+        s = 2.0 * np.sqrt(trace + 1.0)
+        q = np.array([(r[2, 1] - r[1, 2]) / s, (r[0, 2] - r[2, 0]) / s, (r[1, 0] - r[0, 1]) / s, 0.25 * s])
+    else:
+        idx = int(np.argmax(np.diag(r)))
+        if idx == 0:
+            s = 2.0 * np.sqrt(max(EPS, 1.0 + r[0, 0] - r[1, 1] - r[2, 2]))
+            q = np.array([0.25 * s, (r[0, 1] + r[1, 0]) / s, (r[0, 2] + r[2, 0]) / s, (r[2, 1] - r[1, 2]) / s])
+        elif idx == 1:
+            s = 2.0 * np.sqrt(max(EPS, 1.0 + r[1, 1] - r[0, 0] - r[2, 2]))
+            q = np.array([(r[0, 1] + r[1, 0]) / s, 0.25 * s, (r[1, 2] + r[2, 1]) / s, (r[0, 2] - r[2, 0]) / s])
+        else:
+            s = 2.0 * np.sqrt(max(EPS, 1.0 + r[2, 2] - r[0, 0] - r[1, 1]))
+            q = np.array([(r[0, 2] + r[2, 0]) / s, (r[1, 2] + r[2, 1]) / s, 0.25 * s, (r[1, 0] - r[0, 1]) / s])
+    return q / max(EPS, float(np.linalg.norm(q)))
+
+
+def _rotation_between(source: np.ndarray, target: np.ndarray) -> np.ndarray:
+    """Minimal Rodrigues rotation taking source to target, including antipodal case."""
+    a = _unit(source)
+    b = _unit(target)
+    if a is None or b is None:
+        return np.eye(3)
+    cosine = float(np.clip(np.dot(a, b), -1.0, 1.0))
+    if cosine > 1.0 - 1.0e-9:
+        return np.eye(3)
+    if cosine < -1.0 + 1.0e-9:
+        basis = np.array([1.0, 0.0, 0.0]) if abs(a[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+        axis = _unit(np.cross(a, basis))
+        return 2.0 * np.outer(axis, axis) - np.eye(3)
+    cross = np.cross(a, b)
+    sine = float(np.linalg.norm(cross))
+    axis = cross / sine
+    skew = np.array([[0.0, -axis[2], axis[1]], [axis[2], 0.0, -axis[0]], [-axis[1], axis[0], 0.0]])
+    return np.eye(3) + sine * skew + (1.0 - cosine) * (skew @ skew)
 
 
 class StableObjectIdTracker:
@@ -236,7 +464,14 @@ class HierarchicalTascBelief:
         self.next_grip_track_index: dict[str, int] = {}
         self.selected_grip_indices: dict[str, int] = {}
         self.pending_grip_switches: dict[str, tuple[int, int]] = {}
+        self.orientation_candidates: list[OrientationCandidate] = []
+        self.log_orientation_distribution = np.empty(0, dtype=np.float64)
+        self.orientation_advantage_ema = np.empty(0, dtype=np.float64)
+        self.selected_orientation_index: int | None = None
+        self.pending_orientation_switch: tuple[int, int] | None = None
+        self.last_orientation_target: OrientationTarget | None = None
         self.last_grip_update_monotonic = 0.0
+        self.last_update_monotonic: float | None = None
         self.last_log_monotonic = 0.0
         self.last_target: EETarget | None = None
         self.last_telemetry: dict[str, Any] = {
@@ -244,6 +479,246 @@ class HierarchicalTascBelief:
             "objects": [],
             "target": None,
         }
+
+    def _classify_label(self, label: str) -> tuple[str, dict[str, float]]:
+        text = str(label).strip().lower()
+        role = "UNKNOWN"
+        best = ""
+        for configured_role, keywords in self.config.label_role_keywords.items():
+            for keyword in keywords:
+                needle = str(keyword).lower()
+                if needle in text and len(needle) > len(best):
+                    best = needle
+                    role = "HELD" if str(configured_role).lower() == "held" else "TARGET"
+        prior: dict[str, float] = {}
+        best = ""
+        for keyword, mapping in self.config.label_relation_prior.items():
+            needle = str(keyword).lower()
+            if needle in text and len(needle) > len(best):
+                best = needle
+                prior = {str(key).lower(): float(value) for key, value in mapping.items()}
+        return role, prior
+
+    def _switch_weights_position(
+        self,
+        candidates: list[BeliefInputObject],
+        eef_position: np.ndarray,
+        user_translation: np.ndarray | None,
+    ) -> np.ndarray:
+        centers = np.stack([np.asarray(obj.center_goal_m, dtype=np.float64).reshape(3) for obj in candidates])
+        logits = -np.linalg.norm(centers - eef_position[None, :], axis=1) / max(EPS, self.config.pos_switch_sigma_d)
+        direction = _unit(user_translation)
+        if direction is not None:
+            to_goal = centers - eef_position[None, :]
+            norms = np.linalg.norm(to_goal, axis=1)
+            valid = norms > EPS
+            alignment = np.zeros(centers.shape[0], dtype=np.float64)
+            alignment[valid] = (to_goal[valid] / norms[valid, None]) @ direction
+            logits += self.config.pos_switch_gamma_u * alignment
+        return normalize_log_probs(logits)
+
+    def _jump_predict(
+        self,
+        log_pi: np.ndarray,
+        advantage_std: np.ndarray,
+        switch_log_weights: np.ndarray | None,
+        dt: float,
+        *,
+        lambda0: float | None = None,
+    ) -> tuple[np.ndarray, float, float]:
+        """Adaptive IMM/change-point predict, distinct from the generative prior.
+
+        Innovation variance estimates the unknown switching rate. Prediction is
+        intentionally performed before the likelihood correction below.
+        """
+        pi = np.exp(normalize_log_probs(log_pi))
+        if not self.config.jump_enabled or pi.size < 2:
+            lam_dt = 0.0
+            variance = 0.0
+        else:
+            mean = float(np.sum(pi * advantage_std))
+            variance = float(np.sum(pi * (advantage_std - mean) ** 2))
+            rate = float(self.config.jump_lambda0 if lambda0 is None else lambda0)
+            rate += float(self.config.jump_kappa) * variance
+            lam_dt = float(np.clip(rate * max(0.0, dt), 0.0, 1.0))
+        # Preserve the configured probability at one nominal belief tick while
+        # making the equivalent probability depend only on elapsed time.
+        # At 30 Hz, persist_leak=0.02 remains exactly a 2% leak per tick.
+        leak_per_tick = float(np.clip(self.config.persist_leak, 0.0, 0.999999))
+        nominal_ticks = max(0.0, dt) * max(0.1, self.config.belief_update_hz)
+        q0 = float(1.0 - (1.0 - leak_per_tick) ** nominal_ticks)
+        uniform = np.full_like(pi, 1.0 / max(1, pi.size))
+        persist = (1.0 - q0) * pi + q0 * uniform
+        jump = uniform if switch_log_weights is None else np.exp(normalize_log_probs(switch_log_weights))
+        pi_minus = (1.0 - lam_dt) * persist + lam_dt * jump
+        return normalize_log_probs(np.log(np.maximum(pi_minus, EPS))), lam_dt, variance
+
+    def _orientation_switch_weights(
+        self,
+        candidates: list[OrientationCandidate],
+        hand_axis: np.ndarray,
+        hand_omega: np.ndarray | None,
+    ) -> np.ndarray:
+        axis = _unit(hand_axis)
+        if axis is None:
+            return np.full(len(candidates), -np.log(max(1, len(candidates))))
+        omega = np.zeros(3, dtype=np.float64) if hand_omega is None else np.asarray(hand_omega, dtype=np.float64).reshape(3)
+        logits: list[float] = []
+        for candidate in candidates:
+            normal = _unit(candidate.normal)
+            cosine = float(np.clip(np.dot(axis, normal), -1.0, 1.0))
+            error = 1.0 - abs(cosine) if candidate.relation == "parallel" else abs(cosine)
+            dc = float(np.dot(np.cross(omega, axis), normal))
+            de = -np.sign(cosine) * dc if candidate.relation == "parallel" else np.sign(cosine) * dc
+            logits.append(
+                self.config.ori_switch_gamma_h * (1.0 - error)
+                + self.config.ori_switch_gamma_omega * (-de) / max(EPS, self.config.ori_switch_omega_ref)
+            )
+        # Rank-one jump kernel: it represents the direction the hand is taking,
+        # not similarity to its previous orientation candidate.
+        return normalize_log_probs(np.asarray(logits, dtype=np.float64))
+
+    def _select_orientation_index(self, best: int, probabilities: np.ndarray) -> int:
+        selected = self.selected_orientation_index
+        if selected is None or not 0 <= selected < probabilities.size:
+            self.selected_orientation_index = int(best)
+            self.pending_orientation_switch = None
+            return int(best)
+        if int(best) == selected:
+            self.pending_orientation_switch = None
+            return selected
+        pending = self.pending_orientation_switch
+        count = pending[1] + 1 if pending is not None and pending[0] == int(best) else 1
+        if count >= max(1, self.config.orientation_switch_dwell_frames):
+            selected = int(best)
+            self.pending_orientation_switch = None
+        else:
+            self.pending_orientation_switch = (int(best), int(count))
+        self.selected_orientation_index = selected
+        return selected
+
+    def _quaternion_from_relation(
+        self, candidate: OrientationCandidate, hand_rotation_matrix: np.ndarray
+    ) -> np.ndarray:
+        normal = _unit(candidate.normal)
+        rotation = np.asarray(hand_rotation_matrix, dtype=np.float64).reshape(3, 3)
+        current_axis = _unit(rotation @ np.asarray(self.config.hand_axis_local, dtype=np.float64))
+        cosine = float(np.clip(np.dot(current_axis, normal), -1.0, 1.0))
+        if candidate.relation == "parallel":
+            target_axis = normal if cosine >= 0.0 else -normal
+        else:
+            target_axis = _unit(current_axis - cosine * normal)
+            if target_axis is None:
+                target_axis = _unit(np.cross(normal, np.array([1.0, 0.0, 0.0])))
+                if target_axis is None:
+                    target_axis = _unit(np.cross(normal, np.array([0.0, 1.0, 0.0])))
+        return _mat_to_quat_xyzw(_rotation_between(current_axis, target_axis) @ rotation)
+
+    def _update_orientation_belief(
+        self,
+        objects: list[BeliefInputObject],
+        *,
+        hand_rotation_matrix: np.ndarray | None,
+        hand_angular_velocity: np.ndarray | None,
+        dt: float,
+        view_origin: np.ndarray | None,
+    ) -> tuple[OrientationTarget | None, dict, float, float]:
+        if not self.config.orientation_enabled or hand_rotation_matrix is None:
+            return None, {"enabled": False, "candidates": []}, 0.0, 0.0
+        rotation = np.asarray(hand_rotation_matrix, dtype=np.float64).reshape(3, 3)
+        hand_axis = _unit(rotation @ np.asarray(self.config.hand_axis_local, dtype=np.float64))
+        if hand_axis is None:
+            return None, {"enabled": False, "candidates": []}, 0.0, 0.0
+        candidates: list[OrientationCandidate] = []
+        raw_advantages: list[float] = []
+        breakdowns: list[dict] = []
+        priors: list[float] = []
+        roles: list[str] = []
+        for obj in objects:
+            role, relation_prior = self._classify_label(obj.label)
+            if role == "HELD" and self.config.role_hard_filter:
+                continue
+            contacts = obj.pseudo_contacts
+            if contacts is None:
+                contacts = extract_pseudo_contacts(
+                    np.asarray(obj.points_goal_m if obj.points_goal_m is not None else [obj.center_goal_m]),
+                    self.config.pseudo,
+                    cylinder_model=self.surface_tracker.models.get(obj.object_id),
+                    view_origin=view_origin,
+                    label=obj.label,
+                )
+            for pseudo_index, contact in enumerate(contacts[: self.config.max_contacts_per_object]):
+                for relation in self.config.orientation_relations:
+                    if relation not in {"parallel", "perpendicular"}:
+                        continue
+                    candidate = OrientationCandidate(
+                        object_id=obj.object_id, pseudo_index=pseudo_index, relation=relation,
+                        position=np.asarray(contact.center, dtype=np.float64).reshape(3),
+                        normal=np.asarray(contact.normal, dtype=np.float64).reshape(3),
+                        fit_quality=float(contact.fit_quality), label=obj.label,
+                    )
+                    breakdown = self.feature_cost.orientation_breakdown(
+                        surface_normal=candidate.normal, hand_axis=hand_axis,
+                        hand_angular_velocity=hand_angular_velocity, relation=relation,
+                    )
+                    prior = self.config.label_prior_scale * relation_prior.get(relation, 0.0)
+                    if role == "HELD":
+                        prior -= 1.0
+                    candidates.append(candidate)
+                    raw_advantages.append(float(breakdown["weighted_total"]) * candidate.fit_quality + prior)
+                    breakdowns.append(breakdown)
+                    priors.append(float(prior))
+                    roles.append(role)
+        candidates = candidates[: self.config.max_orientation_candidates]
+        raw = np.asarray(raw_advantages[:len(candidates)], dtype=np.float64)
+        breakdowns, priors, roles = breakdowns[:len(candidates)], priors[:len(candidates)], roles[:len(candidates)]
+        if not candidates:
+            self.orientation_candidates = []
+            self.log_orientation_distribution = np.empty(0, dtype=np.float64)
+            self.last_orientation_target = None
+            return None, {"enabled": True, "hand_axis_world": hand_axis.tolist(), "candidates": []}, 0.0, 0.0
+        if self.orientation_advantage_ema.shape != raw.shape:
+            ema = raw.copy()
+            old = self.orientation_candidates
+            if old and self.orientation_advantage_ema.size:
+                for index, candidate in enumerate(candidates):
+                    distances = [float(np.linalg.norm(candidate.position - other.position)) for other in old]
+                    if distances:
+                        prior_index = int(np.argmin(distances))
+                        if distances[prior_index] <= self.config.grip_match_max_distance_m and prior_index < self.orientation_advantage_ema.size:
+                            ema[index] = self.orientation_advantage_ema[prior_index]
+        else:
+            alpha = float(np.clip(self.config.orientation_ema_alpha, 0.0, 1.0))
+            ema = alpha * raw + (1.0 - alpha) * self.orientation_advantage_ema
+        self.orientation_advantage_ema = ema
+        standardized = robust_standardize(ema, min_signal_spread=self.config.robust_min_signal_spread, scale_floor=self.config.robust_scale_floor, clip=self.config.robust_clip)
+        if self.log_orientation_distribution.shape != standardized.shape:
+            self.log_orientation_distribution = normalize_log_probs(np.zeros_like(standardized))
+        switch = self._orientation_switch_weights(candidates, hand_axis, hand_angular_velocity)
+        predicted, lambda_dt, variance = self._jump_predict(self.log_orientation_distribution, standardized, switch, dt)
+        posterior = self.config.orientation_w_sc * predicted + self.config.orientation_beta * standardized
+        self.log_orientation_distribution = clip_log_probs(normalize_log_probs(posterior), self.config.orientation_max_prob)
+        probabilities = np.exp(self.log_orientation_distribution)
+        index = self._select_orientation_index(int(np.argmax(probabilities)), probabilities)
+        selected = candidates[index]
+        target = OrientationTarget(
+            quaternion_xyzw=self._quaternion_from_relation(selected, rotation), axis_world=np.asarray(selected.normal, dtype=np.float64),
+            relation=selected.relation, object_id=selected.object_id, confidence=float(probabilities[index]), source_position=np.asarray(selected.position, dtype=np.float64),
+        )
+        self.orientation_candidates = candidates
+        self.last_orientation_target = target
+        telemetry = {
+            "enabled": True, "hand_axis_world": hand_axis.tolist(),
+            "hand_omega_rps": None if hand_angular_velocity is None else np.asarray(hand_angular_velocity, dtype=np.float64).reshape(3).tolist(),
+            "candidates": [
+                {"object_id": c.object_id, "label": c.label, "role": roles[i], "relation": c.relation,
+                 "normal": c.normal.tolist(), "fit_quality": c.fit_quality, "probability": float(probabilities[i]),
+                 "advantage_raw": float(raw[i]), "advantage_ema": float(ema[i]), "advantage_standardized": float(standardized[i]),
+                 "label_prior": float(priors[i]), "breakdown": breakdowns[i]}
+                for i, c in enumerate(candidates)
+            ], "selected_index": int(index), "switch_dwell_count": 0 if self.pending_orientation_switch is None else int(self.pending_orientation_switch[1]),
+        }
+        return target, telemetry, lambda_dt, variance
 
     def _align_object_distribution(self, objects: list[BeliefInputObject]) -> np.ndarray:
         ids = [obj.object_id for obj in objects]
@@ -462,12 +937,18 @@ class HierarchicalTascBelief:
         ray_origin_m: np.ndarray | None = None,
         ray_direction: np.ndarray | None = None,
         controller_orientation_xyzw: np.ndarray | None = None,
+        hand_rotation_matrix: np.ndarray | None = None,
+        hand_angular_velocity: np.ndarray | None = None,
+        beta_override: float | None = None,
+        lambda0_override: float | None = None,
         now_monotonic: float | None = None,
     ) -> dict[str, Any]:
         now = time.monotonic() if now_monotonic is None else float(now_monotonic)
         if not self.config.enabled:
             self.last_telemetry = {"enabled": False, "objects": [], "target": None}
             return self.last_telemetry
+        dt = 0.0 if self.last_update_monotonic is None else float(np.clip(now - self.last_update_monotonic, 0.0, 0.2))
+        self.last_update_monotonic = now
         valid_objects: list[BeliefInputObject] = []
         for obj in objects:
             try:
@@ -483,6 +964,7 @@ class HierarchicalTascBelief:
             self.last_target = None
             self.last_telemetry = {"enabled": True, "objects": [], "target": None}
             return self.last_telemetry
+        valid_objects = valid_objects[: max(1, int(self.config.max_objects))]
         valid_object_ids = {obj.object_id for obj in valid_objects}
         self.surface_tracker.finish_frame(valid_object_ids)
         for object_id in list(self.grip_tracks):
@@ -525,19 +1007,18 @@ class HierarchicalTascBelief:
             scale_floor=self.config.robust_scale_floor,
             clip=self.config.robust_clip,
         )
-        log_obj = (
-            self.config.w_sc * self.log_object_distribution
-            + self.config.beta * object_update
+        # Predict before correct. The adaptive jump rate uses the pre-update
+        # posterior and current innovation, never the post-update belief.
+        object_switch = self._switch_weights_position(
+            valid_objects, eef_position, user_translation_mps
         )
-        log_obj = normalize_log_probs(log_obj)
-        confidence = float(np.max(np.exp(log_obj)))
-        kappa = self.config.leak_kappa0 / (
-            1.0 + np.exp(self.config.leak_gamma * confidence)
+        predicted_obj, object_lambda_dt, object_variance = self._jump_predict(
+            self.log_object_distribution, object_update, object_switch, dt,
+            lambda0=lambda0_override,
         )
-        if kappa > 0.0:
-            uniform = np.full_like(log_obj, -np.log(log_obj.size))
-            log_obj = normalize_log_probs((1.0 - kappa) * log_obj + kappa * uniform)
-        log_obj = clip_log_probs(log_obj, self.config.max_prob_any_goal)
+        beta = self.config.beta if beta_override is None else float(beta_override)
+        log_obj = self.config.w_sc * predicted_obj + beta * object_update
+        log_obj = clip_log_probs(normalize_log_probs(log_obj), self.config.max_prob_any_goal)
         self.log_object_distribution = log_obj
 
         should_update_grips = (
@@ -571,6 +1052,7 @@ class HierarchicalTascBelief:
                         source="center_fallback",
                     )
                 ]
+            candidates = list(candidates)[: max(1, int(self.config.max_contacts_per_object))]
             candidates, grip_ids, generated_candidate_count = (
                 self._persistent_grip_candidates(obj.object_id, candidates)
             )
@@ -618,7 +1100,7 @@ class HierarchicalTascBelief:
                     clip=self.config.robust_clip,
                 )
                 log_grip = (
-                    self.config.w_sc * log_grip + self.config.beta * grip_update
+                    self.config.w_sc * log_grip + beta * grip_update
                 )
                 log_grip = clip_log_probs(
                     normalize_log_probs(log_grip), self.config.max_prob_any_goal
@@ -683,6 +1165,17 @@ class HierarchicalTascBelief:
         if should_update_grips:
             self.last_grip_update_monotonic = now
         self.feature_cost.finish_tick(user_translation_mps)
+        if hand_rotation_matrix is None and controller_orientation_xyzw is not None:
+            hand_rotation_matrix = _quat_xyzw_to_mat(controller_orientation_xyzw)
+        orientation_target, orientation_telemetry, ori_lambda_dt, ori_variance = (
+            self._update_orientation_belief(
+                valid_objects,
+                hand_rotation_matrix=hand_rotation_matrix,
+                hand_angular_velocity=hand_angular_velocity,
+                dt=dt,
+                view_origin=ray_origin_m,
+            )
+        )
         self.last_target = best_target
         target_dict = None
         if best_target is not None:
@@ -692,8 +1185,20 @@ class HierarchicalTascBelief:
                 "object_confidence": float(best_target.object_confidence),
                 "joint_confidence": float(best_target.joint_confidence),
                 "position_goal_m": best_target.position.tolist(),
-                "orientation_xyzw": best_target.orientation_xyzw.tolist(),
+                "orientation_xyzw": (
+                    best_target.orientation_xyzw.tolist()
+                    if orientation_target is None
+                    else orientation_target.quaternion_xyzw.tolist()
+                ),
             }
+            if orientation_target is not None:
+                target_dict.update({
+                    "orientation_object_id": orientation_target.object_id,
+                    "orientation_relation": orientation_target.relation,
+                    "orientation_axis_world": orientation_target.axis_world.tolist(),
+                    "orientation_confidence": float(orientation_target.confidence),
+                    "orientation_source_position_m": orientation_target.source_position.tolist(),
+                })
         self.last_telemetry = {
             "enabled": True,
             "eef_position_m": eef_position.tolist(),
@@ -715,6 +1220,13 @@ class HierarchicalTascBelief:
             "object_probabilities": _prob_dict(self.object_ids, self.log_object_distribution),
             "objects": telemetry_objects,
             "target": target_dict,
+            "orientation": orientation_telemetry,
+            "jump": {
+                "object_lambda_dt": float(object_lambda_dt),
+                "object_advantage_variance": float(object_variance),
+                "orientation_lambda_dt": float(ori_lambda_dt),
+                "orientation_advantage_variance": float(ori_variance),
+            },
         }
         return self.last_telemetry
 
@@ -750,6 +1262,13 @@ class HierarchicalTascBelief:
             if isinstance(distance_m, (int, float))
             else ""
         )
+        jump = self.last_telemetry.get("jump") or {}
+        orientation_text = ""
+        if target.get("orientation_relation"):
+            orientation_text = (
+                f" ori={target.get('orientation_object_id')}:{target.get('orientation_relation')}"
+                f"/{float(target.get('orientation_confidence', 0.0)):.2f}"
+            )
         return (
             "[TASC-belief] "
             f"target={target['object_id']} label={obj.get('label', '?')} "
@@ -761,5 +1280,120 @@ class HierarchicalTascBelief:
             f"feat[d={float(contributions.get('distance', 0.0)):+.3f},"
             f"r={float(contributions.get('ray', 0.0)):+.3f},"
             f"a={float(contributions.get('agreement', 0.0)):+.3f}] "
-            f"objects=[{prob_text}]"
+            f"jump={float(jump.get('object_lambda_dt', 0.0)):.3f}/"
+            f"{float(jump.get('orientation_lambda_dt', 0.0)):.3f}"
+            f"{orientation_text} objects=[{prob_text}]"
         )
+
+
+class ParallelTascBelief:
+    """Two independent hand posteriors over one immutable shared geometry frame."""
+
+    def __init__(self, config: TascBeliefConfig | dict | None = None) -> None:
+        self.config = config if isinstance(config, TascBeliefConfig) else TascBeliefConfig.from_dict(config)
+        self.geometry_surface_tracker = PersistentCylinderSurfaceTracker(self.config.grip)
+        self.trackers = {
+            "left": HierarchicalTascBelief(self.config),
+            "right": HierarchicalTascBelief(self.config),
+        }
+        self.states = {side: HandBeliefState(side=side, beta_current=self.config.beta_idle, lambda0_current=self.config.lambda0_idle) for side in self.trackers}
+        self.last_geometry: SharedGeometry | None = None
+        self.last_update_monotonic: float | None = None
+
+    def build_shared_geometry(
+        self,
+        objects: list[BeliefInputObject],
+        *,
+        ray_origin: np.ndarray | None = None,
+        ray_direction: np.ndarray | None = None,
+        stamp_us: int = 0,
+    ) -> SharedGeometry:
+        """Compute hand-independent candidates once, then atomically replace cache."""
+        kept = list(objects)[: self.config.max_objects]
+        active = {obj.object_id for obj in kept}
+        self.geometry_surface_tracker.finish_frame(active)
+        object_candidates: dict[str, list[GripCandidate]] = {}
+        object_pseudo: dict[str, list[PseudoContactPoint]] = {}
+        shared_objects: list[BeliefInputObject] = []
+        orientations: list[OrientationCandidate] = []
+        for obj in kept:
+            candidates = obj.grip_candidates
+            if candidates is None:
+                candidates = self.geometry_surface_tracker.update(obj.object_id, obj.label, obj.points_goal_m) if obj.points_goal_m is not None else []
+                if not candidates and obj.points_goal_m is not None:
+                    candidates = generate_grip_candidates(obj.points_goal_m, self.config.grip)
+            candidates = list(candidates or [])[: self.config.max_contacts_per_object]
+            contacts = obj.pseudo_contacts
+            if contacts is None:
+                cloud = obj.points_goal_m if obj.points_goal_m is not None else np.asarray([obj.center_goal_m])
+                contacts = extract_pseudo_contacts(cloud, self.config.pseudo, cylinder_model=self.geometry_surface_tracker.models.get(obj.object_id), view_origin=ray_origin, label=obj.label)
+            contacts = list(contacts or [])[: self.config.max_contacts_per_object]
+            object_candidates[obj.object_id] = candidates
+            object_pseudo[obj.object_id] = contacts
+            shared_objects.append(BeliefInputObject(obj.object_id, obj.label, obj.score, obj.center_goal_m, None, candidates, contacts))
+            role, _prior = self.trackers["left"]._classify_label(obj.label)
+            if role == "HELD" and self.config.role_hard_filter:
+                continue
+            for index, contact in enumerate(contacts):
+                for relation in self.config.orientation_relations:
+                    orientations.append(OrientationCandidate(obj.object_id, index, relation, contact.center, contact.normal, contact.fit_quality, label=obj.label))
+        geometry = SharedGeometry(shared_objects, object_candidates, object_pseudo, orientations[: self.config.max_orientation_candidates], ray_origin, ray_direction, int(stamp_us))
+        self.last_geometry = geometry
+        return geometry
+
+    def update_hands(
+        self,
+        shared: SharedGeometry,
+        inputs: dict[str, HandInput],
+        *,
+        now_monotonic: float | None = None,
+    ) -> dict[str, dict]:
+        """Update both hand posteriors every tick; buttons only gate authority."""
+        now = time.monotonic() if now_monotonic is None else float(now_monotonic)
+        dt = 0.0 if self.last_update_monotonic is None else float(np.clip(now - self.last_update_monotonic, 0.0, 0.2))
+        self.last_update_monotonic = now
+        output: dict[str, dict] = {}
+        for side, tracker in self.trackers.items():
+            hand = inputs.get(side)
+            if hand is None:
+                continue
+            state = self.states[side]
+            state.armed = bool(hand.button_pressed)
+            beta_target = self.config.beta_armed if state.armed else self.config.beta_idle
+            lambda_target = self.config.lambda0_armed if state.armed else self.config.lambda0_idle
+            ramp = float(np.clip(dt / max(EPS, self.config.beta_ramp_tau_s), 0.0, 1.0))
+            state.beta_current += ramp * (beta_target - state.beta_current)
+            state.lambda0_current += ramp * (lambda_target - state.lambda0_current)
+            hand_rotation = hand.hand_rotation
+            if hand_rotation is None and hand.hand_axis is not None:
+                # No orientation target can be synthesized from an axis alone.
+                hand_rotation = None
+            telemetry = tracker.update(
+                shared.objects,
+                eef_position_m=hand.eef_position,
+                user_translation_mps=hand.user_translation,
+                ray_origin_m=shared.ray_origin,
+                ray_direction=shared.ray_direction,
+                hand_rotation_matrix=hand_rotation,
+                hand_angular_velocity=hand.angular_velocity,
+                beta_override=state.beta_current,
+                lambda0_override=state.lambda0_current,
+                now_monotonic=now,
+            )
+            target = telemetry.get("target")
+            confidence = float(target.get("joint_confidence", 0.0)) if isinstance(target, dict) else 0.0
+            alpha_target = confidence if state.armed else 0.0
+            # Use the configured hand-state time constant for authority too;
+            # a button edge must not turn into a Cartesian reference step.
+            state.alpha += ramp * (alpha_target - state.alpha)
+            state.alpha = float(np.clip(state.alpha, 0.0, 1.0))
+            telemetry["hand"] = {"side": side, "armed": state.armed, "beta": state.beta_current, "lambda0": state.lambda0_current, "alpha": state.alpha}
+            output[side] = telemetry
+        if self.config.dual_hand_exclusive and len(output) == 2:
+            left, right = output.get("left"), output.get("right")
+            if left and right and left["hand"]["armed"] and right["hand"]["armed"]:
+                left_target, right_target = left.get("target"), right.get("target")
+                if left_target and right_target and left_target.get("object_id") == right_target.get("object_id"):
+                    weaker = "left" if left_target.get("joint_confidence", 0.0) < right_target.get("joint_confidence", 0.0) else "right"
+                    output[weaker]["hand"]["alpha"] = 0.0
+        return output

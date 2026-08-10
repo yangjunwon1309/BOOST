@@ -118,6 +118,13 @@ class FeatureConfig:
     agreement_kappa: float = 1.0
     delta_lambda: float = 0.3
     min_user_speed_mps: float = 0.005
+    w_orientation: float = 0.8
+    ori_align_k: float = 1.0
+    ori_align_delta: float = 0.15
+    ori_hold_lambda: float = 1.0
+    ori_converge_lambda: float = 0.5
+    ori_omega_ref_rps: float = 0.5
+    min_hand_omega_rps: float = 0.02
 
     @classmethod
     def from_dict(cls, data: dict | None) -> "FeatureConfig":
@@ -127,6 +134,7 @@ class FeatureConfig:
         ray = dict(features.get("ray", {}))
         agreement = dict(features.get("agreement", {}))
         delta = dict(features.get("delta", {}))
+        orientation = dict(features.get("orientation", {}))
         return cls(
             action_apply_time=float(data.get("action_apply_time", 0.01)),
             w_distance=float(features.get("w_distance", 1.0)),
@@ -143,6 +151,13 @@ class FeatureConfig:
             agreement_kappa=float(agreement.get("kappa", 1.0)),
             delta_lambda=float(delta.get("lambda_d", delta.get("lambda", 0.3))),
             min_user_speed_mps=float(features.get("min_user_speed_mps", 0.005)),
+            w_orientation=float(features.get("w_orientation", 0.8)),
+            ori_align_k=float(orientation.get("align_k", orientation.get("k", 1.0))),
+            ori_align_delta=float(orientation.get("align_delta", orientation.get("delta", 0.15))),
+            ori_hold_lambda=float(orientation.get("hold_lambda", 1.0)),
+            ori_converge_lambda=float(orientation.get("converge_lambda", 0.5)),
+            ori_omega_ref_rps=float(orientation.get("omega_ref_rps", 0.5)),
+            min_hand_omega_rps=float(orientation.get("min_hand_omega_rps", 0.02)),
         )
 
 
@@ -235,6 +250,63 @@ class MultiFeatureCost:
         direction = unit(user_translation)
         if direction is not None:
             self.previous_direction = direction
+
+    def orientation_breakdown(
+        self,
+        *,
+        surface_normal: np.ndarray,
+        hand_axis: np.ndarray,
+        hand_angular_velocity: np.ndarray | None,
+        relation: str,
+    ) -> dict:
+        """Return the independent orientation-intent feature diagnostic."""
+        normal = unit(surface_normal)
+        axis = unit(hand_axis)
+        if normal is None or axis is None:
+            return {
+                "cos_c": None, "alignment_error": None, "relation": str(relation),
+                "align_advantage": 0.0, "hold_advantage": 0.0,
+                "converge_advantage": 0.0, "omega_norm": None,
+                "weighted_total": 0.0,
+            }
+        relation = str(relation).lower()
+        if relation not in {"parallel", "perpendicular"}:
+            raise ValueError(f"unsupported orientation relation: {relation}")
+        cfg = self.config
+        cos_c = float(np.clip(np.dot(axis, normal), -1.0, 1.0))
+        alignment_error = 1.0 - abs(cos_c) if relation == "parallel" else abs(cos_c)
+        align = -huber_like(alignment_error, k=cfg.ori_align_k, delta=cfg.ori_align_delta)
+        hold = 0.0
+        converge = 0.0
+        omega_norm: float | None = None
+        if hand_angular_velocity is not None:
+            omega = np.asarray(hand_angular_velocity, dtype=np.float64).reshape(3)
+            if np.isfinite(omega).all():
+                omega_norm = float(np.linalg.norm(omega))
+                if omega_norm < cfg.min_hand_omega_rps:
+                    hold = cfg.ori_hold_lambda * (1.0 - alignment_error)
+                else:
+                    dc = float(np.dot(np.cross(omega, axis), normal))
+                    de = (
+                        -np.sign(cos_c) * dc
+                        if relation == "parallel"
+                        else np.sign(cos_c) * dc
+                    )
+                    converge = -cfg.ori_converge_lambda * de / max(EPS, cfg.ori_omega_ref_rps)
+        total = align + hold + converge
+        return {
+            "cos_c": cos_c,
+            "alignment_error": float(alignment_error),
+            "relation": relation,
+            "align_advantage": float(align),
+            "hold_advantage": float(hold),
+            "converge_advantage": float(converge),
+            "omega_norm": omega_norm,
+            "weighted_total": float(cfg.w_orientation * total),
+        }
+
+    def orientation_advantage(self, **kwargs) -> float:
+        return float(self.orientation_breakdown(**kwargs)["weighted_total"])
 
     def advantage(
         self,

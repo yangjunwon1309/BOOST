@@ -14,6 +14,10 @@ from seg_web_node.grip_candidates import (
     fit_cylinder_surface,
     generate_grip_candidates,
     _merge_nearby_candidates,
+    extract_pseudo_contacts,
+    fit_circle_in_plane,
+    sample_cylinder_candidates,
+    PseudoContactConfig,
 )
 from seg_web_node.robot_geometry import g1_wrist_ee_position
 from seg_web_node.tasc_belief import (
@@ -239,6 +243,51 @@ def test_cylinder_tracker_retains_surface_during_short_occlusion():
     assert tracker.status("bottle:track0000")["stale_frames"] == 1
 
 
+def test_cylinder_candidates_preserve_orthonormal_surface_frame():
+    model = fit_cylinder_surface(
+        cylinder_points(), CylinderSurfaceConfig(min_points=100, min_angular_coverage=0.15)
+    )
+    assert model is not None
+    candidate = sample_cylinder_candidates(model, GripCandidateConfig())[0]
+    assert candidate.surface_normal is not None
+    assert candidate.surface_tangent is not None
+    assert candidate.surface_axis is not None
+    frame = [candidate.surface_normal, candidate.surface_tangent, candidate.surface_axis]
+    np.testing.assert_allclose([np.linalg.norm(vector) for vector in frame], 1.0, atol=1e-6)
+    np.testing.assert_allclose(np.dot(frame[0], frame[1]), 0.0, atol=1e-6)
+    np.testing.assert_allclose(np.dot(frame[0], frame[2]), 0.0, atol=1e-6)
+    np.testing.assert_allclose(np.dot(frame[1], frame[2]), 0.0, atol=1e-6)
+
+
+def test_pseudo_contact_plane_and_circle_fit_refines_hole_center():
+    center = np.array([0.42, -0.08, 0.20])
+    radius = 0.03
+    theta = np.linspace(0.0, 2.0 * np.pi, 80, endpoint=False)
+    ring = center + np.column_stack((radius * np.cos(theta), radius * np.sin(theta), np.zeros_like(theta)))
+    fitted = fit_circle_in_plane(ring, center, np.array([0.0, 0.0, 1.0]))
+    assert fitted is not None
+    fit_center, fit_radius, rmse = fitted
+    np.testing.assert_allclose(fit_center, center, atol=1e-6)
+    assert abs(fit_radius - radius) < 1e-6 and rmse < 1e-6
+    pseudo = extract_pseudo_contacts(
+        ring, PseudoContactConfig(min_inlier_ratio=0.2), label="white round circled hole"
+    )
+    assert pseudo and pseudo[0].source == "hole_circle"
+
+
+def test_orientation_advantage_prefers_aligned_stationary_hand():
+    feature = MultiFeatureCost(FeatureConfig())
+    aligned = feature.orientation_advantage(
+        surface_normal=np.array([0.0, 0.0, 1.0]), hand_axis=np.array([0.0, 0.0, 1.0]),
+        hand_angular_velocity=np.zeros(3), relation="parallel",
+    )
+    orthogonal = feature.orientation_advantage(
+        surface_normal=np.array([0.0, 0.0, 1.0]), hand_axis=np.array([1.0, 0.0, 0.0]),
+        hand_angular_velocity=np.zeros(3), relation="parallel",
+    )
+    assert aligned > orthogonal
+
+
 def test_tasc_uses_fitted_cylinder_surface_as_contact_domain():
     belief = HierarchicalTascBelief(
         {
@@ -400,3 +449,23 @@ def test_hierarchical_belief_selects_ray_target_and_contact_point():
     breakdown = target_object["selected_grip_feature_breakdown"]
     assert breakdown["distance_m"] > 0.0
     assert set(breakdown["weighted_contributions"]) >= {"distance", "ray", "agreement"}
+
+
+def test_persist_leak_is_elapsed_time_not_callback_rate():
+    belief = HierarchicalTascBelief(
+        {"jump": {"enabled": False, "persist_leak": 0.02}}
+    )
+    initial = np.log(np.array([0.8, 0.2], dtype=np.float64))
+    advantage = np.zeros(2, dtype=np.float64)
+    one_step, _, _ = belief._jump_predict(initial, advantage, None, 1.0)
+
+    many_steps = initial.copy()
+    for _ in range(10):
+        many_steps, _, _ = belief._jump_predict(
+            many_steps, advantage, None, 0.1
+        )
+    np.testing.assert_allclose(
+        np.exp(one_step), np.exp(many_steps), rtol=1.0e-10, atol=1.0e-12
+    )
+    one_tick, _, _ = belief._jump_predict(initial, advantage, None, 1.0 / 30.0)
+    np.testing.assert_allclose(np.exp(one_tick), [0.794, 0.206], atol=1.0e-12)

@@ -20,6 +20,11 @@ path_qp_reference:
   bind: "tcp://*:5560"
   connect: "tcp://127.0.0.1:5560"
   topic: "path_qp_reference"
+path_direct_control:
+  transport: "lcm"
+  upper_command_channel: "G1_PATH_UPPER_COMMAND"
+  motor_command_channel: "G1_PATH_MOTOR_COMMAND"
+  robot_state_channel: "G1_ROBOT_STATE"
 path_state_command:
   bind: "tcp://*:5563"
   connect: "tcp://127.0.0.1:5563"

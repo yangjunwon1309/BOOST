@@ -26,8 +26,17 @@ from seg_web_node.lcm_protocol import (
     decode_robot_state,
     encode_robot_state,
 )
-from seg_web_node.robot_geometry import g1_wrist_ee_position
-from seg_web_node.tasc_belief import BeliefInputObject, HierarchicalTascBelief
+from seg_web_node.robot_geometry import (
+    angular_velocity_from_rotations,
+    g1_hand_base_rotation,
+    g1_wrist_ee_position,
+)
+from seg_web_node.tasc_belief import (
+    BeliefInputObject,
+    HandInput,
+    HierarchicalTascBelief,
+    ParallelTascBelief,
+)
 
 from .protocol import (
     LOCAL_CALIBRATION_CHANNEL,
@@ -227,6 +236,18 @@ def _finite_vec3(value: Any) -> np.ndarray | None:
     return array
 
 
+def _finite_vec4(value: Any) -> np.ndarray | None:
+    if value is None:
+        return None
+    try:
+        array = np.asarray(value, dtype=np.float64).reshape(4)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(array).all() or float(np.linalg.norm(array)) <= 1.0e-9:
+        return None
+    return array / float(np.linalg.norm(array))
+
+
 def _side_from_link(target_link: str, fallback: str = "left") -> str:
     name = str(target_link).lower()
     if "right" in name:
@@ -375,9 +396,11 @@ class ThorRemoteGateway:
             float(value) for value in ee_target_quaternion_wxyz
         )
         self.belief_enabled = bool(belief_enabled)
-        self.tasc_belief = HierarchicalTascBelief(belief_config)
+        self.parallel_tasc_belief = ParallelTascBelief(belief_config)
+        # Compatibility handle for callers that inspect a single selected hand.
+        self.tasc_belief = self.parallel_tasc_belief.trackers["left"]
         self.belief_ee_offset_m = float(belief_ee_offset_m)
-        self.belief_last_eef_by_hand: dict[str, tuple[np.ndarray, int]] = {}
+        self.belief_last_eef_by_hand: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray | None, int]] = {}
         self.shared_hand_selection_endpoint = str(shared_hand_selection_endpoint)
         self.shared_hand_selection_topic = str(shared_hand_selection_topic)
         self.shared_hand_selection_socket = zmq.Context.instance().socket(zmq.SUB)
@@ -438,7 +461,7 @@ class ThorRemoteGateway:
             "belief_enabled": bool(belief_enabled),
             "belief_targets": 0,
             "belief_fallback_targets": 0,
-            "last_belief": self.tasc_belief.last_telemetry,
+            "last_belief": {"enabled": self.parallel_tasc_belief.config.enabled, "hands": {}},
             "belief_selected_hand": "none",
             "belief_selection_active": False,
             "belief_selection_messages": 0,
@@ -759,9 +782,9 @@ class ThorRemoteGateway:
                 timestamp_us = int(payload.get("timestamp_us", 0) or 0)
                 next_hand = hand if active else "none"
                 if next_hand != self.belief_selected_hand:
-                    # A_delta compares consecutive motion directions.  It must
-                    # never compare a left-arm sample to a right-arm sample.
-                    self.tasc_belief.feature_cost.previous_direction = None
+                    # A_delta histories are isolated by hand tracker.
+                    for tracker in self.parallel_tasc_belief.trackers.values():
+                        tracker.feature_cost.previous_direction = None
                 self.belief_selected_hand = next_hand
                 self.belief_selection_active = active
                 self.belief_selection_timestamp_us = timestamp_us
@@ -783,97 +806,107 @@ class ThorRemoteGateway:
     def _belief_state_features(
         self,
         record: ForwardedPairRecord | None,
-    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        hand: str,
+    ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
         if (
             record is None
             or record.robot_state is None
-            or self.belief_selected_hand not in {"left", "right"}
+            or hand not in {"left", "right"}
         ):
-            return None, None
+            return None, None, None, None
         try:
             state = decode_robot_state(record.robot_state)
-            hand = self.belief_selected_hand
             position = g1_wrist_ee_position(
                 state.q,
                 f"{hand}_wrist_yaw_link",
                 self.belief_ee_offset_m,
             )
+            hand_rotation = g1_hand_base_rotation(
+                state.q, f"{hand}_wrist_yaw_link"
+            )
             velocity = None
+            angular_velocity = None
             previous = self.belief_last_eef_by_hand.get(hand)
             if previous is not None:
-                previous_position, previous_timestamp_us = previous
+                previous_position, previous_rotation, previous_omega, previous_timestamp_us = previous
                 dt = (state.timestamp_us - previous_timestamp_us) / 1.0e6
                 if 1.0e-4 <= dt <= 0.5:
                     velocity = (position - previous_position) / dt
-            self.belief_last_eef_by_hand[hand] = (position.copy(), int(state.timestamp_us))
-            return position, velocity
+                    raw_omega = angular_velocity_from_rotations(previous_rotation, hand_rotation, dt)
+                    if raw_omega is not None:
+                        angular_velocity = raw_omega if previous_omega is None else 0.25 * raw_omega + 0.75 * previous_omega
+            self.belief_last_eef_by_hand[hand] = (position.copy(), hand_rotation.copy(), angular_velocity, int(state.timestamp_us))
+            return position, velocity, hand_rotation, angular_velocity
         except Exception as error:
             with self.lock:
                 self.stats["last_belief_state_error"] = str(error)
-            return None, None
+            return None, None, None, None
 
     def _belief_selection_from_result(
         self,
         payload: dict[str, Any],
         record: ForwardedPairRecord | None,
     ) -> tuple[np.ndarray, dict[str, Any], str] | None:
-        if not self.belief_enabled or not self.tasc_belief.config.enabled:
+        if not self.belief_enabled or not self.parallel_tasc_belief.config.enabled:
             return None
         self._drain_shared_hand_selection()
-        if not self.belief_selection_active:
-            with self.lock:
-                self.stats["last_belief"] = {
-                    "enabled": True,
-                    "objects": [],
-                    "target": None,
-                    "reason": "waiting_for_A_or_B_hand_selection",
-                }
-            return None
         inputs = self._belief_inputs_from_result(payload)
         if not inputs:
             with self.lock:
                 self.stats["last_belief"] = {"enabled": True, "objects": [], "target": None}
             return None
-        eef_position, eef_velocity = self._belief_state_features(record)
-        if eef_position is None:
+        hand_inputs: dict[str, HandInput] = {}
+        for side in ("left", "right"):
+            eef_position, eef_velocity, hand_rotation, hand_omega = self._belief_state_features(record, side)
+            if eef_position is None:
+                continue
+            hand_inputs[side] = HandInput(
+                eef_position=eef_position,
+                user_translation=eef_velocity,
+                hand_rotation=hand_rotation,
+                hand_axis=None,
+                angular_velocity=hand_omega,
+                button_pressed=(self.belief_selection_active and self.belief_selected_hand == side),
+            )
+        if not hand_inputs:
             with self.lock:
                 self.stats["last_belief"] = {
                     "enabled": True,
                     "objects": [],
                     "target": None,
-                    "reason": "selected_hand_robot_state_unavailable",
-                    "selected_hand": self.belief_selected_hand,
+                    "reason": "robot_state_unavailable_for_both_hands",
                 }
             return None
         ray_origin = _finite_vec3(payload.get("camera_goal_origin_m"))
         ray_direction = _finite_vec3(payload.get("camera_goal_forward_m"))
-        controller_xyzw = np.asarray(
-            [
-                self.ee_target_quaternion_wxyz[1],
-                self.ee_target_quaternion_wxyz[2],
-                self.ee_target_quaternion_wxyz[3],
-                self.ee_target_quaternion_wxyz[0],
-            ],
-            dtype=np.float64,
+        shared_geometry = self.parallel_tasc_belief.build_shared_geometry(
+            inputs, ray_origin=ray_origin, ray_direction=ray_direction,
+            stamp_us=int(payload.get("source_rgb_timestamp_us", 0) or 0),
         )
-        telemetry = self.tasc_belief.update(
-            inputs,
-            eef_position_m=eef_position,
-            user_translation_mps=eef_velocity,
-            ray_origin_m=ray_origin,
-            ray_direction=ray_direction,
-            controller_orientation_xyzw=controller_xyzw,
+        per_hand = self.parallel_tasc_belief.update_hands(shared_geometry, hand_inputs)
+        selected = per_hand.get(self.belief_selected_hand)
+        telemetry = (
+            dict(selected)
+            if selected is not None
+            else {"enabled": True, "objects": [], "target": None}
         )
+        telemetry["hands"] = per_hand
         telemetry["selected_hand"] = self.belief_selected_hand
+        telemetry["selection_active"] = self.belief_selection_active
         telemetry["eef_target_link"] = self._belief_target_link()
         telemetry["ray_source"] = (
             "camera_optical_center" if ray_origin is not None and ray_direction is not None else "unavailable"
         )
-        if self.tasc_belief.should_log():
-            LOG.info(self.tasc_belief.format_log_line())
-            self.tasc_belief.mark_logged()
+        selected_tracker = self.parallel_tasc_belief.trackers.get(self.belief_selected_hand)
+        if selected_tracker is not None and selected_tracker.should_log():
+            LOG.info(selected_tracker.format_log_line())
+            selected_tracker.mark_logged()
         with self.lock:
             self.stats["last_belief"] = telemetry
+        # A/B only gates command injection. Both posteriors above were updated
+        # regardless of button state; with no hold we deliberately publish none.
+        if not self.belief_selection_active:
+            return None
         target = telemetry.get("target")
         if not isinstance(target, dict):
             return None
@@ -919,6 +952,11 @@ class ThorRemoteGateway:
             "belief_ee_target_link": self._belief_target_link(),
             "belief_ray_origin_m": ray_origin.tolist() if ray_origin is not None else None,
             "belief_ray_direction": ray_direction.tolist() if ray_direction is not None else None,
+            "orientation_object_id": target.get("orientation_object_id"),
+            "orientation_relation": target.get("orientation_relation"),
+            "orientation_axis_world": target.get("orientation_axis_world"),
+            "orientation_confidence": target.get("orientation_confidence"),
+            "orientation_source_position_m": target.get("orientation_source_position_m"),
         }
         output = {
             "position": position,
@@ -931,6 +969,7 @@ class ThorRemoteGateway:
             "object_id": object_id,
             "label": label,
             "grip_index": int(target.get("grip_index", -1)),
+            "orientation_xyzw": target.get("orientation_xyzw"),
         }
         return position, output, "belief"
 
@@ -955,11 +994,17 @@ class ThorRemoteGateway:
         target_side = _side_from_link(target_link)
         if belief_selection is not None:
             position, selected_output, selected_position_field = belief_selection
+            orientation_xyzw = _finite_vec4(selected_output.get("orientation_xyzw"))
+            orientation_wxyz = (
+                self.ee_target_quaternion_wxyz
+                if orientation_xyzw is None
+                else (float(orientation_xyzw[3]), float(orientation_xyzw[0]), float(orientation_xyzw[1]), float(orientation_xyzw[2]))
+            )
             payload_out = make_goal_payload(
                 position,
                 side=target_side,
                 target_link=target_link,
-                quaternion=self.ee_target_quaternion_wxyz,
+                quaternion=orientation_wxyz,
                 duration_sec=self.ee_target_duration_sec,
                 final_hold_sec=self.ee_target_final_hold_sec,
                 workspace_info={
@@ -997,6 +1042,20 @@ class ThorRemoteGateway:
                     "target_link": target_link,
                     "position": np.round(position, 4).tolist(),
                     "position_field": selected_position_field,
+                }
+            return
+        if self.belief_enabled and self.parallel_tasc_belief.config.enabled:
+            # Do not fall through to the legacy one-hand/raw object publisher:
+            # A/B is the sole authority gate for injecting a belief reference.
+            with self.lock:
+                self.stats["ee_targets_skipped"] += 1
+                self.stats["last_ee_target_skip"] = {
+                    "sequence": payload.get("sequence"),
+                    "reason": (
+                        "waiting_for_A_or_B_hand_selection"
+                        if not self.belief_selection_active
+                        else "selected_hand_has_no_valid_belief_target"
+                    ),
                 }
             return
         selection = _best_remote_object(

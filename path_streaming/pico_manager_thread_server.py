@@ -1262,7 +1262,6 @@ class PicoVrPoseDebugPublisher:
         self.stream_mode_getter = stream_mode_getter
         self.arm_reference_mode = "head_position"
         self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
-        self.alignment_gate = AlignmentGate()
         self._align_ok = False
         self._align_reason = "inactive"
         self._align_ok_frames = 0
@@ -1274,11 +1273,9 @@ class PicoVrPoseDebugPublisher:
 
     @property
     def alignment_ready(self) -> bool:
-        with self._align_lock:
-            return bool(
-                self._align_ok
-                and self._align_ok_frames >= self.alignment_gate.hold_frames
-            )
+        # Absolute controller-to-waist targets have no zero-pose calibration.
+        # This remains only as a compatibility status property for old callers.
+        return True
 
     def start(self) -> None:
         self._thread.start()
@@ -1346,42 +1343,27 @@ class PicoVrPoseDebugPublisher:
                             left_velocity = np.full(3, np.inf)
                             right_velocity = np.full(3, np.inf)
 
-                        align_ok = False
-                        align_reason = "inactive"
-                        if mode == StreamMode.ALIGNING and targets_ok:
-                            align_ok, align_reason = self.alignment_gate.check(
-                                left_waist,
-                                right_waist,
-                                left_velocity,
-                                right_velocity,
-                            )
-                        elif mode == StreamMode.TRACKING and targets_ok:
-                            align_ok, align_reason = True, "tracking"
+                        # Do not gate absolute PICO targets on a hand-forward
+                        # pose or a stationary 25-frame initialization window.
+                        # The only remaining gate is finite raw tracking data.
+                        align_ok = bool(targets_ok and active)
+                        align_reason = "bypassed" if align_ok else "inactive"
 
                         with self._align_lock:
-                            if mode == StreamMode.ALIGNING:
-                                self._align_ok_frames = (
-                                    self._align_ok_frames + 1 if align_ok else 0
-                                )
-                            elif mode != StreamMode.TRACKING:
-                                self._align_ok_frames = 0
+                            self._align_ok_frames = 1 if align_ok else 0
                             self._align_ok = align_ok
                             self._align_reason = align_reason
                             align_ok_frames = self._align_ok_frames
 
-                        if (
-                            mode == StreamMode.ALIGNING
-                            and now - last_alignment_log >= 1.0
-                        ):
+                        if active and now - last_alignment_log >= 1.0:
                             max_speed = max(
                                 float(np.linalg.norm(left_velocity)),
                                 float(np.linalg.norm(right_velocity)),
                             )
                             print(
-                                "[PICO-VR] ALIGNING "
+                                "[PICO-VR] absolute-target stream "
                                 f"reason={align_reason} "
-                                f"stable={align_ok_frames}/"
-                                f"{self.alignment_gate.hold_frames} "
+                                f"valid={align_ok_frames} "
                                 f"controller_speed={max_speed:.3f}m/s"
                             )
                             last_alignment_log = now
@@ -2640,7 +2622,7 @@ def run_pico_manager(
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
     Controller input:
       A+X: PATH tracking arm/disarm only
-      A+B+X+Y: Q_READY alignment and policy start/stop
+      A+B+X+Y: immediately start/stop absolute PICO wrist targets
     """
     if replay_session:
         if enable_vis_vr3pt or enable_smpl_vis:
@@ -2725,7 +2707,7 @@ def run_pico_manager(
     )
 
     print(
-        "Manager controls: A+B+X+Y=Q_READY alignment/start/stop; "
+        "Manager controls: A+B+X+Y=immediate PICO target start/stop; "
         "A+X=PATH tracking arm/disarm only"
     )
     current_mode = StreamMode.OFF
@@ -2759,11 +2741,6 @@ def run_pico_manager(
             new_mode = current_mode
             if current_mode == StreamMode.OFF:
                 if start_combo and not prev_start_combo:
-                    new_mode = StreamMode.ALIGNING
-            elif current_mode == StreamMode.ALIGNING:
-                if start_combo and not prev_start_combo:
-                    new_mode = StreamMode.OFF
-                elif vr_pose_publisher.alignment_ready:
                     three_point.start_tracking_session()
                     new_mode = StreamMode.TRACKING
             elif current_mode == StreamMode.TRACKING:
@@ -2772,7 +2749,7 @@ def run_pico_manager(
 
             # Handle mode transitions before running loop
             if new_mode != current_mode:
-                if new_mode == StreamMode.ALIGNING:
+                if new_mode == StreamMode.TRACKING:
                     planner_streamer.reset_yaw()
 
             # Run one iteration of the new mode

@@ -141,15 +141,28 @@ class GoalPublisher:
             context = zmq.Context.instance()
             self.goal_socket = context.socket(zmq.PUB)
             self.goal_socket.setsockopt(zmq.LINGER, 0)
+            # Belief is a latest-state stream.  Never let a disconnected or
+            # slow bridge stall the perception/belief worker behind an old
+            # target message.
+            self.goal_socket.setsockopt(zmq.SNDHWM, 1)
             self.goal_socket.connect(goal_endpoint)
             if planner_endpoint:
                 self.planner_socket = context.socket(zmq.PUB)
                 self.planner_socket.setsockopt(zmq.LINGER, 0)
+                self.planner_socket.setsockopt(zmq.SNDHWM, 1)
                 self.planner_socket.connect(planner_endpoint)
 
     @staticmethod
     def _send(socket: zmq.Socket, topic: str, payload: dict) -> None:
-        socket.send(topic.encode() + msgpack.packb(payload, use_bin_type=True))
+        try:
+            socket.send(
+                topic.encode() + msgpack.packb(payload, use_bin_type=True),
+                flags=zmq.NOBLOCK,
+            )
+        except zmq.Again:
+            # Dropping an obsolete belief packet is correct: the next 5 Hz
+            # publication contains the full current two-hand state.
+            pass
 
     def publish(
         self,

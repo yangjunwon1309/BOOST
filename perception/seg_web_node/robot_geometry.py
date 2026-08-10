@@ -153,6 +153,65 @@ def g1_wrist_ee_position(
     return (transform @ local)[:3].copy()
 
 
+_HAND_BASE_ROTATION_FROM_WRIST = {
+    # MuJoCo g1_29dof_with_revo2.xml: wrist_yaw_link -> {side}_base_link.
+    # Quaternions are wxyz and establish the BrainCo hand +Y spread axis used
+    # by orientation belief in the same pelvis-identity FK frame.
+    "left": np.array([
+        [0.0, 0.0, 1.0],
+        [-1.0, 0.0, 0.0],
+        [0.0, -1.0, 0.0],
+    ], dtype=np.float64),
+    "right": np.array([
+        [0.0, 0.0, 1.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+    ], dtype=np.float64),
+}
+
+
+def g1_hand_base_rotation(q: np.ndarray, target_link: str) -> np.ndarray:
+    """Return pelvis<-BrainCo base rotation from a wrist-yaw target link.
+
+    The offset is fixed by the attached hand XML; translation does not affect
+    the hand spread-axis orientation used by belief inference.
+    """
+    side = "left" if str(target_link).startswith("left_") else "right"
+    transforms = g1_link_transforms(q)
+    wrist = transforms.get(target_link)
+    if wrist is None:
+        raise ValueError(f"unknown G1 target link: {target_link}")
+    return wrist[:3, :3] @ _HAND_BASE_ROTATION_FROM_WRIST[side]
+
+
+def angular_velocity_from_rotations(
+    previous: np.ndarray,
+    current: np.ndarray,
+    dt_sec: float,
+) -> np.ndarray | None:
+    """World-frame angular velocity from two world<-hand rotations."""
+    dt = float(dt_sec)
+    if not (1.0e-4 <= dt <= 0.5):
+        return None
+    delta = np.asarray(current, dtype=np.float64).reshape(3, 3) @ np.asarray(previous, dtype=np.float64).reshape(3, 3).T
+    cosine = float(np.clip((np.trace(delta) - 1.0) * 0.5, -1.0, 1.0))
+    angle = float(math.acos(cosine))
+    if angle < 1.0e-8:
+        return np.zeros(3, dtype=np.float64)
+    sine = math.sin(angle)
+    if abs(sine) < 1.0e-6:
+        values, vectors = np.linalg.eigh(delta + np.eye(3))
+        axis = vectors[:, int(np.argmax(values))]
+    else:
+        axis = np.array([
+            delta[2, 1] - delta[1, 2],
+            delta[0, 2] - delta[2, 0],
+            delta[1, 0] - delta[0, 1],
+        ], dtype=np.float64) / (2.0 * sine)
+    norm = float(np.linalg.norm(axis))
+    return None if not np.isfinite(norm) or norm < 1.0e-9 else axis / norm * (angle / dt)
+
+
 def quaternion_rotation_wxyz(q: np.ndarray) -> np.ndarray:
     q = np.asarray(q, dtype=float)
     norm = np.linalg.norm(q)

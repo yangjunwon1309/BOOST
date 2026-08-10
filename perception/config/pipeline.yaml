@@ -141,10 +141,9 @@ publish:
   keepalive_hz: 1.0
   stale_after_s: 1.5
 ee_target:
-  # The server still requires the explicit --enable-ee-publishing CLI flag and
-  # starts tracking only after an object is selected and Send is pressed.
-  # Tracking republishes the latest center until Stop is pressed or the selected
-  # object disappears for tracking_lost_grace_frames consecutive SAM3 frames.
+  # With --enable-ee-publishing, the server continuously emits both hand
+  # belief targets. A/B selection is performed only by the PATH bridge.
+  belief_publishing_enabled: true
   # Test mode: accept any finite segmented center without range or timing gates.
   bypass_checks: true
   camera_info: config/camera_info.yaml
@@ -170,7 +169,9 @@ ee_target:
   min_depth_points: 100
   goal_endpoint: tcp://127.0.0.1:5564
   goal_topic: path_static_ee_target
-  send_planner_goal: true
+  # Direct PATH control consumes only path_static_ee_target.  Do not also
+  # publish legacy cuRobo path_goal commands on port 5561.
+  send_planner_goal: false
   planner_endpoint: tcp://127.0.0.1:5561
   planner_topic: path_goal
   workspace:
@@ -198,6 +199,52 @@ tasc_belief:
   beta: 1.0
   w_sc: 0.95
   max_prob_any_goal: 0.99
+  jump:
+    enabled: true
+    lambda0: 0.05
+    kappa: 2.0
+    switch_sigma_d: 0.15
+    # Uniform posterior-drift probability per nominal 30 Hz belief tick.
+    # Runtime scales it exponentially by elapsed time.
+    persist_leak: 0.02
+  # Object/contact and orientation belief are separate posteriors.  The
+  # latter uses the BrainCo hand spread axis (+Y) for both hands.
+  orientation:
+    enabled: true
+    beta: 1.0
+    w_sc: 0.95
+    max_prob: 0.99
+    ema_alpha: 0.25
+    relations: [parallel, perpendicular]
+    hand_axis_local: [0.0, 1.0, 0.0]
+    switch_dwell_frames: 2
+    role_hard_filter: false
+    label_prior_scale: 1.0
+    switch_gamma_h: 3.0
+    switch_gamma_omega: 1.0
+    switch_omega_ref: 0.5
+    pseudo:
+      enabled: true
+      max_points: 6
+      plane_ransac_iters: 60
+      plane_inlier_thresh_m: 0.006
+      min_inlier_ratio: 0.35
+      normal_sign_reference: camera
+  per_hand_parallel: true
+  beta_armed: 1.0
+  beta_idle: 0.2
+  lambda0_armed: 0.05
+  lambda0_idle: 0.30
+  beta_ramp_tau_s: 0.2
+  commit_boost_enabled: false
+  dual_hand_exclusive: false
+  pos_switch_sigma_d: 0.15
+  pos_switch_gamma_u: 2.0
+  geometry_update_hz: 8.0
+  belief_update_hz: 30.0
+  max_objects: 10
+  max_contacts_per_object: 6
+  max_orientation_candidates: 96
   # FK point used as P_ee = target_link origin + local +X offset.
   # This matches the wrist EE point shown by the QP/FK web telemetry.
   ee_offset_m: 0.05
@@ -207,14 +254,19 @@ tasc_belief:
     w_ray: 0.3
     w_agreement: 0.6
     w_delta: 0.0
+    w_orientation: 0.8
     min_user_speed_mps: 0.005
     distance: {k: 1.5, delta: 0.10, c: 0.1}
     ray: {k_r: 1.0, delta_r: 0.15, c_r: 0.1}
     agreement: {lambda_a: 1.0, kappa: 1.0}
     delta: {lambda_d: 0.3, lpf_alpha: 0.5}
-  leak:
-    kappa0: 0.3
-    gamma: 5.0
+    orientation:
+      align_k: 1.0
+      align_delta: 0.15
+      hold_lambda: 1.0
+      converge_lambda: 0.5
+      omega_ref_rps: 0.5
+      min_hand_omega_rps: 0.02
   grip:
     enable: true
     top_k: 4

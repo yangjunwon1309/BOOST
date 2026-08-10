@@ -91,15 +91,69 @@ class GripCandidate:
     width: float
     geom_score: float
     source: str = "geometry"
+    surface_normal: np.ndarray | None = None
+    surface_tangent: np.ndarray | None = None
+    surface_axis: np.ndarray | None = None
 
     def to_dict(self) -> dict:
-        return {
+        payload = {
             "center_goal_m": np.asarray(self.center, dtype=np.float64).reshape(3).tolist(),
             "approach_goal": np.asarray(self.approach, dtype=np.float64).reshape(3).tolist(),
             "width_m": float(self.width),
             "geom_score": float(self.geom_score),
             "source": self.source,
         }
+        for key, vector in (
+            ("surface_normal", self.surface_normal),
+            ("surface_tangent", self.surface_tangent),
+            ("surface_axis", self.surface_axis),
+        ):
+            payload[key] = (
+                None
+                if vector is None
+                else np.asarray(vector, dtype=np.float64).reshape(3).tolist()
+            )
+        return payload
+
+
+@dataclass(frozen=True)
+class PseudoContactPoint:
+    """Surface sample used as an orientation reference, not a physical contact."""
+
+    center: np.ndarray
+    normal: np.ndarray
+    fit_quality: float
+    source: str
+
+    def to_dict(self) -> dict:
+        return {
+            "center_goal_m": np.asarray(self.center, dtype=np.float64).reshape(3).tolist(),
+            "normal_goal": np.asarray(self.normal, dtype=np.float64).reshape(3).tolist(),
+            "fit_quality": float(self.fit_quality),
+            "source": str(self.source),
+        }
+
+
+@dataclass(frozen=True)
+class PseudoContactConfig:
+    enabled: bool = True
+    max_points: int = 6
+    plane_ransac_iters: int = 60
+    plane_inlier_thresh_m: float = 0.006
+    min_inlier_ratio: float = 0.35
+    normal_sign_reference: str = "camera"
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "PseudoContactConfig":
+        data = dict(data or {})
+        return cls(
+            enabled=bool(data.get("enabled", True)),
+            max_points=int(data.get("max_points", 6)),
+            plane_ransac_iters=int(data.get("plane_ransac_iters", 60)),
+            plane_inlier_thresh_m=float(data.get("plane_inlier_thresh_m", 0.006)),
+            min_inlier_ratio=float(data.get("min_inlier_ratio", 0.35)),
+            normal_sign_reference=str(data.get("normal_sign_reference", "camera")),
+        )
 
 
 @dataclass(frozen=True)
@@ -396,6 +450,18 @@ def sample_cylinder_candidates(
         for angle_index in range(circumference_samples):
             angle = 2.0 * np.pi * angle_index / circumference_samples
             normal = np.cos(angle) * basis_u + np.sin(angle) * basis_v
+            tangent = -np.sin(angle) * basis_u + np.cos(angle) * basis_v
+            normal = _unit(normal, basis_u)
+            tangent = _unit(tangent, basis_v)
+            axis = _unit(model.axis, np.array([0.0, 0.0, 1.0]))
+            # These are analytical cylinder-frame vectors. Keep the invariant
+            # explicit because orientation belief consumes all three.
+            assert abs(float(np.dot(normal, tangent))) < 1.0e-6
+            assert abs(float(np.dot(normal, axis))) < 1.0e-6
+            assert abs(float(np.dot(tangent, axis))) < 1.0e-6
+            assert abs(float(np.linalg.norm(normal)) - 1.0) < 1.0e-6
+            assert abs(float(np.linalg.norm(tangent)) - 1.0) < 1.0e-6
+            assert abs(float(np.linalg.norm(axis)) - 1.0) < 1.0e-6
             center = model.center + float(axial) * model.axis + model.radius * normal
             candidates.append(
                 GripCandidate(
@@ -404,6 +470,9 @@ def sample_cylinder_candidates(
                     width=2.0 * model.radius,
                     geom_score=confidence * (1.0 - 0.25 * abs(float(axial)) / max(EPS, model.height)),
                     source="cylinder_surface",
+                    surface_normal=normal,
+                    surface_tangent=tangent,
+                    surface_axis=axis,
                 )
             )
     max_candidates = max(int(config.top_k), int(surface.max_candidates), 1)
@@ -411,6 +480,160 @@ def sample_cylinder_candidates(
         return candidates
     indices = np.linspace(0, len(candidates) - 1, max_candidates, dtype=np.int64)
     return [candidates[int(index)] for index in indices]
+
+
+def _orient_normal(
+    normal: np.ndarray,
+    point: np.ndarray,
+    view_origin: np.ndarray | None,
+) -> np.ndarray:
+    oriented = _unit(normal, np.array([0.0, 0.0, 1.0]))
+    if view_origin is not None:
+        to_view = _unit(np.asarray(view_origin, dtype=np.float64).reshape(3) - point, oriented)
+        if float(np.dot(oriented, to_view)) < 0.0:
+            oriented = -oriented
+    elif oriented[2] < 0.0:
+        oriented = -oriented
+    return oriented
+
+
+def _fit_plane_ransac(
+    points: np.ndarray,
+    config: PseudoContactConfig,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float] | None:
+    """Return refitted plane point, normal, inlier points, and inlier ratio."""
+    if points.shape[0] < 3:
+        return None
+    rng = np.random.default_rng(0)
+    best_mask: np.ndarray | None = None
+    best_count = 0
+    for _ in range(max(1, int(config.plane_ransac_iters))):
+        indices = rng.choice(points.shape[0], size=3, replace=False)
+        a, b, c = points[indices]
+        normal = np.cross(b - a, c - a)
+        norm = float(np.linalg.norm(normal))
+        if norm <= EPS:
+            continue
+        normal /= norm
+        mask = np.abs((points - a) @ normal) <= max(EPS, config.plane_inlier_thresh_m)
+        count = int(mask.sum())
+        if count > best_count:
+            best_mask, best_count = mask, count
+    if best_mask is None:
+        return None
+    ratio = float(best_count / points.shape[0])
+    if ratio < float(config.min_inlier_ratio):
+        return None
+    inliers = points[best_mask]
+    point = np.mean(inliers, axis=0)
+    covariance = np.cov((inliers - point).T)
+    if covariance.shape != (3, 3) or not np.isfinite(covariance).all():
+        return None
+    values, vectors = np.linalg.eigh(covariance)
+    normal = _unit(vectors[:, int(np.argmin(values))], np.array([0.0, 0.0, 1.0]))
+    return point, normal, inliers, ratio
+
+
+def fit_circle_in_plane(
+    points: np.ndarray,
+    plane_point: np.ndarray,
+    plane_normal: np.ndarray,
+) -> tuple[np.ndarray, float, float] | None:
+    """Fit a 3-D circle after projection into a plane-local 2-D basis."""
+    pts = _finite_points(points, 8000)
+    if pts.shape[0] < 3:
+        return None
+    normal = _unit(plane_normal, np.array([0.0, 0.0, 1.0]))
+    basis_u, basis_v = _radial_basis(normal)
+    delta = pts - np.asarray(plane_point, dtype=np.float64).reshape(3)
+    x, y = delta @ basis_u, delta @ basis_v
+    design = np.column_stack((2.0 * x, 2.0 * y, np.ones_like(x)))
+    rhs = x * x + y * y
+    try:
+        cx, cy, constant = np.linalg.lstsq(design, rhs, rcond=None)[0]
+    except np.linalg.LinAlgError:
+        return None
+    radius_sq = float(constant + cx * cx + cy * cy)
+    if not np.isfinite(radius_sq) or radius_sq <= EPS:
+        return None
+    radius = float(np.sqrt(radius_sq))
+    residual = np.sqrt((x - cx) ** 2 + (y - cy) ** 2) - radius
+    rmse = float(np.sqrt(np.mean(residual * residual)))
+    center = np.asarray(plane_point, dtype=np.float64).reshape(3) + cx * basis_u + cy * basis_v
+    if not np.isfinite(center).all() or not np.isfinite(rmse):
+        return None
+    return center, radius, rmse
+
+
+def extract_pseudo_contacts(
+    points_goal: np.ndarray,
+    config: PseudoContactConfig,
+    *,
+    cylinder_model: CylinderSurfaceModel | None = None,
+    view_origin: np.ndarray | None = None,
+    label: str = "",
+) -> list[PseudoContactPoint]:
+    """Extract orientation-reference surface samples from one object cloud."""
+    if not config.enabled:
+        return []
+    points = _finite_points(points_goal, 8000)
+    if points.shape[0] == 0:
+        return []
+    count = max(1, int(config.max_points))
+    if points.shape[0] < 3:
+        center = np.mean(points, axis=0)
+        return [PseudoContactPoint(
+            center=center,
+            normal=_orient_normal(np.array([0.0, 0.0, 1.0]), center, view_origin),
+            fit_quality=0.0,
+            source="center_fallback",
+        )]
+    if cylinder_model is not None and cylinder_model.inlier_ratio >= 0.35:
+        quality = float(np.clip(
+            cylinder_model.inlier_ratio * np.exp(-cylinder_model.fit_rmse / 0.015),
+            0.0,
+            1.0,
+        ))
+        basis_u, basis_v = _radial_basis(cylinder_model.axis)
+        contacts: list[PseudoContactPoint] = []
+        for angle in np.linspace(0.0, 2.0 * np.pi, count, endpoint=False):
+            normal = np.cos(angle) * basis_u + np.sin(angle) * basis_v
+            center = cylinder_model.center + cylinder_model.radius * normal
+            contacts.append(PseudoContactPoint(
+                center=center,
+                normal=_orient_normal(normal, center, view_origin),
+                fit_quality=quality,
+                source="cylinder",
+            ))
+        return contacts
+
+    plane = _fit_plane_ransac(points, config)
+    if plane is not None:
+        plane_point, normal, inliers, ratio = plane
+        normal = _orient_normal(normal, plane_point, view_origin)
+        lower_label = str(label).lower()
+        if "hole" in lower_label or "circle" in lower_label:
+            circle = fit_circle_in_plane(inliers, plane_point, normal)
+            if circle is not None:
+                center, radius, rmse = circle
+                if 0.002 <= radius <= 0.100 and rmse <= max(EPS, config.plane_inlier_thresh_m):
+                    return [PseudoContactPoint(
+                        center=center,
+                        normal=normal,
+                        fit_quality=float(np.clip(ratio * np.exp(-rmse / config.plane_inlier_thresh_m), 0.0, 1.0)),
+                        source="hole_circle",
+                    )]
+        indices = np.linspace(0, inliers.shape[0] - 1, min(count, inliers.shape[0]), dtype=np.int64)
+        return [PseudoContactPoint(
+            center=inliers[int(index)].copy(), normal=normal, fit_quality=ratio, source="plane"
+        ) for index in indices]
+
+    center, axes, _extents = _principal_axes(points)
+    normal = _orient_normal(axes[-1], center, view_origin)
+    indices = np.linspace(0, points.shape[0] - 1, min(count, points.shape[0]), dtype=np.int64)
+    return [PseudoContactPoint(
+        center=points[int(index)].copy(), normal=normal, fit_quality=0.3, source="pca"
+    ) for index in indices]
 
 
 class PersistentCylinderSurfaceTracker:
@@ -491,12 +714,25 @@ def _merge_candidate_cluster(cluster: list[GripCandidate]) -> GripCandidate:
     geom_score = float(np.max([float(item.geom_score) for item in cluster]))
     sources = sorted({str(item.source) for item in cluster})
     source = sources[0] if len(sources) == 1 else "merged(" + "+".join(sources) + ")"
+
+    def merge_vector(name: str) -> np.ndarray | None:
+        vectors = [getattr(item, name) for item in cluster]
+        if any(vector is None for vector in vectors):
+            return None
+        stacked = np.stack(
+            [np.asarray(vector, dtype=np.float64).reshape(3) for vector in vectors]
+        )
+        return _unit(np.sum(stacked * weights[:, None], axis=0), stacked[0])
+
     return GripCandidate(
         center=center,
         approach=approach,
         width=width,
         geom_score=geom_score,
         source=source,
+        surface_normal=merge_vector("surface_normal"),
+        surface_tangent=merge_vector("surface_tangent"),
+        surface_axis=merge_vector("surface_axis"),
     )
 
 
@@ -572,6 +808,11 @@ def generate_grip_candidates(
                     width=extent,
                     geom_score=float(geom_score),
                     source="pca_surface",
+                    surface_normal=_unit(surface_point - center, -approach),
+                    surface_tangent=_unit(
+                        np.cross(axis, surface_point - center), table_normal
+                    ),
+                    surface_axis=_unit(axis, np.array([1.0, 0.0, 0.0])),
                 )
             )
 
@@ -584,6 +825,8 @@ def generate_grip_candidates(
                 width=0.0,
                 geom_score=0.20 + 0.20 * support,
                 source="surface_fps",
+                surface_normal=-table_normal,
+                surface_axis=None,
             )
         )
 

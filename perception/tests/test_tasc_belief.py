@@ -23,6 +23,7 @@ from seg_web_node.robot_geometry import g1_wrist_ee_position
 from seg_web_node.tasc_belief import (
     BeliefInputObject,
     HierarchicalTascBelief,
+    OrientationCandidate,
     StableObjectIdTracker,
 )
 
@@ -469,3 +470,39 @@ def test_persist_leak_is_elapsed_time_not_callback_rate():
     )
     one_tick, _, _ = belief._jump_predict(initial, advantage, None, 1.0 / 30.0)
     np.testing.assert_allclose(np.exp(one_tick), [0.794, 0.206], atol=1.0e-12)
+
+
+def test_pseudo_contacts_never_return_more_than_one_surface_target():
+    sparse = np.array([[0.0, 0.0, 0.0], [0.01, 0.0, 0.0]])
+    plane = np.array([[x, y, 0.0] for x in np.linspace(-.1, .1, 8) for y in np.linspace(-.1, .1, 8)])
+    ring = np.array([[.03*np.cos(t), .03*np.sin(t), 0.0] for t in np.linspace(0, 2*np.pi, 32, endpoint=False)])
+    for cloud, label in ((sparse, "point"), (plane, "table"), (ring, "circle hole")):
+        assert len(extract_pseudo_contacts(cloud, PseudoContactConfig(min_inlier_ratio=.2), label=label)) <= 1
+
+
+def test_orientation_candidate_bank_carries_posterior_across_domain_change():
+    belief = HierarchicalTascBelief({"orientation": {"switch_dwell_frames": 1}})
+    first = [
+        OrientationCandidate("obj", 0, relation, np.array([.3, .1, .2]), np.array([0, 0, 1.]), 1.0, track_id=f"obj:{relation}")
+        for relation in ("parallel", "perpendicular")
+    ]
+    belief.orientation_candidates = first
+    belief.log_orientation_distribution = np.log(np.array([.9, .1]))
+    belief.orientation_advantage_ema = np.array([.4, -.2])
+    expanded = first + [
+        OrientationCandidate(f"other{i}", 0, "parallel", np.array([.4+i*.01, 0, .2]), np.array([0,0,1.]), 1.0, track_id=f"other{i}:parallel")
+        for i in range(10)
+    ]
+    match = belief._match_orientation_candidates(expanded)
+    assert match[0] == 0 and match[1] == 1
+    assert belief.log_orientation_distribution[match[0]] > belief.log_orientation_distribution[match[1]]
+
+
+def test_orientation_disabled_retains_position_belief_compatibility():
+    belief = HierarchicalTascBelief({"orientation": {"enabled": False}, "jump": {"enabled": False}})
+    telemetry = belief.update(
+        [BeliefInputObject("obj", "bottle", 1.0, np.array([.3, 0., .2]))],
+        eef_position_m=np.zeros(3), now_monotonic=1.0,
+    )
+    assert telemetry["target"] is not None
+    assert telemetry["orientation"]["enabled"] is False

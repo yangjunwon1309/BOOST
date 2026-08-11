@@ -29,7 +29,8 @@ from seg_web_node.lcm_protocol import (
 from seg_web_node.robot_geometry import (
     angular_velocity_from_rotations,
     g1_hand_base_rotation,
-    g1_wrist_ee_position,
+    g1_grasp_center_position,
+    hand_frame_profile,
 )
 from seg_web_node.tasc_belief import (
     BeliefInputObject,
@@ -399,6 +400,22 @@ class ThorRemoteGateway:
         self.parallel_tasc_belief = ParallelTascBelief(belief_config)
         # Compatibility handle for callers that inspect a single selected hand.
         self.tasc_belief = self.parallel_tasc_belief.trackers["left"]
+        self.belief_hand_model = str(
+            belief_config.get("hand_model", "dex1")
+        ).strip().lower()
+        self.belief_hand_profile = hand_frame_profile(self.belief_hand_model)
+        self.belief_grasp_center_local_m = np.asarray(
+            belief_config.get(
+                "grasp_center_local_m",
+                self.belief_hand_profile["grasp_center_local"],
+            ),
+            dtype=np.float64,
+        ).reshape(3)
+        self.belief_orientation_min_confidence = float(
+            belief_config.get("orientation_min_confidence", 0.35)
+        )
+        # Compatibility only. Canonical EE geometry is now supplied by the
+        # selected hand profile instead of a wrist +x scalar offset.
         self.belief_ee_offset_m = float(belief_ee_offset_m)
         self.belief_last_eef_by_hand: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray | None, int]] = {}
         self.shared_hand_selection_endpoint = str(shared_hand_selection_endpoint)
@@ -816,13 +833,14 @@ class ThorRemoteGateway:
             return None, None, None, None
         try:
             state = decode_robot_state(record.robot_state)
-            position = g1_wrist_ee_position(
+            position = g1_grasp_center_position(
                 state.q,
                 f"{hand}_wrist_yaw_link",
-                self.belief_ee_offset_m,
+                self.belief_grasp_center_local_m,
+                self.belief_hand_model,
             )
             hand_rotation = g1_hand_base_rotation(
-                state.q, f"{hand}_wrist_yaw_link"
+                state.q, f"{hand}_wrist_yaw_link", self.belief_hand_model
             )
             velocity = None
             angular_velocity = None
@@ -970,6 +988,10 @@ class ThorRemoteGateway:
             "label": label,
             "grip_index": int(target.get("grip_index", -1)),
             "orientation_xyzw": target.get("orientation_xyzw"),
+            "orientation_axis_world": target.get("orientation_axis_world"),
+            "orientation_relation": target.get("orientation_relation"),
+            "orientation_confidence": target.get("orientation_confidence"),
+            "position_point": f"{self.belief_hand_model}_grasp_center",
         }
         return position, output, "belief"
 
@@ -1028,7 +1050,24 @@ class ThorRemoteGateway:
                     "object_id": selected_output["object_id"],
                     "label": selected_output["label"],
                     "grip_index": selected_output["grip_index"],
+                    "position_point": selected_output["position_point"],
+                    "orientation_axis_world": selected_output[
+                        "orientation_axis_world"
+                    ],
+                    "orientation_relation": selected_output[
+                        "orientation_relation"
+                    ],
+                    "orientation_confidence": selected_output[
+                        "orientation_confidence"
+                    ],
                 }
+            )
+            payload_out["orientation_valid"] = bool(
+                _finite_vec3(payload_out.get("orientation_axis_world")) is not None
+                and payload_out.get("orientation_relation")
+                in {"parallel", "perpendicular"}
+                and float(payload_out.get("orientation_confidence", 0.0) or 0.0)
+                >= self.belief_orientation_min_confidence
             )
             self.ee_target_pub.publish(payload_out)
             with self.lock:

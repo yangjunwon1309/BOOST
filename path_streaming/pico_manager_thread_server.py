@@ -883,6 +883,17 @@ class PicoButtonEventPublisher:
                 buttons = get_abxy_buttons()
                 lx, ly, rx, ry = get_controller_axes()
                 left_axis_click, right_axis_click = get_axis_clicks()
+                # Keep analogue hand controls on this dedicated 100 Hz path.
+                # vr_pose_debug is conflated downstream for Cartesian arm
+                # tracking, so a short trigger press must not depend on which
+                # body-pose frame happens to survive that conflation.
+                (
+                    _,
+                    left_trigger,
+                    right_trigger,
+                    left_grip,
+                    right_grip,
+                ) = get_controller_inputs()
                 read_timestamp_us = time.monotonic_ns() // 1000
                 with self._lock:
                     self._latest = buttons
@@ -897,6 +908,10 @@ class PicoButtonEventPublisher:
                     "right_axis": [float(rx), float(ry)],
                     "left_axis_click": bool(left_axis_click),
                     "right_axis_click": bool(right_axis_click),
+                    "left_trigger": float(left_trigger),
+                    "right_trigger": float(right_trigger),
+                    "left_grip": float(left_grip),
+                    "right_grip": float(right_grip),
                     "a": bool(a),
                     "b": bool(b),
                     "x": bool(x),

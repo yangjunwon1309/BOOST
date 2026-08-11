@@ -28,14 +28,11 @@ python -u path_streaming/path_state_machine_bridge.py \
   --gravity-bias-max-deg "${PATH_GRAVITY_BIAS_MAX_DEG:-3.0}" \
   --gravity-accel-norm-tolerance "${PATH_GRAVITY_ACCEL_NORM_TOLERANCE:-0.50}" \
   --gravity-bias-gyro-gate-rad-s "${PATH_GRAVITY_BIAS_GYRO_GATE_RAD_S:-0.05}" \
-  --shared-rho1 "${PATH_SHARED_RHO1:-0.60}" \
-  --shared-rho2 "${PATH_SHARED_RHO2:-0.90}" \
-  --shared-alpha-rate-up "${PATH_SHARED_ALPHA_RATE_UP:-1.0}" \
-  --shared-alpha-rate-down "${PATH_SHARED_ALPHA_RATE_DOWN:-3.0}" \
-  --shared-v-transfer-max "${PATH_SHARED_V_TRANSFER_MAX:-0.25}" \
-  --shared-startup-hold-sec "${PATH_SHARED_STARTUP_HOLD_SEC:-0.0}" \
   --shared-stale-after-sec "${PATH_SHARED_STALE_AFTER_SEC:-0.3}" \
   --shared-d-max-m "${PATH_SHARED_D_MAX_M:-0.9}" \
+  --end-effector-model "${PATH_END_EFFECTOR_MODEL:-dex1}" \
+  --hand-axis-local ${PATH_HAND_AXIS_LOCAL:-1.0 0.0 0.0} \
+  --grasp-center-local ${PATH_GRASP_CENTER_LOCAL:-0.0 0.0 0.060} \
   --shared-ref-lpf-alpha "${PATH_SHARED_REF_LPF_ALPHA:-0.3}" \
   --shared-hand-h-margin-m "${PATH_SHARED_HAND_H_MARGIN_M:-0.05}" \
   --shared-hand-switch-confirm-n "${PATH_SHARED_HAND_SWITCH_CONFIRM_N:-10}" \
@@ -53,7 +50,7 @@ python -u path_streaming/path_state_machine_bridge.py \
   --arm-ik-urdf "${PATH_ARM_IK_URDF:-/home/url/00_workspace/xr_teleop/assets/g1/g1_body29_hand14.urdf}" \
   --arm-ik-model-dir "${PATH_ARM_IK_MODEL_DIR:-/home/url/00_workspace/xr_teleop/assets/g1}" \
   --arm-ik-max-iter "${PATH_ARM_IK_MAX_ITER:-30}" \
-  --arm-ik-ee-offset-m "${PATH_ARM_IK_EE_OFFSET_M:-0.05}" \
+  --arm-ik-ee-offset-m "${PATH_ARM_IK_EE_OFFSET_M:-0.0}" \
   --arm-ik-orientation-full-error-m "${PATH_ARM_IK_ORIENTATION_FULL_ERROR_M:-0.01}" \
   --arm-ik-orientation-zero-error-m "${PATH_ARM_IK_ORIENTATION_ZERO_ERROR_M:-0.03}" \
   --arm-ik-orientation-min-scale "1.0" \

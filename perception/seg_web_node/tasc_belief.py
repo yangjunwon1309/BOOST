@@ -62,6 +62,9 @@ class OrientationCandidate:
     fit_quality: float
     track_id: str = ""
     label: str = ""
+    role: str = "UNKNOWN"
+    label_prior: float = 0.0
+    source: str = ""
 
 
 @dataclass(frozen=True)
@@ -104,6 +107,8 @@ class SharedGeometry:
     ray_origin: np.ndarray | None
     ray_direction: np.ndarray | None
     stamp_us: int
+    up_goal: np.ndarray | None = None
+    surface_status: dict[str, dict] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -151,7 +156,12 @@ class TascBeliefConfig:
     orientation_switch_gamma: float = 4.0
     orientation_relations: tuple[str, ...] = ("parallel", "perpendicular")
     hand_axis_local: tuple[float, float, float] = (0.0, 1.0, 0.0)
-    orientation_switch_dwell_frames: int = 2
+    orientation_match_max_distance_m: float = 0.08
+    orientation_match_max_normal_deg: float = 25.0
+    orientation_track_missing_ttl_frames: int = 5
+    orientation_switch_dwell_frames: int = 15
+    orientation_advantage_scale: float = 0.5
+    orientation_gravity_snap_deg: float = 15.0
     pseudo: PseudoContactConfig = field(default_factory=PseudoContactConfig)
     role_hard_filter: bool = False
     label_role_keywords: dict[str, tuple[str, ...]] = field(default_factory=lambda: {
@@ -266,8 +276,13 @@ class TascBeliefConfig:
             orientation_switch_gamma=float(orientation.get("switch_gamma", data.get("orientation_switch_gamma", 4.0))),
             orientation_relations=tuple(str(v).lower() for v in orientation.get("relations", data.get("orientation_relations", ("parallel", "perpendicular")))),
             hand_axis_local=tuple(float(v) for v in orientation.get("hand_axis_local", data.get("hand_axis_local", (0.0, 1.0, 0.0)))),
-            orientation_switch_dwell_frames=int(orientation.get("switch_dwell_frames", data.get("orientation_switch_dwell_frames", 2))),
-            pseudo=PseudoContactConfig.from_dict(orientation.get("pseudo", data.get("pseudo"))),
+            orientation_match_max_distance_m=float(orientation.get("match_max_distance_m", data.get("orientation_match_max_distance_m", 0.08))),
+            orientation_match_max_normal_deg=float(orientation.get("match_max_normal_deg", data.get("orientation_match_max_normal_deg", 25.0))),
+            orientation_track_missing_ttl_frames=int(orientation.get("track_missing_ttl_frames", data.get("orientation_track_missing_ttl_frames", 5))),
+            orientation_switch_dwell_frames=int(orientation.get("switch_dwell_frames", data.get("orientation_switch_dwell_frames", 15))),
+            orientation_advantage_scale=float(orientation.get("advantage_scale", data.get("orientation_advantage_scale", 0.5))),
+            orientation_gravity_snap_deg=float(orientation.get("gravity_snap_deg", data.get("orientation_gravity_snap_deg", 15.0))),
+            pseudo=PseudoContactConfig.from_dict({**dict(data.get("pseudo") or {}), **dict(orientation.get("pseudo") or {}), "gravity_snap_deg": orientation.get("gravity_snap_deg", data.get("orientation_gravity_snap_deg", 15.0))}),
             role_hard_filter=bool(orientation.get("role_hard_filter", data.get("role_hard_filter", False))),
             label_role_keywords={str(k): tuple(str(v) for v in values) for k, values in (role_keywords or {
                 "held": ("stick", "leg", "rod", "bar", "pole"),
@@ -325,6 +340,30 @@ def _unit(vector: np.ndarray | None) -> np.ndarray | None:
     arr = np.asarray(vector, dtype=np.float64).reshape(3)
     norm = float(np.linalg.norm(arr))
     return None if not np.isfinite(norm) or norm <= EPS else arr / norm
+
+
+def classify_label(
+    label: str,
+    role_keywords: dict[str, tuple[str, ...]],
+    relation_prior: dict[str, dict[str, float]],
+) -> tuple[str, dict[str, float]]:
+    """Classify once in the geometry stage; longest keyword match wins."""
+    text = str(label).strip().lower()
+    role, best = "UNKNOWN", ""
+    for configured_role, keywords in role_keywords.items():
+        for keyword in keywords:
+            needle = str(keyword).lower()
+            if needle in text and len(needle) > len(best):
+                best = needle
+                role = "HELD" if str(configured_role).lower() == "held" else "TARGET"
+    prior: dict[str, float] = {}
+    best = ""
+    for keyword, mapping in relation_prior.items():
+        needle = str(keyword).lower()
+        if needle in text and len(needle) > len(best):
+            best = needle
+            prior = {str(key).lower(): float(value) for key, value in mapping.items()}
+    return role, prior
 
 
 def _quat_xyzw_to_mat(quaternion: np.ndarray) -> np.ndarray | None:
@@ -468,7 +507,9 @@ class HierarchicalTascBelief:
         self.log_orientation_distribution = np.empty(0, dtype=np.float64)
         self.orientation_advantage_ema = np.empty(0, dtype=np.float64)
         self.selected_orientation_index: int | None = None
-        self.pending_orientation_switch: tuple[int, int] | None = None
+        self.selected_orientation_track_id: str = ""
+        self.pending_orientation_switch: tuple[str, int] | None = None
+        self.orientation_missing_tracks: dict[str, tuple[OrientationCandidate, int]] = {}
         self.last_orientation_target: OrientationTarget | None = None
         self.last_grip_update_monotonic = 0.0
         self.last_update_monotonic: float | None = None
@@ -481,23 +522,7 @@ class HierarchicalTascBelief:
         }
 
     def _classify_label(self, label: str) -> tuple[str, dict[str, float]]:
-        text = str(label).strip().lower()
-        role = "UNKNOWN"
-        best = ""
-        for configured_role, keywords in self.config.label_role_keywords.items():
-            for keyword in keywords:
-                needle = str(keyword).lower()
-                if needle in text and len(needle) > len(best):
-                    best = needle
-                    role = "HELD" if str(configured_role).lower() == "held" else "TARGET"
-        prior: dict[str, float] = {}
-        best = ""
-        for keyword, mapping in self.config.label_relation_prior.items():
-            needle = str(keyword).lower()
-            if needle in text and len(needle) > len(best):
-                best = needle
-                prior = {str(key).lower(): float(value) for key, value in mapping.items()}
-        return role, prior
+        return classify_label(label, self.config.label_role_keywords, self.config.label_relation_prior)
 
     def _switch_weights_position(
         self,
@@ -567,9 +592,9 @@ class HierarchicalTascBelief:
         for candidate in candidates:
             normal = _unit(candidate.normal)
             cosine = float(np.clip(np.dot(axis, normal), -1.0, 1.0))
-            error = 1.0 - abs(cosine) if candidate.relation == "parallel" else abs(cosine)
+            error = 1.0 - cosine * cosine if candidate.relation == "parallel" else cosine * cosine
             dc = float(np.dot(np.cross(omega, axis), normal))
-            de = -np.sign(cosine) * dc if candidate.relation == "parallel" else np.sign(cosine) * dc
+            de = -2.0 * cosine * dc if candidate.relation == "parallel" else 2.0 * cosine * dc
             logits.append(
                 self.config.ori_switch_gamma_h * (1.0 - error)
                 + self.config.ori_switch_gamma_omega * (-de) / max(EPS, self.config.ori_switch_omega_ref)
@@ -578,24 +603,63 @@ class HierarchicalTascBelief:
         # not similarity to its previous orientation candidate.
         return normalize_log_probs(np.asarray(logits, dtype=np.float64))
 
-    def _select_orientation_index(self, best: int, probabilities: np.ndarray) -> int:
-        selected = self.selected_orientation_index
-        if selected is None or not 0 <= selected < probabilities.size:
+    def _select_orientation_index(
+        self, best: int, probabilities: np.ndarray, candidates: list[OrientationCandidate]
+    ) -> int:
+        """Dwell hysteresis keyed by stable track ID, never list index."""
+        best_id = candidates[int(best)].track_id
+        by_id = {candidate.track_id: index for index, candidate in enumerate(candidates)}
+        current = by_id.get(self.selected_orientation_track_id, -1)
+        if current < 0:
+            self.selected_orientation_track_id = best_id
+            self.pending_orientation_switch = None
             self.selected_orientation_index = int(best)
-            self.pending_orientation_switch = None
             return int(best)
-        if int(best) == selected:
+        if best_id == self.selected_orientation_track_id:
             self.pending_orientation_switch = None
-            return selected
+            self.selected_orientation_index = int(current)
+            return int(current)
         pending = self.pending_orientation_switch
-        count = pending[1] + 1 if pending is not None and pending[0] == int(best) else 1
+        count = pending[1] + 1 if pending is not None and pending[0] == best_id else 1
         if count >= max(1, self.config.orientation_switch_dwell_frames):
-            selected = int(best)
+            self.selected_orientation_track_id = best_id
             self.pending_orientation_switch = None
-        else:
-            self.pending_orientation_switch = (int(best), int(count))
-        self.selected_orientation_index = selected
-        return selected
+            self.selected_orientation_index = int(best)
+            return int(best)
+        self.pending_orientation_switch = (best_id, int(count))
+        self.selected_orientation_index = int(current)
+        return int(current)
+
+    def _match_orientation_candidates(self, candidates: list[OrientationCandidate]) -> dict[int, int]:
+        """Map each new candidate to a previous candidate without K-reset."""
+        previous = self.orientation_candidates
+        if not previous:
+            return {}
+        by_track = {candidate.track_id: index for index, candidate in enumerate(previous) if candidate.track_id}
+        cos_limit = float(np.cos(np.deg2rad(self.config.orientation_match_max_normal_deg)))
+        matched: dict[int, int] = {}
+        used: set[int] = set()
+        for index, candidate in enumerate(candidates):
+            prior = by_track.get(candidate.track_id)
+            if prior is not None and prior not in used:
+                matched[index] = prior
+                used.add(prior)
+        for index, candidate in enumerate(candidates):
+            if index in matched:
+                continue
+            best, best_distance = -1, float("inf")
+            for prior_index, other in enumerate(previous):
+                if prior_index in used or other.relation != candidate.relation:
+                    continue
+                distance = float(np.linalg.norm(candidate.position - other.position))
+                alignment = abs(float(np.dot(_unit(candidate.normal), _unit(other.normal))))
+                if (distance <= self.config.orientation_match_max_distance_m
+                        and alignment >= cos_limit and distance < best_distance):
+                    best, best_distance = prior_index, distance
+            if best >= 0:
+                matched[index] = best
+                used.add(best)
+        return matched
 
     def _quaternion_from_relation(
         self, candidate: OrientationCandidate, hand_rotation_matrix: np.ndarray
@@ -622,6 +686,7 @@ class HierarchicalTascBelief:
         hand_angular_velocity: np.ndarray | None,
         dt: float,
         view_origin: np.ndarray | None,
+        orientation_candidates: list[OrientationCandidate] | None = None,
     ) -> tuple[OrientationTarget | None, dict, float, float]:
         if not self.config.orientation_enabled or hand_rotation_matrix is None:
             return None, {"enabled": False, "candidates": []}, 0.0, 0.0
@@ -629,12 +694,12 @@ class HierarchicalTascBelief:
         hand_axis = _unit(rotation @ np.asarray(self.config.hand_axis_local, dtype=np.float64))
         if hand_axis is None:
             return None, {"enabled": False, "candidates": []}, 0.0, 0.0
-        candidates: list[OrientationCandidate] = []
+        candidates: list[OrientationCandidate] = [] if orientation_candidates is None else list(orientation_candidates)
         raw_advantages: list[float] = []
         breakdowns: list[dict] = []
         priors: list[float] = []
         roles: list[str] = []
-        for obj in objects:
+        for obj in objects if orientation_candidates is None else []:
             role, relation_prior = self._classify_label(obj.label)
             if role == "HELD" and self.config.role_hard_filter:
                 continue
@@ -655,7 +720,8 @@ class HierarchicalTascBelief:
                         object_id=obj.object_id, pseudo_index=pseudo_index, relation=relation,
                         position=np.asarray(contact.center, dtype=np.float64).reshape(3),
                         normal=np.asarray(contact.normal, dtype=np.float64).reshape(3),
-                        fit_quality=float(contact.fit_quality), label=obj.label,
+                        fit_quality=float(contact.fit_quality), track_id=f"{obj.object_id}:{relation}", label=obj.label,
+                        role=role, label_prior=float(self.config.label_prior_scale * relation_prior.get(relation, 0.0) - (1.0 if role == "HELD" else 0.0)), source=contact.source,
                     )
                     breakdown = self.feature_cost.orientation_breakdown(
                         surface_normal=candidate.normal, hand_axis=hand_axis,
@@ -669,7 +735,34 @@ class HierarchicalTascBelief:
                     breakdowns.append(breakdown)
                     priors.append(float(prior))
                     roles.append(role)
+        # Keep briefly occluded tracks in the posterior domain. This prevents a
+        # one-frame segmentation dropout from deleting its probability mass.
+        present_ids = {candidate.track_id for candidate in candidates if candidate.track_id}
+        for track_id, (candidate, missing) in list(self.orientation_missing_tracks.items()):
+            if track_id in present_ids:
+                del self.orientation_missing_tracks[track_id]
+                continue
+            missing += 1
+            if missing > self.config.orientation_track_missing_ttl_frames:
+                del self.orientation_missing_tracks[track_id]
+            else:
+                self.orientation_missing_tracks[track_id] = (candidate, missing)
+                candidates.append(candidate)
+        for candidate in self.orientation_candidates:
+            if candidate.track_id and candidate.track_id not in present_ids and candidate.track_id not in self.orientation_missing_tracks:
+                self.orientation_missing_tracks[candidate.track_id] = (candidate, 1)
+                candidates.append(candidate)
         candidates = candidates[: self.config.max_orientation_candidates]
+        if orientation_candidates is not None:
+            for candidate in candidates:
+                breakdown = self.feature_cost.orientation_breakdown(
+                    surface_normal=candidate.normal, hand_axis=hand_axis,
+                    hand_angular_velocity=hand_angular_velocity, relation=candidate.relation,
+                )
+                raw_advantages.append(float(breakdown["weighted_total"]) * candidate.fit_quality + candidate.label_prior)
+                breakdowns.append(breakdown)
+                priors.append(float(candidate.label_prior))
+                roles.append(candidate.role)
         raw = np.asarray(raw_advantages[:len(candidates)], dtype=np.float64)
         breakdowns, priors, roles = breakdowns[:len(candidates)], priors[:len(candidates)], roles[:len(candidates)]
         if not candidates:
@@ -677,29 +770,25 @@ class HierarchicalTascBelief:
             self.log_orientation_distribution = np.empty(0, dtype=np.float64)
             self.last_orientation_target = None
             return None, {"enabled": True, "hand_axis_world": hand_axis.tolist(), "candidates": []}, 0.0, 0.0
-        if self.orientation_advantage_ema.shape != raw.shape:
-            ema = raw.copy()
-            old = self.orientation_candidates
-            if old and self.orientation_advantage_ema.size:
-                for index, candidate in enumerate(candidates):
-                    distances = [float(np.linalg.norm(candidate.position - other.position)) for other in old]
-                    if distances:
-                        prior_index = int(np.argmin(distances))
-                        if distances[prior_index] <= self.config.grip_match_max_distance_m and prior_index < self.orientation_advantage_ema.size:
-                            ema[index] = self.orientation_advantage_ema[prior_index]
-        else:
-            alpha = float(np.clip(self.config.orientation_ema_alpha, 0.0, 1.0))
-            ema = alpha * raw + (1.0 - alpha) * self.orientation_advantage_ema
+        match = self._match_orientation_candidates(candidates)
+        uniform_log = -float(np.log(max(1, len(candidates))))
+        aligned_log = np.full(len(candidates), uniform_log, dtype=np.float64)
+        ema = raw.copy()
+        alpha = float(np.clip(self.config.orientation_ema_alpha, 0.0, 1.0))
+        for new_index, prior_index in match.items():
+            if prior_index < self.log_orientation_distribution.size:
+                aligned_log[new_index] = self.log_orientation_distribution[prior_index]
+            if prior_index < self.orientation_advantage_ema.size:
+                ema[new_index] = alpha * raw[new_index] + (1.0 - alpha) * self.orientation_advantage_ema[prior_index]
         self.orientation_advantage_ema = ema
-        standardized = robust_standardize(ema, min_signal_spread=self.config.robust_min_signal_spread, scale_floor=self.config.robust_scale_floor, clip=self.config.robust_clip)
-        if self.log_orientation_distribution.shape != standardized.shape:
-            self.log_orientation_distribution = normalize_log_probs(np.zeros_like(standardized))
+        standardized = np.clip(ema / max(EPS, self.config.orientation_advantage_scale), -self.config.robust_clip, self.config.robust_clip)
+        self.log_orientation_distribution = normalize_log_probs(aligned_log)
         switch = self._orientation_switch_weights(candidates, hand_axis, hand_angular_velocity)
         predicted, lambda_dt, variance = self._jump_predict(self.log_orientation_distribution, standardized, switch, dt)
         posterior = self.config.orientation_w_sc * predicted + self.config.orientation_beta * standardized
         self.log_orientation_distribution = clip_log_probs(normalize_log_probs(posterior), self.config.orientation_max_prob)
         probabilities = np.exp(self.log_orientation_distribution)
-        index = self._select_orientation_index(int(np.argmax(probabilities)), probabilities)
+        index = self._select_orientation_index(int(np.argmax(probabilities)), probabilities, candidates)
         selected = candidates[index]
         target = OrientationTarget(
             quaternion_xyzw=self._quaternion_from_relation(selected, rotation), axis_world=np.asarray(selected.normal, dtype=np.float64),
@@ -711,12 +800,14 @@ class HierarchicalTascBelief:
             "enabled": True, "hand_axis_world": hand_axis.tolist(),
             "hand_omega_rps": None if hand_angular_velocity is None else np.asarray(hand_angular_velocity, dtype=np.float64).reshape(3).tolist(),
             "candidates": [
-                {"object_id": c.object_id, "label": c.label, "role": roles[i], "relation": c.relation,
+                {"object_id": c.object_id, "label": c.label, "role": roles[i], "relation": c.relation, "track_id": c.track_id, "source": c.source,
                  "normal": c.normal.tolist(), "fit_quality": c.fit_quality, "probability": float(probabilities[i]),
                  "advantage_raw": float(raw[i]), "advantage_ema": float(ema[i]), "advantage_standardized": float(standardized[i]),
-                 "label_prior": float(priors[i]), "breakdown": breakdowns[i]}
+                 "label_prior": float(priors[i]), "breakdown": breakdowns[i], "matched_previous": bool(i in match)}
                 for i, c in enumerate(candidates)
-            ], "selected_index": int(index), "switch_dwell_count": 0 if self.pending_orientation_switch is None else int(self.pending_orientation_switch[1]),
+            ], "selected_index": int(index), "selected_track_id": self.selected_orientation_track_id,
+            "switch_dwell_count": 0 if self.pending_orientation_switch is None else int(self.pending_orientation_switch[1]),
+            "candidate_count": int(len(candidates)), "matched_count": int(len(match)), "advantage_scale": float(self.config.orientation_advantage_scale),
         }
         return target, telemetry, lambda_dt, variance
 
@@ -941,6 +1032,8 @@ class HierarchicalTascBelief:
         hand_angular_velocity: np.ndarray | None = None,
         beta_override: float | None = None,
         lambda0_override: float | None = None,
+        orientation_candidates: list[OrientationCandidate] | None = None,
+        surface_status: dict[str, dict] | None = None,
         now_monotonic: float | None = None,
     ) -> dict[str, Any]:
         now = time.monotonic() if now_monotonic is None else float(now_monotonic)
@@ -966,7 +1059,9 @@ class HierarchicalTascBelief:
             return self.last_telemetry
         valid_objects = valid_objects[: max(1, int(self.config.max_objects))]
         valid_object_ids = {obj.object_id for obj in valid_objects}
-        self.surface_tracker.finish_frame(valid_object_ids)
+        standalone_geometry = any(obj.grip_candidates is None for obj in valid_objects)
+        if standalone_geometry:
+            self.surface_tracker.finish_frame(valid_object_ids)
         for object_id in list(self.grip_tracks):
             if object_id not in valid_object_ids:
                 del self.grip_tracks[object_id]
@@ -1138,7 +1233,7 @@ class HierarchicalTascBelief:
                     "object_advantage_ema": float(object_advantages[obj_index]),
                     "object_advantage_standardized": float(object_update[obj_index]),
                     "object_feature_breakdown": object_feature_breakdowns[obj_index],
-                    "surface_model": self.surface_tracker.status(obj.object_id),
+                    "surface_model": (surface_status or {}).get(obj.object_id, self.surface_tracker.status(obj.object_id)),
                     "generated_grip_candidate_count": int(generated_candidate_count),
                     "persistent_grip_candidate_count": int(len(candidates)),
                     "grip_track_ids": list(grip_ids),
@@ -1174,6 +1269,7 @@ class HierarchicalTascBelief:
                 hand_angular_velocity=hand_angular_velocity,
                 dt=dt,
                 view_origin=ray_origin_m,
+                orientation_candidates=orientation_candidates,
             )
         )
         self.last_target = best_target
@@ -1306,6 +1402,7 @@ class ParallelTascBelief:
         *,
         ray_origin: np.ndarray | None = None,
         ray_direction: np.ndarray | None = None,
+        up_goal: np.ndarray | None = None,
         stamp_us: int = 0,
     ) -> SharedGeometry:
         """Compute hand-independent candidates once, then atomically replace cache."""
@@ -1326,18 +1423,28 @@ class ParallelTascBelief:
             contacts = obj.pseudo_contacts
             if contacts is None:
                 cloud = obj.points_goal_m if obj.points_goal_m is not None else np.asarray([obj.center_goal_m])
-                contacts = extract_pseudo_contacts(cloud, self.config.pseudo, cylinder_model=self.geometry_surface_tracker.models.get(obj.object_id), view_origin=ray_origin, label=obj.label)
-            contacts = list(contacts or [])[: self.config.max_contacts_per_object]
+                contacts = extract_pseudo_contacts(cloud, self.config.pseudo, cylinder_model=self.geometry_surface_tracker.models.get(obj.object_id), view_origin=ray_origin, label=obj.label, up_goal=up_goal)
+            contacts = list(contacts or [])[:1]
             object_candidates[obj.object_id] = candidates
             object_pseudo[obj.object_id] = contacts
             shared_objects.append(BeliefInputObject(obj.object_id, obj.label, obj.score, obj.center_goal_m, None, candidates, contacts))
-            role, _prior = self.trackers["left"]._classify_label(obj.label)
+            role, relation_prior = classify_label(obj.label, self.config.label_role_keywords, self.config.label_relation_prior)
             if role == "HELD" and self.config.role_hard_filter:
                 continue
             for index, contact in enumerate(contacts):
                 for relation in self.config.orientation_relations:
-                    orientations.append(OrientationCandidate(obj.object_id, index, relation, contact.center, contact.normal, contact.fit_quality, label=obj.label))
-        geometry = SharedGeometry(shared_objects, object_candidates, object_pseudo, orientations[: self.config.max_orientation_candidates], ray_origin, ray_direction, int(stamp_us))
+                    if relation not in {"parallel", "perpendicular"}:
+                        continue
+                    prior = self.config.label_prior_scale * relation_prior.get(relation, 0.0)
+                    if role == "HELD":
+                        prior -= 1.0
+                    orientations.append(OrientationCandidate(
+                        obj.object_id, index, relation, contact.center, contact.normal, contact.fit_quality,
+                        track_id=f"{obj.object_id}:{relation}", label=obj.label, role=role,
+                        label_prior=float(prior), source=contact.source,
+                    ))
+        surface_status = {object_id: self.geometry_surface_tracker.status(object_id) for object_id in active}
+        geometry = SharedGeometry(shared_objects, object_candidates, object_pseudo, orientations[: self.config.max_orientation_candidates], ray_origin, ray_direction, int(stamp_us), up_goal=up_goal, surface_status=surface_status)
         self.last_geometry = geometry
         return geometry
 
@@ -1376,6 +1483,8 @@ class ParallelTascBelief:
                 ray_direction=shared.ray_direction,
                 hand_rotation_matrix=hand_rotation,
                 hand_angular_velocity=hand.angular_velocity,
+                orientation_candidates=shared.orientation_candidates,
+                surface_status=shared.surface_status,
                 beta_override=state.beta_current,
                 lambda0_override=state.lambda0_current,
                 now_monotonic=now,

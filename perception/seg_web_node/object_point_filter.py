@@ -17,8 +17,8 @@ class ObjectPointFilterConfig:
     enabled: bool = True
     erosion_px: int = 2
     depth_edge_threshold_m: float = 0.030
-    mad_scale: float = 3.5
-    min_depth_band_m: float = 0.020
+    mad_scale: float = 6.0
+    min_depth_band_m: float = 0.150
     voxel_size_m: float = 0.005
     radius_outlier_m: float = 0.018
     min_radius_neighbors: int = 3
@@ -68,6 +68,23 @@ def _deproject_selected(
     )
 
 
+def project_camera_point_to_pixel(
+    point_camera_m: np.ndarray,
+    intrinsics: CameraIntrinsics,
+) -> tuple[int, int]:
+    """Project one camera-frame point with the inverse of _deproject_selected."""
+    intrinsics.validate()
+    point = np.asarray(point_camera_m, dtype=np.float64).reshape(3)
+    if not np.isfinite(point).all() or point[2] <= 0.0:
+        raise ValueError("camera point must be finite and in front of the camera")
+    u = int(np.rint(intrinsics.fx * point[0] / point[2] + intrinsics.cx))
+    v = int(np.rint(intrinsics.fy * point[1] / point[2] + intrinsics.cy))
+    return (
+        int(np.clip(u, 0, int(intrinsics.width) - 1)),
+        int(np.clip(v, 0, int(intrinsics.height) - 1)),
+    )
+
+
 def _voxel_centroids(points: np.ndarray, voxel_size_m: float) -> np.ndarray:
     if voxel_size_m <= 0.0 or points.shape[0] < 2:
         return points
@@ -109,6 +126,7 @@ def extract_filtered_object_cloud(
     max_depth_m: float,
     min_valid_points: int,
     max_points: int,
+    erosion_px_override: int | None = None,
 ) -> FilteredObjectCloud | None:
     """Extract one robust cloud used by both center and surface estimation."""
     intrinsics.validate()
@@ -118,8 +136,9 @@ def extract_filtered_object_cloud(
         raise ValueError("depth, mask, and intrinsics dimensions must match")
 
     input_pixels = int(clean.sum())
-    if config.enabled and config.erosion_px > 0 and input_pixels:
-        size = 2 * config.erosion_px + 1
+    erosion_px = config.erosion_px if erosion_px_override is None else max(0, int(erosion_px_override))
+    if config.enabled and erosion_px > 0 and input_pixels:
+        size = 2 * erosion_px + 1
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
         clean = cv2.erode(clean.astype(np.uint8), kernel, iterations=1).astype(bool)
     eroded_pixels = int(clean.sum())
@@ -179,7 +198,7 @@ def extract_filtered_object_cloud(
         points = points[indices]
 
     center = np.median(points, axis=0).astype(np.float64)
-    pixel = (int(np.median(cols)), int(np.median(rows)))
+    pixel = project_camera_point_to_pixel(center, intrinsics)
     return FilteredObjectCloud(
         points_camera_m=np.asarray(points, dtype=np.float64),
         center_camera_m=center,

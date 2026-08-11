@@ -114,8 +114,8 @@ cloud:
     enabled: true
     erosion_px: 2
     depth_edge_threshold_m: 0.030
-    mad_scale: 3.5
-    min_depth_band_m: 0.020
+    mad_scale: 6.0
+    min_depth_band_m: 0.150
     voxel_size_m: 0.005
     radius_outlier_m: 0.018
     min_radius_neighbors: 3
@@ -207,8 +207,10 @@ tasc_belief:
     # Uniform posterior-drift probability per nominal 30 Hz belief tick.
     # Runtime scales it exponentially by elapsed time.
     persist_leak: 0.02
-  # Object/contact and orientation belief are separate posteriors.  The
-  # latter uses the BrainCo hand spread axis (+Y) for both hands.
+  # Object/contact and orientation belief are separate posteriors. Dex1-1 is
+  # mounted with its base aligned to wrist_yaw_link; its parallel-jaw spread
+  # axis is base-local +X.
+  hand_model: dex1
   orientation:
     enabled: true
     beta: 1.0
@@ -216,8 +218,13 @@ tasc_belief:
     max_prob: 0.99
     ema_alpha: 0.25
     relations: [parallel, perpendicular]
-    hand_axis_local: [0.0, 1.0, 0.0]
-    switch_dwell_frames: 2
+    hand_axis_local: [1.0, 0.0, 0.0]
+    match_max_distance_m: 0.08
+    match_max_normal_deg: 25.0
+    track_missing_ttl_frames: 5
+    switch_dwell_frames: 15
+    advantage_scale: 0.5
+    gravity_snap_deg: 15.0
     role_hard_filter: false
     label_prior_scale: 1.0
     switch_gamma_h: 3.0
@@ -225,11 +232,16 @@ tasc_belief:
     switch_omega_ref: 0.5
     pseudo:
       enabled: true
-      max_points: 6
+      max_points: 1
       plane_ransac_iters: 60
       plane_inlier_thresh_m: 0.006
       min_inlier_ratio: 0.35
       normal_sign_reference: camera
+      plane_residual_mad_scale: 2.5
+      plane_refit_iters: 2
+      gravity_snap_deg: 15.0
+      hole_min_radius_m: 0.002
+      hole_max_radius_m: 0.100
   per_hand_parallel: true
   beta_armed: 1.0
   beta_idle: 0.2
@@ -245,9 +257,10 @@ tasc_belief:
   max_objects: 10
   max_contacts_per_object: 6
   max_orientation_candidates: 96
-  # FK point used as P_ee = target_link origin + local +X offset.
-  # This matches the wrist EE point shown by the QP/FK web telemetry.
-  ee_offset_m: 0.05
+  # Canonical belief EE point in the active hand base frame. Keep the existing
+  # 6 cm local offset until the physical Dex1 fingertip/contact point is
+  # calibrated on hardware.
+  grasp_center_local_m: [0.0, 0.0, 0.060]
   fallback_eef_position_m: [0.0, 0.0, 0.0]
   features:
     w_distance: 1.0
@@ -262,7 +275,7 @@ tasc_belief:
     delta: {lambda_d: 0.3, lpf_alpha: 0.5}
     orientation:
       align_k: 1.0
-      align_delta: 0.15
+      align_delta: 0.30
       hold_lambda: 1.0
       converge_lambda: 0.5
       omega_ref_rps: 0.5

@@ -153,10 +153,9 @@ def g1_wrist_ee_position(
     return (transform @ local)[:3].copy()
 
 
-_HAND_BASE_ROTATION_FROM_WRIST = {
+_BRAINCO_HAND_BASE_ROTATION_FROM_WRIST = {
     # MuJoCo g1_29dof_with_revo2.xml: wrist_yaw_link -> {side}_base_link.
-    # Quaternions are wxyz and establish the BrainCo hand +Y spread axis used
-    # by orientation belief in the same pelvis-identity FK frame.
+    # Quaternions are wxyz. BrainCo's spread axis is base-local +Y.
     "left": np.array([
         [0.0, 0.0, 1.0],
         [-1.0, 0.0, 0.0],
@@ -168,20 +167,153 @@ _HAND_BASE_ROTATION_FROM_WRIST = {
         [0.0, 1.0, 0.0],
     ], dtype=np.float64),
 }
+_BRAINCO_HAND_BASE_TRANSLATION_FROM_WRIST = {
+    "left": np.array([0.0415, 0.0030, 0.0], dtype=np.float64),
+    "right": np.array([0.0415, -0.0030, 0.0], dtype=np.float64),
+}
+
+# Directly read from the Dex1 G1 assembly URDF:
+# g1_29dof_mode_15_with_dex1_1.urdf, left/right_base_joint. Both attachments
+# are fixed joints with rpy=0 and xyz=(0.0415, 0, 0).
+_DEX1_HAND_BASE_ROTATION_FROM_WRIST = {
+    "left": np.eye(3, dtype=np.float64),
+    "right": np.eye(3, dtype=np.float64),
+}
+_DEX1_HAND_BASE_TRANSLATION_FROM_WRIST = {
+    "left": np.array([0.0415, 0.0, 0.0], dtype=np.float64),
+    "right": np.array([0.0415, 0.0, 0.0], dtype=np.float64),
+}
+
+# Keep the existing 6 cm canonical EE offset while transitioning hardware.
+# It remains a configurable base-local point; it is deliberately not replaced
+# with the estimated Dex1 fingertip centre until hardware validation is done.
+_BRAINCO_GRASP_CENTER_LOCAL = np.array([0.0, 0.0, 0.060], dtype=np.float64)
+_DEX1_GRASP_CENTER_LOCAL = np.array([0.0, 0.0, 0.060], dtype=np.float64)
+
+_HAND_FRAME_PROFILES = {
+    "brainco": {
+        "rotation": _BRAINCO_HAND_BASE_ROTATION_FROM_WRIST,
+        "translation": _BRAINCO_HAND_BASE_TRANSLATION_FROM_WRIST,
+        "grasp_center_local": _BRAINCO_GRASP_CENTER_LOCAL,
+        "orientation_axis_local": np.array([0.0, 1.0, 0.0], dtype=np.float64),
+    },
+    "dex1": {
+        "rotation": _DEX1_HAND_BASE_ROTATION_FROM_WRIST,
+        "translation": _DEX1_HAND_BASE_TRANSLATION_FROM_WRIST,
+        "grasp_center_local": _DEX1_GRASP_CENTER_LOCAL,
+        # Dex1-1: +Y is finger extension; +/-X is the parallel-jaw spread.
+        "orientation_axis_local": np.array([1.0, 0.0, 0.0], dtype=np.float64),
+    },
+}
 
 
-def g1_hand_base_rotation(q: np.ndarray, target_link: str) -> np.ndarray:
-    """Return pelvis<-BrainCo base rotation from a wrist-yaw target link.
+def hand_frame_profile(hand_model: str = "dex1") -> dict[str, object]:
+    """Return copies of the selected physical hand-frame convention."""
+    model = str(hand_model).strip().lower()
+    if model not in _HAND_FRAME_PROFILES:
+        raise ValueError(f"unsupported hand model: {hand_model!r}")
+    profile = _HAND_FRAME_PROFILES[model]
+    return {
+        "name": model,
+        "rotation": {side: value.copy() for side, value in profile["rotation"].items()},
+        "translation": {side: value.copy() for side, value in profile["translation"].items()},
+        "grasp_center_local": profile["grasp_center_local"].copy(),
+        "orientation_axis_local": profile["orientation_axis_local"].copy(),
+    }
 
-    The offset is fixed by the attached hand XML; translation does not affect
-    the hand spread-axis orientation used by belief inference.
-    """
+
+def _hand_profile_for_link(hand_model: str, target_link: str) -> tuple[str, dict[str, object]]:
     side = "left" if str(target_link).startswith("left_") else "right"
+    model = str(hand_model).strip().lower()
+    if model not in _HAND_FRAME_PROFILES:
+        raise ValueError(f"unsupported hand model: {hand_model!r}")
+    return side, _HAND_FRAME_PROFILES[model]
+
+
+def g1_hand_base_rotation(
+    q: np.ndarray,
+    target_link: str,
+    hand_model: str = "dex1",
+) -> np.ndarray:
+    """Return pelvis<-selected-hand-base rotation from a wrist-yaw link."""
+    side, profile = _hand_profile_for_link(hand_model, target_link)
     transforms = g1_link_transforms(q)
     wrist = transforms.get(target_link)
     if wrist is None:
         raise ValueError(f"unknown G1 target link: {target_link}")
-    return wrist[:3, :3] @ _HAND_BASE_ROTATION_FROM_WRIST[side]
+    return wrist[:3, :3] @ profile["rotation"][side]
+
+
+def g1_hand_base_transform(
+    q: np.ndarray,
+    target_link: str,
+    hand_model: str = "dex1",
+) -> np.ndarray:
+    """Return the pelvis<-selected-hand-base transform from a wrist link."""
+    side, profile = _hand_profile_for_link(hand_model, target_link)
+    transforms = g1_link_transforms(q)
+    wrist = transforms.get(target_link)
+    if wrist is None:
+        raise ValueError(f"unknown G1 target link: {target_link}")
+    return wrist @ _homogeneous(profile["rotation"][side], profile["translation"][side])
+
+
+def g1_grasp_center_position(
+    q: np.ndarray,
+    target_link: str = "left_wrist_yaw_link",
+    grasp_center_local_m: np.ndarray | None = None,
+    hand_model: str = "dex1",
+) -> np.ndarray:
+    """Return the pelvis-frame canonical grasp centre for the selected hand."""
+    _, profile = _hand_profile_for_link(hand_model, target_link)
+    base = g1_hand_base_transform(q, target_link, hand_model)
+    local = (
+        profile["grasp_center_local"]
+        if grasp_center_local_m is None
+        else np.asarray(grasp_center_local_m, dtype=np.float64).reshape(3)
+    )
+    return (base @ np.array([local[0], local[1], local[2], 1.0], dtype=np.float64))[:3].copy()
+
+
+def g1_wrist_to_grasp_offset(
+    q: np.ndarray,
+    target_link: str,
+    grasp_center_local_m: np.ndarray | None = None,
+    hand_model: str = "dex1",
+) -> np.ndarray:
+    """Return the pelvis-frame canonical grasp-centre offset from the wrist."""
+    wrist = g1_link_transforms(q).get(target_link)
+    if wrist is None:
+        raise ValueError(f"unknown G1 target link: {target_link}")
+    return (
+        g1_grasp_center_position(q, target_link, grasp_center_local_m, hand_model)
+        - wrist[:3, 3]
+    )
+
+
+def gravity_up_in_pelvis(base_quat_wxyz: np.ndarray | None) -> np.ndarray | None:
+    """Return world up expressed in the pelvis-identity goal frame."""
+    if base_quat_wxyz is None:
+        return None
+    try:
+        rotation = quaternion_rotation_wxyz(np.asarray(base_quat_wxyz, dtype=np.float64))
+    except (TypeError, ValueError):
+        return None
+    up = rotation.T @ np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    norm = float(np.linalg.norm(up))
+    return None if norm < 1.0e-6 else up / norm
+
+
+BRAINCO_GRASP_CENTER_LOCAL = _BRAINCO_GRASP_CENTER_LOCAL.copy()
+DEX1_GRASP_CENTER_LOCAL = _DEX1_GRASP_CENTER_LOCAL.copy()
+HAND_BASE_ROTATION_FROM_WRIST = {
+    name: {side: value.copy() for side, value in profile["rotation"].items()}
+    for name, profile in _HAND_FRAME_PROFILES.items()
+}
+HAND_BASE_TRANSLATION_FROM_WRIST = {
+    name: {side: value.copy() for side, value in profile["translation"].items()}
+    for name, profile in _HAND_FRAME_PROFILES.items()
+}
 
 
 def angular_velocity_from_rotations(

@@ -124,6 +124,7 @@ class PseudoContactPoint:
     normal: np.ndarray
     fit_quality: float
     source: str
+    snapped_to_gravity: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -131,28 +132,40 @@ class PseudoContactPoint:
             "normal_goal": np.asarray(self.normal, dtype=np.float64).reshape(3).tolist(),
             "fit_quality": float(self.fit_quality),
             "source": str(self.source),
+            "snapped_to_gravity": bool(self.snapped_to_gravity),
         }
 
 
 @dataclass(frozen=True)
 class PseudoContactConfig:
     enabled: bool = True
-    max_points: int = 6
+    max_points: int = 1
     plane_ransac_iters: int = 60
     plane_inlier_thresh_m: float = 0.006
     min_inlier_ratio: float = 0.35
     normal_sign_reference: str = "camera"
+    plane_residual_mad_scale: float = 2.5
+    plane_refit_iters: int = 2
+    gravity_snap_deg: float = 15.0
+    hole_min_radius_m: float = 0.002
+    hole_max_radius_m: float = 0.100
 
     @classmethod
     def from_dict(cls, data: dict | None) -> "PseudoContactConfig":
         data = dict(data or {})
         return cls(
             enabled=bool(data.get("enabled", True)),
-            max_points=int(data.get("max_points", 6)),
+            # INV-1: a surface creates at most one pseudo contact.
+            max_points=1,
             plane_ransac_iters=int(data.get("plane_ransac_iters", 60)),
             plane_inlier_thresh_m=float(data.get("plane_inlier_thresh_m", 0.006)),
             min_inlier_ratio=float(data.get("min_inlier_ratio", 0.35)),
             normal_sign_reference=str(data.get("normal_sign_reference", "camera")),
+            plane_residual_mad_scale=float(data.get("plane_residual_mad_scale", 2.5)),
+            plane_refit_iters=int(data.get("plane_refit_iters", 2)),
+            gravity_snap_deg=float(data.get("gravity_snap_deg", 15.0)),
+            hole_min_radius_m=float(data.get("hole_min_radius_m", 0.002)),
+            hole_max_radius_m=float(data.get("hole_max_radius_m", 0.100)),
         )
 
 
@@ -254,9 +267,8 @@ def _axis_angles(axis: np.ndarray) -> tuple[float, float]:
 
 def _radial_basis(axis: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     unit_axis = _unit(axis, np.array([0.0, 0.0, 1.0]))
-    reference = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-    if abs(float(np.dot(unit_axis, reference))) > 0.90:
-        reference = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    reference = np.zeros(3, dtype=np.float64)
+    reference[int(np.argmin(np.abs(unit_axis)))] = 1.0
     first = _unit(np.cross(unit_axis, reference), np.array([0.0, 1.0, 0.0]))
     second = _unit(np.cross(unit_axis, first), np.array([1.0, 0.0, 0.0]))
     return first, second
@@ -525,13 +537,49 @@ def _fit_plane_ransac(
     if ratio < float(config.min_inlier_ratio):
         return None
     inliers = points[best_mask]
-    point = np.mean(inliers, axis=0)
-    covariance = np.cov((inliers - point).T)
-    if covariance.shape != (3, 3) or not np.isfinite(covariance).all():
+
+    def _plane_from_points(samples: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
+        point = np.mean(samples, axis=0)
+        covariance = np.cov((samples - point).T)
+        if covariance.shape != (3, 3) or not np.isfinite(covariance).all():
+            return None
+        values, vectors = np.linalg.eigh(covariance)
+        return point, _unit(vectors[:, int(np.argmin(values))], np.array([0.0, 0.0, 1.0]))
+
+    for _ in range(max(0, int(config.plane_refit_iters))):
+        plane = _plane_from_points(inliers)
+        if plane is None:
+            return None
+        point, normal = plane
+        residual = np.abs((inliers - point) @ normal)
+        median = float(np.median(residual))
+        mad = float(np.median(np.abs(residual - median)))
+        threshold = max(float(config.plane_inlier_thresh_m), median + float(config.plane_residual_mad_scale) * 1.4826 * mad)
+        trimmed = inliers[residual <= threshold]
+        if trimmed.shape[0] < 3:
+            break
+        inliers = trimmed
+    plane = _plane_from_points(inliers)
+    if plane is None:
         return None
-    values, vectors = np.linalg.eigh(covariance)
-    normal = _unit(vectors[:, int(np.argmin(values))], np.array([0.0, 0.0, 1.0]))
+    point, normal = plane
+    ratio = float(inliers.shape[0] / points.shape[0])
     return point, normal, inliers, ratio
+
+
+def _snap_normal_to_gravity(
+    normal: np.ndarray,
+    up_goal: np.ndarray | None,
+    cone_deg: float,
+) -> tuple[np.ndarray, bool]:
+    oriented = _unit(normal, np.array([0.0, 0.0, 1.0]))
+    if up_goal is None:
+        return oriented, False
+    up = _unit(np.asarray(up_goal, dtype=np.float64), oriented)
+    cosine = abs(float(np.dot(oriented, up)))
+    if cosine >= float(np.cos(np.deg2rad(max(0.0, float(cone_deg))))):
+        return up.copy(), True
+    return oriented, False
 
 
 def fit_circle_in_plane(
@@ -572,6 +620,7 @@ def extract_pseudo_contacts(
     cylinder_model: CylinderSurfaceModel | None = None,
     view_origin: np.ndarray | None = None,
     label: str = "",
+    up_goal: np.ndarray | None = None,
 ) -> list[PseudoContactPoint]:
     """Extract orientation-reference surface samples from one object cloud."""
     if not config.enabled:
@@ -579,12 +628,12 @@ def extract_pseudo_contacts(
     points = _finite_points(points_goal, 8000)
     if points.shape[0] == 0:
         return []
-    count = max(1, int(config.max_points))
     if points.shape[0] < 3:
         center = np.mean(points, axis=0)
+        normal = _unit(up_goal, np.array([0.0, 0.0, 1.0])) if up_goal is not None else np.array([0.0, 0.0, 1.0])
         return [PseudoContactPoint(
             center=center,
-            normal=_orient_normal(np.array([0.0, 0.0, 1.0]), center, view_origin),
+            normal=normal,
             fit_quality=0.0,
             source="center_fallback",
         )]
@@ -594,46 +643,43 @@ def extract_pseudo_contacts(
             0.0,
             1.0,
         ))
-        basis_u, basis_v = _radial_basis(cylinder_model.axis)
-        contacts: list[PseudoContactPoint] = []
-        for angle in np.linspace(0.0, 2.0 * np.pi, count, endpoint=False):
-            normal = np.cos(angle) * basis_u + np.sin(angle) * basis_v
-            center = cylinder_model.center + cylinder_model.radius * normal
-            contacts.append(PseudoContactPoint(
-                center=center,
-                normal=_orient_normal(normal, center, view_origin),
-                fit_quality=quality,
-                source="cylinder",
-            ))
-        return contacts
+        # The temporally filtered cylinder axis is stable; radial normals are
+        # sample-basis dependent and jump across frames.
+        return [PseudoContactPoint(
+            center=cylinder_model.center.copy(),
+            normal=_unit(cylinder_model.axis, np.array([0.0, 0.0, 1.0])),
+            fit_quality=quality,
+            source="cylinder_axis",
+        )]
 
     plane = _fit_plane_ransac(points, config)
     if plane is not None:
         plane_point, normal, inliers, ratio = plane
         normal = _orient_normal(normal, plane_point, view_origin)
+        normal, snapped = _snap_normal_to_gravity(normal, up_goal, config.gravity_snap_deg)
         lower_label = str(label).lower()
         if "hole" in lower_label or "circle" in lower_label:
             circle = fit_circle_in_plane(inliers, plane_point, normal)
             if circle is not None:
                 center, radius, rmse = circle
-                if 0.002 <= radius <= 0.100 and rmse <= max(EPS, config.plane_inlier_thresh_m):
+                if (config.hole_min_radius_m <= radius <= config.hole_max_radius_m
+                        and rmse <= max(EPS, config.plane_inlier_thresh_m)):
                     return [PseudoContactPoint(
                         center=center,
                         normal=normal,
                         fit_quality=float(np.clip(ratio * np.exp(-rmse / config.plane_inlier_thresh_m), 0.0, 1.0)),
                         source="hole_circle",
+                        snapped_to_gravity=snapped,
                     )]
-        indices = np.linspace(0, inliers.shape[0] - 1, min(count, inliers.shape[0]), dtype=np.int64)
         return [PseudoContactPoint(
-            center=inliers[int(index)].copy(), normal=normal, fit_quality=ratio, source="plane"
-        ) for index in indices]
+            center=plane_point.copy(), normal=normal, fit_quality=ratio, source="plane",
+            snapped_to_gravity=snapped,
+        )]
 
     center, axes, _extents = _principal_axes(points)
     normal = _orient_normal(axes[-1], center, view_origin)
-    indices = np.linspace(0, points.shape[0] - 1, min(count, points.shape[0]), dtype=np.int64)
-    return [PseudoContactPoint(
-        center=points[int(index)].copy(), normal=normal, fit_quality=0.3, source="pca"
-    ) for index in indices]
+    normal, snapped = _snap_normal_to_gravity(normal, up_goal, config.gravity_snap_deg)
+    return [PseudoContactPoint(center=center, normal=normal, fit_quality=0.3, source="pca", snapped_to_gravity=snapped)]
 
 
 class PersistentCylinderSurfaceTracker:

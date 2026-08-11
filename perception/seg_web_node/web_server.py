@@ -41,13 +41,16 @@ from .robot_geometry import (
     RobotStateBuffer,
     angular_velocity_from_rotations,
     g1_hand_base_rotation,
-    g1_wrist_ee_position,
+    g1_grasp_center_position,
+    hand_frame_profile,
+    gravity_up_in_pelvis,
     pelvis_to_torso,
 )
 from .rgbd_sync import RgbdPair, RgbdSynchronizer, depth_at_rgb_size
 from .object_point_filter import (
     ObjectPointFilterConfig,
     extract_filtered_object_cloud,
+    project_camera_point_to_pixel,
 )
 from .sam2_backend import Sam2HieraTinyBackend
 from .efficienttam_backend import EfficientTamTi512Backend
@@ -376,6 +379,9 @@ def draw_belief_highlight(
     overlay: np.ndarray,
     objects: list[dict[str, Any]],
     belief_telemetry: dict[str, Any],
+    *,
+    t_goal_cam: np.ndarray | None = None,
+    intrinsics: CameraIntrinsics | None = None,
 ) -> None:
     target = belief_telemetry.get("target") or {}
     object_id = target.get("object_id")
@@ -412,16 +418,19 @@ def draw_belief_highlight(
             2,
             cv2.LINE_AA,
         )
-    pixel = selected.get("center_pixel_uv")
-    if isinstance(pixel, list) and len(pixel) == 2:
-        cv2.drawMarker(
-            overlay,
-            (int(pixel[0]), int(pixel[1])),
-            color,
-            cv2.MARKER_CROSS,
-            24,
-            3,
-        )
+    pixel = None
+    position_goal = target.get("position_goal_m")
+    if position_goal is not None and t_goal_cam is not None and intrinsics is not None:
+        try:
+            point_goal = np.asarray(position_goal, dtype=np.float64).reshape(3)
+            homogeneous = np.ones(4, dtype=np.float64)
+            homogeneous[:3] = point_goal
+            point_camera = (np.linalg.inv(np.asarray(t_goal_cam, dtype=np.float64)) @ homogeneous)[:3]
+            pixel = project_camera_point_to_pixel(point_camera, intrinsics)
+        except Exception:
+            pixel = None
+    if pixel is not None:
+        cv2.drawMarker(overlay, pixel, color, cv2.MARKER_CROSS, 24, 3)
 
 
 class SegmentationRuntime:
@@ -511,7 +520,17 @@ class SegmentationRuntime:
                 belief_config.get("grip", {}).get("max_points", 8000),
             )
         )
-        self.tasc_ee_offset_m = float(belief_config.get("ee_offset_m", 0.05))
+        self.tasc_hand_model = str(
+            belief_config.get("hand_model", "dex1")
+        ).strip().lower()
+        self.tasc_hand_profile = hand_frame_profile(self.tasc_hand_model)
+        self.tasc_grasp_center_local_m = np.asarray(
+            belief_config.get(
+                "grasp_center_local_m",
+                self.tasc_hand_profile["grasp_center_local"],
+            ),
+            dtype=np.float64,
+        ).reshape(3)
         self.tasc_last_eef_by_link: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray | None, int]] = {}
         self.shared_hand_selection = SharedControlHandSubscriber(
             shared_hand_selection_endpoint, shared_hand_selection_topic
@@ -954,10 +973,24 @@ class SegmentationRuntime:
         # override the operator wrist orientation in the state machine.  The
         # generic quaternion in make_goal_payload is otherwise just a legacy
         # placeholder and must remain inactive.
+        orientation_axis = target.get("orientation_axis_world")
+        orientation_confidence = float(target.get("orientation_confidence", 0.0) or 0.0)
+        axis_ok = False
+        if orientation_axis is not None:
+            try:
+                axis = np.asarray(orientation_axis, dtype=np.float64).reshape(3)
+                axis_ok = bool(np.isfinite(axis).all() and np.linalg.norm(axis) > 1.0e-6)
+            except (TypeError, ValueError):
+                axis_ok = False
         payload["orientation_valid"] = bool(
-            str(target.get("orientation_object_id", "")) == object_id
-            and target.get("orientation_relation") in {"parallel", "perpendicular"}
+            axis_ok and target.get("orientation_relation") in {"parallel", "perpendicular"}
+            and orientation_confidence >= float(self.target_config.get("orientation_min_confidence", 0.35))
         )
+        payload["orientation_axis_world"] = None if not axis_ok else axis.tolist()
+        payload["orientation_relation"] = target.get("orientation_relation")
+        payload["orientation_confidence"] = orientation_confidence
+        payload["orientation_frame"] = "pelvis_identity_fk"
+        payload["position_point"] = f"{self.tasc_hand_model}_grasp_center"
         return payload, position, label
 
     def _belief_payload_locked(self) -> tuple[dict[str, Any], np.ndarray | None, str]:
@@ -1202,7 +1235,10 @@ class SegmentationRuntime:
                 2,
                 cv2.LINE_AA,
             )
-        draw_belief_highlight(overlay, instances, belief)
+        draw_belief_highlight(
+            overlay, instances, belief,
+            t_goal_cam=visual.get("t_goal_cam"), intrinsics=visual.get("intrinsics"),
+        )
         age_ms = (
             (int(frame.timestamp_us) - segment_timestamp_us) / 1000.0
             if segment_timestamp_us > 0
@@ -1231,10 +1267,15 @@ class SegmentationRuntime:
         for side in ("left", "right"):
             link = f"{side}_wrist_yaw_link"
             try:
-                position = g1_wrist_ee_position(
-                    state.q, link, self.tasc_ee_offset_m
+                position = g1_grasp_center_position(
+                    state.q,
+                    link,
+                    self.tasc_grasp_center_local_m,
+                    self.tasc_hand_model,
                 )
-                rotation = g1_hand_base_rotation(state.q, link)
+                rotation = g1_hand_base_rotation(
+                    state.q, link, self.tasc_hand_model
+                )
                 previous = self.tasc_last_eef_by_link.get(link)
                 velocity = None
                 omega = None
@@ -1260,9 +1301,7 @@ class SegmentationRuntime:
                     hand_rotation=rotation,
                     hand_axis=None,
                     angular_velocity=omega,
-                    # A/B is a bridge-side arm-injection gate only.  Both
-                    # belief filters must keep updating while no button is held.
-                    button_pressed=False,
+                    button_pressed=(self.shared_hand_selection.selected_hand == side),
                 )
             except Exception as error:
                 self._record_error(f"TASC {side} EE FK unavailable: {error}")
@@ -1352,6 +1391,7 @@ class SegmentationRuntime:
                         observation["inputs"],
                         ray_origin=observation["ray_origin"],
                         ray_direction=observation["ray_direction"],
+                        up_goal=observation.get("up_goal"),
                         stamp_us=observation["stamp_us"],
                     )
                     self.geometry_revision += 1
@@ -1631,6 +1671,7 @@ class SegmentationRuntime:
                             pair.depth.depth_scale_um / 1_000_000.0
                         )
                         for index, mask in enumerate(masks):
+                            label_lower = str(labels[index]).lower()
                             cloud = extract_filtered_object_cloud(
                                 depth_m,
                                 mask,
@@ -1640,6 +1681,7 @@ class SegmentationRuntime:
                                 max_depth_m=self.max_depth_m,
                                 min_valid_points=self.target_min_depth_points,
                                 max_points=self.tasc_pointcloud_max_points,
+                                erosion_px_override=0 if ("hole" in label_lower or "circle" in label_lower) else None,
                             )
                             objects[index]["center_camera_m"] = None
                             objects[index]["center_goal_m"] = None
@@ -1677,9 +1719,7 @@ class SegmentationRuntime:
                                     [64, 64, 255] if index % 2 == 0 else [96, 220, 64]
                                 )
                             )
-                            cv2.drawMarker(
-                                overlay, pixel_uv, color, cv2.MARKER_CROSS, 18, 2
-                            )
+                            cv2.circle(overlay, pixel_uv, 3, color, -1)
                     except Exception as error:
                         geometry_runtime_error = f"3-D center unavailable: {error}"
                     assignments = self.tasc_object_tracker.assign(pending_tasc_inputs)
@@ -1742,11 +1782,15 @@ class SegmentationRuntime:
                     self.status["torso_transform"] = transform_metadata
                     self.status["last_error"] = None
                     self.last_processed_monotonic = time.monotonic()
+                    belief_up_goal = None
+                    if state_for_belief is not None and state_for_belief.has_torso_imu:
+                        belief_up_goal = gravity_up_in_pelvis(state_for_belief.base_quat_wxyz)
                     self.latest_belief_observation = {
                         "inputs": tasc_inputs,
                         "ray_origin": belief_ray_origin,
                         "ray_direction": belief_ray_direction,
                         "stamp_us": int(pair.rgb.timestamp_us),
+                        "up_goal": belief_up_goal,
                     }
                     self.latest_visual = {
                         "masks": [np.asarray(mask, dtype=bool).copy() for mask in masks],
@@ -1754,6 +1798,8 @@ class SegmentationRuntime:
                         "scores": [float(score) for score in scores],
                         "labels": [str(label) for label in labels],
                         "frame_timestamp_us": int(pair.rgb.timestamp_us),
+                        "t_goal_cam": None if t_goal_cam is None else np.asarray(t_goal_cam).copy(),
+                        "intrinsics": frame_intrinsics,
                     }
             except Exception as error:
                 self._record_error(f"inference failed: {error}")

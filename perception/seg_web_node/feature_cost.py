@@ -120,7 +120,7 @@ class FeatureConfig:
     min_user_speed_mps: float = 0.005
     w_orientation: float = 0.8
     ori_align_k: float = 1.0
-    ori_align_delta: float = 0.15
+    ori_align_delta: float = 0.30
     ori_hold_lambda: float = 1.0
     ori_converge_lambda: float = 0.5
     ori_omega_ref_rps: float = 0.5
@@ -153,7 +153,7 @@ class FeatureConfig:
             min_user_speed_mps=float(features.get("min_user_speed_mps", 0.005)),
             w_orientation=float(features.get("w_orientation", 0.8)),
             ori_align_k=float(orientation.get("align_k", orientation.get("k", 1.0))),
-            ori_align_delta=float(orientation.get("align_delta", orientation.get("delta", 0.15))),
+            ori_align_delta=float(orientation.get("align_delta", orientation.get("delta", 0.30))),
             ori_hold_lambda=float(orientation.get("hold_lambda", 1.0)),
             ori_converge_lambda=float(orientation.get("converge_lambda", 0.5)),
             ori_omega_ref_rps=float(orientation.get("omega_ref_rps", 0.5)),
@@ -274,7 +274,9 @@ class MultiFeatureCost:
             raise ValueError(f"unsupported orientation relation: {relation}")
         cfg = self.config
         cos_c = float(np.clip(np.dot(axis, normal), -1.0, 1.0))
-        alignment_error = 1.0 - abs(cos_c) if relation == "parallel" else abs(cos_c)
+        # Squared, sign-invariant alignment error is differentiable through
+        # c=0, the perpendicular optimum.
+        alignment_error = 1.0 - cos_c * cos_c if relation == "parallel" else cos_c * cos_c
         align = -huber_like(alignment_error, k=cfg.ori_align_k, delta=cfg.ori_align_delta)
         hold = 0.0
         converge = 0.0
@@ -287,11 +289,7 @@ class MultiFeatureCost:
                     hold = cfg.ori_hold_lambda * (1.0 - alignment_error)
                 else:
                     dc = float(np.dot(np.cross(omega, axis), normal))
-                    de = (
-                        -np.sign(cos_c) * dc
-                        if relation == "parallel"
-                        else np.sign(cos_c) * dc
-                    )
+                    de = -2.0 * cos_c * dc if relation == "parallel" else 2.0 * cos_c * dc
                     converge = -cfg.ori_converge_lambda * de / max(EPS, cfg.ori_omega_ref_rps)
         total = align + hold + converge
         return {

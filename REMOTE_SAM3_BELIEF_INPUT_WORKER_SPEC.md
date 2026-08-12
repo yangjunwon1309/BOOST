@@ -242,6 +242,69 @@ the remote RGB, depth, result, heartbeat, masks, point-filter telemetry,
 surface model, and candidates over Wi-Fi LCM. It should remain a passive
 observer.
 
+The remote SAM3 worker does not calculate the final posterior: Thor's gateway
+does. The laptop web view remains a passive RGB-D, segmentation, and geometry
+observer. Final two-hand belief diagnostics are recorded directly on Thor,
+without adding another Wi-Fi LCM stream.
+
+### 9.1 Thor Belief CSV
+
+`thor_gateway.py` records the latest bounded two-hand TASC diagnostic state to
+an append-only CSV when started with `--belief-csv <path>`. The maximum record
+rate is `--belief-log-hz` (default: 10 Hz). Each orientation candidate is one
+row and the recorded state is:
+
+```json
+{
+  "published_timestamp_us": 0,
+  "source_rgb_timestamp_us": 0,
+  "remote_sequence": 0,
+  "selected_hand": "left|right|none",
+  "hands": {
+    "left": {
+      "armed": false,
+      "alpha": 0.0,
+      "target": null,
+      "objects": [],
+      "orientation": {}
+    },
+    "right": {
+      "armed": false,
+      "alpha": 0.0,
+      "target": null,
+      "objects": [],
+      "orientation": {}
+    }
+  },
+  "result_valid": true,
+  "result_age_ms": 0.0
+}
+```
+
+Each row contains candidate position and surface normal; relation; normal-dot-
+hand-axis, alignment error, alignment/hold/converge advantages, angular-speed
+term, and weighted orientation advantage; candidate posterior; hand axis and
+angular velocity; and the final orientation target. A/B selection is recorded
+only as `armed`, `selected_hand`, and `alpha`; both posteriors continue to be
+updated and logged when neither button is held.
+
+### 9.2 Laptop UI Requirements
+
+The remote web server renders the same RGB-D and geometry diagnostics as the
+current local SAM3 web view:
+
+- RGB video remains the latest LCM RGB frame rate, independently of SAM3 or
+  belief update rate.
+- The latest SAM3 masks, boxes, contact markers, surface-normal arrows, and
+  cylinder diagnostics remain overlaid until the next inference result.
+- Display selected contact point, normal arrow, result age, source state delta,
+  and geometry fallback status from the remote worker.
+
+The current `draw_belief_overlay` and HTML belief-table behavior in
+`seg_web_node/web_server.py` are the rendering reference. Refactor shared
+rendering helpers if practical, but the remote viewer must not import or start
+the Thor web-server runtime.
+
 Extend it with diagnostic-only display of:
 
 - `source_robot_state_delta_ms` and result age;
@@ -249,6 +312,8 @@ Extend it with diagnostic-only display of:
 - cylinder axis, radius, RMSE, angular coverage, stale frame count;
 - selected candidate and all candidate scores;
 - pseudo-contact normal, fit quality, and gravity snap state.
+- final two-hand posterior/target analysis from Thor's belief CSV; no final
+  posterior is reconstructed in the remote viewer.
 
 Do not put a publish button or ZMQ socket in this remote web view. The existing
 Thor web view may continue to show the final per-hand posterior/target state;
@@ -318,6 +383,7 @@ docker run --rm --network host path-g1-remote-sam3:rtx4060 \
    old masks.
 6. Remote web runtime renders result packets containing optional pseudo-contact
    fields without affecting the stream rate.
+7. Thor belief CSV records both hand states even when neither A nor B is held.
 
 ### End-to-End
 
@@ -331,6 +397,8 @@ docker run --rm --network host path-g1-remote-sam3:rtx4060 \
    changes laptop inference or geometry publication.
 5. Killing the laptop worker makes Thor mark the result stale and hold operator
    teleoperation; no stale remote candidate becomes a new target.
+6. With no A/B button held, Thor continues to record both posteriors but does
+   not inject either target into the control path.
 
 ## 13. Implementation Order
 

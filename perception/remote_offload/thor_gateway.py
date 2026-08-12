@@ -56,6 +56,7 @@ from .protocol import (
     unpack_result,
     validate_result,
 )
+from .belief_csv import RemoteBeliefCsvRecorder
 
 
 LOG = logging.getLogger("remote_offload.thor_gateway")
@@ -374,6 +375,8 @@ class ThorRemoteGateway:
         belief_enabled: bool,
         belief_config: dict[str, Any],
         belief_ee_offset_m: float,
+        belief_csv_path: str,
+        belief_log_hz: float,
         shared_hand_selection_endpoint: str,
         shared_hand_selection_topic: str,
     ) -> None:
@@ -397,6 +400,11 @@ class ThorRemoteGateway:
             float(value) for value in ee_target_quaternion_wxyz
         )
         self.belief_enabled = bool(belief_enabled)
+        self.belief_log_period = 1.0 / max(0.1, float(belief_log_hz))
+        self.last_belief_log_monotonic = 0.0
+        self.belief_csv = (
+            RemoteBeliefCsvRecorder(belief_csv_path) if str(belief_csv_path) else None
+        )
         self.parallel_tasc_belief = ParallelTascBelief(belief_config)
         # Compatibility handle for callers that inspect a single selected hand.
         self.tasc_belief = self.parallel_tasc_belief.trackers["left"]
@@ -482,6 +490,9 @@ class ThorRemoteGateway:
             "belief_selected_hand": "none",
             "belief_selection_active": False,
             "belief_selection_messages": 0,
+            "belief_log_ticks": 0,
+            "belief_log_rows": 0,
+            "belief_csv_path": str(self.belief_csv.path) if self.belief_csv else None,
             "sim_robot_state": 0,
             "sim_robot_state_errors": 0,
             "last_sim_robot_state": None,
@@ -523,6 +534,8 @@ class ThorRemoteGateway:
         if self.sim_state_socket is not None:
             self.sim_state_socket.close(0)
         self.shared_hand_selection_socket.close(0)
+        if self.belief_csv is not None:
+            self.belief_csv.close()
 
     def _record_error(self, error: Exception | str) -> None:
         with self.lock:
@@ -870,8 +883,18 @@ class ThorRemoteGateway:
         self._drain_shared_hand_selection()
         inputs = self._belief_inputs_from_result(payload)
         if not inputs:
+            telemetry = {
+                "enabled": True,
+                "objects": [],
+                "target": None,
+                "hands": {},
+                "selected_hand": self.belief_selected_hand,
+                "selection_active": self.belief_selection_active,
+                "reason": "no_valid_remote_geometry",
+            }
             with self.lock:
-                self.stats["last_belief"] = {"enabled": True, "objects": [], "target": None}
+                self.stats["last_belief"] = telemetry
+            self._record_belief_csv(payload, telemetry)
             return None
         hand_inputs: dict[str, HandInput] = {}
         for side in ("left", "right"):
@@ -887,13 +910,18 @@ class ThorRemoteGateway:
                 button_pressed=(self.belief_selection_active and self.belief_selected_hand == side),
             )
         if not hand_inputs:
+            telemetry = {
+                "enabled": True,
+                "objects": [],
+                "target": None,
+                "hands": {},
+                "selected_hand": self.belief_selected_hand,
+                "selection_active": self.belief_selection_active,
+                "reason": "robot_state_unavailable_for_both_hands",
+            }
             with self.lock:
-                self.stats["last_belief"] = {
-                    "enabled": True,
-                    "objects": [],
-                    "target": None,
-                    "reason": "robot_state_unavailable_for_both_hands",
-                }
+                self.stats["last_belief"] = telemetry
+            self._record_belief_csv(payload, telemetry)
             return None
         ray_origin = _finite_vec3(payload.get("camera_goal_origin_m"))
         ray_direction = _finite_vec3(payload.get("camera_goal_forward_m"))
@@ -921,6 +949,7 @@ class ThorRemoteGateway:
             selected_tracker.mark_logged()
         with self.lock:
             self.stats["last_belief"] = telemetry
+        self._record_belief_csv(payload, telemetry)
         # A/B only gates command injection. Both posteriors above were updated
         # regardless of button state; with no hold we deliberately publish none.
         if not self.belief_selection_active:
@@ -994,6 +1023,35 @@ class ThorRemoteGateway:
             "position_point": f"{self.belief_hand_model}_grasp_center",
         }
         return position, output, "belief"
+
+    def _record_belief_csv(
+        self,
+        result: dict[str, Any],
+        telemetry: dict[str, Any],
+    ) -> None:
+        if self.belief_csv is None:
+            return
+        now = time.monotonic()
+        if now - self.last_belief_log_monotonic < self.belief_log_period:
+            return
+        self.last_belief_log_monotonic = now
+        payload = {
+            "published_timestamp_us": int(time.time_ns() // 1000),
+            "source_rgb_timestamp_us": int(result.get("source_rgb_timestamp_us", 0) or 0),
+            "remote_sequence": int(result.get("sequence", -1)),
+            "result_valid": bool(result.get("valid", False)),
+            "selected_hand": self.belief_selected_hand,
+            "selection_active": bool(self.belief_selection_active),
+            "hands": telemetry.get("hands", {}),
+            "reason": telemetry.get("reason"),
+        }
+        try:
+            rows = self.belief_csv.record(payload)
+            with self.lock:
+                self.stats["belief_log_ticks"] = int(self.stats.get("belief_log_ticks", 0)) + 1
+                self.stats["belief_log_rows"] = int(self.stats.get("belief_log_rows", 0)) + int(rows)
+        except Exception as error:
+            self._record_error(error)
 
     def _publish_ee_target_from_result(
         self,
@@ -1428,6 +1486,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--belief-csv",
+        default=os.environ.get("PATH_REMOTE_BELIEF_CSV", ""),
+        help=(
+            "Append two-hand belief/orientation diagnostics on Thor to this CSV. "
+            "Disabled when omitted."
+        ),
+    )
+    parser.add_argument(
+        "--belief-log-hz",
+        type=float,
+        default=float(os.environ.get("PATH_REMOTE_BELIEF_LOG_HZ", "10.0")),
+        help="Maximum Thor-side belief CSV logging rate.",
+    )
+    parser.add_argument(
         "--shared-hand-selection-endpoint",
         default=DEFAULT_SHARED_HAND_SELECTION_ENDPOINT,
         help="ZMQ state-machine A/B hand-selection heartbeat endpoint.",
@@ -1477,6 +1549,8 @@ def main(argv: list[str] | None = None) -> int:
         belief_enabled=args.belief_inference,
         belief_config=belief_config,
         belief_ee_offset_m=float(belief_config.get("ee_offset_m", target_config.get("ee_offset_m", 0.05))),
+        belief_csv_path=args.belief_csv,
+        belief_log_hz=args.belief_log_hz,
         shared_hand_selection_endpoint=args.shared_hand_selection_endpoint,
         shared_hand_selection_topic=args.shared_hand_selection_topic,
     )
@@ -1495,6 +1569,8 @@ def main(argv: list[str] | None = None) -> int:
         "enabled" if args.belief_inference else "disabled",
         args.config,
     )
+    if args.belief_csv:
+        LOG.info("Thor belief CSV logging enabled: %s at %.1f Hz", args.belief_csv, args.belief_log_hz)
     if args.sim_state_zmq_endpoint:
         LOG.info(
             "MuJoCo sim robot-state forwarding enabled from %s/%s to %s",

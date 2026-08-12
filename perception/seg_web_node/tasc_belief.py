@@ -823,7 +823,7 @@ class HierarchicalTascBelief:
             "hand_omega_rps": None if hand_angular_velocity is None else np.asarray(hand_angular_velocity, dtype=np.float64).reshape(3).tolist(),
             "candidates": [
                 {"object_id": c.object_id, "label": c.label, "role": roles[i], "relation": c.relation, "track_id": c.track_id, "source": c.source,
-                 "normal": c.normal.tolist(), "fit_quality": c.fit_quality, "probability": float(probabilities[i]),
+                 "position_goal_m": c.position.tolist(), "normal": c.normal.tolist(), "fit_quality": c.fit_quality, "probability": float(probabilities[i]),
                  "advantage_raw": float(raw[i]), "advantage_ema": float(ema[i]), "advantage_standardized": float(standardized[i]),
                  "label_prior": float(priors[i]), "breakdown": breakdowns[i], "matched_previous": bool(i in match)}
                 for i, c in enumerate(candidates)

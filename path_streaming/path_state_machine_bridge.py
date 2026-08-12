@@ -64,10 +64,11 @@ from path_core.intention.action_blending import (
     LEFT_WRIST_LINK,
     RIGHT_WRIST_LINK,
     SharedControlConfig,
-    explicit_orientation_wxyz,
     rotation_target_from_relation,
 )
+from perception.seg_web_node.robot_geometry import HAND_AXIS_LOCAL
 from path_core.intention.reference_dynamics import (
+    OrientationTargetGate,
     SecondOrderOrientationReference,
     SecondOrderPositionReference,
     rotation_vector,
@@ -1245,7 +1246,6 @@ def ee_target_from_static_payload(
         "object_index",
         default=-1,
     )
-    orientation_wxyz = explicit_orientation_wxyz(payload)
     axis_vector = None
     try:
         candidate = np.asarray(payload.get("orientation_axis_world"), dtype=np.float64).reshape(3)
@@ -1256,7 +1256,10 @@ def ee_target_from_static_payload(
     return EETarget(
         position=position,
         confidence=confidence,
-        orientation_wxyz=orientation_wxyz,
+        # Dynamic orientation is controlled exclusively by the surface-normal
+        # relation below; legacy payload quaternions can be arbitrary at the
+        # perpendicular singularity and must never reach the IK objective.
+        orientation_wxyz=None,
         object_id=object_id,
         grip_index=grip_index,
         goal_uid=str(payload.get("goal_uid", "")),
@@ -1468,11 +1471,14 @@ class OuterWaistPlanner:
 
 def main() -> int:
     args = parse_args()
+    hand_axis_local_override = args.hand_axis_local is not None
     if args.hand_axis_local is None:
-        args.hand_axis_local = (
-            (1.0, 0.0, 0.0)
-            if args.end_effector_model == "dex1"
-            else (0.0, 1.0, 0.0)
+        args.hand_axis_local = tuple(HAND_AXIS_LOCAL[args.end_effector_model].tolist())
+    else:
+        print(
+            "[PATH-state] WARNING: --hand-axis-local overrides the canonical "
+            "physical hand-axis convention.",
+            flush=True,
         )
     if args.grasp_center_local is None:
         # Keep the existing 6 cm base-local target for both profiles until the
@@ -1766,16 +1772,24 @@ def main() -> int:
         waist_mode=str(args.shared_waist_mode),
     )
     position_reference = {side: SecondOrderPositionReference(
-        zeta=shared_config.zeta, omega_n=shared_config.omega_n_position_released,
+        zeta=shared_config.zeta_released, omega_n=shared_config.omega_n_position_released,
         max_speed_mps=shared_config.max_speed_mps, resync_distance_m=shared_config.resync_distance_m,
     ) for side in ("left", "right")}
     orientation_reference = {side: SecondOrderOrientationReference(
-        zeta=shared_config.zeta, omega_n=shared_config.omega_n_orientation_released,
+        zeta=shared_config.zeta_released, omega_n=shared_config.omega_n_orientation_released,
         max_rate_rps=shared_config.max_rate_rps, resync_angle_rad=shared_config.resync_angle_rad,
     ) for side in ("left", "right")}
     hand_axis_local = np.asarray(args.hand_axis_local, dtype=np.float64).reshape(3)
     grasp_center_local = np.asarray(args.grasp_center_local, dtype=np.float64).reshape(3)
     latest_shared_result = None
+    orientation_gate = {
+        side: OrientationTargetGate(
+            max_angle_rad=shared_config.orientation_max_angle_rad,
+            max_step_rate_rps=shared_config.orientation_max_step_rate_rps,
+            accept_dwell=shared_config.orientation_accept_dwell,
+        )
+        for side in ("left", "right")
+    }
     # A/B is a dead-man switch for the left/right belief blend.
     shared_selected_hand = "none"
     shared_hand_selection_revision = 0
@@ -1787,7 +1801,7 @@ def main() -> int:
     )
     log(
         "teleop second_order_reference="
-        f"zeta={shared_config.zeta:.1f} armed_pos/orient="
+        f"zeta=armed/released={shared_config.zeta_armed:.2f}/{shared_config.zeta_released:.2f} armed_pos/orient="
         f"{shared_config.omega_n_position_armed:.1f}/"
         f"{shared_config.omega_n_orientation_armed:.1f} "
         f"hand_model={args.end_effector_model} "
@@ -1802,6 +1816,7 @@ def main() -> int:
         for side, transform in (("left", left_tf), ("right", right_tf)):
             position_reference[side].reset(transform[:3, 3])
             orientation_reference[side].reset(transform[:3, :3])
+            orientation_gate[side].reset()
         log(f"reference resync ({reason})")
     wrist_fk: MujocoWristFk | None = None
     try:
@@ -2736,17 +2751,49 @@ def main() -> int:
                         belief_target = shared_target if shared_selection_armed and requested_hand == side else None
                         rotation_target = human_tf[side][:3, :3]
                         orientation_source = "operator"
+                        zeta_ori = shared_config.zeta_released
                         omega_n_ori = shared_config.omega_n_orientation_released
+                        gate_reason = "no_constraint"
                         current_rotation = orientation_reference[side].rotation if orientation_reference[side].rotation is not None else measured_tf[side][:3, :3]
                         if belief_target is not None and belief_target.has_orientation_constraint:
-                            constrained = rotation_target_from_relation(current_rotation, belief_target.orientation_axis_world, belief_target.orientation_relation, hand_axis_local)
-                            if constrained is not None:
+                            target_model = str(args.end_effector_model).lower()
+                            position_point = str(belief_target.position_point or "")
+                            if position_point.endswith("_grasp_center"):
+                                candidate_model = position_point[: -len("_grasp_center")]
+                                if candidate_model in HAND_AXIS_LOCAL:
+                                    target_model = candidate_model
+                            target_hand_axis = (
+                                hand_axis_local
+                                if hand_axis_local_override
+                                else HAND_AXIS_LOCAL[target_model]
+                            )
+                            constrained = rotation_target_from_relation(
+                                current_rotation,
+                                belief_target.orientation_axis_world,
+                                belief_target.orientation_relation,
+                                target_hand_axis,
+                            )
+                            gate = orientation_gate[side]
+                            if gate.accept(constrained, current_rotation, dt):
                                 rotation_target = constrained
                                 orientation_source = "belief_relation"
+                                zeta_ori = shared_config.zeta_armed
                                 omega_n_ori = shared_config.omega_n_orientation_armed
-                        r_ref = orientation_reference[side].step(rotation_target, dt, measured=measured_tf[side][:3, :3], omega_n=omega_n_ori)
+                            else:
+                                rotation_target = current_rotation
+                                orientation_source = "gate_hold"
+                                zeta_ori = shared_config.zeta_armed
+                                omega_n_ori = shared_config.omega_n_orientation_armed
+                            gate_reason = gate.last_reason
+                        else:
+                            orientation_gate[side].accept(None, current_rotation, dt)
+                        r_ref = orientation_reference[side].step(
+                            rotation_target, dt, measured=measured_tf[side][:3, :3],
+                            omega_n=omega_n_ori, zeta=zeta_ori,
+                        )
                         position_target = human_tf[side][:3, 3]
                         position_source = "operator"
+                        zeta_pos = shared_config.zeta_released
                         omega_n_pos = shared_config.omega_n_position_released
                         if belief_target is not None:
                             goal = np.asarray(belief_target.position, dtype=np.float64).reshape(3)
@@ -2762,8 +2809,12 @@ def main() -> int:
                             if np.linalg.norm(goal_wrist - human_tf[side][:3, 3]) <= shared_config.d_max_m:
                                 position_target = goal_wrist
                                 position_source = "belief_contact"
+                                zeta_pos = shared_config.zeta_armed
                                 omega_n_pos = shared_config.omega_n_position_armed
-                        p_ref = position_reference[side].step(position_target, dt, measured=measured_tf[side][:3, 3], omega_n=omega_n_pos)
+                        p_ref = position_reference[side].step(
+                            position_target, dt, measured=measured_tf[side][:3, 3],
+                            omega_n=omega_n_pos, zeta=zeta_pos,
+                        )
                         human_tf[side][:3, :3] = r_ref
                         human_tf[side][:3, 3] = p_ref
                         reference_diagnostics[side] = {
@@ -2775,6 +2826,10 @@ def main() -> int:
                             "reference_rate_rps": float(np.linalg.norm(orientation_reference[side].rate)),
                             "object_id": "" if belief_target is None else belief_target.object_id,
                             "relation": "" if belief_target is None else belief_target.orientation_relation,
+                            "orientation_gate_reason": gate_reason,
+                            "orientation_gate_rejects": int(orientation_gate[side].reject_count),
+                            "zeta_position": float(zeta_pos),
+                            "zeta_orientation": float(zeta_ori),
                         }
                     left_target_tf, right_target_tf = human_tf["left"], human_tf["right"]
                     latest_shared_result = reference_diagnostics
@@ -2840,7 +2895,15 @@ def main() -> int:
                                 ),
                                 reference_left=latest_shared_result["left"],
                                 reference_right=latest_shared_result["right"],
-                                reference_zeta=float(shared_config.zeta),
+                                orientation_gate={
+                                    side: {
+                                        "accepted": latest_shared_result[side]["orientation_gate_reason"] == "ok",
+                                        "reason": latest_shared_result[side]["orientation_gate_reason"],
+                                        "reject_count": latest_shared_result[side]["orientation_gate_rejects"],
+                                    }
+                                    for side in ("left", "right")
+                                },
+                                reference_zeta=float(shared_config.zeta_armed if shared_selection_armed else shared_config.zeta_released),
                                 shared_human_wrist_source=human_wrist_source,
                                 shared_coordinate_frame=PICO_WAIST_FRAME,
                                 shared_orientation_source="second_order_reference",
@@ -3266,9 +3329,11 @@ def main() -> int:
                     shared_log = (
                         f"shared_select={shared_selected_hand} "
                         f"ref_L[{left_ref['position_source'][:3]}/{left_ref['orientation_source'][:3]} "
-                        f"e={left_ref['position_error_m'] * 100:.1f}cm/{np.rad2deg(left_ref['orientation_error_rad']):.1f}deg] "
+                        f"e={left_ref['position_error_m'] * 100:.1f}cm/{np.rad2deg(left_ref['orientation_error_rad']):.1f}deg "
+                        f"gate={left_ref['orientation_gate_reason']}] "
                         f"ref_R[{right_ref['position_source'][:3]}/{right_ref['orientation_source'][:3]} "
-                        f"e={right_ref['position_error_m'] * 100:.1f}cm/{np.rad2deg(right_ref['orientation_error_rad']):.1f}deg]"
+                        f"e={right_ref['position_error_m'] * 100:.1f}cm/{np.rad2deg(right_ref['orientation_error_rad']):.1f}deg "
+                        f"gate={right_ref['orientation_gate_reason']}]"
                     )
                 log(
                     f"state={current_state} pico_fresh={pico_body_fresh} "

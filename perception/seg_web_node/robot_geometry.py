@@ -72,6 +72,13 @@ JOINT_ORDER = [
     "right_wrist_pitch_joint", "right_wrist_yaw_joint",
 ]
 
+G1_SHOULDER_LINK = {
+    "left": "left_shoulder_pitch_link",
+    "right": "right_shoulder_pitch_link",
+}
+G1_ARM_REACH_MAX_M = 0.55
+G1_ARM_REACH_MIN_M = 0.18
+
 
 def _rot(axis: str, angle: float) -> np.ndarray:
     c, s = math.cos(angle), math.sin(angle)
@@ -139,6 +146,12 @@ def g1_link_position(q: np.ndarray, link_name: str) -> np.ndarray:
     return transform[:3, 3].copy()
 
 
+def g1_shoulder_position(q: np.ndarray, side: str) -> np.ndarray:
+    """Return the pelvis-frame shoulder pitch origin for one arm."""
+    normalized = "left" if str(side).lower().startswith("l") else "right"
+    return g1_link_position(q, G1_SHOULDER_LINK[normalized])
+
+
 def g1_wrist_ee_position(
     q: np.ndarray,
     target_link: str = "left_wrist_yaw_link",
@@ -190,19 +203,27 @@ _DEX1_HAND_BASE_TRANSLATION_FROM_WRIST = {
 _BRAINCO_GRASP_CENTER_LOCAL = np.array([0.0, 0.0, 0.060], dtype=np.float64)
 _DEX1_GRASP_CENTER_LOCAL = np.array([0.0, 0.0, 0.060], dtype=np.float64)
 
+# The orientation relation is defined against this physical hand axis.  It is
+# deliberately exported so perception and the PATH bridge cannot silently use
+# different Dex1/BrainCo conventions.
+HAND_AXIS_LOCAL = {
+    "brainco": np.array([0.0, 1.0, 0.0], dtype=np.float64),
+    "dex1": np.array([1.0, 0.0, 0.0], dtype=np.float64),
+}
+
 _HAND_FRAME_PROFILES = {
     "brainco": {
         "rotation": _BRAINCO_HAND_BASE_ROTATION_FROM_WRIST,
         "translation": _BRAINCO_HAND_BASE_TRANSLATION_FROM_WRIST,
         "grasp_center_local": _BRAINCO_GRASP_CENTER_LOCAL,
-        "orientation_axis_local": np.array([0.0, 1.0, 0.0], dtype=np.float64),
+        "orientation_axis_local": HAND_AXIS_LOCAL["brainco"],
     },
     "dex1": {
         "rotation": _DEX1_HAND_BASE_ROTATION_FROM_WRIST,
         "translation": _DEX1_HAND_BASE_TRANSLATION_FROM_WRIST,
         "grasp_center_local": _DEX1_GRASP_CENTER_LOCAL,
         # Dex1-1: +Y is finger extension; +/-X is the parallel-jaw spread.
-        "orientation_axis_local": np.array([1.0, 0.0, 0.0], dtype=np.float64),
+        "orientation_axis_local": HAND_AXIS_LOCAL["dex1"],
     },
 }
 

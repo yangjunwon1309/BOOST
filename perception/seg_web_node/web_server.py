@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
 import socket
 import threading
@@ -38,10 +39,12 @@ from .lcm_protocol import (
     decode_robot_state,
 )
 from .robot_geometry import (
+    HAND_AXIS_LOCAL,
     RobotStateBuffer,
     angular_velocity_from_rotations,
     g1_hand_base_rotation,
     g1_grasp_center_position,
+    g1_shoulder_position,
     hand_frame_profile,
     gravity_up_in_pelvis,
     pelvis_to_torso,
@@ -64,6 +67,16 @@ from .tasc_belief import (
     StableObjectIdTracker,
 )
 from .visualization import render_segmented_rgbd
+
+
+LOG = logging.getLogger(__name__)
+BELIEF_HAND_COLOR = {"left": (255, 190, 40), "right": (60, 160, 255)}
+BELIEF_DIM_ALPHA = 0.40
+BELIEF_ARMED_BOX_PX = 3
+BELIEF_DIM_BOX_PX = 1
+BELIEF_ARMED_CROSS_PX = 24
+BELIEF_DIM_CROSS_PX = 14
+BELIEF_DASH_PX = 9
 
 
 def parse_cpu_set(spec: str) -> set[int]:
@@ -218,13 +231,13 @@ h1{font-size:18px;margin:0;color:#58a6ff}.grow{flex:1}input{background:#0d1117;c
 button{background:#238636;color:white;border:0;border-radius:6px;padding:9px 14px;cursor:pointer}button.danger{background:#da3633}button:disabled{opacity:.45;cursor:not-allowed}
 select{width:100%;margin:10px 0;background:#0d1117;color:#fff;border:1px solid #30363d;border-radius:6px;padding:8px}
 main{padding:16px;display:grid;grid-template-columns:minmax(0,1fr) 290px;gap:16px}
-#view{width:100%;max-height:calc(100vh - 110px);object-fit:contain;background:#000;border:1px solid #30363d}
+#view{width:100%;max-height:calc(100vh - 110px);object-fit:contain;background:#000;border:1px solid #30363d}table{width:100%;border-collapse:collapse;margin-top:8px;font-size:12px}th,td{padding:5px;border-bottom:1px solid #30363d;text-align:left}.belief-selected{background:#22314a}.belief-dim{opacity:.55}
 .card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:14px;margin-bottom:12px}.ok{color:#3fb950}.bad{color:#f85149}pre{white-space:pre-wrap;line-height:1.5;color:#8b949e}.row{display:flex;gap:8px}.row button{flex:1}#targetmsg{min-height:38px;color:#8b949e;margin-top:10px}
 @media(max-width:900px){main{grid-template-columns:1fr}}
 </style></head><body>
 <header><h1>G1 · SAM3 RGB-D</h1><div class="grow"></div>
 <input id="prompt" placeholder="person, box, tool, robot part"><button onclick="setPrompt()">Apply concepts</button></header>
-<main><div><img id="view" src="/stream.mjpg"></div><aside>
+<main><div><img id="view" src="/stream.mjpg"><div class="card"><b>Per-hand belief</b><table><thead><tr><th>object</th><th>L</th><th>R</th></tr></thead><tbody id="beliefrows"></tbody></table></div></div><aside>
 <div class="card"><b>Belief target publisher</b>
 <div id="targetmsg">Continuously publishing both hand belief targets; A/B in PATH selects the receiving arm.</div></div>
 <div class="card"><b>Pipeline status</b><pre id="status">connecting…</pre></div></aside></main>
@@ -232,7 +245,9 @@ main{padding:16px;display:grid;grid-template-columns:minmax(0,1fr) 290px;gap:16p
 let state={};
 async function api(url,body){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const data=await r.json();if(!r.ok)throw new Error(data.detail||JSON.stringify(data));return data}
 function renderTarget(s){state=s;const t=s.ee_target||{};const blockers=(t.blockers||[]).join('; ');const active=`Continuously publishing both hand belief targets at ${Number(t.publish_hz||0).toFixed(1)} Hz${t.last_published_label?` — ${t.last_published_label}`:''}`;document.getElementById('targetmsg').textContent=active||t.last_result||blockers;}
-async function update(){try{const s=await (await fetch('/api/status')).json();document.getElementById('status').textContent=JSON.stringify(s,null,2);renderTarget(s);if(document.activeElement!==document.getElementById('prompt'))document.getElementById('prompt').value=(s.concepts||[]).join(', ');}catch(e){document.getElementById('status').textContent=String(e)}}
+function beliefCell(view,selected,side){if(!view)return '<td class="belief-dim">-</td>';const p=Number(view.object_probability||0).toFixed(2);const j=view.joint_confidence==null?'-':Number(view.joint_confidence).toFixed(2);const c=side===selected?'belief-selected':'belief-dim';return `<td class="${c}">${p} / ${j}</td>`}
+function renderBeliefTable(s){const selected=String((s.tasc_belief||{}).selected_hand||'none');const rows=(s.instances||[]).map(o=>{const h=o.tasc_hand_beliefs||{};return `<tr><td>${o.label||o.tasc_object_id||'object'}</td>${beliefCell(h.left,selected,'left')}${beliefCell(h.right,selected,'right')}</tr>`}).join('');document.getElementById('beliefrows').innerHTML=rows||'<tr><td colspan="3">no segmented belief candidates</td></tr>';}
+async function update(){try{const s=await (await fetch('/api/status')).json();document.getElementById('status').textContent=JSON.stringify(s,null,2);renderTarget(s);renderBeliefTable(s);if(document.activeElement!==document.getElementById('prompt'))document.getElementById('prompt').value=(s.concepts||[]).join(', ');}catch(e){document.getElementById('status').textContent=String(e)}}
 async function setPrompt(){const prompt=document.getElementById('prompt').value.trim();await fetch('/api/prompt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt})});update()}
 setInterval(update,1000);update();
 </script></body></html>"""
@@ -375,62 +390,161 @@ def select_tracking_candidate(
     return selected, "ok"
 
 
-def draw_belief_highlight(
+def _dashed_rectangle(
+    image: np.ndarray, top_left: tuple[int, int], bottom_right: tuple[int, int],
+    color: tuple[int, int, int], thickness: int, dash_px: int = BELIEF_DASH_PX,
+) -> None:
+    x0, y0 = top_left
+    x1, y1 = bottom_right
+    step = max(2, int(dash_px))
+    for x in range(x0, x1, 2 * step):
+        cv2.line(image, (x, y0), (min(x + step, x1), y0), color, thickness)
+        cv2.line(image, (x, y1), (min(x + step, x1), y1), color, thickness)
+    for y in range(y0, y1, 2 * step):
+        cv2.line(image, (x0, y), (x0, min(y + step, y1)), color, thickness)
+        cv2.line(image, (x1, y), (x1, min(y + step, y1)), color, thickness)
+
+
+def _goal_point_to_pixel(
+    position_goal_m: Any, t_goal_cam: np.ndarray | None, intrinsics: CameraIntrinsics | None,
+) -> tuple[int, int] | None:
+    if position_goal_m is None or t_goal_cam is None or intrinsics is None:
+        return None
+    try:
+        homogeneous = np.ones(4, dtype=np.float64)
+        homogeneous[:3] = np.asarray(position_goal_m, dtype=np.float64).reshape(3)
+        camera = (np.linalg.inv(np.asarray(t_goal_cam, dtype=np.float64)) @ homogeneous)[:3]
+        return project_camera_point_to_pixel(camera, intrinsics)
+    except Exception:
+        return None
+
+
+def _draw_hand_label(
+    layer: np.ndarray, side: str, target: dict[str, Any], color: tuple[int, int, int],
+    *, anchor: tuple[int, int], armed: bool,
+) -> None:
+    parts = ["L" if side == "left" else "R"]
+    confidence = target.get("joint_confidence")
+    if isinstance(confidence, (int, float)):
+        parts.append(f"{float(confidence):.2f}")
+    grip = target.get("grip_index")
+    if isinstance(grip, int) and grip >= 0:
+        parts.append(f"g{grip}")
+    relation = target.get("orientation_relation")
+    if relation in {"parallel", "perpendicular"}:
+        parts.append("par" if relation == "parallel" else "perp")
+    if armed:
+        parts.append("A/B")
+    text = " ".join(parts)
+    scale, thickness = (0.52, 2) if armed else (0.44, 1)
+    if armed:
+        (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
+        x, y = anchor
+        cv2.rectangle(layer, (x - 2, y - th - baseline - 2), (x + tw + 2, y + 2), color, -1)
+        cv2.putText(layer, text, (x, y - baseline + 1), cv2.FONT_HERSHEY_SIMPLEX, scale, (20, 20, 20), thickness, cv2.LINE_AA)
+    else:
+        cv2.putText(layer, text, anchor, cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
+
+
+def _draw_orientation_arrow(
+    layer: np.ndarray, target: dict[str, Any], color: tuple[int, int, int], thickness: int,
+    t_goal_cam: np.ndarray | None, intrinsics: CameraIntrinsics | None, length_m: float = 0.08,
+) -> None:
+    origin = target.get("orientation_source_position_m")
+    axis = target.get("orientation_axis_world")
+    if origin is None or axis is None:
+        return
+    try:
+        start = np.asarray(origin, dtype=np.float64).reshape(3)
+        direction = np.asarray(axis, dtype=np.float64).reshape(3)
+        norm = float(np.linalg.norm(direction))
+        if not np.isfinite(norm) or norm < 1.0e-9:
+            return
+        end = start + direction / norm * float(length_m)
+    except (TypeError, ValueError):
+        return
+    p0 = _goal_point_to_pixel(start, t_goal_cam, intrinsics)
+    p1 = _goal_point_to_pixel(end, t_goal_cam, intrinsics)
+    if p0 is not None and p1 is not None:
+        cv2.arrowedLine(layer, p0, p1, color, max(1, thickness), cv2.LINE_AA, tipLength=0.3)
+
+
+def _draw_hand_belief(
+    layer: np.ndarray, objects: list[dict[str, Any]], side: str, target: dict[str, Any], *,
+    armed: bool, t_goal_cam: np.ndarray | None, intrinsics: CameraIntrinsics | None,
+    label_slot: int, draw_normal: bool,
+) -> None:
+    object_id = str(target.get("object_id") or "")
+    if not object_id:
+        return
+    color = BELIEF_HAND_COLOR.get(side, (200, 200, 200))
+    height, width = layer.shape[:2]
+    box_px = BELIEF_ARMED_BOX_PX if armed else BELIEF_DIM_BOX_PX
+    cross_px = BELIEF_ARMED_CROSS_PX if armed else BELIEF_DIM_CROSS_PX
+    selected = next((obj for obj in objects if str(obj.get("tasc_object_id", "")) == object_id), None)
+    if selected is not None:
+        box = selected.get("box_xyxy")
+        if isinstance(box, list) and len(box) == 4:
+            x0, y0, x1, y1 = [int(round(float(value))) for value in box]
+            x0, x1 = [int(v) for v in np.clip([x0, x1], 0, width - 1)]
+            y0, y1 = [int(v) for v in np.clip([y0, y1], 0, height - 1)]
+            if armed:
+                cv2.rectangle(layer, (x0, y0), (x1, y1), color, box_px)
+            else:
+                _dashed_rectangle(layer, (x0, y0), (x1, y1), color, box_px)
+            _draw_hand_label(layer, side, target, color, anchor=(x0, min(height - 6, y1 + 18 + label_slot * 20)), armed=armed)
+    pixel = _goal_point_to_pixel(target.get("position_goal_m"), t_goal_cam, intrinsics)
+    if pixel is not None:
+        cv2.drawMarker(layer, pixel, color, cv2.MARKER_CROSS, cross_px, box_px + 1)
+    if draw_normal and target.get("orientation_relation") in {"parallel", "perpendicular"}:
+        _draw_orientation_arrow(layer, target, color, box_px, t_goal_cam, intrinsics)
+
+
+def _draw_belief_legend(overlay: np.ndarray, hands: dict[str, Any], selected_hand: str) -> None:
+    y = 20
+    for side in ("left", "right"):
+        color = BELIEF_HAND_COLOR[side]
+        target = (hands.get(side) or {}).get("target") or {}
+        state = "A/B" if side == selected_hand else "idle"
+        if not target.get("object_id"):
+            state = "no target"
+        cv2.rectangle(overlay, (10, y - 10), (24, y + 2), color, -1)
+        cv2.putText(overlay, f"{'L' if side == 'left' else 'R'} {state}", (30, y), cv2.FONT_HERSHEY_SIMPLEX, 0.46, color, 1, cv2.LINE_AA)
+        y += 20
+
+
+def draw_belief_overlay(
     overlay: np.ndarray,
     objects: list[dict[str, Any]],
     belief_telemetry: dict[str, Any],
     *,
     t_goal_cam: np.ndarray | None = None,
     intrinsics: CameraIntrinsics | None = None,
+    draw_normals: bool = True,
 ) -> None:
-    target = belief_telemetry.get("target") or {}
-    object_id = target.get("object_id")
-    if not object_id:
+    hands = belief_telemetry.get("hands") or {}
+    if not isinstance(hands, dict):
         return
-    selected = next(
-        (obj for obj in objects if obj.get("tasc_object_id") == object_id),
-        None,
-    )
-    if selected is None:
-        return
-    height, width = overlay.shape[:2]
-    color = (40, 255, 40)
-    box = selected.get("box_xyxy")
-    if isinstance(box, list) and len(box) == 4:
-        x0, y0, x1, y1 = [int(round(float(value))) for value in box]
-        x0, x1 = np.clip([x0, x1], 0, width - 1)
-        y0, y1 = np.clip([y0, y1], 0, height - 1)
-        cv2.rectangle(overlay, (x0, y0), (x1, y1), color, 3)
-        confidence = target.get("joint_confidence")
-        grip = target.get("grip_index")
-        label = "belief"
-        if isinstance(confidence, (int, float)):
-            label += f" {float(confidence):.2f}"
-        if grip is not None:
-            label += f" grip {int(grip)}"
-        cv2.putText(
-            overlay,
-            label,
-            (x0, min(height - 6, y1 + 18)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.52,
-            color,
-            2,
-            cv2.LINE_AA,
-        )
-    pixel = None
-    position_goal = target.get("position_goal_m")
-    if position_goal is not None and t_goal_cam is not None and intrinsics is not None:
-        try:
-            point_goal = np.asarray(position_goal, dtype=np.float64).reshape(3)
-            homogeneous = np.ones(4, dtype=np.float64)
-            homogeneous[:3] = point_goal
-            point_camera = (np.linalg.inv(np.asarray(t_goal_cam, dtype=np.float64)) @ homogeneous)[:3]
-            pixel = project_camera_point_to_pixel(point_camera, intrinsics)
-        except Exception:
-            pixel = None
-    if pixel is not None:
-        cv2.drawMarker(overlay, pixel, color, cv2.MARKER_CROSS, 24, 3)
+    selected_hand = str(belief_telemetry.get("selected_hand", "none")).lower()
+    armed_sides, dim_sides = [], []
+    for side in ("left", "right"):
+        hand_data = hands.get(side)
+        if not isinstance(hand_data, dict) or not (hand_data.get("target") or {}).get("object_id"):
+            continue
+        (armed_sides if side == selected_hand else dim_sides).append(side)
+    if dim_sides:
+        scratch = overlay.copy()
+        for slot, side in enumerate(dim_sides):
+            _draw_hand_belief(scratch, objects, side, hands[side]["target"], armed=False, t_goal_cam=t_goal_cam, intrinsics=intrinsics, label_slot=slot, draw_normal=draw_normals)
+        cv2.addWeighted(scratch, BELIEF_DIM_ALPHA, overlay, 1.0 - BELIEF_DIM_ALPHA, 0.0, overlay)
+    for slot, side in enumerate(armed_sides, start=len(dim_sides)):
+        _draw_hand_belief(overlay, objects, side, hands[side]["target"], armed=True, t_goal_cam=t_goal_cam, intrinsics=intrinsics, label_slot=slot, draw_normal=draw_normals)
+    _draw_belief_legend(overlay, hands, selected_hand)
+
+
+def draw_belief_highlight(*args, **kwargs) -> None:
+    """Compatibility wrapper for callers outside this module."""
+    draw_belief_overlay(*args, **kwargs)
 
 
 class SegmentationRuntime:
@@ -503,6 +617,37 @@ class SegmentationRuntime:
         self.publisher = publisher
         self.workspace = workspace
         self.target_config = target_config
+        self.belief_overlay_normals = bool(target_config.get("overlay_normals", True))
+        self.tasc_gravity_warned = False
+        self.tasc_hand_model = str(
+            belief_config.get("hand_model", "dex1")
+        ).strip().lower()
+        self.tasc_hand_profile = hand_frame_profile(self.tasc_hand_model)
+        # Perception and control must share one physical hand-axis convention.
+        belief_config = dict(belief_config)
+        orientation_config = dict(belief_config.get("orientation", {}))
+        canonical_axis = HAND_AXIS_LOCAL[self.tasc_hand_model]
+        configured_axis = orientation_config.get("hand_axis_local")
+        if configured_axis is not None:
+            try:
+                if not np.allclose(
+                    np.asarray(configured_axis, dtype=np.float64).reshape(3),
+                    canonical_axis,
+                    atol=1.0e-9,
+                ):
+                    LOG.warning(
+                        "overriding tasc orientation.hand_axis_local=%s with canonical %s for %s",
+                        configured_axis,
+                        canonical_axis.tolist(),
+                        self.tasc_hand_model,
+                    )
+            except (TypeError, ValueError):
+                LOG.warning(
+                    "invalid tasc orientation.hand_axis_local=%r; using canonical axis",
+                    configured_axis,
+                )
+        orientation_config["hand_axis_local"] = canonical_axis.tolist()
+        belief_config["orientation"] = orientation_config
         self.parallel_tasc_belief = ParallelTascBelief(belief_config)
         # Compatibility handle for legacy diagnostics. Runtime inference uses
         # parallel_tasc_belief for both hands below.
@@ -520,10 +665,6 @@ class SegmentationRuntime:
                 belief_config.get("grip", {}).get("max_points", 8000),
             )
         )
-        self.tasc_hand_model = str(
-            belief_config.get("hand_model", "dex1")
-        ).strip().lower()
-        self.tasc_hand_profile = hand_frame_profile(self.tasc_hand_model)
         self.tasc_grasp_center_local_m = np.asarray(
             belief_config.get(
                 "grasp_center_local_m",
@@ -904,11 +1045,13 @@ class SegmentationRuntime:
             )
         )
         joint_confidence = float(target.get("joint_confidence", object_confidence))
+        orientation_value = target.get("orientation_xyzw")
+        has_orientation_quaternion = orientation_value is not None
         orientation_xyzw = np.asarray(
-            target.get("orientation_xyzw", [
+            orientation_value if has_orientation_quaternion else [
                 self.target_quaternion[1], self.target_quaternion[2],
                 self.target_quaternion[3], self.target_quaternion[0],
-            ]), dtype=np.float64,
+            ], dtype=np.float64,
         ).reshape(4)
         orientation_wxyz = (
             float(orientation_xyzw[3]), float(orientation_xyzw[0]),
@@ -991,6 +1134,10 @@ class SegmentationRuntime:
         payload["orientation_confidence"] = orientation_confidence
         payload["orientation_frame"] = "pelvis_identity_fk"
         payload["position_point"] = f"{self.tasc_hand_model}_grasp_center"
+        if not has_orientation_quaternion:
+            # The relationship normal is the only valid orientation control
+            # representation at a perpendicular singularity.
+            payload.pop("quaternion", None)
         return payload, position, label
 
     def _belief_payload_locked(self) -> tuple[dict[str, Any], np.ndarray | None, str]:
@@ -1235,9 +1382,10 @@ class SegmentationRuntime:
                 2,
                 cv2.LINE_AA,
             )
-        draw_belief_highlight(
+        draw_belief_overlay(
             overlay, instances, belief,
             t_goal_cam=visual.get("t_goal_cam"), intrinsics=visual.get("intrinsics"),
+            draw_normals=self.belief_overlay_normals,
         )
         age_ms = (
             (int(frame.timestamp_us) - segment_timestamp_us) / 1000.0
@@ -1302,6 +1450,7 @@ class SegmentationRuntime:
                     hand_axis=None,
                     angular_velocity=omega,
                     button_pressed=(self.shared_hand_selection.selected_hand == side),
+                    shoulder_position=g1_shoulder_position(state.q, side),
                 )
             except Exception as error:
                 self._record_error(f"TASC {side} EE FK unavailable: {error}")
@@ -1351,10 +1500,17 @@ class SegmentationRuntime:
             # Preserve the legacy scalar fields for existing web clients,
             # choosing the better of the two independent posteriors only for
             # display. A/B authority remains bridge-side.
-            display_side, display = max(
-                hand_views.items(),
-                key=lambda item: float(item[1].get("joint_confidence") or 0.0),
-            )
+            def _display_rank(item: tuple[str, dict[str, Any]]) -> tuple[float, float]:
+                view = item[1]
+                return (
+                    float(view.get("joint_confidence") or 0.0),
+                    float(view.get("object_probability") or 0.0),
+                )
+
+            ranked = sorted(hand_views.items(), key=_display_rank, reverse=True)
+            display_side, display = ranked[0]
+            if len(ranked) > 1 and _display_rank(ranked[0]) == _display_rank(ranked[1]):
+                display_side = "tie"
             obj["tasc_display_hand"] = display_side
             obj["tasc_object_probability"] = display.get("object_probability")
             obj["tasc_selected_grip_index"] = display.get("selected_grip_index")
@@ -1783,8 +1939,23 @@ class SegmentationRuntime:
                     self.status["last_error"] = None
                     self.last_processed_monotonic = time.monotonic()
                     belief_up_goal = None
-                    if state_for_belief is not None and state_for_belief.has_torso_imu:
-                        belief_up_goal = gravity_up_in_pelvis(state_for_belief.base_quat_wxyz)
+                    if state_for_belief is not None:
+                        belief_up_goal = gravity_up_in_pelvis(
+                            getattr(state_for_belief, "base_quat_wxyz", None)
+                        )
+                    if belief_up_goal is None and not self.tasc_gravity_warned:
+                        LOG.warning("gravity up unavailable; normal snapping disabled")
+                        self.tasc_gravity_warned = True
+                    geometry = self.latest_belief_geometry
+                    gravity_snap_count = sum(
+                        int(bool(contact.snapped_to_gravity))
+                        for contacts in (geometry.pseudo_contacts.values() if geometry is not None else [])
+                        for contact in contacts
+                    )
+                    self.status["gravity_up_goal"] = (
+                        None if belief_up_goal is None else belief_up_goal.tolist()
+                    )
+                    self.status["gravity_snap_count"] = int(gravity_snap_count)
                     self.latest_belief_observation = {
                         "inputs": tasc_inputs,
                         "ray_origin": belief_ray_origin,

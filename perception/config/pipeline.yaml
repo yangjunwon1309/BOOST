@@ -225,6 +225,7 @@ tasc_belief:
     switch_dwell_frames: 15
     advantage_scale: 0.5
     gravity_snap_deg: 15.0
+    ghost_decay: 0.35
     role_hard_filter: false
     label_prior_scale: 1.0
     switch_gamma_h: 3.0
@@ -242,6 +243,8 @@ tasc_belief:
       gravity_snap_deg: 15.0
       hole_min_radius_m: 0.002
       hole_max_radius_m: 0.100
+      cylinder_max_stale_frames: 5
+      cylinder_ref_coverage: 0.5
   per_hand_parallel: true
   beta_armed: 1.0
   beta_idle: 0.2
@@ -263,15 +266,15 @@ tasc_belief:
   grasp_center_local_m: [0.0, 0.0, 0.060]
   fallback_eef_position_m: [0.0, 0.0, 0.0]
   features:
-    w_distance: 1.0
-    w_ray: 0.3
-    w_agreement: 0.6
+    w_distance: 1.4
+    w_progress: 1.0
+    w_agreement: 0.4
+    w_reach: 1.0
     w_delta: 0.0
     w_orientation: 0.8
     min_user_speed_mps: 0.005
     distance: {k: 1.5, delta: 0.10, c: 0.1}
-    ray: {k_r: 1.0, delta_r: 0.15, c_r: 0.1}
-    agreement: {lambda_a: 1.0, kappa: 1.0}
+    agreement: {lambda_a: 1.0, kappa: 0.25}
     delta: {lambda_d: 0.3, lpf_alpha: 0.5}
     orientation:
       align_k: 1.0

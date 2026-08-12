@@ -13,7 +13,10 @@ EPS = 1.0e-9
 def _second_order_transition(omega_n: float, zeta: float, dt: float) -> tuple[float, float, float, float]:
     """Exact transition for e_ddot=-2*zeta*wn*e_dot-wn^2*e."""
     wn = max(EPS, float(omega_n))
-    z = max(1.0 + 1.0e-6, float(zeta))
+    # The overdamped closed form divides by 2*wn*sqrt(zeta^2 - 1).
+    # Close to one, subtraction between the two exponential modes loses
+    # precision, so retain an explicitly numerically safe overdamped margin.
+    z = max(1.05, float(zeta))
     root = float(np.sqrt(z * z - 1.0))
     s1, s2 = -wn * (z - root), -wn * (z + root)
     gap = s1 - s2
@@ -59,13 +62,18 @@ class SecondOrderPositionReference:
         self.position = np.asarray(position, dtype=np.float64).reshape(3).copy()
         self.velocity = np.zeros(3) if velocity is None else np.asarray(velocity, dtype=np.float64).reshape(3).copy()
 
-    def step(self, target: np.ndarray, dt: float, *, measured: np.ndarray | None = None, omega_n: float | None = None) -> np.ndarray:
+    def step(self, target: np.ndarray, dt: float, *, measured: np.ndarray | None = None,
+             omega_n: float | None = None, zeta: float | None = None) -> np.ndarray:
         target = np.asarray(target, dtype=np.float64).reshape(3)
         if self.position is None or self.velocity is None:
             self.reset(measured if measured is not None else target)
         if measured is not None and np.linalg.norm(self.position - np.asarray(measured, dtype=np.float64).reshape(3)) > self.resync_distance_m:
             self.reset(measured, self.velocity)
-        a11, a12, a21, a22 = _second_order_transition(self.omega_n if omega_n is None else omega_n, self.zeta, dt)
+        a11, a12, a21, a22 = _second_order_transition(
+            self.omega_n if omega_n is None else omega_n,
+            self.zeta if zeta is None else zeta,
+            dt,
+        )
         error = self.position - target
         self.position, self.velocity = target + a11 * error + a12 * self.velocity, a21 * error + a22 * self.velocity
         speed = float(np.linalg.norm(self.velocity))
@@ -87,18 +95,83 @@ class SecondOrderOrientationReference:
         self.rotation = np.asarray(rotation, dtype=np.float64).reshape(3, 3).copy()
         self.rate = np.zeros(3) if rate is None else np.asarray(rate, dtype=np.float64).reshape(3).copy()
 
-    def step(self, target: np.ndarray, dt: float, *, measured: np.ndarray | None = None, omega_n: float | None = None) -> np.ndarray:
+    def step(self, target: np.ndarray, dt: float, *, measured: np.ndarray | None = None,
+             omega_n: float | None = None, zeta: float | None = None) -> np.ndarray:
         target = np.asarray(target, dtype=np.float64).reshape(3, 3)
         if self.rotation is None or self.rate is None:
             self.reset(measured if measured is not None else target)
         if measured is not None and np.linalg.norm(rotation_vector(np.asarray(measured).reshape(3, 3) @ self.rotation.T)) > self.resync_angle_rad:
             self.reset(measured, self.rate)
-        a11, a12, a21, a22 = _second_order_transition(self.omega_n if omega_n is None else omega_n, self.zeta, dt)
+        a11, a12, a21, a22 = _second_order_transition(
+            self.omega_n if omega_n is None else omega_n,
+            self.zeta if zeta is None else zeta,
+            dt,
+        )
         error = -rotation_vector(target @ self.rotation.T)
         new_error = a11 * error + a12 * self.rate
         self.rate = a21 * error + a22 * self.rate
         rate = float(np.linalg.norm(self.rate))
         if rate > self.max_rate_rps:
             self.rate *= self.max_rate_rps / max(EPS, rate)
-        self.rotation = rotation_from_vector(-new_error) @ target
+        # log(R_new R_target^T) == new_error, therefore
+        # R_new = exp(new_error) R_target.  Negating new_error creates the
+        # target mirror image and a period-two orientation limit cycle.
+        self.rotation = rotation_from_vector(new_error) @ target
         return self.rotation.copy()
+
+
+@dataclass
+class OrientationTargetGate:
+    """Reject discontinuous or contradictory orientation constraints.
+
+    The gate belongs at the reference-control boundary: a perception-side
+    posterior can be temporally consistent for a few frames while still
+    describing an invalid surface normal.
+    """
+
+    max_angle_rad: float = 1.047
+    max_step_rate_rps: float = 3.0
+    accept_dwell: int = 3
+    previous_target: np.ndarray | None = None
+    pending_count: int = 0
+    reject_count: int = 0
+    last_reason: str = ""
+
+    def reset(self) -> None:
+        self.previous_target = None
+        self.pending_count = 0
+        self.last_reason = ""
+
+    def accept(self, target: np.ndarray | None, reference: np.ndarray, dt: float) -> bool:
+        if target is None:
+            self.previous_target = None
+            self.pending_count = 0
+            self.last_reason = "no_target"
+            return False
+
+        target = np.asarray(target, dtype=np.float64).reshape(3, 3)
+        reference = np.asarray(reference, dtype=np.float64).reshape(3, 3)
+        angle = float(np.linalg.norm(rotation_vector(target @ reference.T)))
+        if angle > float(self.max_angle_rad):
+            self.previous_target = None
+            self.pending_count = 0
+            self.reject_count += 1
+            self.last_reason = f"angle_{np.degrees(angle):.0f}deg"
+            return False
+
+        if self.previous_target is not None and dt > 0.0:
+            step = float(np.linalg.norm(rotation_vector(target @ self.previous_target.T)))
+            if step > float(self.max_step_rate_rps) * float(dt):
+                self.previous_target = target.copy()
+                self.pending_count = 0
+                self.reject_count += 1
+                self.last_reason = f"jump_{np.degrees(step):.0f}deg"
+                return False
+
+        self.previous_target = target.copy()
+        self.pending_count += 1
+        if self.pending_count < max(1, int(self.accept_dwell)):
+            self.last_reason = f"dwell_{self.pending_count}"
+            return False
+        self.last_reason = "ok"
+        return True

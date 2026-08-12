@@ -18,6 +18,7 @@ from seg_web_node.grip_candidates import (
     fit_circle_in_plane,
     sample_cylinder_candidates,
     PseudoContactConfig,
+    _fit_plane_ransac,
 )
 from seg_web_node.robot_geometry import g1_wrist_ee_position
 from seg_web_node.tasc_belief import (
@@ -77,7 +78,7 @@ def test_huber_like_midpoint_convexity():
 
 def test_distance_advantage_positive_when_action_moves_toward_target():
     feature = MultiFeatureCost(
-        FeatureConfig(action_apply_time=1.0, w_ray=0.0, w_agreement=0.0)
+        FeatureConfig(action_apply_time=1.0, w_progress=0.0, w_agreement=0.0, w_reach=0.0)
     )
     advantage = feature.advantage(
         np.array([1.0, 0.0, 0.0]),
@@ -87,40 +88,33 @@ def test_distance_advantage_positive_when_action_moves_toward_target():
     assert advantage > 0.0
 
 
-def test_ray_feature_prefers_pointed_object():
-    feature = MultiFeatureCost(FeatureConfig(w_distance=0.0, w_ray=1.0, w_agreement=0.0))
+def test_ray_feature_is_compatibility_only_and_has_zero_weight():
+    feature = MultiFeatureCost(FeatureConfig(w_distance=0.0, w_progress=0.0, w_agreement=0.0, w_reach=0.0))
     origin = np.zeros(3)
-    direction = np.array([1.0, 0.0, 0.0])
     pointed = feature.advantage(
         np.array([1.0, 0.0, 0.0]),
         eef_position=origin,
-        ray_origin=origin,
-        ray_direction=direction,
     )
     off_axis = feature.advantage(
         np.array([1.0, 1.0, 0.0]),
         eef_position=origin,
-        ray_origin=origin,
-        ray_direction=direction,
     )
-    assert pointed > off_axis
+    assert pointed == off_axis == 0.0
 
 
-def test_agreement_direction_override_uses_robot_view_direction():
+def test_agreement_uses_hand_to_target_direction():
     feature = MultiFeatureCost(
-        FeatureConfig(w_distance=0.0, w_ray=0.0, w_agreement=1.0)
+        FeatureConfig(w_distance=0.0, w_progress=0.0, w_agreement=1.0, w_reach=0.0)
     )
     aligned = feature.advantage(
-        np.array([0.5, 0.2, 0.1]),
+        np.array([0.5, 0.0, 0.0]),
         eef_position=np.zeros(3),
         user_translation=np.array([1.0, 0.0, 0.0]),
-        agreement_direction=np.array([1.0, 0.0, 0.0]),
     )
     off_axis = feature.advantage(
-        np.array([0.5, 0.2, 0.1]),
+        np.array([0.0, 0.5, 0.0]),
         eef_position=np.zeros(3),
         user_translation=np.array([1.0, 0.0, 0.0]),
-        agreement_direction=np.array([0.0, 1.0, 0.0]),
     )
     assert aligned > off_axis
 
@@ -146,20 +140,33 @@ def test_robust_standardize_uses_floor_and_clip_for_real_signal():
 
 
 def test_feature_breakdown_exposes_values_and_weighted_contributions():
-    feature = MultiFeatureCost(FeatureConfig(w_distance=1.0, w_ray=0.8, w_agreement=0.6))
+    feature = MultiFeatureCost(FeatureConfig(w_distance=1.0, w_progress=1.0, w_agreement=0.6, w_reach=0.0))
     breakdown = feature.breakdown(
         np.array([1.0, 0.0, 0.0]),
         eef_position=np.zeros(3),
         user_translation=np.array([0.2, 0.0, 0.0]),
-        ray_origin=np.zeros(3),
-        ray_direction=np.array([1.0, 0.0, 0.0]),
-        agreement_direction=np.array([1.0, 0.0, 0.0]),
     )
     assert breakdown["distance_m"] == 1.0
     assert breakdown["distance_advantage"] > 0.0
     assert breakdown["ray_cost"] == 0.0
+    assert breakdown["weights"]["ray"] == 0.0
+    assert "progress_advantage" in breakdown
     assert breakdown["weighted_contributions"]["distance"] > 0.0
     assert "weighted_total" in breakdown
+
+
+def test_reach_feature_penalizes_target_outside_shoulder_annulus():
+    feature = MultiFeatureCost(
+        FeatureConfig(w_distance=0.0, w_progress=0.0, w_agreement=0.0, w_reach=1.0)
+    )
+    reachable = feature.breakdown(
+        np.array([0.40, 0.0, 0.0]), eef_position=np.zeros(3), shoulder_position=np.zeros(3)
+    )
+    unreachable = feature.breakdown(
+        np.array([0.90, 0.0, 0.0]), eef_position=np.zeros(3), shoulder_position=np.zeros(3)
+    )
+    assert reachable["reach_advantage"] == 0.0
+    assert unreachable["reach_advantage"] < 0.0
 
 
 def test_g1_wrist_fk_matches_pelvis_side_convention():
@@ -506,3 +513,96 @@ def test_orientation_disabled_retains_position_belief_compatibility():
     )
     assert telemetry["target"] is not None
     assert telemetry["orientation"]["enabled"] is False
+
+
+def test_perpendicular_orientation_singularity_returns_no_quaternion():
+    belief = HierarchicalTascBelief({"orientation": {"hand_axis_local": [1, 0, 0]}})
+    candidate = OrientationCandidate(
+        "surface", 0, "perpendicular", np.array([0.3, 0.0, 0.2]),
+        np.array([1.0, 0.0, 0.0]), 1.0,
+    )
+    assert belief._quaternion_from_relation(candidate, np.eye(3)) is None
+
+
+def test_standalone_orientation_ghost_stays_in_lockstep():
+    belief = HierarchicalTascBelief({"orientation": {"switch_dwell_frames": 1}})
+    belief.orientation_candidates = [
+        OrientationCandidate(
+            "old", 0, "parallel", np.array([0.3, 0.0, 0.2]),
+            np.array([0.0, 0.0, 1.0]), 1.0, track_id="old:parallel",
+        )
+    ]
+    belief.log_orientation_distribution = np.log(np.array([1.0]))
+    belief.orientation_advantage_ema = np.array([0.0])
+    target, telemetry, _, _ = belief._update_orientation_belief(
+        [BeliefInputObject("new", "surface", 1.0, np.array([0.4, 0.0, 0.2]))],
+        hand_rotation_matrix=np.eye(3),
+        hand_angular_velocity=np.zeros(3),
+        dt=1.0 / 30.0,
+        view_origin=None,
+    )
+    assert target is not None
+    assert len(telemetry["candidates"]) == belief.orientation_advantage_ema.size
+
+
+def test_stationary_jump_kernels_are_uniform():
+    belief = HierarchicalTascBelief()
+    objects = [
+        BeliefInputObject("a", "a", 1.0, np.array([0.2, 0.0, 0.1])),
+        BeliefInputObject("b", "b", 1.0, np.array([0.4, 0.0, 0.1])),
+    ]
+    position_kernel = belief._switch_weights_position(objects, np.zeros(3), None)
+    np.testing.assert_allclose(np.exp(position_kernel), [0.5, 0.5])
+    orientation_kernel = belief._orientation_switch_weights(
+        [
+            OrientationCandidate("a", 0, "parallel", np.zeros(3), np.array([0, 0, 1.0]), 1.0),
+            OrientationCandidate("b", 0, "perpendicular", np.zeros(3), np.array([1.0, 0, 0]), 1.0),
+        ],
+        np.array([0.0, 0.0, 1.0]),
+        None,
+    )
+    np.testing.assert_allclose(np.exp(orientation_kernel), [0.5, 0.5])
+
+
+def test_new_orientation_candidate_enters_at_existing_posterior_floor():
+    belief = HierarchicalTascBelief({
+        "jump": {"enabled": False, "persist_leak": 0.0},
+        "orientation": {"beta": 0.0, "w_sc": 1.0, "switch_dwell_frames": 1},
+    })
+    old = [
+        OrientationCandidate(f"old{i}", 0, "parallel", np.array([.3 + .01 * i, 0, .2]), np.array([0, 0, 1.]), 1.0, track_id=f"old{i}:parallel")
+        for i in range(3)
+    ]
+    belief.orientation_candidates = old
+    belief.log_orientation_distribution = np.log(np.array([.90, .08, .02]))
+    belief.orientation_advantage_ema = np.zeros(3)
+    candidates = old + [
+        OrientationCandidate("new", 0, "parallel", np.array([.5, 0, .2]), np.array([0, 0, 1.]), 1.0, track_id="new:parallel")
+    ]
+    _target, telemetry, _, _ = belief._update_orientation_belief(
+        [], hand_rotation_matrix=np.eye(3), hand_angular_velocity=np.zeros(3),
+        dt=1.0 / 30.0, view_origin=None, orientation_candidates=candidates,
+    )
+    probabilities = np.asarray([item["probability"] for item in telemetry["candidates"]])
+    new_index = next(i for i, item in enumerate(telemetry["candidates"]) if item["track_id"] == "new:parallel")
+    assert probabilities[new_index] <= probabilities[2] + 1.0e-12
+
+
+def test_plane_fit_quality_improves_with_lower_residual_noise():
+    rng = np.random.default_rng(31)
+    base = np.array([[x, y, 0.0] for x in np.linspace(-.1, .1, 16) for y in np.linspace(-.1, .1, 16)])
+    config = PseudoContactConfig(min_inlier_ratio=.2, plane_inlier_thresh_m=.012)
+    clean = _fit_plane_ransac(base + rng.normal(scale=0.0003, size=base.shape), config)
+    noisy = _fit_plane_ransac(base + rng.normal(scale=0.0040, size=base.shape), config)
+    assert clean is not None and noisy is not None
+    assert clean[3] > noisy[3]
+
+
+def test_grip_candidates_use_supplied_gravity_axis():
+    points = box_points(np.array([0.4, 0.0, 0.2]), np.array([0.12, 0.08, 0.04]))
+    up = np.array([0.0, 0.5, np.sqrt(0.75)])
+    candidates = generate_grip_candidates(
+        points, GripCandidateConfig(top_k=1, surface_augment=0), up_goal=up
+    )
+    assert candidates
+    np.testing.assert_allclose(candidates[0].approach, -up, atol=1.0e-6)

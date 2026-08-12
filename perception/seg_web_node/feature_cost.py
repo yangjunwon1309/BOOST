@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 
 import numpy as np
 
 
 EPS = 1.0e-9
+LOG = logging.getLogger(__name__)
 
 
 def unit(vector: np.ndarray) -> np.ndarray | None:
@@ -104,20 +106,22 @@ def clip_log_probs(log_probs: np.ndarray, max_prob: float) -> np.ndarray:
 @dataclass(frozen=True)
 class FeatureConfig:
     action_apply_time: float = 0.01
-    w_distance: float = 1.0
-    w_ray: float = 0.8
-    w_agreement: float = 0.6
+    w_distance: float = 1.4
+    w_progress: float = 1.0
+    w_agreement: float = 0.4
+    w_reach: float = 1.0
     w_delta: float = 0.0
     distance_k: float = 1.5
     distance_delta: float = 0.10
     distance_c: float = 0.1
-    ray_k: float = 1.0
-    ray_delta: float = 0.15
-    ray_c: float = 0.1
     agreement_lambda: float = 1.0
-    agreement_kappa: float = 1.0
+    agreement_kappa: float = 0.25
     delta_lambda: float = 0.3
     min_user_speed_mps: float = 0.005
+    reach_min_m: float = 0.18
+    reach_max_m: float = 0.55
+    reach_k: float = 1.0
+    reach_delta: float = 0.10
     w_orientation: float = 0.8
     ori_align_k: float = 1.0
     ori_align_delta: float = 0.30
@@ -132,25 +136,29 @@ class FeatureConfig:
         features = dict(data.get("features", data))
         distance = dict(features.get("distance", {}))
         ray = dict(features.get("ray", {}))
+        if ray or "w_ray" in features:
+            LOG.warning("TASC ray feature is deprecated and ignored; camera rays remain geometry-only")
         agreement = dict(features.get("agreement", {}))
         delta = dict(features.get("delta", {}))
         orientation = dict(features.get("orientation", {}))
         return cls(
             action_apply_time=float(data.get("action_apply_time", 0.01)),
-            w_distance=float(features.get("w_distance", 1.0)),
-            w_ray=float(features.get("w_ray", 0.8)),
-            w_agreement=float(features.get("w_agreement", 0.6)),
+            w_distance=float(features.get("w_distance", 1.4)),
+            w_progress=float(features.get("w_progress", 1.0)),
+            w_agreement=float(features.get("w_agreement", 0.4)),
+            w_reach=float(features.get("w_reach", 1.0)),
             w_delta=float(features.get("w_delta", 0.0)),
             distance_k=float(distance.get("k", 1.5)),
             distance_delta=float(distance.get("delta", 0.10)),
             distance_c=float(distance.get("c", 0.1)),
-            ray_k=float(ray.get("k_r", ray.get("k", 1.0))),
-            ray_delta=float(ray.get("delta_r", ray.get("delta", 0.15))),
-            ray_c=float(ray.get("c_r", ray.get("c", 0.1))),
             agreement_lambda=float(agreement.get("lambda_a", agreement.get("lambda", 1.0))),
-            agreement_kappa=float(agreement.get("kappa", 1.0)),
+            agreement_kappa=float(agreement.get("kappa", 0.25)),
             delta_lambda=float(delta.get("lambda_d", delta.get("lambda", 0.3))),
             min_user_speed_mps=float(features.get("min_user_speed_mps", 0.005)),
+            reach_min_m=float(features.get("reach_min_m", 0.18)),
+            reach_max_m=float(features.get("reach_max_m", 0.55)),
+            reach_k=float(features.get("reach_k", 1.0)),
+            reach_delta=float(features.get("reach_delta", 0.10)),
             w_orientation=float(features.get("w_orientation", 0.8)),
             ori_align_k=float(orientation.get("align_k", orientation.get("k", 1.0))),
             ori_align_delta=float(orientation.get("align_delta", orientation.get("delta", 0.30))),
@@ -162,7 +170,7 @@ class FeatureConfig:
 
 
 class MultiFeatureCost:
-    """Weighted distance, ray, and agreement advantage for one 3-D target."""
+    """Weighted hand-centric intent advantages for one 3-D target."""
 
     def __init__(self, config: FeatureConfig):
         self.config = config
@@ -184,45 +192,60 @@ class MultiFeatureCost:
             d_after, k=cfg.distance_k, delta=cfg.distance_delta, c=cfg.distance_c
         )
 
-    def ray_advantage(
-        self,
-        target: np.ndarray,
-        ray_origin: np.ndarray | None,
-        ray_direction: np.ndarray | None,
-    ) -> float:
-        if ray_origin is None or ray_direction is None:
-            return 0.0
-        direction = unit(ray_direction)
-        to_target = unit(np.asarray(target, dtype=np.float64).reshape(3) - ray_origin)
-        if direction is None or to_target is None:
-            return 0.0
-        cos_psi = float(np.clip(np.dot(direction, to_target), -1.0, 1.0))
-        e_ang = 1.0 - cos_psi
-        cfg = self.config
-        return -huber_like(e_ang, k=cfg.ray_k, delta=cfg.ray_delta, c=cfg.ray_c)
-
     def agreement_advantage(
         self,
         target: np.ndarray,
         eef_position: np.ndarray,
         user_translation: np.ndarray | None,
-        agreement_direction: np.ndarray | None = None,
     ) -> float:
         if user_translation is None:
             return 0.0
         u = np.asarray(user_translation, dtype=np.float64).reshape(3)
         if float(np.linalg.norm(u)) < self.config.min_user_speed_mps:
             return 0.0
-        if agreement_direction is None:
-            direction_source = np.asarray(target, dtype=np.float64).reshape(3) - eef_position
-        else:
-            direction_source = agreement_direction
-        target_dir = unit(direction_source)
+        target_dir = unit(np.asarray(target, dtype=np.float64).reshape(3) - eef_position)
         if target_dir is None:
             return 0.0
         u_opt = self.config.agreement_kappa * target_dir
         error = u - u_opt
         return -self.config.agreement_lambda * float(np.dot(error, error))
+
+    def progress_advantage(
+        self,
+        target: np.ndarray,
+        eef_position: np.ndarray,
+        user_translation: np.ndarray | None,
+    ) -> float:
+        """Speed-invariant directed progress from the hand to a candidate."""
+        if user_translation is None:
+            return 0.0
+        velocity = np.asarray(user_translation, dtype=np.float64).reshape(3)
+        if float(np.linalg.norm(velocity)) < self.config.min_user_speed_mps:
+            return 0.0
+        direction = unit(velocity)
+        target_direction = unit(
+            np.asarray(target, dtype=np.float64).reshape(3)
+            - np.asarray(eef_position, dtype=np.float64).reshape(3)
+        )
+        if direction is None or target_direction is None:
+            return 0.0
+        return float(np.dot(direction, target_direction))
+
+    def reach_advantage(
+        self, target: np.ndarray, shoulder_position: np.ndarray | None
+    ) -> tuple[float, float | None]:
+        """Penalize candidates outside the measured shoulder reach annulus."""
+        if shoulder_position is None:
+            return 0.0, None
+        radius = float(np.linalg.norm(
+            np.asarray(target, dtype=np.float64).reshape(3)
+            - np.asarray(shoulder_position, dtype=np.float64).reshape(3)
+        ))
+        outside = max(0.0, radius - self.config.reach_max_m)
+        inside = max(0.0, self.config.reach_min_m - radius)
+        penalty = huber_like(outside, k=self.config.reach_k, delta=self.config.reach_delta)
+        penalty += huber_like(inside, k=self.config.reach_k, delta=self.config.reach_delta)
+        return -float(penalty), radius
 
     def delta_advantage(
         self,
@@ -312,18 +335,14 @@ class MultiFeatureCost:
         *,
         eef_position: np.ndarray,
         user_translation: np.ndarray | None = None,
-        ray_origin: np.ndarray | None = None,
-        ray_direction: np.ndarray | None = None,
-        agreement_direction: np.ndarray | None = None,
+        shoulder_position: np.ndarray | None = None,
     ) -> float:
         return float(
             self.breakdown(
                 target,
                 eef_position=eef_position,
                 user_translation=user_translation,
-                ray_origin=ray_origin,
-                ray_direction=ray_direction,
-                agreement_direction=agreement_direction,
+                shoulder_position=shoulder_position,
             )["weighted_total"]
         )
 
@@ -333,9 +352,7 @@ class MultiFeatureCost:
         *,
         eef_position: np.ndarray,
         user_translation: np.ndarray | None = None,
-        ray_origin: np.ndarray | None = None,
-        ray_direction: np.ndarray | None = None,
-        agreement_direction: np.ndarray | None = None,
+        shoulder_position: np.ndarray | None = None,
     ) -> dict:
         cfg = self.config
         target = np.asarray(target, dtype=np.float64).reshape(3)
@@ -359,30 +376,12 @@ class MultiFeatureCost:
         )
         a_dist = v_dist - v_dist_after
 
-        ray_cos = None
-        ray_error = None
-        ray_cost = 0.0
-        if ray_origin is not None and ray_direction is not None:
-            direction = unit(ray_direction)
-            to_target = unit(target - np.asarray(ray_origin, dtype=np.float64).reshape(3))
-            if direction is not None and to_target is not None:
-                ray_cos = float(np.clip(np.dot(direction, to_target), -1.0, 1.0))
-                ray_error = 1.0 - ray_cos
-                ray_cost = huber_like(
-                    ray_error, k=cfg.ray_k, delta=cfg.ray_delta, c=cfg.ray_c
-                )
-        a_ray = -ray_cost
-
         agreement_dir = None
         agreement_cost = 0.0
         u_opt = None
         user_speed = float(np.linalg.norm(user))
         if user_translation is not None and user_speed >= cfg.min_user_speed_mps:
-            if agreement_direction is None:
-                direction_source = target - eef_position
-            else:
-                direction_source = agreement_direction
-            target_dir = unit(direction_source)
+            target_dir = unit(target - eef_position)
             if target_dir is not None:
                 agreement_dir = target_dir
                 u_opt_arr = cfg.agreement_kappa * target_dir
@@ -390,12 +389,16 @@ class MultiFeatureCost:
                 agreement_cost = cfg.agreement_lambda * float(np.dot(error, error))
                 u_opt = u_opt_arr.tolist()
         a_agreement = -agreement_cost
+        a_progress = self.progress_advantage(target, eef_position, user_translation)
+        a_reach, shoulder_distance = self.reach_advantage(target, shoulder_position)
 
         a_delta = self.delta_advantage(target, eef_position, user_translation)
         weighted = {
             "distance": cfg.w_distance * a_dist,
-            "ray": cfg.w_ray * a_ray,
+            "ray": 0.0,
+            "progress": cfg.w_progress * a_progress,
             "agreement": cfg.w_agreement * a_agreement,
+            "reach": cfg.w_reach * a_reach,
             "delta": cfg.w_delta * a_delta,
         }
         return {
@@ -412,21 +415,30 @@ class MultiFeatureCost:
             "distance_value": v_dist,
             "distance_value_after_action": v_dist_after,
             "distance_advantage": a_dist,
-            "ray_cos": ray_cos,
-            "ray_error_1_minus_cos": ray_error,
-            "ray_cost": ray_cost,
-            "ray_advantage": a_ray,
+            "ray_cos": None,
+            "ray_error_1_minus_cos": None,
+            "ray_cost": 0.0,
+            "ray_advantage": 0.0,
             "agreement_direction": (
                 agreement_dir.tolist() if agreement_dir is not None else None
             ),
             "agreement_u_opt_mps": u_opt,
             "agreement_cost": agreement_cost,
             "agreement_advantage": a_agreement,
+            "progress_advantage": a_progress,
+            "shoulder_position_m": (
+                None if shoulder_position is None
+                else np.asarray(shoulder_position, dtype=np.float64).reshape(3).tolist()
+            ),
+            "shoulder_target_distance_m": shoulder_distance,
+            "reach_advantage": a_reach,
             "delta_advantage": a_delta,
             "weights": {
                 "distance": cfg.w_distance,
-                "ray": cfg.w_ray,
+                "ray": 0.0,
+                "progress": cfg.w_progress,
                 "agreement": cfg.w_agreement,
+                "reach": cfg.w_reach,
                 "delta": cfg.w_delta,
             },
             "weighted_contributions": weighted,

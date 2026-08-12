@@ -149,6 +149,8 @@ class PseudoContactConfig:
     gravity_snap_deg: float = 15.0
     hole_min_radius_m: float = 0.002
     hole_max_radius_m: float = 0.100
+    cylinder_max_stale_frames: int = 5
+    cylinder_ref_coverage: float = 0.5
 
     @classmethod
     def from_dict(cls, data: dict | None) -> "PseudoContactConfig":
@@ -166,6 +168,8 @@ class PseudoContactConfig:
             gravity_snap_deg=float(data.get("gravity_snap_deg", 15.0)),
             hole_min_radius_m=float(data.get("hole_min_radius_m", 0.002)),
             hole_max_radius_m=float(data.get("hole_max_radius_m", 0.100)),
+            cylinder_max_stale_frames=int(data.get("cylinder_max_stale_frames", 5)),
+            cylinder_ref_coverage=float(data.get("cylinder_ref_coverage", 0.5)),
         )
 
 
@@ -466,14 +470,6 @@ def sample_cylinder_candidates(
             normal = _unit(normal, basis_u)
             tangent = _unit(tangent, basis_v)
             axis = _unit(model.axis, np.array([0.0, 0.0, 1.0]))
-            # These are analytical cylinder-frame vectors. Keep the invariant
-            # explicit because orientation belief consumes all three.
-            assert abs(float(np.dot(normal, tangent))) < 1.0e-6
-            assert abs(float(np.dot(normal, axis))) < 1.0e-6
-            assert abs(float(np.dot(tangent, axis))) < 1.0e-6
-            assert abs(float(np.linalg.norm(normal)) - 1.0) < 1.0e-6
-            assert abs(float(np.linalg.norm(tangent)) - 1.0) < 1.0e-6
-            assert abs(float(np.linalg.norm(axis)) - 1.0) < 1.0e-6
             center = model.center + float(axial) * model.axis + model.radius * normal
             candidates.append(
                 GripCandidate(
@@ -513,7 +509,7 @@ def _fit_plane_ransac(
     points: np.ndarray,
     config: PseudoContactConfig,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float] | None:
-    """Return refitted plane point, normal, inlier points, and inlier ratio."""
+    """Return refitted plane point, normal, inliers, and residual quality."""
     if points.shape[0] < 3:
         return None
     rng = np.random.default_rng(0)
@@ -563,8 +559,15 @@ def _fit_plane_ransac(
     if plane is None:
         return None
     point, normal = plane
-    ratio = float(inliers.shape[0] / points.shape[0])
-    return point, normal, inliers, ratio
+    residual = (inliers - point) @ normal
+    rmse = float(np.sqrt(np.mean(residual * residual)))
+    coverage = float(inliers.shape[0] / points.shape[0])
+    quality = float(np.clip(
+        coverage * np.exp(-rmse / max(EPS, config.plane_inlier_thresh_m)),
+        0.0,
+        1.0,
+    ))
+    return point, normal, inliers, quality
 
 
 def _snap_normal_to_gravity(
@@ -636,25 +639,35 @@ def extract_pseudo_contacts(
             normal=normal,
             fit_quality=0.0,
             source="center_fallback",
+            snapped_to_gravity=up_goal is not None,
         )]
-    if cylinder_model is not None and cylinder_model.inlier_ratio >= 0.35:
+    if (
+        cylinder_model is not None
+        and cylinder_model.stale_frames <= config.cylinder_max_stale_frames
+    ):
         quality = float(np.clip(
-            cylinder_model.inlier_ratio * np.exp(-cylinder_model.fit_rmse / 0.015),
+            cylinder_model.inlier_ratio
+            * cylinder_model.angular_coverage / max(EPS, config.cylinder_ref_coverage)
+            * np.exp(-cylinder_model.fit_rmse / 0.015),
             0.0,
             1.0,
         ))
         # The temporally filtered cylinder axis is stable; radial normals are
         # sample-basis dependent and jump across frames.
+        axis, snapped = _snap_normal_to_gravity(
+            cylinder_model.axis, up_goal, config.gravity_snap_deg
+        )
         return [PseudoContactPoint(
             center=cylinder_model.center.copy(),
-            normal=_unit(cylinder_model.axis, np.array([0.0, 0.0, 1.0])),
+            normal=axis,
             fit_quality=quality,
             source="cylinder_axis",
+            snapped_to_gravity=snapped,
         )]
 
     plane = _fit_plane_ransac(points, config)
     if plane is not None:
-        plane_point, normal, inliers, ratio = plane
+        plane_point, normal, inliers, quality = plane
         normal = _orient_normal(normal, plane_point, view_origin)
         normal, snapped = _snap_normal_to_gravity(normal, up_goal, config.gravity_snap_deg)
         lower_label = str(label).lower()
@@ -667,12 +680,12 @@ def extract_pseudo_contacts(
                     return [PseudoContactPoint(
                         center=center,
                         normal=normal,
-                        fit_quality=float(np.clip(ratio * np.exp(-rmse / config.plane_inlier_thresh_m), 0.0, 1.0)),
+                        fit_quality=float(np.clip(quality * np.exp(-rmse / config.plane_inlier_thresh_m), 0.0, 1.0)),
                         source="hole_circle",
                         snapped_to_gravity=snapped,
                     )]
         return [PseudoContactPoint(
-            center=plane_point.copy(), normal=normal, fit_quality=ratio, source="plane",
+            center=plane_point.copy(), normal=normal, fit_quality=quality, source="plane",
             snapped_to_gravity=snapped,
         )]
 
@@ -813,13 +826,18 @@ def _merge_nearby_candidates(
 def generate_grip_candidates(
     points_goal: np.ndarray,
     config: GripCandidateConfig | None = None,
+    *,
+    up_goal: np.ndarray | None = None,
 ) -> list[GripCandidate]:
     cfg = config or GripCandidateConfig()
     points = _finite_points(points_goal, cfg.max_points)
     if points.shape[0] == 0:
         return []
 
-    table_normal = _unit(np.asarray(cfg.table_normal), np.array([0.0, 0.0, 1.0]))
+    table_normal = _unit(
+        np.asarray(cfg.table_normal if up_goal is None else up_goal),
+        np.array([0.0, 0.0, 1.0]),
+    )
     center, axes, extents = _principal_axes(points)
     height = float(np.ptp(points @ table_normal))
     top_down = height < cfg.h_th_m

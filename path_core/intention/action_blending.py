@@ -14,11 +14,12 @@ LOG = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class SharedControlConfig:
-    zeta: float = 2.0
-    omega_n_position_armed: float = 3.0
-    omega_n_orientation_armed: float = 4.0
-    omega_n_position_released: float = 12.0
-    omega_n_orientation_released: float = 15.0
+    zeta_armed: float = 2.0
+    zeta_released: float = 1.2
+    omega_n_position_armed: float = 1.8
+    omega_n_orientation_armed: float = 2.5
+    omega_n_position_released: float = 10.0
+    omega_n_orientation_released: float = 12.0
     max_speed_mps: float = 0.35
     max_rate_rps: float = 1.5
     resync_distance_m: float = 0.15
@@ -26,6 +27,9 @@ class SharedControlConfig:
     stale_after_s: float = 0.3
     d_max_m: float = 0.9
     orientation_min_confidence: float = 0.35
+    orientation_max_angle_rad: float = 1.047
+    orientation_max_step_rate_rps: float = 3.0
+    orientation_accept_dwell: int = 3
     waist_mode: str = "sonic_passthrough"
 
     @classmethod
@@ -34,7 +38,16 @@ class SharedControlConfig:
         obsolete = {"rho1", "rho2", "alpha_rate_up", "alpha_rate_down", "v_transfer_max", "startup_hold_s"}
         if obsolete.intersection(data):
             LOG.warning("obsolete shared-control alpha parameters are ignored by second-order reference control")
-        return cls(**{key: value for key, value in data.items() if key in cls.__dataclass_fields__})
+        if "zeta" in data:
+            LOG.warning("shared-control zeta is deprecated; applying it to zeta_armed and zeta_released")
+            data.setdefault("zeta_armed", data["zeta"])
+            data.setdefault("zeta_released", data["zeta"])
+        values = {key: value for key, value in data.items() if key in cls.__dataclass_fields__}
+        for key in ("zeta_armed", "zeta_released"):
+            if key in values and float(values[key]) < 1.05:
+                LOG.warning("%s=%s is below the stable overdamped limit; clamping to 1.05", key, values[key])
+                values[key] = 1.05
+        return cls(**values)
 
 
 @dataclass(frozen=True)

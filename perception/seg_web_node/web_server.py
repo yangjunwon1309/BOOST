@@ -1094,6 +1094,8 @@ class SegmentationRuntime:
                 "orientation_axis_world": target.get("orientation_axis_world"),
                 "orientation_confidence": target.get("orientation_confidence"),
                 "orientation_source_position_m": target.get("orientation_source_position_m"),
+                "orientation_policy": target.get("orientation_policy", "minimal_rotation"),
+                "orientation_frame_world": target.get("orientation_frame_world"),
                 "streaming_goal": True,
                 "target_valid": True,
                 "belief_selected": True,
@@ -1125,13 +1127,22 @@ class SegmentationRuntime:
                 axis_ok = bool(np.isfinite(axis).all() and np.linalg.norm(axis) > 1.0e-6)
             except (TypeError, ValueError):
                 axis_ok = False
+        frame_ok = False
+        try:
+            frame = np.asarray(target.get("orientation_frame_world"), dtype=np.float64).reshape(3, 3)
+            frame_ok = bool(np.isfinite(frame).all() and abs(float(np.linalg.det(frame))) > 0.5)
+        except (TypeError, ValueError, np.linalg.LinAlgError):
+            pass
         payload["orientation_valid"] = bool(
-            axis_ok and target.get("orientation_relation") in {"parallel", "perpendicular"}
+            ((frame_ok and target.get("orientation_policy") == "grasp_frame")
+             or (axis_ok and target.get("orientation_relation") in {"parallel", "perpendicular"}))
             and orientation_confidence >= float(self.target_config.get("orientation_min_confidence", 0.35))
         )
         payload["orientation_axis_world"] = None if not axis_ok else axis.tolist()
         payload["orientation_relation"] = target.get("orientation_relation")
         payload["orientation_confidence"] = orientation_confidence
+        payload["orientation_policy"] = target.get("orientation_policy", "minimal_rotation")
+        payload["orientation_frame_world"] = target.get("orientation_frame_world")
         payload["orientation_frame"] = "pelvis_identity_fk"
         payload["position_point"] = f"{self.tasc_hand_model}_grasp_center"
         if not has_orientation_quaternion:
@@ -1448,6 +1459,7 @@ class SegmentationRuntime:
                     user_translation=velocity,
                     hand_rotation=rotation,
                     hand_axis=None,
+                    approach_axis=rotation @ np.asarray(self.tasc_hand_profile["approach_axis_local"], dtype=np.float64),
                     angular_velocity=omega,
                     button_pressed=(self.shared_hand_selection.selected_hand == side),
                     shoulder_position=g1_shoulder_position(state.q, side),
@@ -1948,9 +1960,9 @@ class SegmentationRuntime:
                         self.tasc_gravity_warned = True
                     geometry = self.latest_belief_geometry
                     gravity_snap_count = sum(
-                        int(bool(contact.snapped_to_gravity))
-                        for contacts in (geometry.pseudo_contacts.values() if geometry is not None else [])
-                        for contact in contacts
+                        int(bool(primitive.snapped_to_gravity))
+                        for primitives in (geometry.surface_primitives.values() if geometry is not None else [])
+                        for primitive in primitives
                     )
                     self.status["gravity_up_goal"] = (
                         None if belief_up_goal is None else belief_up_goal.tolist()

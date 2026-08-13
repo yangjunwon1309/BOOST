@@ -64,12 +64,16 @@ def _payload():
                     "updates": 4,
                     "stale_frames": 0,
                 },
-                "pseudo_contacts": [
+                "surface_primitives": [
                     {
-                        "center_goal_m": [0.3, 0.1, 0.2],
-                        "normal_goal": [0.0, 0.0, 1.0],
+                        "kind": "cylinder",
+                        "origin_goal_m": [0.3, 0.1, 0.2],
+                        "axis_goal": [0.0, 0.0, 1.0],
                         "fit_quality": 0.81,
-                        "source": "cylinder_axis",
+                        "source": "cylinder",
+                        "radius": 0.04,
+                        "half_height": 0.10,
+                        "extent": None,
                         "snapped_to_gravity": True,
                     }
                 ],
@@ -101,8 +105,8 @@ def test_remote_perception_rejects_invalid_cylinder_surface():
         encode_perception_result(payload)
 
 
-def test_remote_perception_rejects_invalid_pseudo_contact():
+def test_remote_perception_rejects_invalid_surface_primitive():
     payload = _payload()
-    payload["objects"][0]["pseudo_contacts"][0]["normal_goal"] = [0.0, 1.0]
-    with pytest.raises(ValueError, match="pseudo_contacts.*normal_goal"):
+    payload["objects"][0]["surface_primitives"][0]["axis_goal"] = [0.0, 1.0]
+    with pytest.raises(ValueError, match="surface_primitives.*axis_goal"):
         encode_perception_result(payload)

@@ -12,7 +12,7 @@ from seg_web_node.grip_candidates import (
     GripCandidateConfig,
     PersistentCylinderSurfaceTracker,
     PseudoContactConfig,
-    extract_pseudo_contacts,
+    extract_surface_primitives,
     generate_grip_candidates,
 )
 from seg_web_node.object_point_filter import (
@@ -145,12 +145,6 @@ class RemoteRgbdGeometryPipeline:
         depth_m = np.asarray(depth_raw, dtype=np.float32) * (
             float(depth_scale_um) / 1_000_000.0
         )
-        view_origin = (
-            None
-            if t_goal_cam is None
-            else np.asarray(t_goal_cam, dtype=np.float64).reshape(4, 4)[:3, 3]
-        )
-
         detections: list[dict[str, Any]] = []
         for index, (mask, label, score) in enumerate(zip(masks, labels, scores)):
             detection: dict[str, Any] = {
@@ -164,7 +158,7 @@ class RemoteRgbdGeometryPipeline:
                 "median_depth_m": None,
                 "target_contact_goal_m": None,
                 "contact_candidates": [],
-                "pseudo_contacts": [],
+                "surface_primitives": [],
                 "surface_model": None,
                 "point_filter": None,
                 "_points_goal_m": None,
@@ -230,13 +224,12 @@ class RemoteRgbdGeometryPipeline:
                         ]
                 model = self.surface_tracker.models.get(track_id)
                 detection["surface_model"] = self.surface_tracker.status(track_id)
-                detection["pseudo_contacts"] = [
-                    contact.to_dict()
-                    for contact in extract_pseudo_contacts(
+                detection["surface_primitives"] = [
+                    primitive.to_dict()
+                    for primitive in extract_surface_primitives(
                         points_goal,
                         self.pseudo_config,
                         cylinder_model=model,
-                        view_origin=view_origin,
                         label=str(label),
                         up_goal=up_goal,
                     )
@@ -258,7 +251,7 @@ class RemoteRgbdGeometryPipeline:
             )
             wire_object.update(
                 {
-                    "pseudo_contacts": list(detection.get("pseudo_contacts", [])),
+                    "surface_primitives": list(detection.get("surface_primitives", [])),
                     "point_filter": detection.get("point_filter"),
                     "geometry_fallback": False,
                     "missing_frames": 0,

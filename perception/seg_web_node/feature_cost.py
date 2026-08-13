@@ -111,6 +111,8 @@ class FeatureConfig:
     w_agreement: float = 0.4
     w_reach: float = 1.0
     w_delta: float = 0.0
+    w_align: float = 0.9
+    align_min_quality: float = 0.25
     distance_k: float = 1.5
     distance_delta: float = 0.10
     distance_c: float = 0.1
@@ -148,6 +150,8 @@ class FeatureConfig:
             w_agreement=float(features.get("w_agreement", 0.4)),
             w_reach=float(features.get("w_reach", 1.0)),
             w_delta=float(features.get("w_delta", 0.0)),
+            w_align=float(features.get("w_align", 0.9)),
+            align_min_quality=float(features.get("align_min_quality", 0.25)),
             distance_k=float(distance.get("k", 1.5)),
             distance_delta=float(distance.get("delta", 0.10)),
             distance_c=float(distance.get("c", 0.1)),
@@ -329,6 +333,22 @@ class MultiFeatureCost:
     def orientation_advantage(self, **kwargs) -> float:
         return float(self.orientation_breakdown(**kwargs)["weighted_total"])
 
+    def alignment_advantage(
+        self,
+        *,
+        approach_axis: np.ndarray | None,
+        contact_normal: np.ndarray | None,
+        fit_quality: float,
+    ) -> float:
+        """Position-stage grasp alignment: approaching a surface head-on wins."""
+        if float(fit_quality) < self.config.align_min_quality:
+            return 0.0
+        approach = None if approach_axis is None else unit(approach_axis)
+        normal = None if contact_normal is None else unit(contact_normal)
+        if approach is None or normal is None:
+            return 0.0
+        return -float(np.dot(approach, normal))
+
     def advantage(
         self,
         target: np.ndarray,
@@ -336,6 +356,9 @@ class MultiFeatureCost:
         eef_position: np.ndarray,
         user_translation: np.ndarray | None = None,
         shoulder_position: np.ndarray | None = None,
+        contact_normal: np.ndarray | None = None,
+        hand_approach_axis: np.ndarray | None = None,
+        contact_fit_quality: float = 0.0,
     ) -> float:
         return float(
             self.breakdown(
@@ -343,6 +366,9 @@ class MultiFeatureCost:
                 eef_position=eef_position,
                 user_translation=user_translation,
                 shoulder_position=shoulder_position,
+                contact_normal=contact_normal,
+                hand_approach_axis=hand_approach_axis,
+                contact_fit_quality=contact_fit_quality,
             )["weighted_total"]
         )
 
@@ -353,6 +379,9 @@ class MultiFeatureCost:
         eef_position: np.ndarray,
         user_translation: np.ndarray | None = None,
         shoulder_position: np.ndarray | None = None,
+        contact_normal: np.ndarray | None = None,
+        hand_approach_axis: np.ndarray | None = None,
+        contact_fit_quality: float = 0.0,
     ) -> dict:
         cfg = self.config
         target = np.asarray(target, dtype=np.float64).reshape(3)
@@ -393,6 +422,11 @@ class MultiFeatureCost:
         a_reach, shoulder_distance = self.reach_advantage(target, shoulder_position)
 
         a_delta = self.delta_advantage(target, eef_position, user_translation)
+        a_align = self.alignment_advantage(
+            approach_axis=hand_approach_axis,
+            contact_normal=contact_normal,
+            fit_quality=contact_fit_quality,
+        )
         weighted = {
             "distance": cfg.w_distance * a_dist,
             "ray": 0.0,
@@ -400,6 +434,7 @@ class MultiFeatureCost:
             "agreement": cfg.w_agreement * a_agreement,
             "reach": cfg.w_reach * a_reach,
             "delta": cfg.w_delta * a_delta,
+            "align": cfg.w_align * a_align,
         }
         return {
             "target_m": target.tolist(),
@@ -433,6 +468,10 @@ class MultiFeatureCost:
             "shoulder_target_distance_m": shoulder_distance,
             "reach_advantage": a_reach,
             "delta_advantage": a_delta,
+            "alignment_advantage": a_align,
+            "contact_normal": None if contact_normal is None else np.asarray(contact_normal, dtype=np.float64).reshape(3).tolist(),
+            "hand_approach_axis": None if hand_approach_axis is None else np.asarray(hand_approach_axis, dtype=np.float64).reshape(3).tolist(),
+            "contact_fit_quality": float(contact_fit_quality),
             "weights": {
                 "distance": cfg.w_distance,
                 "ray": 0.0,
@@ -440,6 +479,7 @@ class MultiFeatureCost:
                 "agreement": cfg.w_agreement,
                 "reach": cfg.w_reach,
                 "delta": cfg.w_delta,
+                "align": cfg.w_align,
             },
             "weighted_contributions": weighted,
             "weighted_total": float(sum(weighted.values())),

@@ -18,7 +18,7 @@ import numpy as np
 import zmq
 
 from seg_web_node.ee_target import make_goal_payload
-from seg_web_node.grip_candidates import GripCandidate, PseudoContactPoint
+from seg_web_node.grip_candidates import GripCandidate, SurfacePrimitive
 from seg_web_node.lcm_protocol import (
     decode_calibration,
     decode_camera,
@@ -183,26 +183,39 @@ def _grip_candidate_from_dict(data: dict[str, Any]) -> GripCandidate | None:
     )
 
 
-def _pseudo_contact_from_dict(data: dict[str, Any]) -> PseudoContactPoint | None:
+def _surface_primitive_from_dict(data: dict[str, Any]) -> SurfacePrimitive | None:
     try:
-        center = np.asarray(data.get("center_goal_m"), dtype=np.float64).reshape(3)
-        normal = np.asarray(data.get("normal_goal"), dtype=np.float64).reshape(3)
+        origin = np.asarray(data.get("origin_goal_m"), dtype=np.float64).reshape(3)
+        axis = np.asarray(data.get("axis_goal"), dtype=np.float64).reshape(3)
         fit_quality = float(data.get("fit_quality", 0.0))
     except (TypeError, ValueError):
         return None
-    norm = float(np.linalg.norm(normal))
+    norm = float(np.linalg.norm(axis))
     if (
-        not np.isfinite(center).all()
-        or not np.isfinite(normal).all()
+        not np.isfinite(origin).all()
+        or not np.isfinite(axis).all()
         or not math.isfinite(fit_quality)
         or norm <= 1.0e-9
     ):
         return None
-    return PseudoContactPoint(
-        center=center,
-        normal=normal / norm,
+    radius = data.get("radius", 0.0)
+    half_height = data.get("half_height", 0.0)
+    extent = data.get("extent")
+    try:
+        radius = float(radius)
+        half_height = float(half_height)
+        extent = None if extent is None else np.asarray(extent, dtype=np.float64).reshape(3)
+    except (TypeError, ValueError):
+        return None
+    return SurfacePrimitive(
+        kind=str(data.get("kind", "pca")),
+        origin=origin,
+        axis=axis / norm,
         fit_quality=float(np.clip(fit_quality, 0.0, 1.0)),
         source=str(data.get("source", "remote")),
+        radius=radius,
+        half_height=half_height,
+        extent=extent,
         snapped_to_gravity=bool(data.get("snapped_to_gravity", False)),
     )
 
@@ -446,6 +459,12 @@ class ThorRemoteGateway:
             float(value) for value in ee_target_quaternion_wxyz
         )
         self.belief_enabled = bool(belief_enabled)
+        self.belief_update_hz = max(
+            0.1, float(belief_config.get("belief_update_hz", 30.0))
+        )
+        self.geometry_update_hz = max(
+            0.1, float(belief_config.get("geometry_update_hz", 8.0))
+        )
         self.belief_log_period = 1.0 / max(0.1, float(belief_log_hz))
         self.last_belief_log_monotonic = 0.0
         self.belief_csv = (
@@ -518,6 +537,12 @@ class ThorRemoteGateway:
         )
         self.latest_calibration: tuple[int | None, bytes] | None = None
         self.latest_robot_state: tuple[int | None, bytes] | None = None
+        # Remote SAM3 results supply geometry at the worker rate.  The local
+        # TASC loop below combines that cached geometry with the newest G1
+        # state at its own control rate, exactly as the local SAM3 server does.
+        self.latest_belief_result: dict[str, Any] | None = None
+        self.latest_belief_geometry: Any | None = None
+        self.latest_belief_geometry_sequence = -1
         self.last_result_sequence: int | None = None
         self.stats: dict[str, Any] = {
             "local_rgb": 0,
@@ -551,6 +576,9 @@ class ThorRemoteGateway:
             "belief_log_rows": 0,
             "belief_csv_path": str(self.belief_csv.path) if self.belief_csv else None,
             "belief_telemetry_published": 0,
+            "belief_update_hz": self.belief_update_hz,
+            "belief_geometry_update_hz": self.geometry_update_hz,
+            "belief_updates": 0,
             "sim_robot_state": 0,
             "sim_robot_state_errors": 0,
             "last_sim_robot_state": None,
@@ -577,6 +605,14 @@ class ThorRemoteGateway:
                 threading.Thread(
                     target=self._sim_state_loop,
                     name="sim-state-zmq",
+                    daemon=True,
+                )
+            )
+        if self.belief_enabled and self.parallel_tasc_belief.config.enabled:
+            self.threads.append(
+                threading.Thread(
+                    target=self._belief_loop,
+                    name="remote-tasc-belief",
                     daemon=True,
                 )
             )
@@ -859,15 +895,15 @@ class ThorRemoteGateway:
                     candidate = _grip_candidate_from_dict(raw_candidate)
                     if candidate is not None:
                         candidates.append(candidate)
-            pseudo_contacts: list[PseudoContactPoint] = []
-            raw_pseudo_contacts = obj.get("pseudo_contacts")
-            if isinstance(raw_pseudo_contacts, list):
-                for raw_contact in raw_pseudo_contacts[:1]:
-                    if not isinstance(raw_contact, dict):
+            surface_primitives: list[SurfacePrimitive] = []
+            raw_surface_primitives = obj.get("surface_primitives")
+            if isinstance(raw_surface_primitives, list):
+                for raw_primitive in raw_surface_primitives[:1]:
+                    if not isinstance(raw_primitive, dict):
                         continue
-                    contact = _pseudo_contact_from_dict(raw_contact)
-                    if contact is not None:
-                        pseudo_contacts.append(contact)
+                    primitive = _surface_primitive_from_dict(raw_primitive)
+                    if primitive is not None:
+                        surface_primitives.append(primitive)
             object_id = str(obj.get("track_id") or f"{obj.get('label', 'object')}:{index}")
             inputs.append(
                 BeliefInputObject(
@@ -877,9 +913,9 @@ class ThorRemoteGateway:
                     center_goal_m=center,
                     points_goal_m=None,
                     grip_candidates=candidates or None,
-                    pseudo_contacts=(
-                        pseudo_contacts
-                        if isinstance(raw_pseudo_contacts, list)
+                    surface_primitives=(
+                        surface_primitives
+                        if isinstance(raw_surface_primitives, list)
                         else None
                     ),
                 )
@@ -915,9 +951,17 @@ class ThorRemoteGateway:
         hand_state = data.get("hand") if isinstance(data.get("hand"), dict) else {}
         target = data.get("target") if isinstance(data.get("target"), dict) else None
         if target is not None:
+            frame = target.get("orientation_frame_world")
+            frame_ok = False
+            try:
+                matrix = np.asarray(frame, dtype=np.float64).reshape(3, 3)
+                frame_ok = bool(np.isfinite(matrix).all() and abs(float(np.linalg.det(matrix))) > 0.5)
+            except (TypeError, ValueError, np.linalg.LinAlgError):
+                pass
             target["orientation_valid"] = bool(
-                _finite_vec3(target.get("orientation_axis_world")) is not None
-                and target.get("orientation_relation") in {"parallel", "perpendicular"}
+                ((frame_ok and target.get("orientation_policy") == "grasp_frame")
+                or (_finite_vec3(target.get("orientation_axis_world")) is not None
+                and target.get("orientation_relation") in {"parallel", "perpendicular"}))
                 and float(target.get("orientation_confidence", 0.0) or 0.0)
                 >= self.belief_orientation_min_confidence
             )
@@ -1008,17 +1052,13 @@ class ThorRemoteGateway:
 
     def _belief_state_features(
         self,
-        record: ForwardedPairRecord | None,
+        robot_state_packet: bytes | None,
         hand: str,
     ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
-        if (
-            record is None
-            or record.robot_state is None
-            or hand not in {"left", "right"}
-        ):
+        if robot_state_packet is None or hand not in {"left", "right"}:
             return None, None, None, None
         try:
-            state = decode_robot_state(record.robot_state)
+            state = decode_robot_state(robot_state_packet)
             position = g1_grasp_center_position(
                 state.q,
                 f"{hand}_wrist_yaw_link",
@@ -1049,7 +1089,8 @@ class ThorRemoteGateway:
     def _belief_selection_from_result(
         self,
         payload: dict[str, Any],
-        record: ForwardedPairRecord | None,
+        robot_state_packet: bytes | None,
+        shared_geometry: Any | None = None,
     ) -> tuple[np.ndarray, dict[str, Any], str] | None:
         if not self.belief_enabled or not self.parallel_tasc_belief.config.enabled:
             return None
@@ -1071,7 +1112,7 @@ class ThorRemoteGateway:
             return None
         hand_inputs: dict[str, HandInput] = {}
         for side in ("left", "right"):
-            eef_position, eef_velocity, hand_rotation, hand_omega = self._belief_state_features(record, side)
+            eef_position, eef_velocity, hand_rotation, hand_omega = self._belief_state_features(robot_state_packet, side)
             if eef_position is None:
                 continue
             hand_inputs[side] = HandInput(
@@ -1079,6 +1120,7 @@ class ThorRemoteGateway:
                 user_translation=eef_velocity,
                 hand_rotation=hand_rotation,
                 hand_axis=None,
+                approach_axis=(hand_rotation @ np.asarray(self.belief_hand_profile["approach_axis_local"], dtype=np.float64) if hand_rotation is not None else None),
                 angular_velocity=hand_omega,
                 button_pressed=(self.belief_selection_active and self.belief_selected_hand == side),
             )
@@ -1099,19 +1141,18 @@ class ThorRemoteGateway:
         ray_origin = _finite_vec3(payload.get("camera_goal_origin_m"))
         ray_direction = _finite_vec3(payload.get("camera_goal_forward_m"))
         up_goal = None
-        if record is not None and record.robot_state is not None:
+        if robot_state_packet is not None:
             try:
-                up_goal = gravity_up_in_pelvis(
-                    decode_robot_state(record.robot_state).base_quat_wxyz
-                )
+                up_goal = gravity_up_in_pelvis(decode_robot_state(robot_state_packet).base_quat_wxyz)
             except Exception as error:
                 with self.lock:
                     self.stats["last_belief_gravity_error"] = str(error)
-        shared_geometry = self.parallel_tasc_belief.build_shared_geometry(
-            inputs, ray_origin=ray_origin, ray_direction=ray_direction,
-            up_goal=up_goal,
-            stamp_us=int(payload.get("source_rgb_timestamp_us", 0) or 0),
-        )
+        if shared_geometry is None:
+            shared_geometry = self.parallel_tasc_belief.build_shared_geometry(
+                inputs, ray_origin=ray_origin, ray_direction=ray_direction,
+                up_goal=up_goal,
+                stamp_us=int(payload.get("source_rgb_timestamp_us", 0) or 0),
+            )
         per_hand = self.parallel_tasc_belief.update_hands(shared_geometry, hand_inputs)
         self._publish_belief_telemetry(payload, per_hand)
         selected = per_hand.get(self.belief_selected_hand)
@@ -1188,6 +1229,8 @@ class ThorRemoteGateway:
             "orientation_axis_world": target.get("orientation_axis_world"),
             "orientation_confidence": target.get("orientation_confidence"),
             "orientation_source_position_m": target.get("orientation_source_position_m"),
+            "orientation_policy": target.get("orientation_policy", "minimal_rotation"),
+            "orientation_frame_world": target.get("orientation_frame_world"),
         }
         output = {
             "position": position,
@@ -1204,6 +1247,8 @@ class ThorRemoteGateway:
             "orientation_axis_world": target.get("orientation_axis_world"),
             "orientation_relation": target.get("orientation_relation"),
             "orientation_confidence": target.get("orientation_confidence"),
+            "orientation_policy": target.get("orientation_policy", "minimal_rotation"),
+            "orientation_frame_world": target.get("orientation_frame_world"),
             "position_point": f"{self.belief_hand_model}_grasp_center",
         }
         return position, output, "belief"
@@ -1237,6 +1282,152 @@ class ThorRemoteGateway:
         except Exception as error:
             self._record_error(error)
 
+    def _publish_belief_target(
+        self,
+        payload: dict[str, Any],
+        belief_selection: tuple[np.ndarray, dict[str, Any], str],
+    ) -> None:
+        """Publish the selected hand target from the continuous belief loop."""
+        if self.ee_target_pub is None:
+            return
+        position, selected_output, selected_position_field = belief_selection
+        target_link = self._belief_target_link()
+        target_side = _side_from_link(target_link)
+        orientation_xyzw = _finite_vec4(selected_output.get("orientation_xyzw"))
+        orientation_wxyz = (
+            self.ee_target_quaternion_wxyz
+            if orientation_xyzw is None
+            else (
+                float(orientation_xyzw[3]),
+                float(orientation_xyzw[0]),
+                float(orientation_xyzw[1]),
+                float(orientation_xyzw[2]),
+            )
+        )
+        payload_out = make_goal_payload(
+            position,
+            side=target_side,
+            target_link=target_link,
+            quaternion=orientation_wxyz,
+            duration_sec=self.ee_target_duration_sec,
+            final_hold_sec=self.ee_target_final_hold_sec,
+            workspace_info={
+                "workspace_mode": "remote_gateway_belief",
+                "workspace_reason": "continuous_remote_tasc_belief",
+                "workspace_clamped": False,
+                "requested_position": position.tolist(),
+            },
+            metadata=selected_output["metadata"],
+        )
+        payload_out.update(
+            {
+                "goal_uid": selected_output["goal_uid"],
+                "force_replan": False,
+                "streaming_goal": True,
+                "target_valid": True,
+                "source": selected_output["source"],
+                "confidence": selected_output["confidence"],
+                "object_confidence": selected_output["object_confidence"],
+                "joint_confidence": selected_output["joint_confidence"],
+                "object_id": selected_output["object_id"],
+                "label": selected_output["label"],
+                "grip_index": selected_output["grip_index"],
+                "position_point": selected_output["position_point"],
+                "orientation_axis_world": selected_output["orientation_axis_world"],
+                "orientation_relation": selected_output["orientation_relation"],
+                "orientation_confidence": selected_output["orientation_confidence"],
+                "orientation_policy": selected_output.get("orientation_policy", "minimal_rotation"),
+                "orientation_frame_world": selected_output.get("orientation_frame_world"),
+            }
+        )
+        try:
+            matrix = np.asarray(
+                payload_out.get("orientation_frame_world"), dtype=np.float64
+            ).reshape(3, 3)
+            frame_ok = bool(
+                np.isfinite(matrix).all() and abs(float(np.linalg.det(matrix))) > 0.5
+            )
+        except (TypeError, ValueError, np.linalg.LinAlgError):
+            frame_ok = False
+        relation_ok = bool(
+            _finite_vec3(payload_out.get("orientation_axis_world")) is not None
+            and payload_out.get("orientation_relation") in {"parallel", "perpendicular"}
+        )
+        policy_ok = bool(
+            frame_ok and payload_out.get("orientation_policy") == "grasp_frame"
+        )
+        payload_out["orientation_valid"] = bool(
+            (policy_ok or relation_ok)
+            and float(payload_out.get("orientation_confidence", 0.0) or 0.0)
+            >= self.belief_orientation_min_confidence
+        )
+        self.ee_target_pub.publish(payload_out)
+        with self.lock:
+            self.stats["ee_targets_published"] += 1
+            self.stats["belief_targets"] += 1
+            self.stats["last_ee_target"] = {
+                "sequence": payload.get("sequence"),
+                "label": selected_output["label"],
+                "score": selected_output["confidence"],
+                "joint_confidence": selected_output["joint_confidence"],
+                "target_link": target_link,
+                "position": np.round(position, 4).tolist(),
+                "position_field": selected_position_field,
+            }
+
+    def _belief_loop(self) -> None:
+        """Run belief from cached remote geometry and the latest G1 state."""
+        belief_period = 1.0 / self.belief_update_hz
+        geometry_period = 1.0 / self.geometry_update_hz
+        next_belief = 0.0
+        next_geometry = 0.0
+        while self.running:
+            now = time.monotonic()
+            if now < next_belief:
+                time.sleep(min(0.005, next_belief - now))
+                continue
+            next_belief = max(next_belief + belief_period, now + belief_period)
+            try:
+                self._drain_shared_hand_selection()
+                with self.lock:
+                    result = self.latest_belief_result
+                    robot_state = (
+                        None
+                        if self.latest_robot_state is None
+                        else self.latest_robot_state[1]
+                    )
+                if result is None or robot_state is None:
+                    continue
+                inputs = self._belief_inputs_from_result(result)
+                if not inputs:
+                    continue
+                if (
+                    self.latest_belief_geometry is None
+                    or now >= next_geometry
+                    or int(result.get("sequence", -1))
+                    != self.latest_belief_geometry_sequence
+                ):
+                    state = decode_robot_state(robot_state)
+                    self.latest_belief_geometry = self.parallel_tasc_belief.build_shared_geometry(
+                        inputs,
+                        ray_origin=_finite_vec3(result.get("camera_goal_origin_m")),
+                        ray_direction=_finite_vec3(result.get("camera_goal_forward_m")),
+                        up_goal=gravity_up_in_pelvis(state.base_quat_wxyz),
+                        stamp_us=int(result.get("source_rgb_timestamp_us", 0) or 0),
+                    )
+                    self.latest_belief_geometry_sequence = int(result.get("sequence", -1))
+                    next_geometry = now + geometry_period
+                selection = self._belief_selection_from_result(
+                    result, robot_state, self.latest_belief_geometry
+                )
+                with self.lock:
+                    self.stats["belief_updates"] += 1
+                if selection is not None:
+                    self._publish_belief_target(result, selection)
+            except Exception as error:
+                self._record_error(error)
+                time.sleep(0.01)
+
     def _publish_ee_target_from_result(
         self,
         payload: dict[str, Any],
@@ -1251,7 +1442,15 @@ class ThorRemoteGateway:
                     "error": payload.get("error"),
                 }
             return
-        belief_selection = self._belief_selection_from_result(payload, record)
+        if self.belief_enabled and self.parallel_tasc_belief.config.enabled:
+            # Result callbacks only refresh remote geometry.  The dedicated
+            # belief loop combines it with current G1 FK at 30 Hz.
+            with self.lock:
+                self.latest_belief_result = dict(payload)
+                self.latest_belief_geometry = None
+                self.latest_belief_geometry_sequence = -1
+            return
+        belief_selection = None
         if self.ee_target_pub is None:
             return
         target_link = self._belief_target_link()
@@ -1302,12 +1501,23 @@ class ThorRemoteGateway:
                     "orientation_confidence": selected_output[
                         "orientation_confidence"
                     ],
+                    "orientation_policy": selected_output.get("orientation_policy", "minimal_rotation"),
+                    "orientation_frame_world": selected_output.get("orientation_frame_world"),
                 }
             )
-            payload_out["orientation_valid"] = bool(
+            frame_ok = False
+            try:
+                matrix = np.asarray(payload_out.get("orientation_frame_world"), dtype=np.float64).reshape(3, 3)
+                frame_ok = bool(np.isfinite(matrix).all() and abs(float(np.linalg.det(matrix))) > 0.5)
+            except (TypeError, ValueError, np.linalg.LinAlgError):
+                pass
+            relation_ok = bool(
                 _finite_vec3(payload_out.get("orientation_axis_world")) is not None
-                and payload_out.get("orientation_relation")
-                in {"parallel", "perpendicular"}
+                and payload_out.get("orientation_relation") in {"parallel", "perpendicular"}
+            )
+            policy_ok = bool(frame_ok and payload_out.get("orientation_policy") == "grasp_frame")
+            payload_out["orientation_valid"] = bool(
+                (policy_ok or relation_ok)
                 and float(payload_out.get("orientation_confidence", 0.0) or 0.0)
                 >= self.belief_orientation_min_confidence
             )

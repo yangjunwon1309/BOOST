@@ -8,7 +8,7 @@ from remote_offload.remote_sam3_belief_input_worker import (
 from remote_offload.remote_sam3_worker import MatchedFrameGeometry, RemoteSam3Worker
 from remote_offload.remote_web_server import _belief_for_object, _draw_remote_belief_overlay
 from remote_offload.remote_yolo11_worker import RemoteYolo11Worker
-from remote_offload.thor_gateway import ThorRemoteGateway, _pseudo_contact_from_dict
+from remote_offload.thor_gateway import ThorRemoteGateway, _surface_primitive_from_dict
 from seg_web_node.geometry import CameraIntrinsics
 from seg_web_node.grip_candidates import (
     GripCandidateConfig,
@@ -67,7 +67,7 @@ def test_shared_geometry_pipeline_is_backend_agnostic_and_protocol_valid():
     assert obj["track_id"] == "bottle:track0000"
     assert obj["center_goal_m"] is not None
     assert obj["contact_candidates"]
-    assert len(obj["pseudo_contacts"]) == 1
+    assert len(obj["surface_primitives"]) == 1
     assert obj["source_robot_state_delta_ms"] == 4.2
     assert obj["goal_frame"] == "pelvis_identity_fk"
 
@@ -165,7 +165,7 @@ def test_missing_geometry_context_keeps_mask_but_never_emits_cached_belief_geome
     assert diagnostic[0]["center_camera_m"] is None
     assert diagnostic[0]["center_goal_m"] is None
     assert diagnostic[0]["contact_candidates"] == []
-    assert diagnostic[0]["pseudo_contacts"] == []
+    assert diagnostic[0]["surface_primitives"] == []
     assert diagnostic[0]["geometry_fallback"] is False
 
 
@@ -225,19 +225,22 @@ def test_fifteen_degree_gravity_tilt_controls_non_cylinder_grip_approach():
     np.testing.assert_allclose(candidates[0].approach, -up, atol=1.0e-6)
 
 
-def test_thor_reconstructs_remote_pseudo_contact():
-    contact = _pseudo_contact_from_dict(
+def test_thor_reconstructs_remote_surface_primitive():
+    primitive = _surface_primitive_from_dict(
         {
-            "center_goal_m": [0.3, 0.1, 0.2],
-            "normal_goal": [0.0, 0.0, 2.0],
+            "kind": "cylinder",
+            "origin_goal_m": [0.3, 0.1, 0.2],
+            "axis_goal": [0.0, 0.0, 2.0],
             "fit_quality": 0.8,
-            "source": "cylinder_axis",
+            "source": "cylinder",
+            "radius": 0.04,
+            "half_height": 0.1,
             "snapped_to_gravity": True,
         }
     )
-    assert contact is not None
-    np.testing.assert_allclose(contact.normal, [0.0, 0.0, 1.0])
-    assert contact.snapped_to_gravity is True
+    assert primitive is not None
+    np.testing.assert_allclose(primitive.axis, [0.0, 0.0, 1.0])
+    assert primitive.snapped_to_gravity is True
 
 
 def test_thor_fallback_age_uses_source_frame_clock_domain():
@@ -251,7 +254,7 @@ def test_thor_fallback_age_uses_source_frame_clock_domain():
         "score": 0.9,
         "center_goal_m": [0.3, 0.1, 0.2],
         "contact_candidates": [],
-        "pseudo_contacts": [],
+        "surface_primitives": [],
         "geometry_fallback": True,
         "geometry_source_timestamp_us": 9_500_000,
     }

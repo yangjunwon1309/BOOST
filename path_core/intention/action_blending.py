@@ -62,11 +62,19 @@ class EETarget:
     orientation_axis_world: np.ndarray | None = None
     orientation_relation: str = ""
     orientation_confidence: float = 0.0
+    orientation_policy: str = "minimal_rotation"
+    orientation_frame_world: np.ndarray | None = None
     position_point: str = "canonical_grasp_center"
 
     @property
     def has_orientation_constraint(self) -> bool:
-        return self.orientation_axis_world is not None and self.orientation_relation in {"parallel", "perpendicular"}
+        return (
+            self.orientation_policy == "grasp_frame"
+            and self.orientation_frame_world is not None
+        ) or (
+            self.orientation_axis_world is not None
+            and self.orientation_relation in {"parallel", "perpendicular"}
+        )
 
 
 def _finite_vec3(values: np.ndarray | list[float] | tuple[float, ...] | None) -> np.ndarray | None:

@@ -117,23 +117,51 @@ class GripCandidate:
 
 
 @dataclass(frozen=True)
-class PseudoContactPoint:
-    """Surface sample used as an orientation reference, not a physical contact."""
+class SurfacePrimitive:
+    """Hand-independent local surface model.
 
-    center: np.ndarray
-    normal: np.ndarray
+    A primitive intentionally has no signed contact normal.  A normal is only
+    meaningful after a particular hand position is known, so it is produced by
+    :func:`contact_frame` below rather than being frozen in camera/view space.
+    """
+
+    kind: str
+    origin: np.ndarray
+    axis: np.ndarray
     fit_quality: float
     source: str
+    radius: float = 0.0
+    half_height: float = 0.0
+    extent: np.ndarray | None = None
     snapped_to_gravity: bool = False
 
     def to_dict(self) -> dict:
         return {
-            "center_goal_m": np.asarray(self.center, dtype=np.float64).reshape(3).tolist(),
-            "normal_goal": np.asarray(self.normal, dtype=np.float64).reshape(3).tolist(),
+            "kind": str(self.kind),
+            "origin_goal_m": np.asarray(self.origin, dtype=np.float64).reshape(3).tolist(),
+            "axis_goal": np.asarray(self.axis, dtype=np.float64).reshape(3).tolist(),
             "fit_quality": float(self.fit_quality),
             "source": str(self.source),
+            "radius": float(self.radius),
+            "half_height": float(self.half_height),
+            "extent": None if self.extent is None else np.asarray(self.extent, dtype=np.float64).reshape(3).tolist(),
             "snapped_to_gravity": bool(self.snapped_to_gravity),
         }
+
+
+@dataclass(frozen=True)
+class ContactFrame:
+    """A hand-relative point/normal contact query on a SurfacePrimitive."""
+
+    point: np.ndarray
+    normal: np.ndarray
+    fit_quality: float
+    source: str
+    primitive_kind: str
+
+
+# Retained as an import alias while downstream users move from the old name.
+PseudoContactPoint = SurfacePrimitive
 
 
 @dataclass(frozen=True)
@@ -143,7 +171,6 @@ class PseudoContactConfig:
     plane_ransac_iters: int = 60
     plane_inlier_thresh_m: float = 0.006
     min_inlier_ratio: float = 0.35
-    normal_sign_reference: str = "camera"
     plane_residual_mad_scale: float = 2.5
     plane_refit_iters: int = 2
     gravity_snap_deg: float = 15.0
@@ -162,7 +189,6 @@ class PseudoContactConfig:
             plane_ransac_iters=int(data.get("plane_ransac_iters", 60)),
             plane_inlier_thresh_m=float(data.get("plane_inlier_thresh_m", 0.006)),
             min_inlier_ratio=float(data.get("min_inlier_ratio", 0.35)),
-            normal_sign_reference=str(data.get("normal_sign_reference", "camera")),
             plane_residual_mad_scale=float(data.get("plane_residual_mad_scale", 2.5)),
             plane_refit_iters=int(data.get("plane_refit_iters", 2)),
             gravity_snap_deg=float(data.get("gravity_snap_deg", 15.0)),
@@ -490,21 +516,6 @@ def sample_cylinder_candidates(
     return [candidates[int(index)] for index in indices]
 
 
-def _orient_normal(
-    normal: np.ndarray,
-    point: np.ndarray,
-    view_origin: np.ndarray | None,
-) -> np.ndarray:
-    oriented = _unit(normal, np.array([0.0, 0.0, 1.0]))
-    if view_origin is not None:
-        to_view = _unit(np.asarray(view_origin, dtype=np.float64).reshape(3) - point, oriented)
-        if float(np.dot(oriented, to_view)) < 0.0:
-            oriented = -oriented
-    elif oriented[2] < 0.0:
-        oriented = -oriented
-    return oriented
-
-
 def _fit_plane_ransac(
     points: np.ndarray,
     config: PseudoContactConfig,
@@ -570,12 +581,13 @@ def _fit_plane_ransac(
     return point, normal, inliers, quality
 
 
-def _snap_normal_to_gravity(
-    normal: np.ndarray,
+def _snap_axis_to_gravity(
+    axis: np.ndarray,
     up_goal: np.ndarray | None,
     cone_deg: float,
 ) -> tuple[np.ndarray, bool]:
-    oriented = _unit(normal, np.array([0.0, 0.0, 1.0]))
+    """Regularize an undirected primitive axis, never a contact-normal sign."""
+    oriented = _unit(axis, np.array([0.0, 0.0, 1.0]))
     if up_goal is None:
         return oriented, False
     up = _unit(np.asarray(up_goal, dtype=np.float64), oriented)
@@ -616,16 +628,15 @@ def fit_circle_in_plane(
     return center, radius, rmse
 
 
-def extract_pseudo_contacts(
+def extract_surface_primitives(
     points_goal: np.ndarray,
     config: PseudoContactConfig,
     *,
     cylinder_model: CylinderSurfaceModel | None = None,
-    view_origin: np.ndarray | None = None,
     label: str = "",
     up_goal: np.ndarray | None = None,
-) -> list[PseudoContactPoint]:
-    """Extract orientation-reference surface samples from one object cloud."""
+) -> list[SurfacePrimitive]:
+    """Extract camera-independent local surface primitives from one cloud."""
     if not config.enabled:
         return []
     points = _finite_points(points_goal, 8000)
@@ -633,10 +644,11 @@ def extract_pseudo_contacts(
         return []
     if points.shape[0] < 3:
         center = np.mean(points, axis=0)
-        normal = _unit(up_goal, np.array([0.0, 0.0, 1.0])) if up_goal is not None else np.array([0.0, 0.0, 1.0])
-        return [PseudoContactPoint(
-            center=center,
-            normal=normal,
+        axis = _unit(up_goal, np.array([0.0, 0.0, 1.0])) if up_goal is not None else np.array([0.0, 0.0, 1.0])
+        return [SurfacePrimitive(
+            kind="point",
+            origin=center,
+            axis=axis,
             fit_quality=0.0,
             source="center_fallback",
             snapped_to_gravity=up_goal is not None,
@@ -652,24 +664,24 @@ def extract_pseudo_contacts(
             0.0,
             1.0,
         ))
-        # The temporally filtered cylinder axis is stable; radial normals are
-        # sample-basis dependent and jump across frames.
-        axis, snapped = _snap_normal_to_gravity(
+        axis, snapped = _snap_axis_to_gravity(
             cylinder_model.axis, up_goal, config.gravity_snap_deg
         )
-        return [PseudoContactPoint(
-            center=cylinder_model.center.copy(),
-            normal=axis,
+        return [SurfacePrimitive(
+            kind="cylinder",
+            origin=cylinder_model.center.copy(),
+            axis=axis,
             fit_quality=quality,
-            source="cylinder_axis",
+            source="cylinder",
+            radius=float(cylinder_model.radius),
+            half_height=0.5 * float(cylinder_model.height),
             snapped_to_gravity=snapped,
         )]
 
     plane = _fit_plane_ransac(points, config)
     if plane is not None:
         plane_point, normal, inliers, quality = plane
-        normal = _orient_normal(normal, plane_point, view_origin)
-        normal, snapped = _snap_normal_to_gravity(normal, up_goal, config.gravity_snap_deg)
+        normal, snapped = _snap_axis_to_gravity(normal, up_goal, config.gravity_snap_deg)
         lower_label = str(label).lower()
         if "hole" in lower_label or "circle" in lower_label:
             circle = fit_circle_in_plane(inliers, plane_point, normal)
@@ -677,22 +689,86 @@ def extract_pseudo_contacts(
                 center, radius, rmse = circle
                 if (config.hole_min_radius_m <= radius <= config.hole_max_radius_m
                         and rmse <= max(EPS, config.plane_inlier_thresh_m)):
-                    return [PseudoContactPoint(
-                        center=center,
-                        normal=normal,
+                    return [SurfacePrimitive(
+                        kind="circle",
+                        origin=center,
+                        axis=normal,
                         fit_quality=float(np.clip(quality * np.exp(-rmse / config.plane_inlier_thresh_m), 0.0, 1.0)),
                         source="hole_circle",
+                        radius=float(radius),
                         snapped_to_gravity=snapped,
                     )]
-        return [PseudoContactPoint(
-            center=plane_point.copy(), normal=normal, fit_quality=quality, source="plane",
+        extent = np.ptp(inliers - plane_point, axis=0)
+        return [SurfacePrimitive(
+            kind="plane", origin=plane_point.copy(), axis=normal, fit_quality=quality, source="plane",
+            extent=0.5 * extent,
             snapped_to_gravity=snapped,
         )]
 
     center, axes, _extents = _principal_axes(points)
-    normal = _orient_normal(axes[-1], center, view_origin)
-    normal, snapped = _snap_normal_to_gravity(normal, up_goal, config.gravity_snap_deg)
-    return [PseudoContactPoint(center=center, normal=normal, fit_quality=0.3, source="pca", snapped_to_gravity=snapped)]
+    normal, snapped = _snap_axis_to_gravity(axes[-1], up_goal, config.gravity_snap_deg)
+    return [SurfacePrimitive(kind="pca", origin=center, axis=normal, fit_quality=0.3, source="pca", extent=0.5 * _extents, snapped_to_gravity=snapped)]
+
+
+def extract_pseudo_contacts(*args, **kwargs) -> list[SurfacePrimitive]:
+    """Compatibility name for the v4 primitive extractor."""
+    kwargs.pop("view_origin", None)
+    return extract_surface_primitives(*args, **kwargs)
+
+
+def contact_frame(
+    primitive: SurfacePrimitive,
+    hand_position: np.ndarray,
+    previous_normal: np.ndarray | None = None,
+) -> ContactFrame | None:
+    """Query a continuous hand-relative contact point and outward normal.
+
+    Cylinder normals are radial from the finite cylinder axis to the hand. For
+    an axis singularity we preserve the prior normal instead of inventing a
+    camera-dependent sign. Plane-like primitives pick the side facing the
+    hand; this makes the two hands naturally obtain opposite normals.
+    """
+    hand = np.asarray(hand_position, dtype=np.float64).reshape(3)
+    origin = np.asarray(primitive.origin, dtype=np.float64).reshape(3)
+    axis = _unit(primitive.axis, np.array([0.0, 0.0, 1.0]))
+    previous = None if previous_normal is None else _unit(previous_normal, axis)
+    kind = str(primitive.kind).lower()
+    if kind == "cylinder" and primitive.radius > 0.0:
+        t = float(np.dot(hand - origin, axis))
+        t = float(np.clip(t, -float(primitive.half_height), float(primitive.half_height)))
+        axis_point = origin + t * axis
+        delta = hand - origin
+        radial = delta - float(np.dot(delta, axis)) * axis
+        if float(np.linalg.norm(radial)) < 1.0e-6:
+            if previous is None:
+                return None
+            normal = _unit(previous - float(np.dot(previous, axis)) * axis, np.zeros(3))
+            if float(np.linalg.norm(normal)) < 1.0e-6:
+                return None
+        else:
+            normal = _unit(radial, radial)
+        return ContactFrame(
+            point=axis_point + float(primitive.radius) * normal,
+            normal=normal,
+            fit_quality=float(primitive.fit_quality),
+            source=str(primitive.source),
+            primitive_kind=kind,
+        )
+    signed_axis = axis
+    if float(np.dot(hand - origin, signed_axis)) < 0.0:
+        signed_axis = -signed_axis
+    point = origin.copy()
+    if kind == "plane":
+        delta = hand - origin
+        point = hand - float(np.dot(delta, signed_axis)) * signed_axis
+        if primitive.extent is not None:
+            offset = point - origin
+            tangential = offset - float(np.dot(offset, axis)) * axis
+            span = float(np.linalg.norm(tangential))
+            limit = float(np.max(np.asarray(primitive.extent, dtype=np.float64)))
+            if span > limit > 0.0:
+                point = origin + tangential * (limit / span)
+    return ContactFrame(point=point, normal=signed_axis, fit_quality=float(primitive.fit_quality), source=str(primitive.source), primitive_kind=kind)
 
 
 class PersistentCylinderSurfaceTracker:

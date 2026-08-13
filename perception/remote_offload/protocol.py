@@ -362,29 +362,37 @@ def validate_result(payload: dict[str, Any], context: ValidationContext) -> list
                 errors.append(f"{candidate_prefix}.track_id is invalid")
             if "source" in candidate and not isinstance(candidate.get("source"), str):
                 errors.append(f"{candidate_prefix}.source is invalid")
-        pseudo_contacts = obj.get("pseudo_contacts", [])
-        if pseudo_contacts is None:
-            pseudo_contacts = []
-        if not isinstance(pseudo_contacts, list):
-            errors.append(f"{prefix}.pseudo_contacts must be a list")
+        primitives = obj.get("surface_primitives", [])
+        if primitives is None:
+            primitives = []
+        if not isinstance(primitives, list):
+            errors.append(f"{prefix}.surface_primitives must be a list")
         else:
-            for pseudo_index, contact in enumerate(pseudo_contacts):
-                contact_prefix = f"{prefix}.pseudo_contacts[{pseudo_index}]"
-                if not isinstance(contact, dict):
-                    errors.append(f"{contact_prefix} is not a map")
+            for primitive_index, primitive in enumerate(primitives):
+                primitive_prefix = f"{prefix}.surface_primitives[{primitive_index}]"
+                if not isinstance(primitive, dict):
+                    errors.append(f"{primitive_prefix} is not a map")
                     continue
-                if not _finite_vector(contact.get("center_goal_m"), 3):
-                    errors.append(f"{contact_prefix}.center_goal_m is invalid")
-                if not _finite_vector(contact.get("normal_goal"), 3):
-                    errors.append(f"{contact_prefix}.normal_goal is invalid")
-                if not _finite_number(contact.get("fit_quality")):
-                    errors.append(f"{contact_prefix}.fit_quality is invalid")
-                if not isinstance(contact.get("source"), str):
-                    errors.append(f"{contact_prefix}.source is invalid")
-                if not isinstance(contact.get("snapped_to_gravity"), bool):
+                if primitive.get("kind") not in {"cylinder", "plane", "circle", "pca", "point"}:
+                    errors.append(f"{primitive_prefix}.kind is invalid")
+                for key in ("origin_goal_m", "axis_goal"):
+                    if not _finite_vector(primitive.get(key), 3):
+                        errors.append(f"{primitive_prefix}.{key} is invalid")
+                if not _finite_number(primitive.get("fit_quality")):
+                    errors.append(f"{primitive_prefix}.fit_quality is invalid")
+                if not isinstance(primitive.get("source"), str):
+                    errors.append(f"{primitive_prefix}.source is invalid")
+                if not isinstance(primitive.get("snapped_to_gravity"), bool):
                     errors.append(
-                        f"{contact_prefix}.snapped_to_gravity is invalid"
+                        f"{primitive_prefix}.snapped_to_gravity is invalid"
                     )
+                for key in ("radius", "half_height"):
+                    value = primitive.get(key, 0.0)
+                    if not _finite_number(value) or float(value) < 0.0:
+                        errors.append(f"{primitive_prefix}.{key} is invalid")
+                extent = primitive.get("extent")
+                if extent is not None and not _finite_vector(extent, 3):
+                    errors.append(f"{primitive_prefix}.extent is invalid")
         surface_model = obj.get("surface_model")
         if surface_model is not None:
             if not isinstance(surface_model, dict):

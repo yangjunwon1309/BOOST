@@ -31,8 +31,8 @@ python -u path_streaming/path_state_machine_bridge.py \
   --shared-stale-after-sec "${PATH_SHARED_STALE_AFTER_SEC:-0.3}" \
   --shared-d-max-m "${PATH_SHARED_D_MAX_M:-0.9}" \
   --end-effector-model "${PATH_END_EFFECTOR_MODEL:-dex1}" \
-  --hand-axis-local ${PATH_HAND_AXIS_LOCAL:-1.0 0.0 0.0} \
-  --grasp-center-local ${PATH_GRASP_CENTER_LOCAL:-0.0 0.0 0.060} \
+  --hand-axis-local ${PATH_HAND_AXIS_LOCAL:-0.0 1.0 0.0} \
+  --grasp-center-local ${PATH_GRASP_CENTER_LOCAL:-0.0 0.100 0.0} \
   --shared-ref-lpf-alpha "${PATH_SHARED_REF_LPF_ALPHA:-0.3}" \
   --shared-hand-h-margin-m "${PATH_SHARED_HAND_H_MARGIN_M:-0.05}" \
   --shared-hand-switch-confirm-n "${PATH_SHARED_HAND_SWITCH_CONFIRM_N:-10}" \

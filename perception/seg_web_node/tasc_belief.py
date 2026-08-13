@@ -20,16 +20,25 @@ from .grip_candidates import (
     GripCandidate,
     GripCandidateConfig,
     PseudoContactConfig,
-    PseudoContactPoint,
+    SurfacePrimitive,
+    ContactFrame,
     PersistentCylinderSurfaceTracker,
-    extract_pseudo_contacts,
+    contact_frame,
+    extract_surface_primitives,
     generate_grip_candidates,
 )
-from .robot_geometry import HAND_AXIS_LOCAL
+from .robot_geometry import HAND_AXIS_LOCAL, hand_frame_profile
 
 
 EPS = 1.0e-9
 LOG = logging.getLogger(__name__)
+POLICY_BY_PRIMITIVE = {
+    "cylinder": "grasp_frame",
+    "plane": "minimal_rotation",
+    "circle": "minimal_rotation",
+    "pca": "minimal_rotation",
+    "point": "minimal_rotation",
+}
 
 
 @dataclass(frozen=True)
@@ -40,7 +49,7 @@ class BeliefInputObject:
     center_goal_m: np.ndarray
     points_goal_m: np.ndarray | None = None
     grip_candidates: list[GripCandidate] | None = None
-    pseudo_contacts: list[PseudoContactPoint] | None = None
+    surface_primitives: list[SurfacePrimitive] | None = None
 
 
 @dataclass(frozen=True)
@@ -66,6 +75,9 @@ class OrientationCandidate:
     role: str = "UNKNOWN"
     label_prior: float = 0.0
     source: str = ""
+    primitive_kind: str = ""
+    surface_axis: np.ndarray | None = None
+    primitive: SurfacePrimitive | None = None
 
 
 @dataclass(frozen=True)
@@ -76,6 +88,8 @@ class OrientationTarget:
     object_id: str
     confidence: float
     source_position: np.ndarray
+    policy: str = "minimal_rotation"
+    frame_world: np.ndarray | None = None
 
 
 @dataclass
@@ -103,8 +117,7 @@ class SharedGeometry:
 
     objects: list[BeliefInputObject]
     grip_candidates: dict[str, list[GripCandidate]]
-    pseudo_contacts: dict[str, list[PseudoContactPoint]]
-    orientation_candidates: list[OrientationCandidate]
+    surface_primitives: dict[str, list[SurfacePrimitive]]
     ray_origin: np.ndarray | None
     ray_direction: np.ndarray | None
     stamp_us: int
@@ -118,6 +131,7 @@ class HandInput:
     user_translation: np.ndarray | None
     hand_rotation: np.ndarray | None
     hand_axis: np.ndarray | None
+    approach_axis: np.ndarray | None
     angular_velocity: np.ndarray | None
     button_pressed: bool
     shoulder_position: np.ndarray | None = None
@@ -157,6 +171,7 @@ class TascBeliefConfig:
     orientation_ema_alpha: float = 0.25
     orientation_switch_gamma: float = 4.0
     orientation_relations: tuple[str, ...] = ("parallel", "perpendicular")
+    hand_model: str = "dex1"
     hand_axis_local: tuple[float, float, float] = tuple(HAND_AXIS_LOCAL["dex1"].tolist())
     orientation_match_max_distance_m: float = 0.08
     orientation_match_max_normal_deg: float = 25.0
@@ -278,6 +293,7 @@ class TascBeliefConfig:
             orientation_ema_alpha=float(orientation.get("ema_alpha", data.get("orientation_ema_alpha", 0.25))),
             orientation_switch_gamma=float(orientation.get("switch_gamma", data.get("orientation_switch_gamma", 4.0))),
             orientation_relations=tuple(str(v).lower() for v in orientation.get("relations", data.get("orientation_relations", ("parallel", "perpendicular")))),
+            hand_model=str(data.get("hand_model", orientation.get("hand_model", "dex1"))).lower(),
             hand_axis_local=tuple(float(v) for v in orientation.get("hand_axis_local", data.get("hand_axis_local", HAND_AXIS_LOCAL["dex1"]))),
             orientation_match_max_distance_m=float(orientation.get("match_max_distance_m", data.get("orientation_match_max_distance_m", 0.08))),
             orientation_match_max_normal_deg=float(orientation.get("match_max_normal_deg", data.get("orientation_match_max_normal_deg", 25.0))),
@@ -412,6 +428,38 @@ def _rotation_between(source: np.ndarray, target: np.ndarray) -> np.ndarray:
     axis = cross / sine
     skew = np.array([[0.0, -axis[2], axis[1]], [axis[2], 0.0, -axis[0]], [-axis[1], axis[0], 0.0]])
     return np.eye(3) + sine * skew + (1.0 - cosine) * (skew @ skew)
+
+
+def grasp_frame_from_cylinder(
+    axis: np.ndarray,
+    normal: np.ndarray,
+    reference_rotation: np.ndarray,
+    profile: dict[str, object] | None = None,
+) -> np.ndarray | None:
+    """Construct an SO(3) Dex1 grasp frame from a cylinder contact frame."""
+    cylinder_axis = _unit(axis)
+    contact_normal = _unit(normal)
+    if cylinder_axis is None or contact_normal is None:
+        return None
+    y_axis = -contact_normal
+    x_axis = _unit(np.cross(cylinder_axis, contact_normal))
+    if x_axis is None:
+        return None
+    reference = np.asarray(reference_rotation, dtype=np.float64).reshape(3, 3)
+    spread_local = np.asarray((profile or {}).get("spread_axis_local", [1.0, 0.0, 0.0]), dtype=np.float64).reshape(3)
+    current_spread = _unit(reference @ spread_local)
+    if current_spread is not None and float(np.dot(x_axis, current_spread)) < 0.0:
+        x_axis = -x_axis
+    z_axis = _unit(np.cross(x_axis, y_axis))
+    if z_axis is None:
+        return None
+    frame = np.column_stack((x_axis, y_axis, z_axis))
+    u, _singular, vt = np.linalg.svd(frame)
+    frame = u @ vt
+    if float(np.linalg.det(frame)) < 0.0:
+        u[:, -1] *= -1.0
+        frame = u @ vt
+    return frame
 
 
 class StableObjectIdTracker:
@@ -636,7 +684,6 @@ class HierarchicalTascBelief:
         if not previous:
             return {}
         by_track = {candidate.track_id: index for index, candidate in enumerate(previous) if candidate.track_id}
-        cos_limit = float(np.cos(np.deg2rad(self.config.orientation_match_max_normal_deg)))
         matched: dict[int, int] = {}
         used: set[int] = set()
         for index, candidate in enumerate(candidates):
@@ -652,9 +699,7 @@ class HierarchicalTascBelief:
                 if prior_index in used or other.relation != candidate.relation:
                     continue
                 distance = float(np.linalg.norm(candidate.position - other.position))
-                alignment = abs(float(np.dot(_unit(candidate.normal), _unit(other.normal))))
-                if (distance <= self.config.orientation_match_max_distance_m
-                        and alignment >= cos_limit and distance < best_distance):
+                if distance <= self.config.orientation_match_max_distance_m and distance < best_distance:
                     best, best_distance = prior_index, distance
             if best >= 0:
                 matched[index] = best
@@ -683,7 +728,6 @@ class HierarchicalTascBelief:
         hand_rotation_matrix: np.ndarray | None,
         hand_angular_velocity: np.ndarray | None,
         dt: float,
-        view_origin: np.ndarray | None,
         up_goal: np.ndarray | None = None,
         orientation_candidates: list[OrientationCandidate] | None = None,
     ) -> tuple[OrientationTarget | None, dict, float, float]:
@@ -724,17 +768,19 @@ class HierarchicalTascBelief:
             role, relation_prior = self._classify_label(obj.label)
             if role == "HELD" and self.config.role_hard_filter:
                 continue
-            contacts = obj.pseudo_contacts
-            if contacts is None:
-                contacts = extract_pseudo_contacts(
-                    np.asarray(obj.points_goal_m if obj.points_goal_m is not None else [obj.center_goal_m]),
-                    self.config.pseudo,
-                    cylinder_model=self.surface_tracker.models.get(obj.object_id),
-                    view_origin=view_origin,
-                    label=obj.label,
-                    up_goal=up_goal,
-                )
-            for pseudo_index, contact in enumerate(contacts[: self.config.max_contacts_per_object]):
+            primitives = obj.surface_primitives or extract_surface_primitives(
+                np.asarray(obj.points_goal_m if obj.points_goal_m is not None else [obj.center_goal_m]),
+                self.config.pseudo,
+                cylinder_model=self.surface_tracker.models.get(obj.object_id),
+                label=obj.label,
+                up_goal=up_goal,
+            )
+            for pseudo_index, primitive in enumerate(primitives[: self.config.max_contacts_per_object]):
+                # Standalone use has no per-hand shared geometry.  The current
+                # hand axis selects a deterministic primitive side here.
+                frame = contact_frame(primitive, np.asarray(self.config.fallback_eef_position_m))
+                if frame is None:
+                    continue
                 for relation in self.config.orientation_relations:
                     if relation not in {"parallel", "perpendicular"}:
                         continue
@@ -743,10 +789,11 @@ class HierarchicalTascBelief:
                         prior -= 1.0
                     candidate = OrientationCandidate(
                         object_id=obj.object_id, pseudo_index=pseudo_index, relation=relation,
-                        position=np.asarray(contact.center, dtype=np.float64).reshape(3),
-                        normal=np.asarray(contact.normal, dtype=np.float64).reshape(3),
-                        fit_quality=float(contact.fit_quality), track_id=f"{obj.object_id}:{relation}", label=obj.label,
-                        role=role, label_prior=float(prior), source=contact.source,
+                        position=np.asarray(frame.point, dtype=np.float64).reshape(3),
+                        normal=np.asarray(frame.normal, dtype=np.float64).reshape(3),
+                        fit_quality=float(frame.fit_quality), track_id=f"{obj.object_id}:{relation}", label=obj.label,
+                        role=role, label_prior=float(prior), source=frame.source,
+                        primitive_kind=frame.primitive_kind,
                     )
                     append_candidate(candidate)
         # Keep briefly occluded tracks in the posterior domain. This prevents a
@@ -812,9 +859,19 @@ class HierarchicalTascBelief:
             if self.pending_orientation_switch is None
             else leader_probability
         )
+        profile = hand_frame_profile(self.config.hand_model)
+        frame_world = None
+        policy = "minimal_rotation"
+        if POLICY_BY_PRIMITIVE.get(selected.primitive_kind, "minimal_rotation") == "grasp_frame" and selected.relation == "parallel":
+            axis = selected.primitive.axis if selected.primitive is not None else selected.surface_axis
+            # The cylinder axis is carried in source metadata by v4 candidates.
+            if axis is not None:
+                frame_world = grasp_frame_from_cylinder(axis, selected.normal, rotation, profile)
+                policy = "grasp_frame" if frame_world is not None else "minimal_rotation"
         target = OrientationTarget(
-            quaternion_xyzw=self._quaternion_from_relation(selected, rotation), axis_world=np.asarray(selected.normal, dtype=np.float64),
+            quaternion_xyzw=(_mat_to_quat_xyzw(frame_world) if frame_world is not None else self._quaternion_from_relation(selected, rotation)), axis_world=np.asarray(selected.normal, dtype=np.float64),
             relation=selected.relation, object_id=selected.object_id, confidence=confidence, source_position=np.asarray(selected.position, dtype=np.float64),
+            policy=policy, frame_world=frame_world,
         )
         self.orientation_candidates = candidates
         self.last_orientation_target = target
@@ -823,7 +880,7 @@ class HierarchicalTascBelief:
             "hand_omega_rps": None if hand_angular_velocity is None else np.asarray(hand_angular_velocity, dtype=np.float64).reshape(3).tolist(),
             "candidates": [
                 {"object_id": c.object_id, "label": c.label, "role": roles[i], "relation": c.relation, "track_id": c.track_id, "source": c.source,
-                 "position_goal_m": c.position.tolist(), "normal": c.normal.tolist(), "fit_quality": c.fit_quality, "probability": float(probabilities[i]),
+                 "position_goal_m": c.position.tolist(), "normal": c.normal.tolist(), "fit_quality": c.fit_quality, "primitive_kind": c.primitive_kind, "probability": float(probabilities[i]),
                  "advantage_raw": float(raw[i]), "advantage_ema": float(ema[i]), "advantage_standardized": float(standardized[i]),
                  "label_prior": float(priors[i]), "breakdown": breakdowns[i], "matched_previous": bool(i in match)}
                 for i, c in enumerate(candidates)
@@ -1054,6 +1111,8 @@ class HierarchicalTascBelief:
         controller_orientation_xyzw: np.ndarray | None = None,
         hand_rotation_matrix: np.ndarray | None = None,
         hand_angular_velocity: np.ndarray | None = None,
+        hand_approach_axis: np.ndarray | None = None,
+        contact_frames: dict[str, ContactFrame] | None = None,
         up_goal: np.ndarray | None = None,
         beta_override: float | None = None,
         lambda0_override: float | None = None,
@@ -1106,6 +1165,9 @@ class HierarchicalTascBelief:
                 eef_position=eef_position,
                 user_translation=user_translation_mps,
                 shoulder_position=shoulder_position_m,
+                contact_normal=(contact_frames or {}).get(obj.object_id).normal if (contact_frames or {}).get(obj.object_id) is not None else None,
+                hand_approach_axis=hand_approach_axis,
+                contact_fit_quality=float((contact_frames or {}).get(obj.object_id).fit_quality) if (contact_frames or {}).get(obj.object_id) is not None else 0.0,
             )
             for obj in valid_objects
         ]
@@ -1195,6 +1257,9 @@ class HierarchicalTascBelief:
                     eef_position=eef_position,
                     user_translation=user_translation_mps,
                     shoulder_position=shoulder_position_m,
+                    contact_normal=(contact_frames or {}).get(obj.object_id).normal if (contact_frames or {}).get(obj.object_id) is not None else candidate.surface_normal,
+                    hand_approach_axis=hand_approach_axis,
+                    contact_fit_quality=float((contact_frames or {}).get(obj.object_id).fit_quality) if (contact_frames or {}).get(obj.object_id) is not None else float(candidate.geom_score),
                 )
                 for candidate in candidates
             ]
@@ -1289,7 +1354,6 @@ class HierarchicalTascBelief:
                 hand_rotation_matrix=hand_rotation_matrix,
                 hand_angular_velocity=hand_angular_velocity,
                 dt=dt,
-                view_origin=ray_origin_m,
                 up_goal=up_goal,
                 orientation_candidates=orientation_candidates,
             )
@@ -1297,6 +1361,8 @@ class HierarchicalTascBelief:
         self.last_target = best_target
         target_dict = None
         if best_target is not None:
+            if orientation_target is not None and orientation_target.object_id != best_target.object_id:
+                orientation_target = None
             target_quaternion = (
                 best_target.orientation_xyzw
                 if orientation_target is None
@@ -1320,6 +1386,8 @@ class HierarchicalTascBelief:
                     "orientation_axis_world": orientation_target.axis_world.tolist(),
                     "orientation_confidence": float(orientation_target.confidence),
                     "orientation_source_position_m": orientation_target.source_position.tolist(),
+                    "orientation_policy": orientation_target.policy,
+                    "orientation_frame_world": None if orientation_target.frame_world is None else orientation_target.frame_world.tolist(),
                 })
         self.last_telemetry = {
             "enabled": True,
@@ -1436,9 +1504,8 @@ class ParallelTascBelief:
         active = {obj.object_id for obj in kept}
         self.geometry_surface_tracker.finish_frame(active)
         object_candidates: dict[str, list[GripCandidate]] = {}
-        object_pseudo: dict[str, list[PseudoContactPoint]] = {}
+        object_primitives: dict[str, list[SurfacePrimitive]] = {}
         shared_objects: list[BeliefInputObject] = []
-        orientations: list[OrientationCandidate] = []
         for obj in kept:
             candidates = obj.grip_candidates
             if candidates is None:
@@ -1448,31 +1515,16 @@ class ParallelTascBelief:
                         obj.points_goal_m, self.config.grip, up_goal=up_goal
                     )
             candidates = list(candidates or [])[: self.config.max_contacts_per_object]
-            contacts = obj.pseudo_contacts
-            if contacts is None:
+            primitives = obj.surface_primitives
+            if primitives is None:
                 cloud = obj.points_goal_m if obj.points_goal_m is not None else np.asarray([obj.center_goal_m])
-                contacts = extract_pseudo_contacts(cloud, self.config.pseudo, cylinder_model=self.geometry_surface_tracker.models.get(obj.object_id), view_origin=ray_origin, label=obj.label, up_goal=up_goal)
-            contacts = list(contacts or [])[:1]
+                primitives = extract_surface_primitives(cloud, self.config.pseudo, cylinder_model=self.geometry_surface_tracker.models.get(obj.object_id), label=obj.label, up_goal=up_goal)
+            primitives = list(primitives or [])[:1]
             object_candidates[obj.object_id] = candidates
-            object_pseudo[obj.object_id] = contacts
-            shared_objects.append(BeliefInputObject(obj.object_id, obj.label, obj.score, obj.center_goal_m, None, candidates, contacts))
-            role, relation_prior = classify_label(obj.label, self.config.label_role_keywords, self.config.label_relation_prior)
-            if role == "HELD" and self.config.role_hard_filter:
-                continue
-            for index, contact in enumerate(contacts):
-                for relation in self.config.orientation_relations:
-                    if relation not in {"parallel", "perpendicular"}:
-                        continue
-                    prior = self.config.label_prior_scale * relation_prior.get(relation, 0.0)
-                    if role == "HELD":
-                        prior -= 1.0
-                    orientations.append(OrientationCandidate(
-                        obj.object_id, index, relation, contact.center, contact.normal, contact.fit_quality,
-                        track_id=f"{obj.object_id}:{relation}", label=obj.label, role=role,
-                        label_prior=float(prior), source=contact.source,
-                    ))
+            object_primitives[obj.object_id] = primitives
+            shared_objects.append(BeliefInputObject(obj.object_id, obj.label, obj.score, obj.center_goal_m, None, candidates, primitives))
         surface_status = {object_id: self.geometry_surface_tracker.status(object_id) for object_id in active}
-        geometry = SharedGeometry(shared_objects, object_candidates, object_pseudo, orientations[: self.config.max_orientation_candidates], ray_origin, ray_direction, int(stamp_us), up_goal=up_goal, surface_status=surface_status)
+        geometry = SharedGeometry(shared_objects, object_candidates, object_primitives, ray_origin, ray_direction, int(stamp_us), up_goal=up_goal, surface_status=surface_status)
         self.last_geometry = geometry
         return geometry
 
@@ -1503,6 +1555,47 @@ class ParallelTascBelief:
             if hand_rotation is None and hand.hand_axis is not None:
                 # No orientation target can be synthesized from an axis alone.
                 hand_rotation = None
+            contact_frames: dict[str, ContactFrame] = {}
+            orientation_candidates: list[OrientationCandidate] = []
+            for obj in shared.objects:
+                primitives = shared.surface_primitives.get(obj.object_id, [])
+                if not primitives:
+                    continue
+                primitive = primitives[0]
+                prior_normal = None
+                for old in tracker.orientation_candidates:
+                    if old.object_id == obj.object_id:
+                        prior_normal = old.normal
+                        break
+                frame = contact_frame(primitive, hand.eef_position, prior_normal)
+                if frame is None:
+                    continue
+                contact_frames[obj.object_id] = frame
+                role, relation_prior = classify_label(obj.label, self.config.label_role_keywords, self.config.label_relation_prior)
+                if role == "HELD" and self.config.role_hard_filter:
+                    continue
+                for relation in self.config.orientation_relations:
+                    if relation not in {"parallel", "perpendicular"}:
+                        continue
+                    prior = self.config.label_prior_scale * relation_prior.get(relation, 0.0)
+                    if role == "HELD":
+                        prior -= 1.0
+                    orientation_candidates.append(OrientationCandidate(
+                        object_id=obj.object_id,
+                        pseudo_index=0,
+                        relation=relation,
+                        position=frame.point,
+                        normal=frame.normal,
+                        fit_quality=frame.fit_quality,
+                        track_id=f"{obj.object_id}:{relation}",
+                        label=obj.label,
+                        role=role,
+                        label_prior=float(prior),
+                        source=frame.source,
+                        primitive_kind=frame.primitive_kind,
+                        surface_axis=np.asarray(primitive.axis, dtype=np.float64).reshape(3),
+                        primitive=primitive,
+                    ))
             telemetry = tracker.update(
                 shared.objects,
                 eef_position_m=hand.eef_position,
@@ -1512,8 +1605,10 @@ class ParallelTascBelief:
                 ray_direction=shared.ray_direction,
                 hand_rotation_matrix=hand_rotation,
                 hand_angular_velocity=hand.angular_velocity,
+                hand_approach_axis=hand.approach_axis,
+                contact_frames=contact_frames,
                 up_goal=shared.up_goal,
-                orientation_candidates=shared.orientation_candidates,
+                orientation_candidates=orientation_candidates[: self.config.max_orientation_candidates],
                 surface_status=shared.surface_status,
                 beta_override=state.beta_current,
                 lambda0_override=state.lambda0_current,

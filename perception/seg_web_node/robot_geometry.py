@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import collections
 import math
+import logging
 
 import numpy as np
 
 from .lcm_protocol import RobotState
+
+
+LOG = logging.getLogger(__name__)
 
 
 JOINT_NAMES_URDF = [
@@ -185,30 +189,33 @@ _BRAINCO_HAND_BASE_TRANSLATION_FROM_WRIST = {
     "right": np.array([0.0415, -0.0030, 0.0], dtype=np.float64),
 }
 
-# Directly read from the Dex1 G1 assembly URDF:
-# g1_29dof_mode_15_with_dex1_1.urdf, left/right_base_joint. Both attachments
-# are fixed joints with rpy=0 and xyz=(0.0415, 0, 0).
+# The wrist-to-base attachment is retained from the existing assembly model.
+# Its exact Dex1-1 verification remains a hardware/URDF preflight item.
+_DEX1_OFFSET_VERIFIED = False
+_DEX1_OFFSET_WARNING_EMITTED = False
 _DEX1_HAND_BASE_ROTATION_FROM_WRIST = {
     "left": np.eye(3, dtype=np.float64),
     "right": np.eye(3, dtype=np.float64),
 }
 _DEX1_HAND_BASE_TRANSLATION_FROM_WRIST = {
-    "left": np.array([0.0415, 0.0, 0.0], dtype=np.float64),
-    "right": np.array([0.0415, 0.0, 0.0], dtype=np.float64),
+    # Measured usable Dex1 grasp-base reference: +X is forward from the
+    # wrist-yaw axis, 45 mm in the plane normal to the yaw axis.
+    "left": np.array([0.0450, 0.0, 0.0], dtype=np.float64),
+    "right": np.array([0.0450, 0.0, 0.0], dtype=np.float64),
 }
 
 # Keep the existing 6 cm canonical EE offset while transitioning hardware.
 # It remains a configurable base-local point; it is deliberately not replaced
 # with the estimated Dex1 fingertip centre until hardware validation is done.
 _BRAINCO_GRASP_CENTER_LOCAL = np.array([0.0, 0.0, 0.060], dtype=np.float64)
-_DEX1_GRASP_CENTER_LOCAL = np.array([0.0, 0.0, 0.060], dtype=np.float64)
+_DEX1_GRASP_CENTER_LOCAL = np.array([0.0, 0.100, 0.0], dtype=np.float64)
 
 # The orientation relation is defined against this physical hand axis.  It is
 # deliberately exported so perception and the PATH bridge cannot silently use
 # different Dex1/BrainCo conventions.
 HAND_AXIS_LOCAL = {
     "brainco": np.array([0.0, 1.0, 0.0], dtype=np.float64),
-    "dex1": np.array([1.0, 0.0, 0.0], dtype=np.float64),
+    "dex1": np.array([0.0, 1.0, 0.0], dtype=np.float64),
 }
 
 _HAND_FRAME_PROFILES = {
@@ -217,6 +224,9 @@ _HAND_FRAME_PROFILES = {
         "translation": _BRAINCO_HAND_BASE_TRANSLATION_FROM_WRIST,
         "grasp_center_local": _BRAINCO_GRASP_CENTER_LOCAL,
         "orientation_axis_local": HAND_AXIS_LOCAL["brainco"],
+        "approach_axis_local": HAND_AXIS_LOCAL["brainco"],
+        "spread_axis_local": np.array([1.0, 0.0, 0.0], dtype=np.float64),
+        "stagger_axis_local": np.array([0.0, 0.0, 1.0], dtype=np.float64),
     },
     "dex1": {
         "rotation": _DEX1_HAND_BASE_ROTATION_FROM_WRIST,
@@ -224,6 +234,12 @@ _HAND_FRAME_PROFILES = {
         "grasp_center_local": _DEX1_GRASP_CENTER_LOCAL,
         # Dex1-1: +Y is finger extension; +/-X is the parallel-jaw spread.
         "orientation_axis_local": HAND_AXIS_LOCAL["dex1"],
+        "approach_axis_local": np.array([0.0, 1.0, 0.0], dtype=np.float64),
+        "spread_axis_local": np.array([1.0, 0.0, 0.0], dtype=np.float64),
+        "stagger_axis_local": np.array([0.0, 0.0, 1.0], dtype=np.float64),
+        "jaw_stroke_m": 0.089,
+        "jaw_gap_open_m": 0.0951,
+        "jaw_gap_closed_m": 0.0061,
     },
 }
 
@@ -234,12 +250,23 @@ def hand_frame_profile(hand_model: str = "dex1") -> dict[str, object]:
     if model not in _HAND_FRAME_PROFILES:
         raise ValueError(f"unsupported hand model: {hand_model!r}")
     profile = _HAND_FRAME_PROFILES[model]
+    global _DEX1_OFFSET_WARNING_EMITTED
+    if model == "dex1" and not _DEX1_OFFSET_VERIFIED and not _DEX1_OFFSET_WARNING_EMITTED:
+        LOG.warning("Dex1 wrist/base offset is unverified; validate against the installed Dex1 URDF and hardware before tuning grasp offsets")
+        _DEX1_OFFSET_WARNING_EMITTED = True
     return {
         "name": model,
         "rotation": {side: value.copy() for side, value in profile["rotation"].items()},
         "translation": {side: value.copy() for side, value in profile["translation"].items()},
         "grasp_center_local": profile["grasp_center_local"].copy(),
         "orientation_axis_local": profile["orientation_axis_local"].copy(),
+        "approach_axis_local": profile["approach_axis_local"].copy(),
+        "spread_axis_local": profile["spread_axis_local"].copy(),
+        "stagger_axis_local": profile["stagger_axis_local"].copy(),
+        "jaw_stroke_m": float(profile.get("jaw_stroke_m", 0.0)),
+        "jaw_gap_open_m": float(profile.get("jaw_gap_open_m", 0.0)),
+        "jaw_gap_closed_m": float(profile.get("jaw_gap_closed_m", 0.0)),
+        "offset_verified": bool(_DEX1_OFFSET_VERIFIED) if model == "dex1" else True,
     }
 
 

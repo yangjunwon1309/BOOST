@@ -539,7 +539,6 @@ def test_standalone_orientation_ghost_stays_in_lockstep():
         hand_rotation_matrix=np.eye(3),
         hand_angular_velocity=np.zeros(3),
         dt=1.0 / 30.0,
-        view_origin=None,
     )
     assert target is not None
     assert len(telemetry["candidates"]) == belief.orientation_advantage_ema.size
@@ -581,7 +580,7 @@ def test_new_orientation_candidate_enters_at_existing_posterior_floor():
     ]
     _target, telemetry, _, _ = belief._update_orientation_belief(
         [], hand_rotation_matrix=np.eye(3), hand_angular_velocity=np.zeros(3),
-        dt=1.0 / 30.0, view_origin=None, orientation_candidates=candidates,
+        dt=1.0 / 30.0, orientation_candidates=candidates,
     )
     probabilities = np.asarray([item["probability"] for item in telemetry["candidates"]])
     new_index = next(i for i, item in enumerate(telemetry["candidates"]) if item["track_id"] == "new:parallel")

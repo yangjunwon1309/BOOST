@@ -66,7 +66,7 @@ from path_core.intention.action_blending import (
     SharedControlConfig,
     rotation_target_from_relation,
 )
-from perception.seg_web_node.robot_geometry import HAND_AXIS_LOCAL
+from perception.seg_web_node.robot_geometry import HAND_AXIS_LOCAL, hand_frame_profile
 from path_core.intention.reference_dynamics import (
     OrientationTargetGate,
     SecondOrderOrientationReference,
@@ -1253,6 +1253,17 @@ def ee_target_from_static_payload(
             axis_vector = candidate
     except (TypeError, ValueError):
         pass
+    frame_world = None
+    try:
+        candidate = np.asarray(payload.get("orientation_frame_world"), dtype=np.float64).reshape(3, 3)
+        if np.isfinite(candidate).all() and abs(float(np.linalg.det(candidate))) > 0.5:
+            u, _singular, vt = np.linalg.svd(candidate)
+            frame_world = u @ vt
+            if float(np.linalg.det(frame_world)) < 0.0:
+                u[:, -1] *= -1.0
+                frame_world = u @ vt
+    except (TypeError, ValueError, np.linalg.LinAlgError):
+        pass
     return EETarget(
         position=position,
         confidence=confidence,
@@ -1267,6 +1278,8 @@ def ee_target_from_static_payload(
         orientation_axis_world=axis_vector if bool(payload.get("orientation_valid", False)) else None,
         orientation_relation=str(payload.get("orientation_relation", "") or ""),
         orientation_confidence=_float_field(payload, "orientation_confidence", default=0.0),
+        orientation_policy=str(payload.get("orientation_policy", "minimal_rotation") or "minimal_rotation"),
+        orientation_frame_world=frame_world if bool(payload.get("orientation_valid", False)) else None,
         position_point=str(payload.get("position_point", "wrist_origin")),
     )
 
@@ -1481,9 +1494,9 @@ def main() -> int:
             flush=True,
         )
     if args.grasp_center_local is None:
-        # Keep the existing 6 cm base-local target for both profiles until the
-        # physical Dex1 fingertip/contact location is measured.
-        args.grasp_center_local = (0.0, 0.0, 0.060)
+        args.grasp_center_local = tuple(
+            np.asarray(hand_frame_profile(args.end_effector_model)["grasp_center_local"], dtype=np.float64)
+        )
     if not args.arm_nonlinear_ik_enabled:
         raise RuntimeError(
             "PATH requires CasADi/IPOPT arm ownership; "
@@ -2767,16 +2780,21 @@ def main() -> int:
                                 if hand_axis_local_override
                                 else HAND_AXIS_LOCAL[target_model]
                             )
-                            constrained = rotation_target_from_relation(
-                                current_rotation,
-                                belief_target.orientation_axis_world,
-                                belief_target.orientation_relation,
-                                target_hand_axis,
+                            constrained = (
+                                belief_target.orientation_frame_world
+                                if belief_target.orientation_policy == "grasp_frame"
+                                and belief_target.orientation_frame_world is not None
+                                else rotation_target_from_relation(
+                                    current_rotation,
+                                    belief_target.orientation_axis_world,
+                                    belief_target.orientation_relation,
+                                    target_hand_axis,
+                                )
                             )
                             gate = orientation_gate[side]
                             if gate.accept(constrained, current_rotation, dt):
                                 rotation_target = constrained
-                                orientation_source = "belief_relation"
+                                orientation_source = f"belief_{belief_target.orientation_policy}"
                                 zeta_ori = shared_config.zeta_armed
                                 omega_n_ori = shared_config.omega_n_orientation_armed
                             else:

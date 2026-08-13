@@ -214,9 +214,8 @@ tasc_belief:
     # Uniform posterior-drift probability per nominal 30 Hz belief tick.
     # Runtime scales it exponentially by elapsed time.
     persist_leak: 0.02
-  # Object/contact and orientation belief are separate posteriors. Dex1-1 is
-  # mounted with its base aligned to wrist_yaw_link; its parallel-jaw spread
-  # axis is base-local +X.
+  # Object/contact and orientation belief are separate posteriors. Dex1 uses
+  # base-local +Y as finger extension/approach and +/-X as jaw spread.
   hand_model: dex1
   orientation:
     enabled: true
@@ -225,7 +224,7 @@ tasc_belief:
     max_prob: 0.99
     ema_alpha: 0.25
     relations: [parallel, perpendicular]
-    hand_axis_local: [1.0, 0.0, 0.0]
+    hand_axis_local: [0.0, 1.0, 0.0]
     match_max_distance_m: 0.08
     match_max_normal_deg: 25.0
     track_missing_ttl_frames: 5
@@ -244,7 +243,6 @@ tasc_belief:
       plane_ransac_iters: 60
       plane_inlier_thresh_m: 0.006
       min_inlier_ratio: 0.35
-      normal_sign_reference: camera
       plane_residual_mad_scale: 2.5
       plane_refit_iters: 2
       gravity_snap_deg: 15.0
@@ -267,10 +265,9 @@ tasc_belief:
   max_objects: 10
   max_contacts_per_object: 6
   max_orientation_candidates: 96
-  # Canonical belief EE point in the active hand base frame. Keep the existing
-  # 6 cm local offset until the physical Dex1 fingertip/contact point is
-  # calibrated on hardware.
-  grasp_center_local_m: [0.0, 0.0, 0.060]
+  # Dex1 canonical grasp center in the hand base frame. Validate the hardware
+  # offset against the installed Dex1 URDF before any real grasp experiment.
+  grasp_center_local_m: [0.0, 0.100, 0.0]
   fallback_eef_position_m: [0.0, 0.0, 0.0]
   features:
     w_distance: 1.4
@@ -278,6 +275,8 @@ tasc_belief:
     w_agreement: 0.4
     w_reach: 1.0
     w_delta: 0.0
+    w_align: 0.9
+    align_min_quality: 0.25
     w_orientation: 0.8
     min_user_speed_mps: 0.005
     distance: {k: 1.5, delta: 0.10, c: 0.1}

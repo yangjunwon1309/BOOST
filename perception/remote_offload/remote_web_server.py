@@ -480,7 +480,7 @@ class RemoteWebRuntime:
                     "center_goal_m": obj.get("center_goal_m"),
                     "target_contact_goal_m": obj.get("target_contact_goal_m"),
                     "contact_candidates": obj.get("contact_candidates", []),
-                    "pseudo_contacts": obj.get("pseudo_contacts", []),
+                    "surface_primitives": obj.get("surface_primitives", []),
                     "surface_model": obj.get("surface_model"),
                     "point_filter": obj.get("point_filter"),
                     "geometry_fallback": obj.get("geometry_fallback", False),
@@ -553,13 +553,13 @@ class RemoteWebRuntime:
                         color,
                         -1,
                     )
-                pseudo_contacts = obj.get("pseudo_contacts") or []
-                if pseudo_contacts:
-                    normal = pseudo_contacts[0].get("normal_goal")
-                    if isinstance(normal, list) and len(normal) == 3:
+                primitives = obj.get("surface_primitives") or []
+                if primitives:
+                    axis = primitives[0].get("axis_goal")
+                    if isinstance(axis, list) and len(axis) == 3:
                         end = (
-                            int(center[0] + 35.0 * float(normal[0])),
-                            int(center[1] - 35.0 * float(normal[1])),
+                            int(center[0] + 35.0 * float(axis[0])),
+                            int(center[1] - 35.0 * float(axis[1])),
                         )
                         cv2.arrowedLine(
                             overlay, center, end, (220, 100, 255), 2, tipLength=0.25

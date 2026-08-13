@@ -1,0 +1,22 @@
+# RTX 4060 remote SAM3 worker. PyTorch 2.7.1/torchvision 0.22.1 are installed
+# first from the cu126 wheel index selected by Dockerfile.remote-sam3.
+numpy>=1.26,<2
+scipy>=1.13,<2
+Pillow>=10,<13
+PyYAML>=6,<7
+fastapi>=0.115,<1
+uvicorn[standard]>=0.34,<1
+websockets>=14,<17
+lcm>=1.5,<2
+msgpack>=1.0,<2
+opencv-python-headless>=4.10,<5
+huggingface-hub>=0.29,<2
+transformers==5.0.0rc1
+accelerate>=1.1,<2
+# SAM3's pinned rope module imports einops from its notebook extra even during
+# normal image-model import, so keep it explicit in the worker runtime.
+einops>=0.8,<1
+# The pinned image-model import reaches SAM3's shared training dataclasses,
+# whose COCO loader imports this module eagerly even for inference-only use.
+pycocotools>=2.0.10,<3
+pytest>=8,<10

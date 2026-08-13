@@ -112,8 +112,9 @@ python -m pip install -r docker/requirements-remote-yolo11.txt
 python -m pip install --no-deps ultralytics==8.4.108
 ```
 
-Use the SAM3 venv only if explicitly testing SAM3. Keep Hugging Face tokens
-outside repo files.
+SAM3 is intentionally not installed in a host venv. Use the dedicated RTX 4060
+container described in `REMOTE_SAM3_BELIEF_INPUT_WORKER.md`, and keep Hugging
+Face tokens outside repo files.
 
 ## Thor Gateway
 
@@ -187,27 +188,41 @@ result with an error string instead of reusing old coordinates.
 
 ## Desktop SAM3 Worker
 
-Run this on the external desktop:
+Build and run the dedicated RTX 4060 container on the external laptop. Do not
+install SAM3 into the host/root Python environment:
 
 ```bash
 cd /path/to/PATH-G1/perception
-source .venv-remote-sam3/bin/activate
-python -m remote_offload.remote_sam3_worker \
-  --wifi-lcm-url "$WIFI_LCM_URL" \
-  --backend pytorch \
-  --concepts 'object' \
-  --inference-hz 3 \
-  --extrinsics config/extrinsics.yaml
+docker build -t path-g1-remote-sam3:rtx4060 \
+  -f docker/Dockerfile.remote-sam3 .
+docker run --rm --gpus all --network host \
+  -e HF_TOKEN \
+  -v "$PWD/models:/models:ro" \
+  -v "$PWD/config:/workspace/perception/config:ro" \
+  -v "$HOME/.cache/huggingface:/cache/huggingface" \
+  -v "$HOME/.cache/torch:/cache/torch" \
+  path-g1-remote-sam3:rtx4060 \
+  python -m remote_offload.remote_sam3_belief_input_worker \
+    --wifi-lcm-url "$WIFI_LCM_URL" \
+    --config config/pipeline.yaml \
+    --backend pytorch \
+    --concepts 'object' \
+    --inference-hz 3 \
+    --publish-overlay-jpeg
 ```
 
 For transport-only validation without SAM3 weights:
 
 ```bash
-python -m remote_offload.remote_sam3_worker \
-  --wifi-lcm-url "$WIFI_LCM_URL" \
-  --backend mock \
-  --concepts 'object' \
-  --inference-hz 3
+docker run --rm --network host \
+  -v "$PWD/config:/workspace/perception/config:ro" \
+  path-g1-remote-sam3:rtx4060 \
+  python -m remote_offload.remote_sam3_belief_input_worker \
+    --wifi-lcm-url "$WIFI_LCM_URL" \
+    --config config/pipeline.yaml \
+    --backend mock \
+    --concepts 'object' \
+    --inference-hz 3
 ```
 
 If SAM3/model state is unavailable, the worker publishes a fresh
@@ -219,11 +234,12 @@ Run this on the external desktop:
 
 ```bash
 cd /path/to/PATH-G1/perception
-source .venv-remote-sam3/bin/activate
-python -m remote_offload.remote_web_server \
-  --wifi-lcm-url "$WIFI_LCM_URL" \
-  --host 0.0.0.0 \
-  --port 8081
+docker run --rm --network host \
+  path-g1-remote-sam3:rtx4060 \
+  python -m remote_offload.remote_web_server \
+    --wifi-lcm-url "$WIFI_LCM_URL" \
+    --host 0.0.0.0 \
+    --port 8081
 ```
 
 Open:
@@ -326,15 +342,21 @@ python tools/thor_remote_rgbd_gateway.py \
   --wifi-lcm-url "$WIFI_LCM_URL"
 
 # Terminal 2, desktop
-python -m remote_offload.remote_sam3_worker \
-  --wifi-lcm-url "$WIFI_LCM_URL" \
-  --backend mock
+docker run --rm --network host \
+  -v "$PWD/config:/workspace/perception/config:ro" \
+  path-g1-remote-sam3:rtx4060 \
+  python -m remote_offload.remote_sam3_belief_input_worker \
+    --wifi-lcm-url "$WIFI_LCM_URL" \
+    --config config/pipeline.yaml \
+    --backend mock
 
 # Terminal 3, desktop
-python -m remote_offload.remote_web_server \
-  --wifi-lcm-url "$WIFI_LCM_URL" \
-  --host 0.0.0.0 \
-  --port 8081
+docker run --rm --network host \
+  path-g1-remote-sam3:rtx4060 \
+  python -m remote_offload.remote_web_server \
+    --wifi-lcm-url "$WIFI_LCM_URL" \
+    --host 0.0.0.0 \
+    --port 8081
 
 # Terminal 4, Thor, using the existing mock publisher
 python tools/mock_rgbd_publisher.py \

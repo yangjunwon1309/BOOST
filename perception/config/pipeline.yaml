@@ -25,6 +25,13 @@ segmentation:
     engine: /models/sam3_trt/sam3_fp16_4out.engine
     model_id: facebook/sam3
     mask_threshold: 0.5
+  # Remote RTX worker settings. Shared thresholds above remain the defaults;
+  # this map holds only SAM3-specific remote geometry persistence overrides.
+  sam3:
+    concepts: [object]
+    track:
+      geometry_fallback_ttl_frames: 6
+      geometry_fallback_score_decay: 0.97
   # Shared RGB-D self-filter for every vision backend. The server/remote worker
   # reads synchronized LCM depth, color intrinsics, camera extrinsics and
   # G1_ROBOT_STATE, renders padded FK collision primitives to a robot depth

@@ -18,7 +18,7 @@ import numpy as np
 import zmq
 
 from seg_web_node.ee_target import make_goal_payload
-from seg_web_node.grip_candidates import GripCandidate
+from seg_web_node.grip_candidates import GripCandidate, PseudoContactPoint
 from seg_web_node.lcm_protocol import (
     decode_calibration,
     decode_camera,
@@ -30,6 +30,7 @@ from seg_web_node.robot_geometry import (
     angular_velocity_from_rotations,
     g1_hand_base_rotation,
     g1_grasp_center_position,
+    gravity_up_in_pelvis,
     hand_frame_profile,
 )
 from seg_web_node.tasc_belief import (
@@ -45,6 +46,7 @@ from .protocol import (
     LOCAL_RGB_CHANNEL,
     LOCAL_ROBOT_STATE_CHANNEL,
     REMOTE_CALIBRATION_CHANNEL,
+    REMOTE_BELIEF_TELEMETRY_CHANNEL,
     REMOTE_DEPTH_CHANNEL,
     REMOTE_HEARTBEAT_CHANNEL,
     REMOTE_OVERLAY_CHANNEL,
@@ -52,6 +54,8 @@ from .protocol import (
     REMOTE_RGB_CHANNEL,
     REMOTE_ROBOT_STATE_CHANNEL,
     ValidationContext,
+    now_us,
+    pack_belief_telemetry,
     unpack_heartbeat,
     unpack_result,
     validate_result,
@@ -177,6 +181,48 @@ def _grip_candidate_from_dict(data: dict[str, Any]) -> GripCandidate | None:
         geom_score=geom_score,
         source=str(data.get("source", "remote")),
     )
+
+
+def _pseudo_contact_from_dict(data: dict[str, Any]) -> PseudoContactPoint | None:
+    try:
+        center = np.asarray(data.get("center_goal_m"), dtype=np.float64).reshape(3)
+        normal = np.asarray(data.get("normal_goal"), dtype=np.float64).reshape(3)
+        fit_quality = float(data.get("fit_quality", 0.0))
+    except (TypeError, ValueError):
+        return None
+    norm = float(np.linalg.norm(normal))
+    if (
+        not np.isfinite(center).all()
+        or not np.isfinite(normal).all()
+        or not math.isfinite(fit_quality)
+        or norm <= 1.0e-9
+    ):
+        return None
+    return PseudoContactPoint(
+        center=center,
+        normal=normal / norm,
+        fit_quality=float(np.clip(fit_quality, 0.0, 1.0)),
+        source=str(data.get("source", "remote")),
+        snapped_to_gravity=bool(data.get("snapped_to_gravity", False)),
+    )
+
+
+def _msgpack_safe(value: Any) -> Any:
+    """Convert bounded telemetry values to plain MessagePack-safe Python."""
+    if value is None or isinstance(value, (str, bytes, bool, int)):
+        return value
+    if isinstance(value, (float, np.floating)):
+        numeric = float(value)
+        return numeric if math.isfinite(numeric) else None
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.ndarray):
+        return _msgpack_safe(value.tolist())
+    if isinstance(value, dict):
+        return {str(key): _msgpack_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_msgpack_safe(item) for item in value]
+    return str(value)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -422,6 +468,17 @@ class ThorRemoteGateway:
         self.belief_orientation_min_confidence = float(
             belief_config.get("orientation_min_confidence", 0.35)
         )
+        self.belief_telemetry_period_sec = 0.1
+        self.last_belief_telemetry_monotonic = 0.0
+        self.belief_telemetry_max_objects = max(
+            1, int(belief_config.get("max_objects", 10))
+        )
+        self.belief_telemetry_max_contacts = max(
+            1, int(belief_config.get("max_contacts_per_object", 6))
+        )
+        self.belief_telemetry_max_orientations = max(
+            1, int(belief_config.get("max_orientation_candidates", 96))
+        )
         # Compatibility only. Canonical EE geometry is now supplied by the
         # selected hand profile instead of a wrist +x scalar offset.
         self.belief_ee_offset_m = float(belief_ee_offset_m)
@@ -493,6 +550,7 @@ class ThorRemoteGateway:
             "belief_log_ticks": 0,
             "belief_log_rows": 0,
             "belief_csv_path": str(self.belief_csv.path) if self.belief_csv else None,
+            "belief_telemetry_published": 0,
             "sim_robot_state": 0,
             "sim_robot_state_errors": 0,
             "last_sim_robot_state": None,
@@ -760,6 +818,10 @@ class ThorRemoteGateway:
         payload: dict[str, Any],
     ) -> list[BeliefInputObject]:
         inputs: list[BeliefInputObject] = []
+        # Geometry timestamps share the original camera packet clock domain,
+        # which is not required to be Unix wall time.  Compare fallback age to
+        # the current result's source frame, never to this process's clock.
+        current_timestamp_us = int(payload.get("source_rgb_timestamp_us", 0) or 0)
         for index, obj in enumerate(payload.get("objects", [])):
             if not isinstance(obj, dict):
                 continue
@@ -775,6 +837,19 @@ class ThorRemoteGateway:
             center = _finite_vec3(obj.get("center_goal_m"))
             if center is None:
                 continue
+            geometry_timestamp_us = obj.get(
+                "geometry_source_timestamp_us",
+                payload.get("source_rgb_timestamp_us"),
+            )
+            if bool(obj.get("geometry_fallback", False)):
+                try:
+                    geometry_age_ms = (
+                        current_timestamp_us - int(geometry_timestamp_us)
+                    ) / 1000.0
+                except (TypeError, ValueError):
+                    continue
+                if geometry_age_ms < -100.0 or geometry_age_ms > self.result_max_age_ms:
+                    continue
             candidates: list[GripCandidate] = []
             raw_candidates = obj.get("contact_candidates")
             if isinstance(raw_candidates, list):
@@ -784,6 +859,15 @@ class ThorRemoteGateway:
                     candidate = _grip_candidate_from_dict(raw_candidate)
                     if candidate is not None:
                         candidates.append(candidate)
+            pseudo_contacts: list[PseudoContactPoint] = []
+            raw_pseudo_contacts = obj.get("pseudo_contacts")
+            if isinstance(raw_pseudo_contacts, list):
+                for raw_contact in raw_pseudo_contacts[:1]:
+                    if not isinstance(raw_contact, dict):
+                        continue
+                    contact = _pseudo_contact_from_dict(raw_contact)
+                    if contact is not None:
+                        pseudo_contacts.append(contact)
             object_id = str(obj.get("track_id") or f"{obj.get('label', 'object')}:{index}")
             inputs.append(
                 BeliefInputObject(
@@ -793,9 +877,98 @@ class ThorRemoteGateway:
                     center_goal_m=center,
                     points_goal_m=None,
                     grip_candidates=candidates or None,
+                    pseudo_contacts=(
+                        pseudo_contacts
+                        if isinstance(raw_pseudo_contacts, list)
+                        else None
+                    ),
                 )
             )
         return inputs
+
+    def _bounded_hand_telemetry(self, value: Any) -> dict[str, Any]:
+        data = _msgpack_safe(value if isinstance(value, dict) else {})
+        if not isinstance(data, dict):
+            data = {}
+        objects = data.get("objects")
+        if not isinstance(objects, list):
+            objects = []
+        objects = objects[: self.belief_telemetry_max_objects]
+        for obj in objects:
+            if not isinstance(obj, dict):
+                continue
+            for key in (
+                "grip_candidates",
+                "grip_probabilities",
+                "grip_advantages",
+                "grip_track_ids",
+            ):
+                if isinstance(obj.get(key), list):
+                    obj[key] = obj[key][: self.belief_telemetry_max_contacts]
+        orientation = data.get("orientation")
+        if isinstance(orientation, dict) and isinstance(
+            orientation.get("candidates"), list
+        ):
+            orientation["candidates"] = orientation["candidates"][
+                : self.belief_telemetry_max_orientations
+            ]
+        hand_state = data.get("hand") if isinstance(data.get("hand"), dict) else {}
+        target = data.get("target") if isinstance(data.get("target"), dict) else None
+        if target is not None:
+            target["orientation_valid"] = bool(
+                _finite_vec3(target.get("orientation_axis_world")) is not None
+                and target.get("orientation_relation") in {"parallel", "perpendicular"}
+                and float(target.get("orientation_confidence", 0.0) or 0.0)
+                >= self.belief_orientation_min_confidence
+            )
+        return {
+            **data,
+            "armed": bool(hand_state.get("armed", False)),
+            "alpha": float(hand_state.get("alpha", 0.0) or 0.0),
+            "target": target,
+            "objects": objects,
+            "orientation": orientation if isinstance(orientation, dict) else {},
+        }
+
+    def _publish_belief_telemetry(
+        self,
+        payload: dict[str, Any],
+        per_hand: dict[str, Any],
+    ) -> None:
+        now_monotonic = time.monotonic()
+        if (
+            now_monotonic - self.last_belief_telemetry_monotonic
+            < self.belief_telemetry_period_sec
+        ):
+            return
+        self.last_belief_telemetry_monotonic = now_monotonic
+        published_timestamp_us = now_us()
+        source_rgb_timestamp_us = int(
+            payload.get("source_rgb_timestamp_us", 0) or 0
+        )
+        packet = {
+            "version": 1,
+            "published_timestamp_us": published_timestamp_us,
+            "source_rgb_timestamp_us": source_rgb_timestamp_us,
+            "result_sequence": int(payload.get("sequence", -1)),
+            "selected_hand": self.belief_selected_hand,
+            "hands": {
+                side: self._bounded_hand_telemetry(per_hand.get(side, {}))
+                for side in ("left", "right")
+            },
+            "result_valid": bool(payload.get("valid", False)),
+            "result_age_ms": max(
+                0.0,
+                (published_timestamp_us - int(payload.get("published_timestamp_us", 0)))
+                / 1000.0,
+            ),
+        }
+        self.wifi_bus.publish(
+            REMOTE_BELIEF_TELEMETRY_CHANNEL,
+            pack_belief_telemetry(_msgpack_safe(packet)),
+        )
+        with self.lock:
+            self.stats["belief_telemetry_published"] += 1
 
     def _drain_shared_hand_selection(self) -> None:
         while True:
@@ -925,11 +1098,22 @@ class ThorRemoteGateway:
             return None
         ray_origin = _finite_vec3(payload.get("camera_goal_origin_m"))
         ray_direction = _finite_vec3(payload.get("camera_goal_forward_m"))
+        up_goal = None
+        if record is not None and record.robot_state is not None:
+            try:
+                up_goal = gravity_up_in_pelvis(
+                    decode_robot_state(record.robot_state).base_quat_wxyz
+                )
+            except Exception as error:
+                with self.lock:
+                    self.stats["last_belief_gravity_error"] = str(error)
         shared_geometry = self.parallel_tasc_belief.build_shared_geometry(
             inputs, ray_origin=ray_origin, ray_direction=ray_direction,
+            up_goal=up_goal,
             stamp_us=int(payload.get("source_rgb_timestamp_us", 0) or 0),
         )
         per_hand = self.parallel_tasc_belief.update_hands(shared_geometry, hand_inputs)
+        self._publish_belief_telemetry(payload, per_hand)
         selected = per_hand.get(self.belief_selected_hand)
         telemetry = (
             dict(selected)
@@ -1058,8 +1242,6 @@ class ThorRemoteGateway:
         payload: dict[str, Any],
         record: ForwardedPairRecord | None,
     ) -> None:
-        if self.ee_target_pub is None:
-            return
         if not bool(payload.get("valid", False)):
             with self.lock:
                 self.stats["ee_targets_skipped"] += 1
@@ -1070,6 +1252,8 @@ class ThorRemoteGateway:
                 }
             return
         belief_selection = self._belief_selection_from_result(payload, record)
+        if self.ee_target_pub is None:
+            return
         target_link = self._belief_target_link()
         target_side = _side_from_link(target_link)
         if belief_selection is not None:

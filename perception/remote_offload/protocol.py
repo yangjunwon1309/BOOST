@@ -26,6 +26,7 @@ REMOTE_ROBOT_STATE_CHANNEL = "PATH_REMOTE_ROBOT_STATE"
 REMOTE_RESULT_CHANNEL = "PATH_REMOTE_PERCEPTION_RESULT"
 REMOTE_HEARTBEAT_CHANNEL = "PATH_REMOTE_PERCEPTION_HEARTBEAT"
 REMOTE_OVERLAY_CHANNEL = "PATH_REMOTE_OVERLAY_JPEG"
+REMOTE_BELIEF_TELEMETRY_CHANNEL = "PATH_REMOTE_BELIEF_TELEMETRY"
 
 MASK_ENCODING = "bitpack-zlib-row-major"
 BACKENDS = {"sam3_pytorch", "sam3_tensorrt", "yolo11_pytorch", "mock"}
@@ -74,6 +75,17 @@ def unpack_heartbeat(data: bytes) -> dict[str, Any]:
     payload = msgpack.unpackb(data, raw=False, strict_map_key=False)
     if not isinstance(payload, dict):
         raise ValueError("remote heartbeat payload is not a map")
+    return payload
+
+
+def pack_belief_telemetry(payload: dict[str, Any]) -> bytes:
+    return msgpack.packb(payload, use_bin_type=True, strict_types=False)
+
+
+def unpack_belief_telemetry(data: bytes) -> dict[str, Any]:
+    payload = msgpack.unpackb(data, raw=False, strict_map_key=False)
+    if not isinstance(payload, dict):
+        raise ValueError("remote belief telemetry payload is not a map")
     return payload
 
 
@@ -302,6 +314,27 @@ def validate_result(payload: dict[str, Any], context: ValidationContext) -> list
             errors.append(f"{prefix}.center_goal_m is invalid")
         if not isinstance(obj.get("valid_depth_points"), int) or obj["valid_depth_points"] < 0:
             errors.append(f"{prefix}.valid_depth_points is invalid")
+        if "source_robot_state_delta_ms" in obj:
+            delta_ms = obj.get("source_robot_state_delta_ms")
+            if not _finite_number(delta_ms, allow_none=True) or (
+                delta_ms is not None and float(delta_ms) < 0.0
+            ):
+                errors.append(f"{prefix}.source_robot_state_delta_ms is invalid")
+        if "goal_frame" in obj and obj.get("goal_frame") != "pelvis_identity_fk":
+            errors.append(f"{prefix}.goal_frame is invalid")
+        if "geometry_source_timestamp_us" in obj:
+            geometry_timestamp = obj.get("geometry_source_timestamp_us")
+            if not isinstance(geometry_timestamp, int) or geometry_timestamp <= 0:
+                errors.append(f"{prefix}.geometry_source_timestamp_us is invalid")
+        if "geometry_fallback" in obj and not isinstance(
+            obj.get("geometry_fallback"), bool
+        ):
+            errors.append(f"{prefix}.geometry_fallback is invalid")
+        if "missing_frames" in obj and (
+            not isinstance(obj.get("missing_frames"), int)
+            or int(obj.get("missing_frames", -1)) < 0
+        ):
+            errors.append(f"{prefix}.missing_frames is invalid")
         if not _finite_vector(obj.get("target_contact_goal_m"), 3, allow_none=True):
             errors.append(f"{prefix}.target_contact_goal_m is invalid")
         contact_candidates = obj.get("contact_candidates", [])
@@ -329,6 +362,29 @@ def validate_result(payload: dict[str, Any], context: ValidationContext) -> list
                 errors.append(f"{candidate_prefix}.track_id is invalid")
             if "source" in candidate and not isinstance(candidate.get("source"), str):
                 errors.append(f"{candidate_prefix}.source is invalid")
+        pseudo_contacts = obj.get("pseudo_contacts", [])
+        if pseudo_contacts is None:
+            pseudo_contacts = []
+        if not isinstance(pseudo_contacts, list):
+            errors.append(f"{prefix}.pseudo_contacts must be a list")
+        else:
+            for pseudo_index, contact in enumerate(pseudo_contacts):
+                contact_prefix = f"{prefix}.pseudo_contacts[{pseudo_index}]"
+                if not isinstance(contact, dict):
+                    errors.append(f"{contact_prefix} is not a map")
+                    continue
+                if not _finite_vector(contact.get("center_goal_m"), 3):
+                    errors.append(f"{contact_prefix}.center_goal_m is invalid")
+                if not _finite_vector(contact.get("normal_goal"), 3):
+                    errors.append(f"{contact_prefix}.normal_goal is invalid")
+                if not _finite_number(contact.get("fit_quality")):
+                    errors.append(f"{contact_prefix}.fit_quality is invalid")
+                if not isinstance(contact.get("source"), str):
+                    errors.append(f"{contact_prefix}.source is invalid")
+                if not isinstance(contact.get("snapped_to_gravity"), bool):
+                    errors.append(
+                        f"{contact_prefix}.snapped_to_gravity is invalid"
+                    )
         surface_model = obj.get("surface_model")
         if surface_model is not None:
             if not isinstance(surface_model, dict):

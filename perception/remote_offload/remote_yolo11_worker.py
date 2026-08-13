@@ -8,28 +8,20 @@ import time
 from pathlib import Path
 from typing import Any
 
-import cv2
 import numpy as np
 import yaml
 
-from seg_web_node.geometry import (
-    CameraIntrinsics,
-    transform_points,
-)
-from seg_web_node.grip_candidates import (
-    GripCandidateConfig,
-    PersistentCylinderSurfaceTracker,
-    generate_grip_candidates,
-)
-from seg_web_node.geometry_fallback import LastValidGeometryFallback
+from seg_web_node.geometry import CameraIntrinsics
+from seg_web_node.grip_candidates import GripCandidateConfig, PseudoContactConfig
 from seg_web_node.rgbd_sync import RgbdPair
-from seg_web_node.object_point_filter import (
-    ObjectPointFilterConfig,
-    extract_filtered_object_cloud,
-)
+from seg_web_node.object_point_filter import ObjectPointFilterConfig
 from seg_web_node.yolo11_backend import Yolo11SegBackend
 
-from .protocol import make_empty_result, make_object
+from .protocol import make_empty_result
+from .remote_geometry_pipeline import (
+    RemoteRgbdGeometryPipeline,
+    camera_geometry_metadata,
+)
 from .remote_sam3_worker import RemoteSam3Worker, load_extrinsics, parse_concepts
 
 
@@ -71,15 +63,13 @@ class RemoteYolo11Worker(RemoteSam3Worker):
         object_point_filter: dict[str, Any],
         contact_candidates: bool,
         contact_config: GripCandidateConfig,
+        pseudo_config: PseudoContactConfig | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self.yolo_options = dict(yolo_options)
         self.depth_self_filter_options = dict(depth_self_filter)
-        self.object_point_filter = ObjectPointFilterConfig.from_dict(object_point_filter)
-        self.contact_candidates_enabled = bool(contact_candidates)
-        self.contact_config = contact_config
-        self.surface_tracker = PersistentCylinderSurfaceTracker(contact_config)
+        self.geometry_requires_robot_state = True
         track_options = dict(self.yolo_options.get("track", {}))
         fallback_ttl = int(
             track_options.get(
@@ -87,14 +77,27 @@ class RemoteYolo11Worker(RemoteSam3Worker):
                 track_options.get("missing_ttl_frames", 6),
             )
         )
-        self.geometry_fallback = LastValidGeometryFallback(
-            fallback_ttl,
-            float(track_options.get("geometry_fallback_score_decay", 0.97)),
+        self.geometry_pipeline = RemoteRgbdGeometryPipeline(
+            object_point_filter=ObjectPointFilterConfig.from_dict(object_point_filter),
+            contact_config=contact_config,
+            pseudo_config=pseudo_config,
+            contact_candidates=contact_candidates,
+            min_depth_m=self.min_depth_m,
+            max_depth_m=self.max_depth_m,
+            min_depth_points=self.min_depth_points,
+            tracker=self.tracker,
+            fallback_ttl_frames=fallback_ttl,
+            fallback_score_decay=float(
+                track_options.get("geometry_fallback_score_decay", 0.97)
+            ),
+            fallback_reason="yolo_detection_missing",
         )
-        self.tracker.missing_ttl_frames = max(
-            int(self.tracker.missing_ttl_frames),
-            fallback_ttl,
-        )
+        # Compatibility handles for diagnostics/tests that inspect worker state.
+        self.object_point_filter = self.geometry_pipeline.object_point_filter
+        self.contact_candidates_enabled = self.geometry_pipeline.contact_candidates_enabled
+        self.contact_config = contact_config
+        self.surface_tracker = self.geometry_pipeline.surface_tracker
+        self.geometry_fallback = self.geometry_pipeline.geometry_fallback
 
     def _backend_display_name(self) -> str:
         return "YOLO11"
@@ -136,53 +139,22 @@ class RemoteYolo11Worker(RemoteSam3Worker):
         intrinsics: CameraIntrinsics | None,
         pair: RgbdPair,
     ) -> None:
-        if not hasattr(backend, "set_depth_filter_context"):
-            return
-        if intrinsics is None:
-            backend.set_depth_filter_context(
-                image_bgr=image_bgr,
-                depth_raw=depth,
-                depth_scale_um=pair.depth.depth_scale_um,
-                intrinsics=None,
-                t_goal_cam=None,
-                q=None,
-            )
-            return
         try:
-            t_goal_cam = self._goal_transform(pair.rgb.timestamp_us)
-            match = self.state_buffer.nearest(
-                pair.rgb.timestamp_us,
-                self.robot_state_max_delta_ms,
+            super()._prepare_backend_for_frame(
+                backend, image_bgr, depth, intrinsics, pair
             )
-            if t_goal_cam is None or match is None:
+        except Exception as error:
+            LOG.warning("depth self-filter context unavailable: %s", error)
+            self.frame_geometry = None
+            if hasattr(backend, "set_depth_filter_context"):
                 backend.set_depth_filter_context(
                     image_bgr=image_bgr,
                     depth_raw=depth,
                     depth_scale_um=pair.depth.depth_scale_um,
-                    intrinsics=intrinsics,
+                    intrinsics=None,
                     t_goal_cam=None,
                     q=None,
                 )
-                return
-            state, _delta_ms = match
-            backend.set_depth_filter_context(
-                image_bgr=image_bgr,
-                depth_raw=depth,
-                depth_scale_um=pair.depth.depth_scale_um,
-                intrinsics=intrinsics,
-                t_goal_cam=t_goal_cam,
-                q=state.q,
-            )
-        except Exception as error:
-            LOG.warning("depth self-filter context unavailable: %s", error)
-            backend.set_depth_filter_context(
-                image_bgr=image_bgr,
-                depth_raw=depth,
-                depth_scale_um=pair.depth.depth_scale_um,
-                intrinsics=None,
-                t_goal_cam=None,
-                q=None,
-            )
 
     def _build_result(
         self,
@@ -207,115 +179,31 @@ class RemoteYolo11Worker(RemoteSam3Worker):
             backend=backend_wire_name,
             inference_ms=inference_ms,
         )
-        t_goal_cam = self._goal_transform(pair.rgb.timestamp_us)
-        if t_goal_cam is not None:
-            # The optical +Z axis is the image-center ray in the common goal
-            # frame.  The Thor gateway uses it for the TASC ray feature.
-            payload["camera_goal_origin_m"] = (
-                np.asarray(t_goal_cam[:3, 3], dtype=np.float64).tolist()
-            )
-            payload["camera_goal_forward_m"] = (
-                np.asarray(t_goal_cam[:3, :3], dtype=np.float64)
-                @ np.array([0.0, 0.0, 1.0], dtype=np.float64)
-            ).tolist()
-        depth_m = depth.astype(np.float32) * (pair.depth.depth_scale_um / 1_000_000.0)
-
-        detections: list[dict[str, Any]] = []
-        for index, (mask, label, score) in enumerate(zip(masks, labels, scores)):
-            mask_bool = np.asarray(mask, dtype=bool)
-            detection: dict[str, Any] = {
-                "index": index,
-                "label": str(label),
-                "score": float(score),
-                "center_camera_m": None,
-                "center_goal_m": None,
-                "center_pixel_uv": None,
-                "valid_depth_points": 0,
-                "median_depth_m": None,
-                "target_contact_goal_m": None,
-                "contact_candidates": [],
-                "surface_model": None,
-                "point_filter": None,
-                "_points_goal_m": None,
-            }
-            cloud = None
-            if intrinsics is not None:
-                cloud = extract_filtered_object_cloud(
-                    depth_m,
-                    mask_bool,
-                    intrinsics,
-                    self.object_point_filter,
-                    min_depth_m=self.min_depth_m,
-                    max_depth_m=self.max_depth_m,
-                    min_valid_points=self.min_depth_points,
-                    max_points=self.contact_config.max_points,
-                )
-            if cloud is not None:
-                detection["median_depth_m"] = cloud.median_depth_m
-                detection["center_camera_m"] = cloud.center_camera_m.tolist()
-                detection["center_pixel_uv"] = [
-                    int(cloud.center_pixel_uv[0]),
-                    int(cloud.center_pixel_uv[1]),
-                ]
-                detection["valid_depth_points"] = cloud.valid_depth_points
-                detection["point_filter"] = cloud.stats
-                if t_goal_cam is not None:
-                    center_goal = transform_points(cloud.center_camera_m, t_goal_cam)
-                    detection["center_goal_m"] = center_goal.tolist()
-                    if self.contact_candidates_enabled:
-                        detection["_points_goal_m"] = transform_points(
-                            cloud.points_camera_m,
-                            t_goal_cam,
-                        )
-            detections.append(detection)
-
-        track_ids = self.tracker.assign(detections)
-        active_track_ids: set[str] = set()
-        wire_objects: list[dict[str, Any]] = []
-        for index, (mask, box, score, label) in enumerate(zip(masks, boxes, scores, labels)):
-            detection = detections[index]
-            track_id = track_ids.get(index, f"{label}:untracked{index:04d}")
-            points_goal = detection.pop("_points_goal_m", None)
-            if self.contact_candidates_enabled and points_goal is not None:
-                active_track_ids.add(track_id)
-                fitted_candidates = self.surface_tracker.update(
-                    track_id,
-                    str(label),
-                    points_goal,
-                )
-                if not fitted_candidates:
-                    fitted_candidates = generate_grip_candidates(
-                        points_goal,
-                        self.contact_config,
-                    )
-                candidates = [candidate.to_dict() for candidate in fitted_candidates]
-                detection["contact_candidates"] = candidates
-                detection["surface_model"] = self.surface_tracker.status(track_id)
-                if candidates:
-                    detection["target_contact_goal_m"] = candidates[0]["center_goal_m"]
-            wire_object = make_object(
-                track_id=track_id,
-                label=str(label),
-                score=float(score),
-                box_xyxy=[float(value) for value in box],
-                mask=mask,
-                median_depth_m=detection.get("median_depth_m"),
-                center_pixel_uv=detection.get("center_pixel_uv"),
-                center_camera_m=detection.get("center_camera_m"),
-                center_goal_m=detection.get("center_goal_m"),
-                valid_depth_points=int(detection.get("valid_depth_points", 0)),
-                target_contact_goal_m=detection.get("target_contact_goal_m"),
-                contact_candidates=detection.get("contact_candidates"),
-                surface_model=detection.get("surface_model"),
-            )
-            wire_object["point_filter"] = detection.get("point_filter")
-            wire_objects.append(wire_object)
-        self.surface_tracker.finish_frame(active_track_ids)
-        payload["objects"] = self.geometry_fallback.complete_frame(
-            wire_objects,
-            self.surface_tracker,
+        context = self._current_frame_geometry(pair.rgb.timestamp_us)
+        payload.update(camera_geometry_metadata(context.t_goal_cam))
+        payload["gravity_up_goal"] = (
+            None if context.up_goal is None else context.up_goal.tolist()
+        )
+        geometry_intrinsics = (
+            intrinsics
+            if context.state is not None and context.t_goal_cam is not None
+            else None
+        )
+        payload["objects"] = self.geometry_pipeline.build_object_geometry(
+            masks=masks,
+            boxes=boxes,
+            scores=scores,
+            labels=labels,
+            depth_raw=depth,
+            depth_scale_um=pair.depth.depth_scale_um,
+            intrinsics=geometry_intrinsics,
+            t_goal_cam=context.t_goal_cam if geometry_intrinsics is not None else None,
+            up_goal=context.up_goal,
+            source_robot_state_delta_ms=context.state_delta_ms,
+            source_timestamp_us=pair.rgb.timestamp_us,
             image_width=pair.rgb.width,
             image_height=pair.rgb.height,
+            allow_geometry_fallback=geometry_intrinsics is not None,
         )
         return payload
 
@@ -391,6 +279,13 @@ def main(argv: list[str] | None = None) -> int:
             ),
         )
     )
+    pseudo_config_data = dict(tasc_config.get("pseudo", {}))
+    orientation_config = dict(tasc_config.get("orientation", {}))
+    pseudo_config_data.update(dict(orientation_config.get("pseudo", {})))
+    pseudo_config_data["gravity_snap_deg"] = orientation_config.get(
+        "gravity_snap_deg",
+        pseudo_config_data.get("gravity_snap_deg", 15.0),
+    )
     extrinsics_path = args.extrinsics or (
         Path(str(target_config["extrinsics"])) if target_config.get("extrinsics") else None
     )
@@ -461,6 +356,7 @@ def main(argv: list[str] | None = None) -> int:
         object_point_filter=dict(cloud_config.get("object_filter", {})),
         contact_candidates=not bool(args.disable_contact_candidates),
         contact_config=GripCandidateConfig.from_dict(contact_config_data),
+        pseudo_config=PseudoContactConfig.from_dict(pseudo_config_data),
     )
     worker.start()
     LOG.info("remote YOLO11 worker started on Wi-Fi LCM; publishes perception results only")

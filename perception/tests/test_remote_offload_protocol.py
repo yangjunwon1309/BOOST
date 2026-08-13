@@ -64,6 +64,20 @@ def _payload():
                     "updates": 4,
                     "stale_frames": 0,
                 },
+                "pseudo_contacts": [
+                    {
+                        "center_goal_m": [0.3, 0.1, 0.2],
+                        "normal_goal": [0.0, 0.0, 1.0],
+                        "fit_quality": 0.81,
+                        "source": "cylinder_axis",
+                        "snapped_to_gravity": True,
+                    }
+                ],
+                "source_robot_state_delta_ms": 4.2,
+                "geometry_source_timestamp_us": 90,
+                "goal_frame": "pelvis_identity_fk",
+                "geometry_fallback": False,
+                "missing_frames": 0,
             }
         ],
     }
@@ -84,4 +98,11 @@ def test_remote_perception_rejects_invalid_cylinder_surface():
     payload = _payload()
     payload["objects"][0]["surface_model"]["radius_m"] = float("nan")
     with pytest.raises(ValueError, match="surface_model.radius_m"):
+        encode_perception_result(payload)
+
+
+def test_remote_perception_rejects_invalid_pseudo_contact():
+    payload = _payload()
+    payload["objects"][0]["pseudo_contacts"][0]["normal_goal"] = [0.0, 1.0]
+    with pytest.raises(ValueError, match="pseudo_contacts.*normal_goal"):
         encode_perception_result(payload)

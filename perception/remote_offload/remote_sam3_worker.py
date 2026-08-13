@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import logging
 import threading
 import time
@@ -30,7 +31,12 @@ from seg_web_node.lcm_protocol import (
     decode_robot_state,
 )
 from seg_web_node.rgbd_sync import RgbdPair, RgbdSynchronizer, depth_at_rgb_size
-from seg_web_node.robot_geometry import RobotStateBuffer, camera_goal_transform
+from seg_web_node.robot_geometry import (
+    RobotStateBuffer,
+    camera_goal_transform,
+    gravity_up_in_pelvis,
+    pelvis_to_torso,
+)
 from seg_web_node.sam3_backend import TensorRTSam3Backend, TorchSam3Backend
 from seg_web_node.visualization import render_segmented_rgbd
 
@@ -48,9 +54,19 @@ from .protocol import (
     pack_heartbeat,
     pack_result,
 )
+from .remote_geometry_pipeline import Stable3DTracker
 
 
 LOG = logging.getLogger("remote_offload.remote_sam3_worker")
+
+
+@dataclasses.dataclass(frozen=True)
+class MatchedFrameGeometry:
+    timestamp_us: int
+    state: Any | None
+    state_delta_ms: float | None
+    t_goal_cam: np.ndarray | None
+    up_goal: np.ndarray | None
 
 
 def parse_concepts(text: str) -> list[str]:
@@ -83,54 +99,6 @@ def suppress_duplicate_masks(
             keep.append(int(index))
     keep_array = np.asarray(keep, dtype=np.int64)
     return masks[keep_array], boxes[keep_array], scores[keep_array], [labels[i] for i in keep]
-
-
-class Stable3DTracker:
-    def __init__(self, *, max_distance_m: float = 0.25, missing_ttl_frames: int = 5) -> None:
-        self.max_distance_m = float(max_distance_m)
-        self.missing_ttl_frames = int(missing_ttl_frames)
-        self.tracks: dict[str, dict[str, Any]] = {}
-        self.next_id = 0
-
-    def assign(self, detections: list[dict[str, Any]]) -> dict[int, str]:
-        assignments: dict[int, str] = {}
-        used: set[str] = set()
-        for detection in detections:
-            center = detection.get("center_goal_m") or detection.get("center_camera_m")
-            if center is None:
-                continue
-            center_array = np.asarray(center, dtype=np.float64).reshape(3)
-            if not np.isfinite(center_array).all():
-                continue
-            label = str(detection.get("label", "object"))
-            best_id = ""
-            best_distance = float("inf")
-            for track_id, track in self.tracks.items():
-                if track_id in used or str(track["label"]) != label:
-                    continue
-                distance = float(np.linalg.norm(center_array - np.asarray(track["center"])))
-                if distance < best_distance:
-                    best_id = track_id
-                    best_distance = distance
-            if best_id and best_distance <= self.max_distance_m:
-                track_id = best_id
-            else:
-                track_id = f"{label}:track{self.next_id:04d}"
-                self.next_id += 1
-            self.tracks[track_id] = {
-                "label": label,
-                "center": center_array.copy(),
-                "missing": 0,
-            }
-            used.add(track_id)
-            assignments[int(detection["index"])] = track_id
-        for track_id in list(self.tracks):
-            if track_id in used:
-                continue
-            self.tracks[track_id]["missing"] = int(self.tracks[track_id]["missing"]) + 1
-            if self.tracks[track_id]["missing"] > self.missing_ttl_frames:
-                del self.tracks[track_id]
-        return assignments
 
 
 class MockSam3Backend:
@@ -185,6 +153,7 @@ class RemoteSam3Worker:
         torso_estimator: str,
         t_torso_cam: np.ndarray | None,
         publish_overlay_jpeg: bool,
+        depth_self_filter: dict[str, Any] | None = None,
     ) -> None:
         self.bus = lcm.LCM(wifi_lcm_url)
         self.concepts = concepts
@@ -202,17 +171,22 @@ class RemoteSam3Worker:
         self.torso_estimator = torso_estimator
         self.t_torso_cam = t_torso_cam
         self.publish_overlay_jpeg = publish_overlay_jpeg
+        self.depth_self_filter_options = dict(depth_self_filter or {})
+        self.geometry_requires_robot_state = False
         self.sync = RgbdSynchronizer(sync_tolerance_ms, capacity=12)
         self.state_buffer = RobotStateBuffer()
         self.tracker = Stable3DTracker()
         self.lock = threading.Lock()
         self.pair_ready = threading.Condition(self.lock)
+        self.overlay_ready = threading.Condition(self.lock)
         self.pending_pair: RgbdPair | None = None
+        self.pending_overlay: tuple[Any, ...] | None = None
         self.calibration: CameraCalibration | None = None
         self.running = False
         self.sequence = 0
         self.backend = None
         self.backend_error: str | None = None
+        self.frame_geometry: MatchedFrameGeometry | None = None
         self.last_result_age_ms: float | None = None
         self.status: dict[str, Any] = {
             "model_ready": False,
@@ -224,6 +198,10 @@ class RemoteSam3Worker:
             "last_source_timestamp_us": None,
             "last_inference_ms": None,
             "last_object_count": 0,
+            "last_robot_state_delta_ms": None,
+            "overlay_frames": 0,
+            "overlay_dropped": 0,
+            "overlay_errors": 0,
         }
         self.last_status_log_monotonic = 0.0
         self.threads: list[threading.Thread] = []
@@ -239,6 +217,14 @@ class RemoteSam3Worker:
             threading.Thread(target=self._inference_loop, name="remote-sam3", daemon=True),
             threading.Thread(target=self._heartbeat_loop, name="remote-heartbeat", daemon=True),
         ]
+        if self.publish_overlay_jpeg:
+            self.threads.append(
+                threading.Thread(
+                    target=self._overlay_loop,
+                    name="remote-overlay",
+                    daemon=True,
+                )
+            )
         for thread in self.threads:
             thread.start()
 
@@ -246,6 +232,7 @@ class RemoteSam3Worker:
         with self.lock:
             self.running = False
             self.pair_ready.notify_all()
+            self.overlay_ready.notify_all()
         for thread in self.threads:
             thread.join(timeout=2.0)
 
@@ -309,6 +296,7 @@ class RemoteSam3Worker:
                     checkpoint=self.checkpoint,
                     threshold=self.threshold,
                     min_area_px=self.min_area_px,
+                    depth_self_filter=self.depth_self_filter_options,
                 ),
                 "sam3_pytorch",
             )
@@ -321,6 +309,7 @@ class RemoteSam3Worker:
                     model_id=self.trt_model_id,
                     threshold=self.threshold,
                     min_area_px=self.min_area_px,
+                    depth_self_filter=self.depth_self_filter_options,
                 ),
                 "sam3_tensorrt",
             )
@@ -340,7 +329,60 @@ class RemoteSam3Worker:
         intrinsics: CameraIntrinsics | None,
         pair: RgbdPair,
     ) -> None:
-        del backend, image_bgr, depth, intrinsics, pair
+        context = self._resolve_frame_geometry(pair.rgb.timestamp_us)
+        self.frame_geometry = context
+        with self.lock:
+            self.status["last_robot_state_delta_ms"] = context.state_delta_ms
+        if not hasattr(backend, "set_depth_filter_context"):
+            return
+        backend.set_depth_filter_context(
+            image_bgr=image_bgr,
+            depth_raw=depth,
+            depth_scale_um=pair.depth.depth_scale_um,
+            intrinsics=intrinsics,
+            t_goal_cam=context.t_goal_cam,
+            q=None if context.state is None else context.state.q,
+        )
+
+    def _resolve_frame_geometry(self, timestamp_us: int) -> MatchedFrameGeometry:
+        with self.lock:
+            match = self.state_buffer.nearest(
+                timestamp_us,
+                self.robot_state_max_delta_ms,
+            )
+        state = None if match is None else match[0]
+        state_delta_ms = None if match is None else float(match[1])
+        transform = None
+        if self.t_torso_cam is not None and (
+            state is not None or not self.geometry_requires_robot_state
+        ):
+            camera = np.asarray(self.t_torso_cam, dtype=np.float64).reshape(4, 4)
+            if self.torso_estimator == "identity":
+                transform = camera.copy()
+            elif state is not None:
+                t_pelvis_torso, _metadata = pelvis_to_torso(
+                    state,
+                    self.torso_estimator,
+                )
+                transform = t_pelvis_torso @ camera
+        return MatchedFrameGeometry(
+            timestamp_us=int(timestamp_us),
+            state=state,
+            state_delta_ms=state_delta_ms,
+            t_goal_cam=transform,
+            up_goal=(
+                None
+                if state is None
+                else gravity_up_in_pelvis(state.base_quat_wxyz)
+            ),
+        )
+
+    def _current_frame_geometry(self, timestamp_us: int) -> MatchedFrameGeometry:
+        context = self.frame_geometry
+        if context is None or context.timestamp_us != int(timestamp_us):
+            context = self._resolve_frame_geometry(timestamp_us)
+            self.frame_geometry = context
+        return context
 
     def _invalid_result(self, pair: RgbdPair, error: str) -> dict[str, Any]:
         self.sequence += 1
@@ -363,7 +405,12 @@ class RemoteSam3Worker:
     ) -> tuple[np.ndarray, CameraIntrinsics | None]:
         if pair.depth.source == DEPTH_SOURCE_RAW_DEPTH_OPTICAL:
             if calibration is None:
-                raise ValueError("raw depth received before remote camera calibration")
+                # SAM3 segmentation itself needs only RGB.  Preserve that
+                # diagnostic path while withholding every 3-D field until the
+                # raw optical depth can be calibrated and aligned to color.
+                return np.zeros(
+                    (pair.rgb.height, pair.rgb.width), dtype=pair.depth.depth.dtype
+                ), None
             depth = align_depth_to_color(pair.depth, calibration)
             intrinsics = CameraIntrinsics(
                 calibration.color_width,
@@ -504,20 +551,58 @@ class RemoteSam3Worker:
     ) -> None:
         if not self.publish_overlay_jpeg:
             return
-        overlay, _objects = render_segmented_rgbd(
-            image_bgr,
-            depth,
-            masks,
-            boxes,
-            scores,
-            labels,
-            depth_scale_um,
-            self.min_depth_m,
-            self.max_depth_m,
-        )
-        ok, encoded = cv2.imencode(".jpg", overlay, [cv2.IMWRITE_JPEG_QUALITY, 80])
-        if ok:
-            self.bus.publish(REMOTE_OVERLAY_CHANNEL, encoded.tobytes())
+        with self.overlay_ready:
+            if self.pending_overlay is not None:
+                self.status["overlay_dropped"] += 1
+            self.pending_overlay = (
+                image_bgr.copy(),
+                depth.copy(),
+                masks.copy(),
+                boxes.copy(),
+                scores.copy(),
+                list(labels),
+                int(depth_scale_um),
+            )
+            self.overlay_ready.notify()
+
+    def _overlay_loop(self) -> None:
+        while self.running:
+            with self.overlay_ready:
+                self.overlay_ready.wait_for(
+                    lambda: self.pending_overlay is not None or not self.running,
+                    timeout=0.5,
+                )
+                if not self.running:
+                    break
+                pending = self.pending_overlay
+                self.pending_overlay = None
+            if pending is None:
+                continue
+            image_bgr, depth, masks, boxes, scores, labels, depth_scale_um = pending
+            try:
+                overlay, _objects = render_segmented_rgbd(
+                    image_bgr,
+                    depth,
+                    masks,
+                    boxes,
+                    scores,
+                    labels,
+                    depth_scale_um,
+                    self.min_depth_m,
+                    self.max_depth_m,
+                )
+                ok, encoded = cv2.imencode(
+                    ".jpg", overlay, [cv2.IMWRITE_JPEG_QUALITY, 80]
+                )
+                if not ok:
+                    raise RuntimeError("overlay JPEG encoding failed")
+                self.bus.publish(REMOTE_OVERLAY_CHANNEL, encoded.tobytes())
+                with self.lock:
+                    self.status["overlay_frames"] += 1
+            except Exception as error:
+                LOG.warning("remote overlay failed: %s", error)
+                with self.lock:
+                    self.status["overlay_errors"] += 1
 
     def _inference_loop(self) -> None:
         try:
@@ -629,7 +714,15 @@ class RemoteSam3Worker:
                     "decode_errors": int(self.status.get("decode_errors", 0)),
                     "inference_latency_ms": self.status.get("last_inference_ms"),
                     "latest_source_timestamp_us": self.status.get("last_source_timestamp_us"),
+                    "source_robot_state_delta_ms": self.status.get(
+                        "last_robot_state_delta_ms"
+                    ),
                     "last_error": self.status.get("last_error"),
+                    "overlay_count": int(self.status.get("overlay_frames", 0)),
+                    "overlay_dropped_count": int(
+                        self.status.get("overlay_dropped", 0)
+                    ),
+                    "overlay_errors": int(self.status.get("overlay_errors", 0)),
                 }
             now = time.monotonic()
             if now - self.last_status_log_monotonic >= 5.0:

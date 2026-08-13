@@ -6,6 +6,10 @@ Remote x86/Titan XP Wi-Fi offload for YOLO11/SAM3 inference and the external
 webview is documented in
 [`REMOTE_SAM3_WIFI_OFFLOAD.md`](REMOTE_SAM3_WIFI_OFFLOAD.md).
 
+The isolated RTX 4060 SAM3 worker that produces complete Thor belief geometry
+inputs is documented in
+[`REMOTE_SAM3_BELIEF_INPUT_WORKER.md`](REMOTE_SAM3_BELIEF_INPUT_WORKER.md).
+
 This directory provides the isolated SAM3-only runtime specified by the G1
 Perception Pipeline v2 document. It deliberately contains no AnyGrasp,
 MinkowskiEngine, Open3D, PyTorch3D, or pycocotools dependency.

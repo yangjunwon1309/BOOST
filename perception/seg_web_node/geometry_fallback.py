@@ -13,9 +13,16 @@ from .grip_candidates import PersistentCylinderSurfaceTracker
 class LastValidGeometryFallback:
     """Republish the last verified object geometry through short detector gaps."""
 
-    def __init__(self, ttl_frames: int, score_decay: float) -> None:
+    def __init__(
+        self,
+        ttl_frames: int,
+        score_decay: float,
+        *,
+        fallback_reason: str = "yolo_detection_missing",
+    ) -> None:
         self.ttl_frames = max(0, int(ttl_frames))
         self.score_decay = float(np.clip(score_decay, 0.0, 1.0))
+        self.fallback_reason = str(fallback_reason)
         self.entries: dict[str, dict[str, Any]] = {}
 
     @staticmethod
@@ -98,7 +105,7 @@ class LastValidGeometryFallback:
         fallback = copy.deepcopy(cached)
         fallback["score"] = float(entry["base_score"]) * self.score_decay**missing
         fallback["geometry_fallback"] = True
-        fallback["fallback_reason"] = "yolo_detection_missing"
+        fallback["fallback_reason"] = self.fallback_reason
         fallback["missing_frames"] = missing
         surface = surface_tracker.status(track_id)
         if surface is not None:

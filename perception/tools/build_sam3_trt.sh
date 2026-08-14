@@ -4,6 +4,7 @@ set -euo pipefail
 onnx_path="${1:-/models/sam3_trt/runtime4/sam3_4out.onnx}"
 engine_path="${2:-/models/sam3_trt/sam3_fp16_4out.engine}"
 mixed_path="${3:-${onnx_path%.onnx}_autocast.onnx}"
+workspace_size="${SAM3_TRT_WORKSPACE:-4G}"
 
 if [[ ! -f "$onnx_path" ]]; then
     echo "ONNX graph not found: $onnx_path" >&2
@@ -33,13 +34,14 @@ else
     precision_args+=(--fp16)
 fi
 
-echo "[SAM3-TRT] $(trtexec --version 2>&1 | head -n 1)"
+echo "[SAM3-TRT] TensorRT $(python -c 'import tensorrt; print(tensorrt.__version__)')"
 echo "[SAM3-TRT] building $engine_path from $build_onnx"
+echo "[SAM3-TRT] workspace pool limit: $workspace_size"
 exec trtexec \
     --onnx="$build_onnx" \
     --saveEngine="$engine_path" \
     "${precision_args[@]}" \
     --builderOptimizationLevel=5 \
-    --memPoolSize=workspace:16G \
+    --memPoolSize="workspace:${workspace_size}" \
     --profilingVerbosity=detailed \
     --skipInference

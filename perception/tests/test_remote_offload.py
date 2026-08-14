@@ -1,3 +1,5 @@
+import threading
+
 import numpy as np
 
 from remote_offload.protocol import (
@@ -8,10 +10,67 @@ from remote_offload.protocol import (
     make_empty_result,
     make_object,
     now_us,
+    normalize_concepts,
+    pack_concept_control,
     pack_result,
+    unpack_concept_control,
     unpack_result,
     validate_result,
 )
+from remote_offload.remote_sam3_worker import RemoteSam3Worker
+from remote_offload.remote_web_server import RemoteWebRuntime
+
+
+class _ResetRecorder:
+    def __init__(self):
+        self.reset_count = 0
+
+    def reset_tracking(self):
+        self.reset_count += 1
+
+
+def test_remote_concept_control_round_trip_and_validation():
+    payload = {
+        "version": 1,
+        "published_timestamp_us": now_us(),
+        "revision": 7,
+        "concepts": [" bottle ", "red   cup", "bottle"],
+    }
+    decoded = unpack_concept_control(pack_concept_control(payload))
+    assert decoded["concepts"] == ["bottle", "red cup"]
+    assert decoded["revision"] == 7
+    assert normalize_concepts("shoe, cup") == ["shoe", "cup"]
+
+
+def test_web_concept_command_is_applied_once_at_worker_frame_boundary():
+    web = RemoteWebRuntime.__new__(RemoteWebRuntime)
+    web.lock = threading.Lock()
+    web.concept_revision = 100
+    web.pending_control_packets = []
+    web.stats = {"concept_commands": 0}
+    command = web.set_concepts("shoe, red cup")
+
+    assert command["concepts"] == ["shoe", "red cup"]
+    assert len(web.pending_control_packets) == 3
+    assert len(set(web.pending_control_packets)) == 1
+
+    worker = RemoteSam3Worker.__new__(RemoteSam3Worker)
+    worker.lock = threading.Lock()
+    worker.concepts = ["bottle"]
+    worker.pending_concepts = None
+    worker.concept_revision = 0
+    worker.geometry_pipeline = _ResetRecorder()
+    worker._record_error = lambda error: (_ for _ in ()).throw(error)
+
+    packet = web.pending_control_packets[0]
+    worker._on_concept_control("unused", packet)
+    assert worker._apply_pending_concepts() == ["shoe", "red cup"]
+    assert worker.geometry_pipeline.reset_count == 1
+
+    worker._on_concept_control("unused", packet)
+    assert worker.pending_concepts is None
+    assert worker._apply_pending_concepts() == ["shoe", "red cup"]
+    assert worker.geometry_pipeline.reset_count == 1
 
 
 def test_remote_mask_bitpack_round_trip_little_endian():
@@ -101,4 +160,3 @@ def test_remote_result_validator_rejects_stale_mismatched_or_nonmonotonic():
     assert any("source_rgb_timestamp_us mismatch" in error for error in errors)
     assert any("calibration_id mismatch" in error for error in errors)
     assert any("sequence is not monotonic" in error for error in errors)
-

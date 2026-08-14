@@ -1,0 +1,39 @@
+FROM nvcr.io/nvidia/pytorch:25.11-py3
+
+# x86 TensorRT build/runtime image for the RTX 4060 remote worker. CUDA,
+# cuDNN, TensorRT, trtexec, PyTorch and the compiler toolchain remain isolated
+# in this container; no host CUDA or NVIDIA driver package is installed.
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONUNBUFFERED=1 \
+    HF_HOME=/cache/huggingface \
+    TORCH_HOME=/cache/torch \
+    PATH=/usr/src/tensorrt/bin:${PATH}
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libgl1 \
+        libglib2.0-0 \
+        liblcm-dev \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY docker/requirements-remote-sam3.txt /tmp/requirements-remote-sam3.txt
+# Docker build stages do not receive an NVIDIA GPU/driver device. trtexec
+# initializes CUDA even for --version, so only verify that it is installed
+# here; execute it later in `docker run --gpus all`.
+RUN python -m pip install --upgrade "setuptools<81" wheel \
+    && python -m pip install -r /tmp/requirements-remote-sam3.txt \
+    && python -m pip install "onnx>=1.17,<2" \
+    && python -c "import onnx, tensorrt, torch; print('TensorRT', tensorrt.__version__, 'CUDA', torch.version.cuda)" \
+    && command -v trtexec
+
+RUN mkdir -p /cache/huggingface /cache/torch /models \
+    && chmod -R 0777 /cache /models
+
+WORKDIR /workspace/perception
+COPY . /workspace/perception
+
+CMD ["trtexec", "--version"]

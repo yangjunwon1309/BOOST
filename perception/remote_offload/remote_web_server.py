@@ -14,7 +14,7 @@ import cv2
 import lcm
 import numpy as np
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 
 from seg_web_node.lcm_protocol import decode_camera, decode_depth
@@ -23,11 +23,15 @@ from seg_web_node.visualization import render_segmented_rgbd
 
 from .protocol import (
     REMOTE_BELIEF_TELEMETRY_CHANNEL,
+    REMOTE_CONCEPT_CONTROL_CHANNEL,
     REMOTE_DEPTH_CHANNEL,
     REMOTE_HEARTBEAT_CHANNEL,
     REMOTE_RESULT_CHANNEL,
     REMOTE_RGB_CHANNEL,
     decode_mask,
+    normalize_concepts,
+    now_us,
+    pack_concept_control,
     unpack_belief_telemetry,
     unpack_heartbeat,
     unpack_result,
@@ -55,10 +59,17 @@ table{width:100%;border-collapse:collapse;margin-top:8px;font-size:12px}
 th,td{border-bottom:1px solid #33404c;padding:5px;text-align:left}
 .dim{opacity:.45}.armed{font-weight:700}.stale{color:#ffb86b}
 .ok{color:#75d087}.bad{color:#ff7b72}
+.concepts{display:flex;gap:8px;margin-top:8px}.concepts input{flex:1;min-width:0;padding:8px;
+background:#10151a;color:#e8edf2;border:1px solid #3a4652;border-radius:5px}
+.concepts button{padding:8px 12px;background:#1d6f9f;color:white;border:0;border-radius:5px;cursor:pointer}
+#conceptMessage{display:block;margin-top:7px;color:#b8c4cf}
 @media(max-width:900px){main{grid-template-columns:1fr}}
 </style></head><body>
 <header><h1>PATH-G1 Remote Perception</h1><span id="link" class="pill">connecting</span></header>
 <main><img id="view" src="/stream.mjpg"><aside>
+<div class="panel"><b>SAM3 text labels</b>
+<div class="concepts"><input id="conceptInput" value="object" placeholder="bottle, cup">
+<button id="conceptApply">Apply</button></div><span id="conceptMessage">waiting for worker</span></div>
 <div class="panel"><b>Two-hand belief</b><span id="beliefAge"></span>
 <table><thead><tr><th>Object</th><th>Left p/joint</th><th>Right p/joint</th></tr></thead>
 <tbody id="beliefRows"></tbody></table></div>
@@ -91,8 +102,25 @@ async function update(){
       rows.appendChild(tr);
     }
     document.getElementById('status').textContent=JSON.stringify(s,null,2);
+    const active=s.heartbeat?.active_concepts||[];
+    const pending=s.heartbeat?.pending_concepts;
+    const input=document.getElementById('conceptInput');
+    if(document.activeElement!==input && active.length)input.value=active.join(', ');
+    document.getElementById('conceptMessage').textContent=pending?.length?
+      `pending: ${pending.join(', ')}`:`active: ${active.join(', ')||'unknown'}`;
   }catch(e){document.getElementById('status').textContent=String(e)}
 }
+async function applyConcepts(){
+  const message=document.getElementById('conceptMessage');
+  try{
+    const response=await fetch('/api/concepts',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({concepts:document.getElementById('conceptInput').value})});
+    const data=await response.json(); if(!response.ok)throw new Error(data.detail||response.statusText);
+    message.textContent=`sent: ${data.concepts.join(', ')}`;
+  }catch(e){message.textContent=`error: ${e}`}
+}
+document.getElementById('conceptApply').addEventListener('click',applyConcepts);
+document.getElementById('conceptInput').addEventListener('keydown',e=>{if(e.key==='Enter')applyConcepts()});
 setInterval(update,1000);update();
 </script></body></html>"""
 
@@ -288,7 +316,10 @@ class RemoteWebRuntime:
             "decode_errors": 0,
             "last_error": None,
             "objects": [],
+            "concept_commands": 0,
         }
+        self.pending_control_packets: list[bytes] = []
+        self.concept_revision = int(time.time_ns() // 1000)
         self.threads: list[threading.Thread] = []
         self.bus.subscribe(REMOTE_RGB_CHANNEL, self._on_rgb)
         self.bus.subscribe(REMOTE_DEPTH_CHANNEL, self._on_depth)
@@ -370,6 +401,25 @@ class RemoteWebRuntime:
         with self.lock:
             self.stats["decode_errors"] += 1
             self.stats["last_error"] = str(error)
+
+    def set_concepts(self, value: Any) -> dict[str, Any]:
+        concepts = normalize_concepts(value)
+        with self.lock:
+            self.concept_revision = max(
+                self.concept_revision + 1, int(time.time_ns() // 1000)
+            )
+            payload = {
+                "version": 1,
+                "published_timestamp_us": now_us(),
+                "revision": self.concept_revision,
+                "concepts": concepts,
+            }
+            packet = pack_concept_control(payload)
+            # Send redundantly on UDP multicast while retaining one revision;
+            # the worker ignores duplicate revisions.
+            self.pending_control_packets.extend([packet, packet, packet])
+            self.stats["concept_commands"] += 1
+        return payload
 
     def _on_rgb(self, _channel: str, data: bytes) -> None:
         try:
@@ -618,6 +668,14 @@ class RemoteWebRuntime:
     def _lcm_loop(self) -> None:
         while self.running:
             try:
+                with self.lock:
+                    packet = (
+                        self.pending_control_packets.pop(0)
+                        if self.pending_control_packets
+                        else None
+                    )
+                if packet is not None:
+                    self.bus.publish(REMOTE_CONCEPT_CONTROL_CHANNEL, packet)
                 self.bus.handle_timeout(100)
             except Exception as error:
                 self._record_error(error)
@@ -634,6 +692,16 @@ def build_app(runtime: RemoteWebRuntime) -> FastAPI:
     @app.get("/api/status")
     def status():
         return runtime.status_snapshot()
+
+    @app.post("/api/concepts")
+    async def concepts(request: Request):
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                raise ValueError("request body must be a JSON object")
+            return runtime.set_concepts(payload.get("concepts"))
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
 
     @app.get("/stream.mjpg")
     def stream():

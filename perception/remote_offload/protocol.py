@@ -27,6 +27,7 @@ REMOTE_RESULT_CHANNEL = "PATH_REMOTE_PERCEPTION_RESULT"
 REMOTE_HEARTBEAT_CHANNEL = "PATH_REMOTE_PERCEPTION_HEARTBEAT"
 REMOTE_OVERLAY_CHANNEL = "PATH_REMOTE_OVERLAY_JPEG"
 REMOTE_BELIEF_TELEMETRY_CHANNEL = "PATH_REMOTE_BELIEF_TELEMETRY"
+REMOTE_CONCEPT_CONTROL_CHANNEL = "PATH_REMOTE_CONCEPT_CONTROL"
 
 MASK_ENCODING = "bitpack-zlib-row-major"
 BACKENDS = {"sam3_pytorch", "sam3_tensorrt", "yolo11_pytorch", "mock"}
@@ -75,6 +76,60 @@ def unpack_heartbeat(data: bytes) -> dict[str, Any]:
     payload = msgpack.unpackb(data, raw=False, strict_map_key=False)
     if not isinstance(payload, dict):
         raise ValueError("remote heartbeat payload is not a map")
+    return payload
+
+
+def normalize_concepts(value: Any, *, max_concepts: int = 8) -> list[str]:
+    """Validate a bounded perception-only text-prompt vocabulary."""
+    if isinstance(value, str):
+        raw = value.split(",")
+    elif isinstance(value, (list, tuple)):
+        raw = value
+    else:
+        raise ValueError("concepts must be a string or list")
+    concepts: list[str] = []
+    for item in raw:
+        concept = " ".join(str(item).strip().split())
+        if not concept:
+            continue
+        if len(concept) > 80 or any(ord(char) < 32 for char in concept):
+            raise ValueError("each concept must be printable and at most 80 characters")
+        if concept not in concepts:
+            concepts.append(concept)
+    if not concepts:
+        raise ValueError("at least one concept is required")
+    if len(concepts) > max_concepts:
+        raise ValueError(f"at most {max_concepts} concepts are allowed")
+    return concepts
+
+
+def pack_concept_control(payload: dict[str, Any]) -> bytes:
+    concepts = normalize_concepts(payload.get("concepts"))
+    revision = payload.get("revision")
+    if not isinstance(revision, int) or revision < 0:
+        raise ValueError("revision must be a non-negative integer")
+    return msgpack.packb(
+        {
+            "version": 1,
+            "published_timestamp_us": int(payload.get("published_timestamp_us", now_us())),
+            "revision": revision,
+            "concepts": concepts,
+        },
+        use_bin_type=True,
+    )
+
+
+def unpack_concept_control(data: bytes) -> dict[str, Any]:
+    payload = msgpack.unpackb(data, raw=False, strict_map_key=False)
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        raise ValueError("unsupported concept-control payload")
+    revision = payload.get("revision")
+    if not isinstance(revision, int) or revision < 0:
+        raise ValueError("concept-control revision is invalid")
+    timestamp = payload.get("published_timestamp_us")
+    if not isinstance(timestamp, int) or timestamp <= 0:
+        raise ValueError("concept-control timestamp is invalid")
+    payload["concepts"] = normalize_concepts(payload.get("concepts"))
     return payload
 
 

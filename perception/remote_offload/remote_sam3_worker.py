@@ -42,6 +42,7 @@ from seg_web_node.visualization import render_segmented_rgbd
 
 from .protocol import (
     REMOTE_CALIBRATION_CHANNEL,
+    REMOTE_CONCEPT_CONTROL_CHANNEL,
     REMOTE_DEPTH_CHANNEL,
     REMOTE_HEARTBEAT_CHANNEL,
     REMOTE_OVERLAY_CHANNEL,
@@ -53,6 +54,7 @@ from .protocol import (
     now_us,
     pack_heartbeat,
     pack_result,
+    unpack_concept_control,
 )
 from .remote_geometry_pipeline import Stable3DTracker
 
@@ -157,6 +159,8 @@ class RemoteSam3Worker:
     ) -> None:
         self.bus = lcm.LCM(wifi_lcm_url)
         self.concepts = concepts
+        self.pending_concepts: tuple[list[str], int] | None = None
+        self.concept_revision = 0
         self.backend_name = backend_name
         self.checkpoint = checkpoint
         self.trt_engine = trt_engine
@@ -209,6 +213,7 @@ class RemoteSam3Worker:
         self.bus.subscribe(REMOTE_DEPTH_CHANNEL, self._on_depth)
         self.bus.subscribe(REMOTE_CALIBRATION_CHANNEL, self._on_calibration)
         self.bus.subscribe(REMOTE_ROBOT_STATE_CHANNEL, self._on_robot_state)
+        self.bus.subscribe(REMOTE_CONCEPT_CONTROL_CHANNEL, self._on_concept_control)
 
     def start(self) -> None:
         self.running = True
@@ -278,6 +283,38 @@ class RemoteSam3Worker:
                 self.state_buffer.add(state)
         except Exception as error:
             self._record_error(error)
+
+    def _on_concept_control(self, _channel: str, data: bytes) -> None:
+        try:
+            payload = unpack_concept_control(data)
+            revision = int(payload["revision"])
+            concepts = list(payload["concepts"])
+            with self.lock:
+                if revision <= self.concept_revision:
+                    return
+                pending = self.pending_concepts
+                if pending is not None and revision <= pending[1]:
+                    return
+                self.pending_concepts = (concepts, revision)
+        except Exception as error:
+            self._record_error(error)
+
+    def _apply_pending_concepts(self) -> list[str]:
+        with self.lock:
+            pending = self.pending_concepts
+            self.pending_concepts = None
+            if pending is not None:
+                self.concepts = list(pending[0])
+                self.concept_revision = int(pending[1])
+            concepts = list(self.concepts)
+        if pending is not None:
+            geometry_pipeline = getattr(self, "geometry_pipeline", None)
+            if geometry_pipeline is not None:
+                geometry_pipeline.reset_tracking()
+            else:
+                self.tracker.tracks.clear()
+            LOG.info("active SAM3 concepts changed to %s", concepts)
+        return concepts
 
     def _lcm_loop(self) -> None:
         while self.running:
@@ -658,7 +695,8 @@ class RemoteSam3Worker:
                     pair,
                 )
                 started = time.perf_counter()
-                masks, boxes, scores, labels = self.backend.infer(image_bgr, self.concepts)
+                concepts = self._apply_pending_concepts()
+                masks, boxes, scores, labels = self.backend.infer(image_bgr, concepts)
                 inference_ms = (time.perf_counter() - started) * 1000.0
                 if len(masks):
                     masks, boxes, scores, labels = suppress_duplicate_masks(
@@ -723,6 +761,13 @@ class RemoteSam3Worker:
                         self.status.get("overlay_dropped", 0)
                     ),
                     "overlay_errors": int(self.status.get("overlay_errors", 0)),
+                    "active_concepts": list(self.concepts),
+                    "concept_revision": int(self.concept_revision),
+                    "pending_concepts": (
+                        None
+                        if self.pending_concepts is None
+                        else list(self.pending_concepts[0])
+                    ),
                 }
             now = time.monotonic()
             if now - self.last_status_log_monotonic >= 5.0:

@@ -48,15 +48,24 @@ docker run --rm --gpus all --network host \
     --publish-overlay-jpeg
 ```
 
-Run the passive viewer from the same isolated image:
+Run the viewer and perception prompt controller from the same isolated image:
 
 ```bash
 docker run --rm --network host \
+  -v "$PWD:/workspace/perception:ro" \
   path-g1-remote-sam3:rtx4060 \
   python -m remote_offload.remote_web_server \
     --wifi-lcm-url 'udpm://239.255.77.67:7667?ttl=1' \
     --host 0.0.0.0 --port 8081
 ```
+
+Open `http://127.0.0.1:8081`, enter one or more comma-separated labels, and
+press **Apply** (or Enter). The web process sends a versioned perception-only
+command on `PATH_REMOTE_CONCEPT_CONTROL`. The worker applies it between frames,
+clears stale semantic tracks, and reports the active labels in its heartbeat.
+The initial `--concepts` value remains the startup fallback. Each additional
+SAM3 text label adds another prompt pass, so use one label when minimum latency
+is important.
 
 Run the authoritative gateway on Thor with the existing Thor container/runtime:
 

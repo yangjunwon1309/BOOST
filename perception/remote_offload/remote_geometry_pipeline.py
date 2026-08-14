@@ -124,6 +124,12 @@ class RemoteRgbdGeometryPipeline:
             fallback_reason=fallback_reason,
         )
 
+    def reset_tracking(self) -> None:
+        """Drop geometry state when the semantic vocabulary changes."""
+        self.tracker.tracks.clear()
+        self.surface_tracker.models.clear()
+        self.geometry_fallback.entries.clear()
+
     def build_object_geometry(
         self,
         *,

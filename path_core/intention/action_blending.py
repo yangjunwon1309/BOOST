@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import logging
-import numpy as np
+from dataclasses import dataclass
 
+import numpy as np
 
 LEFT_WRIST_LINK = "left_wrist_yaw_link"
 RIGHT_WRIST_LINK = "right_wrist_yaw_link"
@@ -22,8 +22,6 @@ class SharedControlConfig:
     omega_n_orientation_released: float = 12.0
     max_speed_mps: float = 0.35
     max_rate_rps: float = 1.5
-    resync_distance_m: float = 0.06
-    resync_angle_rad: float = 0.6
     stale_after_s: float = 0.3
     d_max_m: float = 0.9
     orientation_min_confidence: float = 0.35
@@ -35,9 +33,21 @@ class SharedControlConfig:
     @classmethod
     def from_dict(cls, payload: dict | None) -> "SharedControlConfig":
         data = dict(payload or {})
-        obsolete = {"rho1", "rho2", "alpha_rate_up", "alpha_rate_down", "v_transfer_max", "startup_hold_s"}
+        obsolete = {
+            "rho1",
+            "rho2",
+            "alpha_rate_up",
+            "alpha_rate_down",
+            "v_transfer_max",
+            "startup_hold_s",
+            "resync_distance_m",
+            "resync_angle_rad",
+        }
         if obsolete.intersection(data):
-            LOG.warning("obsolete shared-control alpha parameters are ignored by second-order reference control")
+            LOG.warning(
+                "obsolete shared-control gating parameters are ignored by "
+                "second-order reference control"
+            )
         if "zeta" in data:
             LOG.warning("shared-control zeta is deprecated; applying it to zeta_armed and zeta_released")
             data.setdefault("zeta_armed", data["zeta"])
@@ -48,31 +58,6 @@ class SharedControlConfig:
                 LOG.warning("%s=%s is below the stable overdamped limit; clamping to 1.05", key, values[key])
                 values[key] = 1.05
         return cls(**values)
-
-
-@dataclass(frozen=True)
-class ContactComplianceConfig:
-    """Resistance detection and conditional compliance scheduling defaults."""
-
-    efficiency_enter: float = 0.35
-    efficiency_exit: float = 0.60
-    min_commanded_mps: float = 0.02
-    static_error_m: float = 0.015
-    static_error_rate_mps: float = 0.01
-    enter_ticks: int = 5
-    block_ticks: int = 15
-    release_ticks: int = 25
-    ema_alpha: float = 0.25
-    resisted_position_scale: float = 0.40
-    blocked_position_scale: float = 0.15
-    resisted_smooth_scale: float = 3.0
-    blocked_smooth_scale: float = 6.0
-    weight_ramp_per_s: float = 2.0
-    engage_error_m: float = 0.01
-    release_error_m: float = 0.004
-    coupling_gain: float = 0.3
-    max_correction_m: float = 0.03
-
 
 @dataclass(frozen=True)
 class EETarget:

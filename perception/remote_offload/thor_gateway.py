@@ -16,7 +16,6 @@ import lcm
 import msgpack
 import numpy as np
 import zmq
-
 from seg_web_node.ee_target import make_goal_payload
 from seg_web_node.grip_candidates import GripCandidate, SurfacePrimitive
 from seg_web_node.lcm_protocol import (
@@ -28,25 +27,25 @@ from seg_web_node.lcm_protocol import (
 )
 from seg_web_node.robot_geometry import (
     angular_velocity_from_rotations,
-    g1_hand_base_rotation,
     g1_grasp_center_position,
+    g1_hand_base_rotation,
     gravity_up_in_pelvis,
     hand_frame_profile,
 )
 from seg_web_node.tasc_belief import (
     BeliefInputObject,
     HandInput,
-    HierarchicalTascBelief,
     ParallelTascBelief,
 )
 
+from .belief_csv import RemoteBeliefCsvRecorder
 from .protocol import (
     LOCAL_CALIBRATION_CHANNEL,
     LOCAL_DEPTH_CHANNEL,
     LOCAL_RGB_CHANNEL,
     LOCAL_ROBOT_STATE_CHANNEL,
-    REMOTE_CALIBRATION_CHANNEL,
     REMOTE_BELIEF_TELEMETRY_CHANNEL,
+    REMOTE_CALIBRATION_CHANNEL,
     REMOTE_DEPTH_CHANNEL,
     REMOTE_HEARTBEAT_CHANNEL,
     REMOTE_OVERLAY_CHANNEL,
@@ -56,12 +55,12 @@ from .protocol import (
     ValidationContext,
     now_us,
     pack_belief_telemetry,
+    strip_invalid_optional_fields,
     unpack_heartbeat,
     unpack_result,
     validate_result,
+    validate_result_soft,
 )
-from .belief_csv import RemoteBeliefCsvRecorder
-
 
 LOG = logging.getLogger("remote_offload.thor_gateway")
 
@@ -184,6 +183,9 @@ def _grip_candidate_from_dict(data: dict[str, Any]) -> GripCandidate | None:
 
 
 def _surface_primitive_from_dict(data: dict[str, Any]) -> SurfacePrimitive | None:
+    kind = data.get("kind")
+    if kind not in {"cylinder", "plane", "circle", "pca", "point"}:
+        return None
     try:
         origin = np.asarray(data.get("origin_goal_m"), dtype=np.float64).reshape(3)
         axis = np.asarray(data.get("axis_goal"), dtype=np.float64).reshape(3)
@@ -207,8 +209,16 @@ def _surface_primitive_from_dict(data: dict[str, Any]) -> SurfacePrimitive | Non
         extent = None if extent is None else np.asarray(extent, dtype=np.float64).reshape(3)
     except (TypeError, ValueError):
         return None
+    if (
+        not math.isfinite(radius)
+        or radius < 0.0
+        or not math.isfinite(half_height)
+        or half_height < 0.0
+        or (extent is not None and not np.isfinite(extent).all())
+    ):
+        return None
     return SurfacePrimitive(
-        kind=str(data.get("kind", "pca")),
+        kind=str(kind),
         origin=origin,
         axis=axis / norm,
         fit_quality=float(np.clip(fit_quality, 0.0, 1.0)),
@@ -217,6 +227,11 @@ def _surface_primitive_from_dict(data: dict[str, Any]) -> SurfacePrimitive | Non
         half_height=half_height,
         extent=extent,
         snapped_to_gravity=bool(data.get("snapped_to_gravity", False)),
+        observation_timestamp_us=int(
+            data.get("observation_timestamp_us", 0) or 0
+        ),
+        observation_track_id=str(data.get("observation_track_id", "")),
+        observation_state=str(data.get("observation_state", "active")),
     )
 
 
@@ -365,7 +380,7 @@ def _best_remote_object(
 
 class RawRgbdSynchronizer:
     def __init__(self, tolerance_ms: float = 50.0, capacity: int = 12) -> None:
-        self.tolerance_us = int(round(float(tolerance_ms) * 1000.0))
+        self.tolerance_us = round(float(tolerance_ms) * 1000.0)
         self.rgb: collections.deque[RawFrame] = collections.deque(maxlen=capacity)
         self.depth: collections.deque[RawFrame] = collections.deque(maxlen=capacity)
         self.dropped_rgb = 0
@@ -487,7 +502,9 @@ class ThorRemoteGateway:
         self.belief_orientation_min_confidence = float(
             belief_config.get("orientation_min_confidence", 0.35)
         )
-        self.belief_telemetry_period_sec = 0.1
+        self.belief_telemetry_period_sec = 1.0 / max(
+            15.0, float(belief_config.get("belief_telemetry_hz", 15.0))
+        )
         self.last_belief_telemetry_monotonic = 0.0
         self.belief_telemetry_max_objects = max(
             1, int(belief_config.get("max_objects", 10))
@@ -544,6 +561,7 @@ class ThorRemoteGateway:
         self.latest_belief_geometry: Any | None = None
         self.latest_belief_geometry_sequence = -1
         self.last_result_sequence: int | None = None
+        self._zero_primitives_warned = False
         self.stats: dict[str, Any] = {
             "local_rgb": 0,
             "local_depth": 0,
@@ -554,6 +572,10 @@ class ThorRemoteGateway:
             "forwarded_robot_state": 0,
             "valid_results": 0,
             "invalid_results": 0,
+            "soft_result_warnings": [],
+            "soft_optional_fields_dropped": 0,
+            "objects_with_primitives": 0,
+            "objects_total": 0,
             "heartbeats": 0,
             "overlays": 0,
             "decode_errors": 0,
@@ -815,18 +837,33 @@ class ThorRemoteGateway:
                 expected_image_height=record.pair.rgb.height if record else None,
                 previous_sequence=previous_sequence,
             )
-            errors = result_errors + validate_result(payload, context)
+            soft_errors = validate_result_soft(payload)
+            dropped_optional = 0
+            if soft_errors:
+                dropped_optional = strip_invalid_optional_fields(payload)
+                LOG.warning(
+                    "remote result seq=%s: dropping %d invalid optional field(s): %s",
+                    payload.get("sequence"),
+                    dropped_optional,
+                    "; ".join(soft_errors[:3]),
+                )
+            fatal_errors = result_errors + validate_result(
+                payload, context, include_soft=False
+            )
             with self.lock:
-                if errors:
+                if soft_errors:
+                    self.stats["soft_result_warnings"] = soft_errors[:8]
+                    self.stats["soft_optional_fields_dropped"] += dropped_optional
+                if fatal_errors:
                     self.stats["invalid_results"] += 1
                     self.stats["last_invalid_result"] = {
                         "sequence": payload.get("sequence"),
-                        "errors": errors,
+                        "errors": fatal_errors,
                     }
                     LOG.warning(
                         "rejected remote result seq=%s: %s",
                         payload.get("sequence"),
-                        "; ".join(errors),
+                        "; ".join(fatal_errors),
                     )
                 else:
                     self.last_result_sequence = int(payload["sequence"])
@@ -844,7 +881,7 @@ class ThorRemoteGateway:
                         len(payload.get("objects", [])),
                         payload.get("valid"),
                     )
-            if not errors:
+            if not fatal_errors:
                 self._publish_ee_target_from_result(payload, record)
         except Exception as error:
             self._record_error(error)
@@ -920,6 +957,29 @@ class ThorRemoteGateway:
                     ),
                 )
             )
+        raw_objects = payload.get("objects", [])
+        objects_total = len(raw_objects) if isinstance(raw_objects, list) else 0
+        objects_with_primitives = sum(
+            1
+            for obj in raw_objects
+            if isinstance(obj, dict)
+            and isinstance(obj.get("surface_primitives"), list)
+            and bool(obj["surface_primitives"])
+        )
+        if hasattr(self, "stats") and hasattr(self, "lock"):
+            with self.lock:
+                self.stats["objects_with_primitives"] = objects_with_primitives
+                self.stats["objects_total"] = objects_total
+        if objects_total and not objects_with_primitives:
+            if not getattr(self, "_zero_primitives_warned", False):
+                LOG.warning(
+                    "remote result carries %d objects but zero surface primitives; "
+                    "orientation belief cannot run",
+                    objects_total,
+                )
+                self._zero_primitives_warned = True
+        else:
+            self._zero_primitives_warned = False
         return inputs
 
     def _bounded_hand_telemetry(self, value: Any) -> dict[str, Any]:
@@ -1141,9 +1201,14 @@ class ThorRemoteGateway:
         ray_origin = _finite_vec3(payload.get("camera_goal_origin_m"))
         ray_direction = _finite_vec3(payload.get("camera_goal_forward_m"))
         up_goal = None
+        base_quat_wxyz = None
         if robot_state_packet is not None:
             try:
-                up_goal = gravity_up_in_pelvis(decode_robot_state(robot_state_packet).base_quat_wxyz)
+                local_state = decode_robot_state(robot_state_packet)
+                base_quat_wxyz = local_state.base_quat_wxyz
+                # Remote geometry can be 100-200 ms old. Belief orientation
+                # uses Thor's current IMU; remote gravity is diagnostic only.
+                up_goal = gravity_up_in_pelvis(base_quat_wxyz)
             except Exception as error:
                 with self.lock:
                     self.stats["last_belief_gravity_error"] = str(error)
@@ -1151,6 +1216,7 @@ class ThorRemoteGateway:
             shared_geometry = self.parallel_tasc_belief.build_shared_geometry(
                 inputs, ray_origin=ray_origin, ray_direction=ray_direction,
                 up_goal=up_goal,
+                base_quat_wxyz=base_quat_wxyz,
                 stamp_us=int(payload.get("source_rgb_timestamp_us", 0) or 0),
             )
         per_hand = self.parallel_tasc_belief.update_hands(shared_geometry, hand_inputs)
@@ -1399,8 +1465,6 @@ class ThorRemoteGateway:
                 if result is None or robot_state is None:
                     continue
                 inputs = self._belief_inputs_from_result(result)
-                if not inputs:
-                    continue
                 if (
                     self.latest_belief_geometry is None
                     or now >= next_geometry
@@ -1413,6 +1477,7 @@ class ThorRemoteGateway:
                         ray_origin=_finite_vec3(result.get("camera_goal_origin_m")),
                         ray_direction=_finite_vec3(result.get("camera_goal_forward_m")),
                         up_goal=gravity_up_in_pelvis(state.base_quat_wxyz),
+                        base_quat_wxyz=state.base_quat_wxyz,
                         stamp_us=int(result.get("source_rgb_timestamp_us", 0) or 0),
                     )
                     self.latest_belief_geometry_sequence = int(result.get("sequence", -1))

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import logging
 import socket
@@ -16,7 +17,6 @@ import numpy as np
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
-
 from seg_web_node.lcm_protocol import decode_camera, decode_depth
 from seg_web_node.rgbd_sync import depth_at_rgb_size
 from seg_web_node.visualization import render_segmented_rgbd
@@ -36,7 +36,6 @@ from .protocol import (
     unpack_heartbeat,
     unpack_result,
 )
-
 
 LOG = logging.getLogger("remote_offload.remote_web_server")
 
@@ -160,7 +159,8 @@ def detect_lan_host() -> str:
     return "127.0.0.1"
 
 
-BELIEF_COLORS = {"left": (255, 180, 60), "right": (80, 180, 255)}
+BELIEF_COLORS = {"left": (255, 190, 40), "right": (60, 160, 255)}
+BELIEF_DIM_ALPHA = 0.40
 
 
 def _belief_for_object(
@@ -223,70 +223,300 @@ def _draw_dashed_rectangle(
         cv2.line(image, (x1, start), (x1, min(start + 6, y1)), color, thickness)
 
 
+def _goal_to_pixel(
+    point_goal_m: Any,
+    t_goal_cam: Any,
+    intrinsics: Any,
+) -> tuple[int, int] | None:
+    """Project a goal-frame point into the frame that produced its geometry."""
+    if point_goal_m is None or t_goal_cam is None or not intrinsics:
+        return None
+    try:
+        homogeneous = np.ones(4, dtype=np.float64)
+        homogeneous[:3] = np.asarray(point_goal_m, dtype=np.float64).reshape(3)
+        transform = np.asarray(t_goal_cam, dtype=np.float64).reshape(4, 4)
+        camera = (np.linalg.inv(transform) @ homogeneous)[:3]
+        if not np.isfinite(camera).all() or camera[2] <= 1.0e-6:
+            return None
+        width = int(intrinsics["width"])
+        height = int(intrinsics["height"])
+        if width <= 0 or height <= 0:
+            return None
+        u = round(
+            float(intrinsics["fx"]) * camera[0] / camera[2]
+            + float(intrinsics["cx"])
+        )
+        v = round(
+            float(intrinsics["fy"]) * camera[1] / camera[2]
+            + float(intrinsics["cy"])
+        )
+    except (TypeError, ValueError, KeyError, np.linalg.LinAlgError):
+        return None
+    return (
+        int(np.clip(u, 0, width - 1)),
+        int(np.clip(v, 0, height - 1)),
+    )
+
+
+def _project_axis_arrow(
+    origin_goal_m: Any,
+    axis_goal: Any,
+    t_goal_cam: Any,
+    intrinsics: Any,
+    length_m: float = 0.08,
+) -> tuple[tuple[int, int], tuple[int, int]] | None:
+    """Project both endpoints of a physical 3-D axis segment."""
+    try:
+        start = np.asarray(origin_goal_m, dtype=np.float64).reshape(3)
+        direction = np.asarray(axis_goal, dtype=np.float64).reshape(3)
+        norm = float(np.linalg.norm(direction))
+        if not np.isfinite(start).all() or not np.isfinite(norm) or norm < 1.0e-9:
+            return None
+        end = start + direction / norm * float(length_m)
+    except (TypeError, ValueError):
+        return None
+    first = _goal_to_pixel(start, t_goal_cam, intrinsics)
+    second = _goal_to_pixel(end, t_goal_cam, intrinsics)
+    return None if first is None or second is None else (first, second)
+
+
+def _projection_metadata(
+    payload: dict[str, Any] | None,
+) -> tuple[np.ndarray | None, dict[str, Any] | None]:
+    if not isinstance(payload, dict):
+        return None, None
+    raw = payload.get("t_goal_cam")
+    intrinsics = payload.get("intrinsics")
+    if not isinstance(raw, list) or len(raw) != 16 or not isinstance(intrinsics, dict):
+        return None, None
+    try:
+        transform = np.asarray(raw, dtype=np.float64).reshape(4, 4)
+    except (TypeError, ValueError):
+        return None, None
+    if not np.isfinite(transform).all():
+        return None, None
+    return transform, intrinsics
+
+
+def _draw_belief_legend(
+    overlay: np.ndarray,
+    hands: dict[str, Any],
+    selected_hand: str,
+    stale: bool,
+    match_state: str,
+) -> None:
+    y = 20
+    for side in ("left", "right"):
+        color = BELIEF_COLORS[side]
+        hand = hands.get(side) or {}
+        target = hand.get("target") or {}
+        if stale:
+            state = "stale"
+        elif not target.get("object_id"):
+            state = "no target"
+        elif side == selected_hand and hand.get("armed"):
+            state = "A/B"
+        else:
+            state = "idle"
+        cv2.rectangle(overlay, (10, y - 10), (24, y + 2), color, -1)
+        cv2.putText(
+            overlay,
+            f"{side[0].upper()} {state}",
+            (30, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.46,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+        y += 20
+    cv2.putText(
+        overlay,
+        f"sync: {match_state}",
+        (10, y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.42,
+        (200, 200, 200),
+        1,
+        cv2.LINE_AA,
+    )
+
+
+def _draw_hand_belief(
+    layer: np.ndarray,
+    objects: list[dict[str, Any]],
+    side: str,
+    hand: dict[str, Any],
+    *,
+    armed: bool,
+    t_goal_cam: Any,
+    intrinsics: Any,
+    label_slot: int,
+) -> None:
+    target = hand.get("target") or {}
+    object_id = str(target.get("object_id", ""))
+    obj = next(
+        (item for item in objects if str(item.get("track_id", "")) == object_id),
+        None,
+    )
+    if obj is None:
+        return
+    box = obj.get("box_xyxy") or [0, 0, 0, 0]
+    try:
+        x0, y0, x1, y1 = [round(float(value)) for value in box]
+    except (TypeError, ValueError):
+        return
+    height, width = layer.shape[:2]
+    x0, x1 = [int(value) for value in np.clip([x0, x1], 0, width - 1)]
+    y0, y1 = [int(value) for value in np.clip([y0, y1], 0, height - 1)]
+    color = BELIEF_COLORS[side]
+    box_px, cross_px = (3, 24) if armed else (1, 14)
+    if armed:
+        cv2.rectangle(layer, (x0, y0), (x1, y1), color, box_px)
+    else:
+        _draw_dashed_rectangle(layer, (x0, y0), (x1, y1), color, box_px)
+
+    # Reuse the same probability extraction as the status table.
+    belief = _belief_for_object(
+        {"hands": {side: hand}}, side, object_id
+    )
+    relation = str(target.get("orientation_relation") or "-")
+    authority = "A/B" if armed else "idle"
+    label = (
+        f"{side[0].upper()} p={belief['object_probability']:.2f} "
+        f"j={belief['joint_probability']:.2f} {relation} [{authority}]"
+    )
+    label_y = int(np.clip(y1 + 18 + 20 * label_slot, 16, height - 4))
+    if armed:
+        (text_width, text_height), baseline = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1
+        )
+        cv2.rectangle(
+            layer,
+            (x0, label_y - text_height - 3),
+            (min(width - 1, x0 + text_width + 5), label_y + baseline),
+            color,
+            -1,
+        )
+        text_color = (0, 0, 0)
+    else:
+        text_color = color
+    cv2.putText(
+        layer,
+        label,
+        (x0 + 2, label_y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        text_color,
+        1,
+        cv2.LINE_AA,
+    )
+
+    contact_goal = target.get("position_goal_m")
+    if contact_goal is None:
+        selected = next(
+            (
+                value
+                for value in (hand.get("objects") or [])
+                if str(value.get("object_id", "")) == object_id
+            ),
+            {},
+        )
+        contact_goal = selected.get("selected_contact_goal_m")
+    pixel = _goal_to_pixel(contact_goal, t_goal_cam, intrinsics)
+    if pixel is None:
+        return
+    cv2.drawMarker(
+        layer,
+        pixel,
+        color,
+        cv2.MARKER_CROSS,
+        cross_px,
+        box_px + 1,
+    )
+    axis = target.get("orientation_axis_world")
+    if target.get("orientation_valid") and axis is not None:
+        origin = target.get("orientation_source_position_m")
+        if origin is None:
+            origin = contact_goal
+        arrow = _project_axis_arrow(origin, axis, t_goal_cam, intrinsics)
+        if arrow is not None:
+            cv2.arrowedLine(
+                layer,
+                arrow[0],
+                arrow[1],
+                color,
+                max(1, box_px),
+                cv2.LINE_AA,
+                tipLength=0.3,
+            )
+
+
 def _draw_remote_belief_overlay(
     overlay: np.ndarray,
     objects: list[dict[str, Any]],
     telemetry: dict[str, Any] | None,
     *,
     stale: bool,
+    t_goal_cam: Any = None,
+    intrinsics: Any = None,
+    match_state: str = "unmatched",
 ) -> None:
     if not isinstance(telemetry, dict):
+        _draw_belief_legend(overlay, {}, "none", stale, match_state)
         return
     hands = telemetry.get("hands") or {}
     selected_hand = str(telemetry.get("selected_hand", "none"))
+    armed_sides: list[str] = []
+    dim_sides: list[str] = []
     for side in ("left", "right"):
         hand = hands.get(side) or {}
         target = hand.get("target") or {}
-        object_id = str(target.get("object_id", ""))
-        if not object_id:
+        if not target.get("object_id"):
             continue
-        obj = next(
-            (item for item in objects if str(item.get("track_id", "")) == object_id),
-            None,
-        )
-        if obj is None:
-            continue
-        box = obj.get("box_xyxy") or [0, 0, 0, 0]
-        x0, y0, x1, y1 = [int(round(float(value))) for value in box]
-        height, width = overlay.shape[:2]
-        x0, x1 = [int(v) for v in np.clip([x0, x1], 0, width - 1)]
-        y0, y1 = [int(v) for v in np.clip([y0, y1], 0, height - 1)]
         armed = side == selected_hand and bool(hand.get("armed", False)) and not stale
-        color = BELIEF_COLORS[side]
-        if armed:
-            cv2.rectangle(overlay, (x0, y0), (x1, y1), color, 3)
-        else:
-            _draw_dashed_rectangle(overlay, (x0, y0), (x1, y1), color)
-        probability = float(target.get("object_confidence", 0.0) or 0.0)
-        joint = float(target.get("joint_confidence", 0.0) or 0.0)
-        cv2.putText(
-            overlay,
-            f"{side[0].upper()} p={probability:.2f} j={joint:.2f}",
-            (x0, min(height - 8, y1 + (18 if side == "left" else 36))),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
-            color,
-            2 if armed else 1,
-            cv2.LINE_AA,
-        )
-        pixel = obj.get("center_pixel_uv")
-        if isinstance(pixel, list) and len(pixel) == 2:
-            center = (int(pixel[0]), int(pixel[1]))
-            cv2.drawMarker(
-                overlay,
-                center,
-                color,
-                cv2.MARKER_CROSS,
-                18 if armed else 12,
-                2 if armed else 1,
+        (armed_sides if armed else dim_sides).append(side)
+
+    if dim_sides:
+        scratch = overlay.copy()
+        for slot, side in enumerate(dim_sides):
+            _draw_hand_belief(
+                scratch,
+                objects,
+                side,
+                hands[side],
+                armed=False,
+                t_goal_cam=t_goal_cam,
+                intrinsics=intrinsics,
+                label_slot=slot,
             )
-            axis = target.get("orientation_axis_world")
-            if isinstance(axis, list) and len(axis) == 3:
-                end = (
-                    int(center[0] + 35.0 * float(axis[0])),
-                    int(center[1] - 35.0 * float(axis[1])),
-                )
-                cv2.arrowedLine(overlay, center, end, color, 2, tipLength=0.25)
+        cv2.addWeighted(
+            scratch,
+            BELIEF_DIM_ALPHA,
+            overlay,
+            1.0 - BELIEF_DIM_ALPHA,
+            0.0,
+            overlay,
+        )
+
+    for slot, side in enumerate(armed_sides, start=len(dim_sides)):
+        _draw_hand_belief(
+            overlay,
+            objects,
+            side,
+            hands[side],
+            armed=True,
+            t_goal_cam=t_goal_cam,
+            intrinsics=intrinsics,
+            label_slot=slot,
+        )
+    _draw_belief_legend(
+        overlay,
+        hands,
+        selected_hand,
+        stale,
+        match_state,
+    )
 
 
 class RemoteWebRuntime:
@@ -302,6 +532,10 @@ class RemoteWebRuntime:
         self.rgb = None
         self.depth = None
         self.result: dict[str, Any] | None = None
+        self.result_history: collections.OrderedDict[int, dict[str, Any]] = (
+            collections.OrderedDict()
+        )
+        self.result_history_max = 12
         self.heartbeat: dict[str, Any] | None = None
         self.belief_telemetry: dict[str, Any] | None = None
         self.belief_telemetry_received_monotonic: float | None = None
@@ -455,10 +689,42 @@ class RemoteWebRuntime:
             payload = unpack_result(data)
             with self.render_ready:
                 self.result = payload
+                sequence = int(payload.get("sequence", -1))
+                if sequence >= 0:
+                    self.result_history[sequence] = payload
+                    while len(self.result_history) > self.result_history_max:
+                        self.result_history.popitem(last=False)
                 self.stats["results"] += 1
                 self._request_render_locked()
         except Exception as error:
             self._record_error(error)
+
+    def _select_belief_pair(
+        self,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str]:
+        """Return newest segmentation and the result described by telemetry."""
+        with self.lock:
+            telemetry = self.belief_telemetry
+            newest = self.result
+            history = dict(self.result_history)
+        if not isinstance(telemetry, dict):
+            return newest, None, "no_telemetry"
+        try:
+            sequence = int(telemetry.get("result_sequence", -1))
+        except (TypeError, ValueError):
+            sequence = -1
+        matched = history.get(sequence)
+        if matched is not None:
+            return newest, matched, "matched"
+        try:
+            source_us = int(telemetry.get("source_rgb_timestamp_us", 0) or 0)
+        except (TypeError, ValueError):
+            source_us = 0
+        if source_us:
+            for payload in history.values():
+                if int(payload.get("source_rgb_timestamp_us", 0) or 0) == source_us:
+                    return newest, payload, "matched_ts"
+        return newest, None, "unmatched"
 
     def _on_belief_telemetry(self, _channel: str, data: bytes) -> None:
         try:
@@ -487,12 +753,13 @@ class RemoteWebRuntime:
                 self._record_error(error)
 
     def _render(self) -> None:
+        newest, matched, match_state = self._select_belief_pair()
         with self.lock:
             rgb = self.rgb
             depth = self.depth
-            payload = self.result
             belief_telemetry = self.belief_telemetry
             belief_received_monotonic = self.belief_telemetry_received_monotonic
+        payload = newest
         if rgb is None:
             return
         encoded = np.frombuffer(rgb.jpeg, dtype=np.uint8)
@@ -570,6 +837,7 @@ class RemoteWebRuntime:
             self.min_depth_m,
             self.max_depth_m,
         )
+        result_t_goal_cam, result_intrinsics = _projection_metadata(payload)
         for index, obj in enumerate(wire_objects):
             box = obj.get("box_xyxy") or [8, 24 + index * 20, 8, 24 + index * 20]
             x0 = int(max(0, min(overlay.shape[1] - 1, round(float(box[0])))))
@@ -603,37 +871,69 @@ class RemoteWebRuntime:
                         color,
                         -1,
                     )
-                primitives = obj.get("surface_primitives") or []
-                if primitives:
-                    axis = primitives[0].get("axis_goal")
-                    if isinstance(axis, list) and len(axis) == 3:
-                        end = (
-                            int(center[0] + 35.0 * float(axis[0])),
-                            int(center[1] - 35.0 * float(axis[1])),
-                        )
-                        cv2.arrowedLine(
-                            overlay, center, end, (220, 100, 255), 2, tipLength=0.25
-                        )
-                surface = obj.get("surface_model")
-                if isinstance(surface, dict):
-                    axis = surface.get("axis_goal")
-                    if isinstance(axis, list) and len(axis) == 3:
-                        end = (
-                            int(center[0] + 30.0 * float(axis[0])),
-                            int(center[1] - 30.0 * float(axis[1])),
-                        )
-                        cv2.line(overlay, center, end, (80, 255, 120), 2)
+            primitives = obj.get("surface_primitives") or []
+            if primitives:
+                primitive = primitives[0]
+                arrow = _project_axis_arrow(
+                    primitive.get("origin_goal_m"),
+                    primitive.get("axis_goal"),
+                    result_t_goal_cam,
+                    result_intrinsics,
+                )
+                if arrow is not None:
+                    cv2.arrowedLine(
+                        overlay,
+                        arrow[0],
+                        arrow[1],
+                        (220, 100, 255),
+                        2,
+                        cv2.LINE_AA,
+                        tipLength=0.25,
+                    )
+            surface = obj.get("surface_model")
+            if isinstance(surface, dict):
+                arrow = _project_axis_arrow(
+                    surface.get("center_goal_m"),
+                    surface.get("axis_goal"),
+                    result_t_goal_cam,
+                    result_intrinsics,
+                )
+                if arrow is not None:
+                    cv2.line(
+                        overlay,
+                        arrow[0],
+                        arrow[1],
+                        (80, 255, 120),
+                        2,
+                        cv2.LINE_AA,
+                    )
         telemetry_stale = True
         if isinstance(belief_telemetry, dict) and belief_received_monotonic is not None:
             telemetry_age_ms = max(
                 0.0, (time.monotonic() - belief_received_monotonic) * 1000.0
             )
             telemetry_stale = telemetry_age_ms > 1500.0
+        belief_objects: list[dict[str, Any]] = []
+        belief_t_goal_cam = None
+        belief_intrinsics = None
+        if matched is not None:
+            belief_objects = [
+                {
+                    "track_id": obj.get("track_id"),
+                    "box_xyxy": obj.get("box_xyxy"),
+                }
+                for obj in matched.get("objects", [])
+                if isinstance(obj, dict)
+            ]
+            belief_t_goal_cam, belief_intrinsics = _projection_metadata(matched)
         _draw_remote_belief_overlay(
             overlay,
-            objects_summary,
+            belief_objects,
             belief_telemetry,
             stale=telemetry_stale,
+            t_goal_cam=belief_t_goal_cam,
+            intrinsics=belief_intrinsics,
+            match_state=match_state,
         )
         result_age_ms = None
         if isinstance(payload, dict):
@@ -644,7 +944,7 @@ class RemoteWebRuntime:
         footer = (
             "live RGB | segmentation pending"
             if result_age_ms is None
-            else f"live RGB | result age={result_age_ms:.0f}ms | belief={'STALE' if telemetry_stale else 'live'}"
+            else f"live RGB | result age={result_age_ms:.0f}ms | belief={'STALE' if telemetry_stale else 'live'} | sync={match_state}"
         )
         cv2.putText(
             overlay,
@@ -663,6 +963,7 @@ class RemoteWebRuntime:
             self.output_jpeg = jpg.tobytes()
             self.output_version += 1
             self.stats["objects"] = objects_summary
+            self.stats["belief_match_state"] = match_state
             self.frame_ready.notify_all()
 
     def _lcm_loop(self) -> None:

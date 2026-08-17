@@ -237,6 +237,20 @@ tasc_belief:
     switch_gamma_h: 3.0
     switch_gamma_omega: 1.0
     switch_omega_ref: 0.5
+    # Persistent world-frame surface-axis bank. Gravity candidates are always
+    # recomputed from the live IMU and are never position/contact candidates.
+    bank:
+      axis_ema_alpha: 0.30
+      coast_ttl_frames: 24
+      max_coast_seconds: 4.0
+      coast_decay: 0.90
+      assoc_max_axis_deg: 30.0
+      assoc_base_distance_m: 0.10
+      assoc_drift_mps: 0.15
+      gravity_candidate_enabled: true
+      gravity_label_prior: -0.3
+      contact_requires_active: true
+      goal_fallback_ttl_frames: 3
     pseudo:
       enabled: true
       max_points: 1
@@ -262,6 +276,7 @@ tasc_belief:
   pos_switch_gamma_u: 2.0
   geometry_update_hz: 8.0
   belief_update_hz: 30.0
+  belief_telemetry_hz: 15.0
   max_objects: 10
   max_contacts_per_object: 6
   max_orientation_candidates: 96

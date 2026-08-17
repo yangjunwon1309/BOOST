@@ -10,7 +10,6 @@ from typing import Any
 
 import numpy as np
 import yaml
-
 from seg_web_node.geometry import CameraIntrinsics
 from seg_web_node.grip_candidates import GripCandidateConfig, PseudoContactConfig
 from seg_web_node.object_point_filter import ObjectPointFilterConfig
@@ -22,7 +21,6 @@ from .remote_geometry_pipeline import (
     camera_geometry_metadata,
 )
 from .remote_sam3_worker import RemoteSam3Worker, load_extrinsics, parse_concepts
-
 
 LOG = logging.getLogger("remote_offload.remote_sam3_belief_input_worker")
 
@@ -62,6 +60,7 @@ class RemoteSam3BeliefInputWorker(RemoteSam3Worker):
     ) -> None:
         super().__init__(**kwargs)
         self.geometry_requires_robot_state = True
+        self._geometry_disabled_warned = False
         self.geometry_pipeline = RemoteRgbdGeometryPipeline(
             object_point_filter=object_point_filter,
             contact_config=contact_config,
@@ -100,17 +99,27 @@ class RemoteSam3BeliefInputWorker(RemoteSam3Worker):
             inference_ms=inference_ms,
         )
         context = self._current_frame_geometry(pair.rgb.timestamp_us)
-        payload.update(camera_geometry_metadata(context.t_goal_cam))
-        payload["gravity_up_goal"] = (
-            None if context.up_goal is None else context.up_goal.tolist()
-        )
-
         # A mask remains useful for diagnostics without calibration/state, but
         # Thor must never mistake camera-only or stale geometry for belief input.
         geometry_intrinsics = (
             intrinsics
             if context.state is not None and context.t_goal_cam is not None
             else None
+        )
+        if geometry_intrinsics is None:
+            if not getattr(self, "_geometry_disabled_warned", False):
+                LOG.warning(
+                    "robot state or T_goal_cam unavailable; publishing masks only. "
+                    "Thor will receive no contact candidates and no surface primitives"
+                )
+                self._geometry_disabled_warned = True
+        else:
+            self._geometry_disabled_warned = False
+        payload.update(
+            camera_geometry_metadata(context.t_goal_cam, geometry_intrinsics)
+        )
+        payload["gravity_up_goal"] = (
+            None if context.up_goal is None else context.up_goal.tolist()
         )
         payload["objects"] = self.geometry_pipeline.build_object_geometry(
             masks=masks,
@@ -128,6 +137,19 @@ class RemoteSam3BeliefInputWorker(RemoteSam3Worker):
             image_height=pair.rgb.height,
             allow_geometry_fallback=geometry_intrinsics is not None,
         )
+        payload["geometry_status"] = {
+            "state_available": context.state is not None,
+            "t_goal_cam_available": context.t_goal_cam is not None,
+            "up_goal_available": context.up_goal is not None,
+            "state_delta_ms": context.state_delta_ms,
+            "primitive_count": sum(
+                len(obj.get("surface_primitives") or [])
+                for obj in payload["objects"]
+            ),
+            "fallback_count": sum(
+                1 for obj in payload["objects"] if obj.get("geometry_fallback")
+            ),
+        }
         return payload
 
 

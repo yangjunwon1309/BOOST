@@ -17,6 +17,7 @@ compile_commands.json
 # Local environments and generated data
 .venv/
 .venv_*/
+.pixi/
 data/*
 !data/.gitkeep
 *.npz

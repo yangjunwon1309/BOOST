@@ -374,12 +374,17 @@ class UnitreeG1ArmNonlinearIK:
         self.param_upper = self.opti.parameter(self.reduced_robot.model.nq)
         self.param_tf_l = self.opti.parameter(4, 4)
         self.param_tf_r = self.opti.parameter(4, 4)
+        self.param_position_scale_l = self.opti.parameter()
+        self.param_position_scale_r = self.opti.parameter()
         self.param_orientation_scale_l = self.opti.parameter()
         self.param_orientation_scale_r = self.opti.parameter()
+        self.param_smooth_scale = self.opti.parameter()
 
-        translational_cost = casadi.sumsqr(
-            self.translational_error(self.var_q, self.param_tf_l, self.param_tf_r)
+        translation_error = self.translational_error(
+            self.var_q, self.param_tf_l, self.param_tf_r
         )
+        left_translation_cost = casadi.sumsqr(translation_error[:3])
+        right_translation_cost = casadi.sumsqr(translation_error[3:])
         rotation_error = self.rotational_error(
             self.var_q, self.param_tf_l, self.param_tf_r
         )
@@ -391,14 +396,18 @@ class UnitreeG1ArmNonlinearIK:
             self.opti.bounded(self.param_lower, self.var_q, self.param_upper)
         )
         self.opti.minimize(
-            position_weight * translational_cost
+            position_weight
+            * (
+                self.param_position_scale_l * left_translation_cost
+                + self.param_position_scale_r * right_translation_cost
+            )
             + orientation_weight
             * (
                 self.param_orientation_scale_l * left_rotation_cost
                 + self.param_orientation_scale_r * right_rotation_cost
             )
             + regularization_weight * regularization_cost
-            + smooth_weight * smooth_cost
+            + smooth_weight * self.param_smooth_scale * smooth_cost
         )
 
         opts = {
@@ -604,8 +613,11 @@ class UnitreeG1ArmNonlinearIK:
         lower: np.ndarray,
         upper: np.ndarray,
         initial: np.ndarray,
+        left_position_scale: float,
+        right_position_scale: float,
         left_orientation_scale: float,
         right_orientation_scale: float,
+        smooth_scale: float,
     ) -> np.ndarray:
         self.opti.set_initial(self.var_q, np.clip(initial, lower, upper))
         self.opti.set_value(self.var_q_last, q_last)
@@ -614,11 +626,18 @@ class UnitreeG1ArmNonlinearIK:
         self.opti.set_value(self.param_tf_l, left_target_tf)
         self.opti.set_value(self.param_tf_r, right_target_tf)
         self.opti.set_value(
+            self.param_position_scale_l, max(0.0, float(left_position_scale))
+        )
+        self.opti.set_value(
+            self.param_position_scale_r, max(0.0, float(right_position_scale))
+        )
+        self.opti.set_value(
             self.param_orientation_scale_l, float(left_orientation_scale)
         )
         self.opti.set_value(
             self.param_orientation_scale_r, float(right_orientation_scale)
         )
+        self.opti.set_value(self.param_smooth_scale, max(0.0, float(smooth_scale)))
         sol = self.opti.solve()
         return np.asarray(sol.value(self.var_q), dtype=np.float64).reshape(14)
 
@@ -632,6 +651,9 @@ class UnitreeG1ArmNonlinearIK:
         lower: np.ndarray | None = None,
         upper: np.ndarray | None = None,
         base_quaternion_wxyz: np.ndarray | None = None,
+        left_position_weight_scale: float = 1.0,
+        right_position_weight_scale: float = 1.0,
+        smooth_weight_scale: float = 1.0,
     ) -> ArmIkResult:
         """Solve both arm joint vectors against explicit pelvis-local EE poses."""
 
@@ -667,8 +689,11 @@ class UnitreeG1ArmNonlinearIK:
                 lower=lower,
                 upper=upper,
                 initial=self.init_data,
+                left_position_scale=left_position_weight_scale,
+                right_position_scale=right_position_weight_scale,
                 left_orientation_scale=left_orientation_scale,
                 right_orientation_scale=right_orientation_scale,
+                smooth_scale=smooth_weight_scale,
             )
             q_raw = self.arm_q_to_q29(q_seed29, arm_q)
             first_metrics = self._solution_metrics(
@@ -713,8 +738,11 @@ class UnitreeG1ArmNonlinearIK:
                     lower=lower,
                     upper=upper,
                     initial=arm_q,
+                    left_position_scale=left_position_weight_scale,
+                    right_position_scale=right_position_weight_scale,
                     left_orientation_scale=left_orientation_scale,
                     right_orientation_scale=right_orientation_scale,
+                    smooth_scale=smooth_weight_scale,
                 )
 
             q_raw = self.arm_q_to_q29(q_seed29, arm_q)
@@ -802,6 +830,9 @@ class UnitreeG1ArmNonlinearIK:
         q_seed29: np.ndarray,
         q_smooth29: np.ndarray | None = None,
         base_quaternion_wxyz: np.ndarray | None = None,
+        left_position_weight_scale: float = 1.0,
+        right_position_weight_scale: float = 1.0,
+        smooth_weight_scale: float = 1.0,
     ) -> ArmIkResult:
         """Solve the authoritative 14-DoF arm target used by PATH q/e modes."""
 
@@ -811,6 +842,9 @@ class UnitreeG1ArmNonlinearIK:
             q_seed29=q_seed29,
             q_smooth29=q_smooth29,
             base_quaternion_wxyz=base_quaternion_wxyz,
+            left_position_weight_scale=left_position_weight_scale,
+            right_position_weight_scale=right_position_weight_scale,
+            smooth_weight_scale=smooth_weight_scale,
         )
 
     def solve_gmr_reference(

@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import logging
 import time
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import numpy as np
@@ -17,18 +17,21 @@ from .feature_cost import (
     robust_standardize,
 )
 from .grip_candidates import (
+    ContactFrame,
     GripCandidate,
     GripCandidateConfig,
+    PersistentCylinderSurfaceTracker,
     PseudoContactConfig,
     SurfacePrimitive,
-    ContactFrame,
-    PersistentCylinderSurfaceTracker,
     contact_frame,
     extract_surface_primitives,
     generate_grip_candidates,
 )
-from .robot_geometry import HAND_AXIS_LOCAL, hand_frame_profile
-
+from .robot_geometry import (
+    HAND_AXIS_LOCAL,
+    hand_frame_profile,
+    pelvis_to_world_rotation,
+)
 
 EPS = 1.0e-9
 LOG = logging.getLogger(__name__)
@@ -38,7 +41,95 @@ POLICY_BY_PRIMITIVE = {
     "circle": "minimal_rotation",
     "pca": "minimal_rotation",
     "point": "minimal_rotation",
+    "gravity": "minimal_rotation",
 }
+GRAVITY_TRACK_UID = "__gravity__"
+
+
+@dataclass
+class AxisEstimator:
+    """Exponentially weighted structure tensor for an undirected axis."""
+
+    alpha: float = 0.30
+    tensor: np.ndarray = field(
+        default_factory=lambda: np.zeros((3, 3), dtype=np.float64)
+    )
+    weight: float = 0.0
+    observations: int = 0
+
+    def update(self, normal: np.ndarray, weight: float = 1.0) -> None:
+        axis = np.asarray(normal, dtype=np.float64).reshape(3)
+        norm = float(np.linalg.norm(axis))
+        if not np.isfinite(norm) or norm < 1.0e-9:
+            return
+        axis = axis / norm
+        value = float(np.clip(weight, 0.0, 1.0))
+        alpha = float(np.clip(self.alpha, 0.0, 1.0))
+        self.tensor = (
+            (1.0 - alpha) * self.tensor
+            + alpha * value * np.outer(axis, axis)
+        )
+        self.weight = (1.0 - alpha) * self.weight + alpha * value
+        self.observations += 1
+
+    def decay(self, factor: float) -> None:
+        """Shrink confidence while preserving the principal eigenvector."""
+        value = float(np.clip(factor, 0.0, 1.0))
+        self.tensor *= value
+        self.weight *= value
+
+    def axis_and_concentration(self) -> tuple[np.ndarray, float] | None:
+        trace = float(np.trace(self.tensor))
+        if not np.isfinite(trace) or trace < 1.0e-9:
+            return None
+        values, vectors = np.linalg.eigh(self.tensor)
+        index = int(np.argmax(values))
+        axis = vectors[:, index]
+        norm = float(np.linalg.norm(axis))
+        if not np.isfinite(norm) or norm < 1.0e-9:
+            return None
+        concentration = float(values[index] / max(1.0e-12, trace))
+        return axis / norm, concentration
+
+
+@dataclass(frozen=True)
+class OrientationBankConfig:
+    axis_ema_alpha: float = 0.30
+    coast_ttl_frames: int = 24
+    max_coast_seconds: float = 4.0
+    coast_decay: float = 0.90
+    assoc_max_axis_deg: float = 30.0
+    assoc_base_distance_m: float = 0.10
+    assoc_drift_mps: float = 0.15
+    gravity_candidate_enabled: bool = True
+    gravity_label_prior: float = -0.3
+    contact_requires_active: bool = True
+    goal_fallback_ttl_frames: int = 3
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "OrientationBankConfig":
+        values = dict(data or {})
+        return cls(
+            axis_ema_alpha=float(values.get("axis_ema_alpha", 0.30)),
+            coast_ttl_frames=int(values.get("coast_ttl_frames", 24)),
+            max_coast_seconds=float(values.get("max_coast_seconds", 4.0)),
+            coast_decay=float(values.get("coast_decay", 0.90)),
+            assoc_max_axis_deg=float(values.get("assoc_max_axis_deg", 30.0)),
+            assoc_base_distance_m=float(
+                values.get("assoc_base_distance_m", 0.10)
+            ),
+            assoc_drift_mps=float(values.get("assoc_drift_mps", 0.15)),
+            gravity_candidate_enabled=bool(
+                values.get("gravity_candidate_enabled", True)
+            ),
+            gravity_label_prior=float(values.get("gravity_label_prior", -0.3)),
+            contact_requires_active=bool(
+                values.get("contact_requires_active", True)
+            ),
+            goal_fallback_ttl_frames=int(
+                values.get("goal_fallback_ttl_frames", 3)
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -78,6 +169,82 @@ class OrientationCandidate:
     primitive_kind: str = ""
     surface_axis: np.ndarray | None = None
     primitive: SurfacePrimitive | None = None
+
+
+@dataclass
+class OrientationTrack:
+    """One persistent surface-axis hypothesis owned by the bank."""
+
+    track_uid: str
+    label: str
+    kind: str
+    axis_estimator: AxisEstimator
+    anchor_world_m: np.ndarray
+    anchor_stamp_us: int
+    radius_m: float = 0.0
+    half_height_m: float = 0.0
+    extent_m: np.ndarray | None = None
+    fit_quality_ema: float = 0.0
+    detection_track_ids: set[str] = field(default_factory=set)
+    last_detection_track_id: str = ""
+    last_seen_us: int = 0
+    missing_frames: int = 0
+    total_observations: int = 0
+    state: str = "active"
+    persistent: bool = False
+    frame_mode: str = "world"
+
+    def effective_quality(self, coast_decay: float) -> float:
+        resolved = self.axis_estimator.axis_and_concentration()
+        if resolved is None:
+            return 0.0
+        _axis, concentration = resolved
+        concentration_quality = max(0.0, (3.0 * concentration - 1.0) * 0.5)
+        coast_quality = float(np.clip(coast_decay, 0.0, 1.0)) ** max(
+            0, self.missing_frames
+        )
+        return float(
+            np.clip(
+                self.fit_quality_ema * concentration_quality * coast_quality,
+                0.0,
+                1.0,
+            )
+        )
+
+    def to_primitive(
+        self,
+        rotation_world_pelvis: np.ndarray | None,
+        coast_decay: float = 1.0,
+    ) -> SurfacePrimitive | None:
+        resolved = self.axis_estimator.axis_and_concentration()
+        if resolved is None:
+            return None
+        axis_stored, _concentration = resolved
+        if self.frame_mode == "world":
+            if rotation_world_pelvis is None:
+                return None
+            axis_goal = rotation_world_pelvis.T @ axis_stored
+            origin_goal = rotation_world_pelvis.T @ self.anchor_world_m
+        else:
+            axis_goal = axis_stored
+            origin_goal = self.anchor_world_m
+        return SurfacePrimitive(
+            kind=self.kind,
+            origin=np.asarray(origin_goal, dtype=np.float64).reshape(3),
+            axis=np.asarray(axis_goal, dtype=np.float64).reshape(3),
+            fit_quality=self.effective_quality(coast_decay),
+            source=f"bank_{self.state}",
+            radius=float(self.radius_m),
+            half_height=float(self.half_height_m),
+            extent=(
+                None
+                if self.extent_m is None
+                else np.asarray(self.extent_m, dtype=np.float64).reshape(3)
+            ),
+            observation_timestamp_us=int(self.last_seen_us),
+            observation_track_id=str(self.last_detection_track_id),
+            observation_state=str(self.state),
+        )
 
 
 @dataclass(frozen=True)
@@ -123,6 +290,9 @@ class SharedGeometry:
     stamp_us: int
     up_goal: np.ndarray | None = None
     surface_status: dict[str, dict] = field(default_factory=dict)
+    base_quat_wxyz: np.ndarray | None = None
+    orientation_candidates: list[OrientationCandidate] = field(default_factory=list)
+    orientation_bank_status: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -180,6 +350,9 @@ class TascBeliefConfig:
     orientation_advantage_scale: float = 0.5
     orientation_gravity_snap_deg: float = 15.0
     orientation_ghost_decay: float = 0.35
+    orientation_bank: OrientationBankConfig = field(
+        default_factory=OrientationBankConfig
+    )
     pseudo: PseudoContactConfig = field(default_factory=PseudoContactConfig)
     role_hard_filter: bool = False
     label_role_keywords: dict[str, tuple[str, ...]] = field(default_factory=lambda: {
@@ -192,6 +365,7 @@ class TascBeliefConfig:
         "surface": {"parallel": -0.5, "perpendicular": 1.0},
         "top": {"parallel": -0.5, "perpendicular": 1.0},
         "board": {"parallel": -0.5, "perpendicular": 1.0},
+        "gravity": {"parallel": -0.3, "perpendicular": -0.3},
     })
     label_prior_scale: float = 1.0
     per_hand_parallel: bool = True
@@ -224,11 +398,27 @@ class TascBeliefConfig:
         grip = dict(data.get("grip", {}))
         jump = dict(data.get("jump", {}))
         orientation = dict(data.get("orientation", {}))
+        orientation_bank = dict(
+            orientation.get("bank", data.get("orientation_bank", {}))
+        )
         legacy_leak = "kappa0" in leak or "gamma" in leak or "leak_kappa0" in data or "leak_gamma" in data
         if legacy_leak and "persist_leak" not in jump and "persist_leak" not in data:
             LOG.warning("tasc_belief leak_kappa0/leak_gamma are deprecated; mapping kappa0 to persist_leak")
         role_keywords = dict(orientation.get("label_role_keywords", data.get("label_role_keywords", {})))
         relation_prior = dict(orientation.get("label_relation_prior", data.get("label_relation_prior", {})))
+        bank_config = OrientationBankConfig.from_dict(orientation_bank)
+        default_relation_prior = {
+            "hole": {"parallel": 1.0, "perpendicular": -0.5},
+            "circle": {"parallel": 1.0, "perpendicular": -0.5},
+            "surface": {"parallel": -0.5, "perpendicular": 1.0},
+            "top": {"parallel": -0.5, "perpendicular": 1.0},
+            "board": {"parallel": -0.5, "perpendicular": 1.0},
+            "gravity": {
+                "parallel": bank_config.gravity_label_prior,
+                "perpendicular": bank_config.gravity_label_prior,
+            },
+        }
+        default_relation_prior.update(relation_prior)
         return cls(
             enabled=bool(data.get("enabled", True)),
             beta=float(data.get("beta", 1.0)),
@@ -302,19 +492,14 @@ class TascBeliefConfig:
             orientation_advantage_scale=float(orientation.get("advantage_scale", data.get("orientation_advantage_scale", 0.5))),
             orientation_gravity_snap_deg=float(orientation.get("gravity_snap_deg", data.get("orientation_gravity_snap_deg", 15.0))),
             orientation_ghost_decay=float(orientation.get("ghost_decay", data.get("orientation_ghost_decay", 0.35))),
+            orientation_bank=bank_config,
             pseudo=PseudoContactConfig.from_dict({**dict(data.get("pseudo") or {}), **dict(orientation.get("pseudo") or {}), "gravity_snap_deg": orientation.get("gravity_snap_deg", data.get("orientation_gravity_snap_deg", 15.0))}),
             role_hard_filter=bool(orientation.get("role_hard_filter", data.get("role_hard_filter", False))),
             label_role_keywords={str(k): tuple(str(v) for v in values) for k, values in (role_keywords or {
                 "held": ("stick", "leg", "rod", "bar", "pole"),
                 "target": ("hole", "circle", "surface", "top", "plate", "board"),
             }).items()},
-            label_relation_prior={str(k): {str(r): float(x) for r, x in values.items()} for k, values in (relation_prior or {
-                "hole": {"parallel": 1.0, "perpendicular": -0.5},
-                "circle": {"parallel": 1.0, "perpendicular": -0.5},
-                "surface": {"parallel": -0.5, "perpendicular": 1.0},
-                "top": {"parallel": -0.5, "perpendicular": 1.0},
-                "board": {"parallel": -0.5, "perpendicular": 1.0},
-            }).items()},
+            label_relation_prior={str(k): {str(r): float(x) for r, x in values.items()} for k, values in default_relation_prior.items()},
             label_prior_scale=float(orientation.get("label_prior_scale", data.get("label_prior_scale", 1.0))),
             per_hand_parallel=bool(data.get("per_hand_parallel", True)),
             beta_armed=float(data.get("beta_armed", 1.0)), beta_idle=float(data.get("beta_idle", 0.2)),
@@ -375,6 +560,411 @@ def classify_label(
             best = needle
             prior = {str(key).lower(): float(value) for key, value in mapping.items()}
     return role, prior
+
+
+@dataclass(frozen=True)
+class _OrientationObservation:
+    detection_track_id: str
+    label: str
+    primitive: SurfacePrimitive
+    axis_world: np.ndarray
+    anchor_world_m: np.ndarray
+    frame_mode: str
+
+
+class OrientationCandidateBank:
+    """Persistent, detection-independent world-frame orientation hypotheses."""
+
+    def __init__(self, config: OrientationBankConfig | dict | None = None) -> None:
+        self.config = (
+            config
+            if isinstance(config, OrientationBankConfig)
+            else OrientationBankConfig.from_dict(config)
+        )
+        self.tracks: dict[str, OrientationTrack] = {}
+        self.next_track_index = 0
+        self.pelvis_to_world: np.ndarray | None = None
+        self.frame_mode = "goal_fallback"
+        self._seen_this_frame: set[str] = set()
+        self.expired_this_frame = 0
+        self.reassociations = 0
+        self.new_tracks = 0
+        self._fallback_warned = False
+        self._last_now_us = 0
+
+    def _associate(
+        self, observation: _OrientationObservation, now_us: int
+    ) -> str | None:
+        """Associate by detector hint, then label, undirected axis, and position."""
+        for uid, track in self.tracks.items():
+            if (
+                uid not in self._seen_this_frame
+                and not track.persistent
+                and track.frame_mode == observation.frame_mode
+                and observation.detection_track_id in track.detection_track_ids
+            ):
+                return uid
+
+        cos_limit = float(
+            np.cos(np.deg2rad(self.config.assoc_max_axis_deg))
+        )
+        best_uid: str | None = None
+        best_distance = float("inf")
+        for uid, track in self.tracks.items():
+            if (
+                uid in self._seen_this_frame
+                or track.persistent
+                or track.label != observation.label
+                or track.frame_mode != observation.frame_mode
+            ):
+                continue
+            elapsed = max(0.0, (now_us - track.last_seen_us) / 1.0e6)
+            if elapsed > self.config.max_coast_seconds:
+                continue
+            resolved = track.axis_estimator.axis_and_concentration()
+            if resolved is None:
+                continue
+            axis, _concentration = resolved
+            if abs(float(np.dot(axis, observation.axis_world))) < cos_limit:
+                continue
+            budget = (
+                self.config.assoc_base_distance_m
+                + self.config.assoc_drift_mps * elapsed
+            )
+            distance = float(
+                np.linalg.norm(
+                    observation.anchor_world_m - track.anchor_world_m
+                )
+            )
+            if distance <= budget and distance < best_distance:
+                best_uid = uid
+                best_distance = distance
+        return best_uid
+
+    def observe(
+        self,
+        primitives: dict[str, SurfacePrimitive],
+        labels: dict[str, str],
+        *,
+        base_quat_wxyz: np.ndarray | None,
+        up_goal: np.ndarray | None,
+        now_us: int,
+    ) -> None:
+        """Fuse the current frame's surface observations into the bank."""
+        del up_goal  # Gravity candidates are recomputed by candidates().
+        self._last_now_us = int(now_us)
+        self._seen_this_frame = set()
+        self.expired_this_frame = 0
+        self.pelvis_to_world = pelvis_to_world_rotation(base_quat_wxyz)
+        self.frame_mode = (
+            "world" if self.pelvis_to_world is not None else "goal_fallback"
+        )
+        if self.frame_mode == "goal_fallback":
+            if not self._fallback_warned:
+                LOG.warning(
+                    "orientation bank has no valid base quaternion; using "
+                    "short-TTL goal-frame fallback"
+                )
+                self._fallback_warned = True
+        else:
+            self._fallback_warned = False
+
+        for detection_track_id, primitive in primitives.items():
+            try:
+                axis_goal = np.asarray(
+                    primitive.axis, dtype=np.float64
+                ).reshape(3)
+                anchor_goal = np.asarray(
+                    primitive.origin, dtype=np.float64
+                ).reshape(3)
+            except (TypeError, ValueError):
+                continue
+            axis_norm = float(np.linalg.norm(axis_goal))
+            if (
+                not np.isfinite(axis_goal).all()
+                or not np.isfinite(anchor_goal).all()
+                or axis_norm < 1.0e-9
+            ):
+                continue
+            axis_goal = axis_goal / axis_norm
+            if self.pelvis_to_world is None:
+                axis_stored = axis_goal
+                anchor_stored = anchor_goal
+            else:
+                axis_stored = self.pelvis_to_world @ axis_goal
+                anchor_stored = self.pelvis_to_world @ anchor_goal
+            observation = _OrientationObservation(
+                detection_track_id=str(detection_track_id),
+                label=str(labels.get(detection_track_id, "object")),
+                primitive=primitive,
+                axis_world=axis_stored,
+                anchor_world_m=anchor_stored,
+                frame_mode=self.frame_mode,
+            )
+            uid = self._associate(observation, int(now_us))
+            if uid is None:
+                uid = f"orientation:{self.next_track_index:06d}"
+                self.next_track_index += 1
+                estimator = AxisEstimator(alpha=self.config.axis_ema_alpha)
+                estimator.update(axis_stored, primitive.fit_quality)
+                self.tracks[uid] = OrientationTrack(
+                    track_uid=uid,
+                    label=observation.label,
+                    kind=str(primitive.kind),
+                    axis_estimator=estimator,
+                    anchor_world_m=anchor_stored.copy(),
+                    anchor_stamp_us=int(now_us),
+                    radius_m=float(primitive.radius),
+                    half_height_m=float(primitive.half_height),
+                    extent_m=(
+                        None
+                        if primitive.extent is None
+                        else np.asarray(primitive.extent, dtype=np.float64)
+                        .reshape(3)
+                        .copy()
+                    ),
+                    fit_quality_ema=float(
+                        np.clip(primitive.fit_quality, 0.0, 1.0)
+                    ),
+                    detection_track_ids={str(detection_track_id)},
+                    last_detection_track_id=str(detection_track_id),
+                    last_seen_us=int(now_us),
+                    total_observations=1,
+                    frame_mode=self.frame_mode,
+                )
+                self.new_tracks += 1
+            else:
+                track = self.tracks[uid]
+                was_reassociation = (
+                    track.state == "coasting"
+                    or str(detection_track_id)
+                    not in track.detection_track_ids
+                )
+                track.axis_estimator.update(
+                    axis_stored, float(primitive.fit_quality)
+                )
+                alpha = float(
+                    np.clip(self.config.axis_ema_alpha, 0.0, 1.0)
+                )
+                quality = float(np.clip(primitive.fit_quality, 0.0, 1.0))
+                track.fit_quality_ema = (
+                    (1.0 - alpha) * track.fit_quality_ema + alpha * quality
+                )
+                track.anchor_world_m = anchor_stored.copy()
+                track.anchor_stamp_us = int(now_us)
+                track.last_seen_us = int(now_us)
+                track.label = observation.label
+                track.kind = str(primitive.kind)
+                track.radius_m = float(primitive.radius)
+                track.half_height_m = float(primitive.half_height)
+                track.extent_m = (
+                    None
+                    if primitive.extent is None
+                    else np.asarray(primitive.extent, dtype=np.float64)
+                    .reshape(3)
+                    .copy()
+                )
+                track.detection_track_ids.add(str(detection_track_id))
+                track.last_detection_track_id = str(detection_track_id)
+                track.missing_frames = 0
+                track.total_observations += 1
+                track.state = "active"
+                if was_reassociation:
+                    self.reassociations += 1
+            self._seen_this_frame.add(uid)
+
+    def advance(self, now_us: int) -> None:
+        """Age unobserved tracks without rotating their fused axes."""
+        self._last_now_us = int(now_us)
+        for uid in list(self.tracks):
+            track = self.tracks[uid]
+            if track.persistent or uid in self._seen_this_frame:
+                continue
+            track.missing_frames += 1
+            track.state = "coasting"
+            track.axis_estimator.decay(self.config.coast_decay)
+            track.fit_quality_ema *= float(self.config.coast_decay)
+            elapsed = max(0.0, (int(now_us) - track.last_seen_us) / 1.0e6)
+            ttl = (
+                self.config.goal_fallback_ttl_frames
+                if track.frame_mode == "goal_fallback"
+                else self.config.coast_ttl_frames
+            )
+            if (
+                track.missing_frames > max(0, int(ttl))
+                or elapsed > self.config.max_coast_seconds
+            ):
+                track.state = "expired"
+                del self.tracks[uid]
+                self.expired_this_frame += 1
+
+    def _gravity_candidates(
+        self,
+        *,
+        relations: tuple[str, ...],
+        up_goal: np.ndarray | None,
+        label_relation_prior: dict[str, dict[str, float]],
+    ) -> list[OrientationCandidate]:
+        if up_goal is None or not self.config.gravity_candidate_enabled:
+            return []
+        axis_goal = _unit(up_goal)
+        if axis_goal is None:
+            return []
+        prior_map = label_relation_prior.get("gravity", {})
+        output: list[OrientationCandidate] = []
+        for relation in relations:
+            if relation not in {"parallel", "perpendicular"}:
+                continue
+            output.append(
+                OrientationCandidate(
+                    object_id=GRAVITY_TRACK_UID,
+                    pseudo_index=0,
+                    relation=relation,
+                    position=np.zeros(3, dtype=np.float64),
+                    normal=axis_goal.copy(),
+                    fit_quality=1.0,
+                    track_id=f"{GRAVITY_TRACK_UID}:{relation}",
+                    label="gravity",
+                    role="UNKNOWN",
+                    label_prior=float(
+                        prior_map.get(
+                            relation, self.config.gravity_label_prior
+                        )
+                    ),
+                    source="gravity_live",
+                    primitive_kind="gravity",
+                    surface_axis=axis_goal.copy(),
+                )
+            )
+        return output
+
+    def candidates(
+        self,
+        *,
+        relations: tuple[str, ...],
+        base_quat_wxyz: np.ndarray | None,
+        up_goal: np.ndarray | None,
+        label_relation_prior: dict[str, dict[str, float]],
+        role_keywords: dict[str, tuple[str, ...]],
+        max_candidates: int,
+    ) -> list[OrientationCandidate]:
+        """Emit current goal-frame candidates plus the untruncated gravity pair."""
+        rotation = pelvis_to_world_rotation(base_quat_wxyz)
+        frame_mode = "world" if rotation is not None else "goal_fallback"
+        ranked: list[tuple[float, OrientationCandidate]] = []
+        for track in self.tracks.values():
+            if track.frame_mode != frame_mode:
+                continue
+            primitive = track.to_primitive(rotation, self.config.coast_decay)
+            if primitive is None:
+                continue
+            axis_goal = _unit(primitive.axis)
+            if axis_goal is None:
+                continue
+            role, relation_prior = classify_label(
+                track.label, role_keywords, label_relation_prior
+            )
+            if role == "HELD":
+                role_penalty = -1.0
+            else:
+                role_penalty = 0.0
+            quality = track.effective_quality(self.config.coast_decay)
+            object_id = (
+                track.last_detection_track_id
+                if track.last_detection_track_id
+                else track.track_uid
+            )
+            for relation in relations:
+                if relation not in {"parallel", "perpendicular"}:
+                    continue
+                prior = float(relation_prior.get(relation, 0.0)) + role_penalty
+                ranked.append(
+                    (
+                        quality,
+                        OrientationCandidate(
+                            object_id=object_id,
+                            pseudo_index=0,
+                            relation=relation,
+                            position=np.asarray(
+                                primitive.origin, dtype=np.float64
+                            ).reshape(3),
+                            normal=axis_goal.copy(),
+                            fit_quality=quality,
+                            track_id=f"{track.track_uid}:{relation}",
+                            label=track.label,
+                            role=role,
+                            label_prior=prior,
+                            source=primitive.source,
+                            primitive_kind=track.kind,
+                            surface_axis=axis_goal.copy(),
+                            primitive=primitive,
+                        ),
+                    )
+                )
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        limit = max(0, int(max_candidates))
+        selected = [candidate for _quality, candidate in ranked[:limit]]
+        selected.extend(
+            self._gravity_candidates(
+                relations=relations,
+                up_goal=up_goal,
+                label_relation_prior=label_relation_prior,
+            )
+        )
+        return selected
+
+    def status(
+        self,
+        *,
+        base_quat_wxyz: np.ndarray | None,
+        up_goal: np.ndarray | None,
+        now_us: int | None = None,
+    ) -> dict[str, Any]:
+        rotation = pelvis_to_world_rotation(base_quat_wxyz)
+        frame_mode = "world" if rotation is not None else "goal_fallback"
+        timestamp_us = self._last_now_us if now_us is None else int(now_us)
+        rows: list[dict[str, Any]] = []
+        for track in self.tracks.values():
+            resolved = track.axis_estimator.axis_and_concentration()
+            primitive = track.to_primitive(rotation, self.config.coast_decay)
+            rows.append(
+                {
+                    "track_uid": track.track_uid,
+                    "label": track.label,
+                    "kind": track.kind,
+                    "state": track.state,
+                    "concentration": (
+                        0.0 if resolved is None else float(resolved[1])
+                    ),
+                    "fit_quality_eff": track.effective_quality(
+                        self.config.coast_decay
+                    ),
+                    "missing_frames": int(track.missing_frames),
+                    "observations": int(track.total_observations),
+                    "axis_goal": (
+                        None
+                        if primitive is None
+                        else np.asarray(primitive.axis).reshape(3).tolist()
+                    ),
+                    "coast_seconds": max(
+                        0.0, (timestamp_us - track.last_seen_us) / 1.0e6
+                    ),
+                }
+            )
+        return {
+            "tracks": rows,
+            "active_count": sum(row["state"] == "active" for row in rows),
+            "coasting_count": sum(
+                row["state"] == "coasting" for row in rows
+            ),
+            "expired_this_frame": int(self.expired_this_frame),
+            "gravity_available": bool(
+                up_goal is not None and self.config.gravity_candidate_enabled
+            ),
+            "frame_mode": frame_mode,
+            "reassociations": int(self.reassociations),
+            "new_tracks": int(self.new_tracks),
+        }
 
 
 def _quat_xyzw_to_mat(quaternion: np.ndarray) -> np.ndarray | None:
@@ -552,7 +1142,6 @@ class HierarchicalTascBelief:
         self.selected_orientation_index: int | None = None
         self.selected_orientation_track_id: str = ""
         self.pending_orientation_switch: tuple[str, int] | None = None
-        self.orientation_missing_tracks: dict[str, tuple[OrientationCandidate, int]] = {}
         self.last_orientation_target: OrientationTarget | None = None
         self.last_grip_update_monotonic = 0.0
         self.last_update_monotonic: float | None = None
@@ -743,8 +1332,8 @@ class HierarchicalTascBelief:
         priors: list[float] = []
         roles: list[str] = []
 
-        def append_candidate(candidate: OrientationCandidate, missing_frames: int = 0) -> None:
-            """Keep all candidate-indexed arrays in lockstep, including ghosts."""
+        def append_candidate(candidate: OrientationCandidate) -> None:
+            """Keep every candidate-indexed posterior array in lockstep."""
             breakdown = self.feature_cost.orientation_breakdown(
                 surface_normal=candidate.normal,
                 hand_axis=hand_axis,
@@ -755,7 +1344,6 @@ class HierarchicalTascBelief:
             raw_advantages.append(
                 float(breakdown["weighted_total"]) * candidate.fit_quality
                 + candidate.label_prior
-                - self.config.orientation_ghost_decay * float(missing_frames)
             )
             breakdowns.append(breakdown)
             priors.append(float(candidate.label_prior))
@@ -796,27 +1384,18 @@ class HierarchicalTascBelief:
                         primitive_kind=frame.primitive_kind,
                     )
                     append_candidate(candidate)
-        # Keep briefly occluded tracks in the posterior domain. This prevents a
-        # one-frame segmentation dropout from deleting its probability mass.
-        present_ids = {candidate.track_id for candidate in candidates if candidate.track_id}
-        for track_id, (candidate, missing) in list(self.orientation_missing_tracks.items()):
-            if track_id in present_ids:
-                del self.orientation_missing_tracks[track_id]
-                continue
-            missing += 1
-            if missing > self.config.orientation_track_missing_ttl_frames:
-                del self.orientation_missing_tracks[track_id]
-            else:
-                self.orientation_missing_tracks[track_id] = (candidate, missing)
-                append_candidate(candidate, missing)
-        for candidate in self.orientation_candidates:
-            if candidate.track_id and candidate.track_id not in present_ids and candidate.track_id not in self.orientation_missing_tracks:
-                self.orientation_missing_tracks[candidate.track_id] = (candidate, 1)
-                append_candidate(candidate, 1)
         limit = max(1, int(self.config.max_orientation_candidates))
-        if len(candidates) > limit:
-            order = np.argsort(np.asarray(raw_advantages, dtype=np.float64))[::-1][:limit]
-            keep = sorted(int(index) for index in order)
+        protected = [
+            index
+            for index, candidate in enumerate(candidates)
+            if candidate.object_id == GRAVITY_TRACK_UID
+        ]
+        ranked = [
+            index for index in range(len(candidates)) if index not in protected
+        ]
+        if len(ranked) > limit:
+            ranked.sort(key=lambda index: raw_advantages[index], reverse=True)
+            keep = sorted(ranked[:limit] + protected)
             candidates = [candidates[index] for index in keep]
             raw_advantages = [raw_advantages[index] for index in keep]
             breakdowns = [breakdowns[index] for index in keep]
@@ -827,7 +1406,13 @@ class HierarchicalTascBelief:
             self.orientation_candidates = []
             self.log_orientation_distribution = np.empty(0, dtype=np.float64)
             self.last_orientation_target = None
-            return None, {"enabled": True, "hand_axis_world": hand_axis.tolist(), "candidates": []}, 0.0, 0.0
+            return None, {
+                "enabled": True,
+                "hand_axis_world": hand_axis.tolist(),
+                "candidates": [],
+                "orientation_valid": False,
+                "target": None,
+            }, 0.0, 0.0
         match = self._match_orientation_candidates(candidates)
         entry_log = (
             float(np.min(self.log_orientation_distribution))
@@ -888,6 +1473,14 @@ class HierarchicalTascBelief:
             "switch_dwell_count": 0 if self.pending_orientation_switch is None else int(self.pending_orientation_switch[1]),
             "candidate_count": int(len(candidates)), "matched_count": int(len(match)), "advantage_scale": float(self.config.orientation_advantage_scale),
             "held_probability": held_probability, "leader_probability": leader_probability,
+            "orientation_valid": True,
+            "target": {
+                "object_id": target.object_id,
+                "relation": target.relation,
+                "axis_goal": target.axis_world.tolist(),
+                "confidence": float(target.confidence),
+                "source_position_goal_m": target.source_position.tolist(),
+            },
         }
         return target, telemetry, lambda_dt, variance
 
@@ -1139,7 +1732,44 @@ class HierarchicalTascBelief:
             self.object_ids = []
             self.log_object_distribution = np.empty(0, dtype=np.float64)
             self.last_target = None
-            self.last_telemetry = {"enabled": True, "objects": [], "target": None}
+            if hand_rotation_matrix is None and controller_orientation_xyzw is not None:
+                hand_rotation_matrix = _quat_xyzw_to_mat(
+                    controller_orientation_xyzw
+                )
+            orientation_target, orientation_telemetry, ori_lambda_dt, ori_variance = (
+                self._update_orientation_belief(
+                    [],
+                    hand_rotation_matrix=hand_rotation_matrix,
+                    hand_angular_velocity=hand_angular_velocity,
+                    dt=dt,
+                    up_goal=up_goal,
+                    orientation_candidates=orientation_candidates,
+                )
+            )
+            self.feature_cost.finish_tick(user_translation_mps)
+            self.last_telemetry = {
+                "enabled": True,
+                "objects": [],
+                "object_probabilities": {},
+                "target": None,
+                "orientation": orientation_telemetry,
+                "orientation_only_target": (
+                    None
+                    if orientation_target is None
+                    else {
+                        "object_id": orientation_target.object_id,
+                        "relation": orientation_target.relation,
+                        "axis_goal": orientation_target.axis_world.tolist(),
+                        "confidence": float(orientation_target.confidence),
+                    }
+                ),
+                "jump": {
+                    "object_lambda_dt": 0.0,
+                    "object_advantage_variance": 0.0,
+                    "orientation_lambda_dt": float(ori_lambda_dt),
+                    "orientation_advantage_variance": float(ori_variance),
+                },
+            }
             return self.last_telemetry
         valid_objects = valid_objects[: max(1, int(self.config.max_objects))]
         valid_object_ids = {obj.object_id for obj in valid_objects}
@@ -1361,7 +1991,11 @@ class HierarchicalTascBelief:
         self.last_target = best_target
         target_dict = None
         if best_target is not None:
-            if orientation_target is not None and orientation_target.object_id != best_target.object_id:
+            if (
+                orientation_target is not None
+                and orientation_target.object_id
+                not in {best_target.object_id, GRAVITY_TRACK_UID}
+            ):
                 orientation_target = None
             target_quaternion = (
                 best_target.orientation_xyzw
@@ -1482,6 +2116,9 @@ class ParallelTascBelief:
     def __init__(self, config: TascBeliefConfig | dict | None = None) -> None:
         self.config = config if isinstance(config, TascBeliefConfig) else TascBeliefConfig.from_dict(config)
         self.geometry_surface_tracker = PersistentCylinderSurfaceTracker(self.config.grip)
+        self.orientation_bank = OrientationCandidateBank(
+            self.config.orientation_bank
+        )
         self.trackers = {
             "left": HierarchicalTascBelief(self.config),
             "right": HierarchicalTascBelief(self.config),
@@ -1497,6 +2134,7 @@ class ParallelTascBelief:
         ray_origin: np.ndarray | None = None,
         ray_direction: np.ndarray | None = None,
         up_goal: np.ndarray | None = None,
+        base_quat_wxyz: np.ndarray | None = None,
         stamp_us: int = 0,
     ) -> SharedGeometry:
         """Compute hand-independent candidates once, then atomically replace cache."""
@@ -1523,8 +2161,60 @@ class ParallelTascBelief:
             object_candidates[obj.object_id] = candidates
             object_primitives[obj.object_id] = primitives
             shared_objects.append(BeliefInputObject(obj.object_id, obj.label, obj.score, obj.center_goal_m, None, candidates, primitives))
+        observed_primitives = {
+            obj.object_id: object_primitives[obj.object_id][0]
+            for obj in shared_objects
+            if object_primitives.get(obj.object_id)
+        }
+        labels = {obj.object_id: obj.label for obj in shared_objects}
+        self.orientation_bank.observe(
+            observed_primitives,
+            labels,
+            base_quat_wxyz=base_quat_wxyz,
+            up_goal=up_goal,
+            now_us=int(stamp_us),
+        )
+        self.orientation_bank.advance(int(stamp_us))
+        scaled_relation_prior = {
+            label: {
+                relation: self.config.label_prior_scale * float(value)
+                for relation, value in priors.items()
+            }
+            for label, priors in self.config.label_relation_prior.items()
+        }
+        orientation_candidates = self.orientation_bank.candidates(
+            relations=self.config.orientation_relations,
+            base_quat_wxyz=base_quat_wxyz,
+            up_goal=up_goal,
+            label_relation_prior=scaled_relation_prior,
+            role_keywords=self.config.label_role_keywords,
+            max_candidates=self.config.max_orientation_candidates,
+        )
+        orientation_bank_status = self.orientation_bank.status(
+            base_quat_wxyz=base_quat_wxyz,
+            up_goal=up_goal,
+            now_us=int(stamp_us),
+        )
         surface_status = {object_id: self.geometry_surface_tracker.status(object_id) for object_id in active}
-        geometry = SharedGeometry(shared_objects, object_candidates, object_primitives, ray_origin, ray_direction, int(stamp_us), up_goal=up_goal, surface_status=surface_status)
+        geometry = SharedGeometry(
+            objects=shared_objects,
+            grip_candidates=object_candidates,
+            surface_primitives=object_primitives,
+            ray_origin=ray_origin,
+            ray_direction=ray_direction,
+            stamp_us=int(stamp_us),
+            up_goal=up_goal,
+            surface_status=surface_status,
+            base_quat_wxyz=(
+                None
+                if base_quat_wxyz is None
+                else np.asarray(base_quat_wxyz, dtype=np.float64)
+                .reshape(4)
+                .copy()
+            ),
+            orientation_candidates=orientation_candidates,
+            orientation_bank_status=orientation_bank_status,
+        )
         self.last_geometry = geometry
         return geometry
 
@@ -1556,12 +2246,20 @@ class ParallelTascBelief:
                 # No orientation target can be synthesized from an axis alone.
                 hand_rotation = None
             contact_frames: dict[str, ContactFrame] = {}
-            orientation_candidates: list[OrientationCandidate] = []
             for obj in shared.objects:
                 primitives = shared.surface_primitives.get(obj.object_id, [])
                 if not primitives:
                     continue
                 primitive = primitives[0]
+                if (
+                    self.config.orientation_bank.contact_requires_active
+                    and str(primitive.source).startswith("bank_")
+                    and primitive.source != "bank_active"
+                ):
+                    # A coasting axis remains rotation-correct, but its anchor
+                    # has unobservable pelvis-translation error and cannot be
+                    # used as a contact position.
+                    continue
                 prior_normal = None
                 for old in tracker.orientation_candidates:
                     if old.object_id == obj.object_id:
@@ -1571,31 +2269,28 @@ class ParallelTascBelief:
                 if frame is None:
                     continue
                 contact_frames[obj.object_id] = frame
-                role, relation_prior = classify_label(obj.label, self.config.label_role_keywords, self.config.label_relation_prior)
-                if role == "HELD" and self.config.role_hard_filter:
+            orientation_candidates: list[OrientationCandidate] = []
+            for candidate in shared.orientation_candidates:
+                if candidate.role == "HELD" and self.config.role_hard_filter:
                     continue
-                for relation in self.config.orientation_relations:
-                    if relation not in {"parallel", "perpendicular"}:
-                        continue
-                    prior = self.config.label_prior_scale * relation_prior.get(relation, 0.0)
-                    if role == "HELD":
-                        prior -= 1.0
-                    orientation_candidates.append(OrientationCandidate(
-                        object_id=obj.object_id,
-                        pseudo_index=0,
-                        relation=relation,
-                        position=frame.point,
-                        normal=frame.normal,
-                        fit_quality=frame.fit_quality,
-                        track_id=f"{obj.object_id}:{relation}",
-                        label=obj.label,
-                        role=role,
-                        label_prior=float(prior),
-                        source=frame.source,
-                        primitive_kind=frame.primitive_kind,
-                        surface_axis=np.asarray(primitive.axis, dtype=np.float64).reshape(3),
-                        primitive=primitive,
-                    ))
+                active_frame = contact_frames.get(candidate.object_id)
+                if (
+                    active_frame is not None
+                    and candidate.source == "bank_active"
+                ):
+                    orientation_candidates.append(
+                        replace(
+                            candidate,
+                            position=np.asarray(
+                                active_frame.point, dtype=np.float64
+                            ).reshape(3),
+                            normal=np.asarray(
+                                active_frame.normal, dtype=np.float64
+                            ).reshape(3),
+                        )
+                    )
+                else:
+                    orientation_candidates.append(candidate)
             telemetry = tracker.update(
                 shared.objects,
                 eef_position_m=hand.eef_position,
@@ -1608,7 +2303,7 @@ class ParallelTascBelief:
                 hand_approach_axis=hand.approach_axis,
                 contact_frames=contact_frames,
                 up_goal=shared.up_goal,
-                orientation_candidates=orientation_candidates[: self.config.max_orientation_candidates],
+                orientation_candidates=orientation_candidates,
                 surface_status=shared.surface_status,
                 beta_override=state.beta_current,
                 lambda0_override=state.lambda0_current,
@@ -1622,6 +2317,7 @@ class ParallelTascBelief:
             state.alpha += ramp * (alpha_target - state.alpha)
             state.alpha = float(np.clip(state.alpha, 0.0, 1.0))
             telemetry["hand"] = {"side": side, "armed": state.armed, "beta": state.beta_current, "lambda0": state.lambda0_current, "alpha": state.alpha}
+            telemetry["orientation_bank"] = shared.orientation_bank_status
             output[side] = telemetry
         if self.config.dual_hand_exclusive and len(output) == 2:
             left, right = output.get("left"), output.get("right")

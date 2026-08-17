@@ -7,7 +7,6 @@ from dataclasses import dataclass, field
 import numpy as np
 from scipy.optimize import least_squares
 
-
 EPS = 1.0e-9
 
 
@@ -33,7 +32,7 @@ class CylinderSurfaceConfig:
     prior_weight: float = 2.0
 
     @classmethod
-    def from_dict(cls, data: dict | None) -> "CylinderSurfaceConfig":
+    def from_dict(cls, data: dict | None) -> CylinderSurfaceConfig:
         data = dict(data or {})
         return cls(
             enabled=bool(data.get("enabled", True)),
@@ -118,11 +117,12 @@ class GripCandidate:
 
 @dataclass(frozen=True)
 class SurfacePrimitive:
-    """Hand-independent local surface model.
+    """Hand-independent surface description for orientation inference.
 
-    A primitive intentionally has no signed contact normal.  A normal is only
-    meaningful after a particular hand position is known, so it is produced by
-    :func:`contact_frame` below rather than being frozen in camera/view space.
+    These field names are the wire contract shared by
+    ``protocol.validate_result`` and ``thor_gateway``. A primitive intentionally
+    has no hand-relative contact normal; :func:`contact_frame` derives that for
+    a particular hand after transport.
     """
 
     kind: str
@@ -134,6 +134,9 @@ class SurfacePrimitive:
     half_height: float = 0.0
     extent: np.ndarray | None = None
     snapped_to_gravity: bool = False
+    observation_timestamp_us: int = 0
+    observation_track_id: str = ""
+    observation_state: str = "active"
 
     def to_dict(self) -> dict:
         return {
@@ -146,6 +149,9 @@ class SurfacePrimitive:
             "half_height": float(self.half_height),
             "extent": None if self.extent is None else np.asarray(self.extent, dtype=np.float64).reshape(3).tolist(),
             "snapped_to_gravity": bool(self.snapped_to_gravity),
+            "observation_timestamp_us": int(self.observation_timestamp_us),
+            "observation_track_id": str(self.observation_track_id),
+            "observation_state": str(self.observation_state),
         }
 
 
@@ -160,7 +166,7 @@ class ContactFrame:
     primitive_kind: str
 
 
-# Retained as an import alias while downstream users move from the old name.
+# Deprecated compatibility alias retained while downstream imports migrate.
 PseudoContactPoint = SurfacePrimitive
 
 
@@ -180,7 +186,7 @@ class PseudoContactConfig:
     cylinder_ref_coverage: float = 0.5
 
     @classmethod
-    def from_dict(cls, data: dict | None) -> "PseudoContactConfig":
+    def from_dict(cls, data: dict | None) -> PseudoContactConfig:
         data = dict(data or {})
         return cls(
             enabled=bool(data.get("enabled", True)),
@@ -210,7 +216,7 @@ class GripCandidateConfig:
     surface: CylinderSurfaceConfig = field(default_factory=CylinderSurfaceConfig)
 
     @classmethod
-    def from_dict(cls, data: dict | None) -> "GripCandidateConfig":
+    def from_dict(cls, data: dict | None) -> GripCandidateConfig:
         data = dict(data or {})
         return cls(
             top_k=int(data.get("top_k", 4)),
@@ -597,6 +603,21 @@ def _snap_axis_to_gravity(
     return oriented, False
 
 
+def _orient_normal(
+    normal: np.ndarray,
+    point: np.ndarray,
+    view_origin: np.ndarray | None,
+) -> np.ndarray:
+    """Orient a plane-like primitive toward the observing camera when known."""
+    oriented = _unit(normal, np.array([0.0, 0.0, 1.0]))
+    if view_origin is None:
+        return oriented
+    view = np.asarray(view_origin, dtype=np.float64).reshape(3)
+    if np.isfinite(view).all() and float(np.dot(oriented, view - point)) < 0.0:
+        return -oriented
+    return oriented
+
+
 def fit_circle_in_plane(
     points: np.ndarray,
     plane_point: np.ndarray,
@@ -633,6 +654,7 @@ def extract_surface_primitives(
     config: PseudoContactConfig,
     *,
     cylinder_model: CylinderSurfaceModel | None = None,
+    view_origin: np.ndarray | None = None,
     label: str = "",
     up_goal: np.ndarray | None = None,
 ) -> list[SurfacePrimitive]:
@@ -672,7 +694,7 @@ def extract_surface_primitives(
             origin=cylinder_model.center.copy(),
             axis=axis,
             fit_quality=quality,
-            source="cylinder",
+            source="cylinder_axis",
             radius=float(cylinder_model.radius),
             half_height=0.5 * float(cylinder_model.height),
             snapped_to_gravity=snapped,
@@ -681,6 +703,7 @@ def extract_surface_primitives(
     plane = _fit_plane_ransac(points, config)
     if plane is not None:
         plane_point, normal, inliers, quality = plane
+        normal = _orient_normal(normal, plane_point, view_origin)
         normal, snapped = _snap_axis_to_gravity(normal, up_goal, config.gravity_snap_deg)
         lower_label = str(label).lower()
         if "hole" in lower_label or "circle" in lower_label:
@@ -698,21 +721,23 @@ def extract_surface_primitives(
                         radius=float(radius),
                         snapped_to_gravity=snapped,
                     )]
-        extent = np.ptp(inliers - plane_point, axis=0)
+        offsets = inliers - plane_point
+        tangential = offsets - np.outer(offsets @ normal, normal)
+        extent = np.max(np.abs(tangential), axis=0) if tangential.size else None
         return [SurfacePrimitive(
             kind="plane", origin=plane_point.copy(), axis=normal, fit_quality=quality, source="plane",
-            extent=0.5 * extent,
+            extent=extent,
             snapped_to_gravity=snapped,
         )]
 
     center, axes, _extents = _principal_axes(points)
-    normal, snapped = _snap_axis_to_gravity(axes[-1], up_goal, config.gravity_snap_deg)
-    return [SurfacePrimitive(kind="pca", origin=center, axis=normal, fit_quality=0.3, source="pca", extent=0.5 * _extents, snapped_to_gravity=snapped)]
+    normal = _orient_normal(axes[-1], center, view_origin)
+    normal, snapped = _snap_axis_to_gravity(normal, up_goal, config.gravity_snap_deg)
+    return [SurfacePrimitive(kind="pca", origin=center, axis=normal, fit_quality=0.3, source="pca", snapped_to_gravity=snapped)]
 
 
 def extract_pseudo_contacts(*args, **kwargs) -> list[SurfacePrimitive]:
     """Compatibility name for the v4 primitive extractor."""
-    kwargs.pop("view_origin", None)
     return extract_surface_primitives(*args, **kwargs)
 
 

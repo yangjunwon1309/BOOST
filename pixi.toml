@@ -1,0 +1,54 @@
+[workspace]
+name = "path-g1-host"
+version = "0.1.0"
+description = "Reproducible host-side PATH-G1 validation and Docker launch tools"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+# This is intentionally a CPU/host tooling environment. CUDA, PyTorch, SAM3,
+# TensorRT, and their Python bindings stay inside the NVIDIA Docker image.
+[dependencies]
+python = "==3.12.3"
+
+# Exact replacement for the temporary /tmp/path-g1-v6-deps environment used
+# during the v6 remote-offload validation. Transitive packages are pinned too
+# so a fresh `pixi install --locked` reproduces the same Python package set.
+[pypi-dependencies]
+annotated-doc = "==0.0.5"
+annotated-types = "==0.8.0"
+anyio = "==4.14.2"
+click = "==8.4.2"
+fastapi = "==0.141.1"
+h11 = "==0.16.0"
+idna = "==3.18"
+iniconfig = "==2.3.0"
+lcm = "==1.5.2"
+msgpack = "==1.2.1"
+numpy = "==1.26.4"
+opencv-python-headless = "==4.11.0.86"
+packaging = "==26.3"
+pillow = "==10.2.0"
+pluggy = "==1.6.0"
+pydantic = "==2.13.4"
+pydantic-core = "==2.46.4"
+pygments = "==2.20.0"
+pytest = "==9.1.1"
+pyyaml = "==6.0.1"
+pyzmq = "==27.1.0"
+ruff = "==0.16.3"
+scipy = "==1.17.1"
+starlette = "==1.6.0"
+typing-extensions = "==4.16.0"
+typing-inspection = "==0.4.4"
+uvicorn = "==0.52.3"
+
+[activation.env]
+PYTHONPATH = "$PIXI_PROJECT_ROOT:$PIXI_PROJECT_ROOT/perception"
+
+[tasks]
+verify-host = "python perception/tools/verify_pixi_host_environment.py"
+test-v6 = "python -m pytest -q perception/tests/test_remote_offload.py perception/tests/test_remote_offload_protocol.py perception/tests/test_remote_sam3_belief_input.py perception/tests/test_remote_yolo_fallback.py perception/tests/test_path_spec_v4.py perception/tests/test_tasc_belief.py perception/tests/test_object_point_filter.py"
+test-perception = "python -m pytest -q perception/tests"
+lint-v6 = "ruff check perception/remote_offload/protocol.py perception/remote_offload/remote_geometry_pipeline.py perception/remote_offload/remote_sam3_belief_input_worker.py perception/remote_offload/remote_web_server.py perception/remote_offload/remote_yolo11_worker.py perception/remote_offload/thor_gateway.py perception/seg_web_node/geometry_fallback.py perception/seg_web_node/grip_candidates.py perception/tests/test_remote_sam3_belief_input.py"
+sam3-worker = { cmd = "bash tools/run_remote_sam3_trt_worker.sh", cwd = "perception" }
+web-viewer = { cmd = "bash tools/run_remote_web_viewer.sh", cwd = "perception" }

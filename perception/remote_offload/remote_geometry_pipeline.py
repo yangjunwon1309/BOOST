@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
-
 from seg_web_node.geometry import CameraIntrinsics, transform_points
 from seg_web_node.geometry_fallback import LastValidGeometryFallback
 from seg_web_node.grip_candidates import (
@@ -21,7 +20,6 @@ from seg_web_node.object_point_filter import (
 )
 
 from .protocol import make_object
-
 
 GOAL_FRAME = "pelvis_identity_fk"
 
@@ -76,16 +74,31 @@ class Stable3DTracker:
         return assignments
 
 
-def camera_geometry_metadata(t_goal_cam: np.ndarray | None) -> dict[str, Any]:
+def camera_geometry_metadata(
+    t_goal_cam: np.ndarray | None,
+    intrinsics: CameraIntrinsics | None = None,
+) -> dict[str, Any]:
+    """Return the per-frame camera pose needed for goal-to-pixel projection."""
     if t_goal_cam is None:
         return {}
     transform = np.asarray(t_goal_cam, dtype=np.float64).reshape(4, 4)
-    return {
+    metadata: dict[str, Any] = {
         "camera_goal_origin_m": transform[:3, 3].tolist(),
         "camera_goal_forward_m": (
             transform[:3, :3] @ np.array([0.0, 0.0, 1.0], dtype=np.float64)
         ).tolist(),
+        "t_goal_cam": [float(value) for value in transform.reshape(16)],
     }
+    if intrinsics is not None:
+        metadata["intrinsics"] = {
+            "fx": float(intrinsics.fx),
+            "fy": float(intrinsics.fy),
+            "cx": float(intrinsics.cx),
+            "cy": float(intrinsics.cy),
+            "width": int(intrinsics.width),
+            "height": int(intrinsics.height),
+        }
+    return metadata
 
 
 class RemoteRgbdGeometryPipeline:
@@ -230,16 +243,25 @@ class RemoteRgbdGeometryPipeline:
                         ]
                 model = self.surface_tracker.models.get(track_id)
                 detection["surface_model"] = self.surface_tracker.status(track_id)
-                detection["surface_primitives"] = [
-                    primitive.to_dict()
-                    for primitive in extract_surface_primitives(
+                primitive_payloads: list[dict[str, Any]] = []
+                for primitive in extract_surface_primitives(
                         points_goal,
                         self.pseudo_config,
                         cylinder_model=model,
+                        view_origin=np.asarray(t_goal_cam, dtype=np.float64)[:3, 3],
                         label=str(label),
                         up_goal=up_goal,
+                    ):
+                    primitive_payload = primitive.to_dict()
+                    primitive_payload.update(
+                        {
+                            "observation_timestamp_us": int(source_timestamp_us),
+                            "observation_track_id": str(track_id),
+                            "observation_state": "active",
+                        }
                     )
-                ]
+                    primitive_payloads.append(primitive_payload)
+                detection["surface_primitives"] = primitive_payloads
             wire_object = make_object(
                 track_id=track_id,
                 label=str(label),
@@ -254,21 +276,13 @@ class RemoteRgbdGeometryPipeline:
                 target_contact_goal_m=detection.get("target_contact_goal_m"),
                 contact_candidates=detection.get("contact_candidates"),
                 surface_model=detection.get("surface_model"),
-            )
-            wire_object.update(
-                {
-                    "surface_primitives": list(detection.get("surface_primitives", [])),
-                    "point_filter": detection.get("point_filter"),
-                    "geometry_fallback": False,
-                    "missing_frames": 0,
-                    "source_robot_state_delta_ms": (
-                        None
-                        if source_robot_state_delta_ms is None
-                        else float(source_robot_state_delta_ms)
-                    ),
-                    "geometry_source_timestamp_us": int(source_timestamp_us),
-                    "goal_frame": GOAL_FRAME,
-                }
+                surface_primitives=list(detection.get("surface_primitives", [])),
+                point_filter=detection.get("point_filter"),
+                geometry_fallback=False,
+                missing_frames=0,
+                source_robot_state_delta_ms=source_robot_state_delta_ms,
+                geometry_source_timestamp_us=int(source_timestamp_us),
+                goal_frame=GOAL_FRAME,
             )
             wire_objects.append(wire_object)
 

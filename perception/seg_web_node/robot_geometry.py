@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import collections
-import math
 import logging
+import math
 
 import numpy as np
 
 from .lcm_protocol import RobotState
-
 
 LOG = logging.getLogger(__name__)
 
@@ -350,6 +349,26 @@ def gravity_up_in_pelvis(base_quat_wxyz: np.ndarray | None) -> np.ndarray | None
     up = rotation.T @ np.array([0.0, 0.0, 1.0], dtype=np.float64)
     norm = float(np.linalg.norm(up))
     return None if norm < 1.0e-6 else up / norm
+
+
+def pelvis_to_world_rotation(
+    base_quat_wxyz: np.ndarray | None,
+) -> np.ndarray | None:
+    """Return ``R_world<-pelvis`` from the gravity-referenced base IMU.
+
+    Orientation tracks need rotation, not pelvis translation. Roll and pitch
+    therefore remain recoverable through occlusion even though a cached
+    pelvis-frame contact position cannot be translated exactly without
+    odometry.
+    """
+    if base_quat_wxyz is None:
+        return None
+    try:
+        return quaternion_rotation_wxyz(
+            np.asarray(base_quat_wxyz, dtype=np.float64)
+        )
+    except (TypeError, ValueError):
+        return None
 
 
 BRAINCO_GRASP_CENTER_LOCAL = _BRAINCO_GRASP_CENTER_LOCAL.copy()

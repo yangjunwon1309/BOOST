@@ -11,7 +11,6 @@ from typing import Any
 import msgpack
 import numpy as np
 
-
 VERSION = 1
 
 LOCAL_RGB_CHANNEL = "G1_CAMERA_FRAME"
@@ -204,7 +203,15 @@ def make_object(
     target_contact_goal_m: list[float] | tuple[float, float, float] | None = None,
     contact_candidates: list[dict[str, Any]] | None = None,
     surface_model: dict[str, Any] | None = None,
+    surface_primitives: list[dict[str, Any]] | None = None,
+    point_filter: dict[str, Any] | None = None,
+    geometry_fallback: bool = False,
+    missing_frames: int = 0,
+    source_robot_state_delta_ms: float | None = None,
+    geometry_source_timestamp_us: int = 0,
+    goal_frame: str = "pelvis_identity_fk",
 ) -> dict[str, Any]:
+    """Build the complete wire object without post-construction schema updates."""
     height, width = np.asarray(mask).shape
     result = {
         "track_id": str(track_id),
@@ -227,7 +234,185 @@ def make_object(
         result["contact_candidates"] = list(contact_candidates)
     if surface_model is not None:
         result["surface_model"] = dict(surface_model)
+    result.update(
+        {
+            "surface_primitives": list(surface_primitives or []),
+            "point_filter": None if point_filter is None else dict(point_filter),
+            "geometry_fallback": bool(geometry_fallback),
+            "missing_frames": int(missing_frames),
+            "source_robot_state_delta_ms": (
+                None
+                if source_robot_state_delta_ms is None
+                else float(source_robot_state_delta_ms)
+            ),
+            "goal_frame": str(goal_frame),
+        }
+    )
+    if int(geometry_source_timestamp_us) > 0:
+        result["geometry_source_timestamp_us"] = int(geometry_source_timestamp_us)
     return result
+
+
+def _validate_contact_candidate(candidate: Any, prefix: str) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(candidate, dict):
+        return [f"{prefix} is not a map"]
+    if not _finite_vector(candidate.get("center_goal_m"), 3):
+        errors.append(f"{prefix}.center_goal_m is invalid")
+    if not _finite_vector(candidate.get("approach_goal"), 3):
+        errors.append(f"{prefix}.approach_goal is invalid")
+    if not _finite_number(candidate.get("width_m")):
+        errors.append(f"{prefix}.width_m is invalid")
+    if not _finite_number(candidate.get("geom_score")):
+        errors.append(f"{prefix}.geom_score is invalid")
+    if "probability" in candidate and not _finite_number(candidate.get("probability")):
+        errors.append(f"{prefix}.probability is invalid")
+    if "track_id" in candidate and not isinstance(candidate.get("track_id"), str):
+        errors.append(f"{prefix}.track_id is invalid")
+    if "source" in candidate and not isinstance(candidate.get("source"), str):
+        errors.append(f"{prefix}.source is invalid")
+    return errors
+
+
+def _validate_surface_primitive(primitive: Any, prefix: str) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(primitive, dict):
+        return [f"{prefix} is not a map"]
+    if primitive.get("kind") not in {"cylinder", "plane", "circle", "pca", "point"}:
+        errors.append(f"{prefix}.kind is invalid")
+    for key in ("origin_goal_m", "axis_goal"):
+        if not _finite_vector(primitive.get(key), 3):
+            errors.append(f"{prefix}.{key} is invalid")
+    if not _finite_number(primitive.get("fit_quality")):
+        errors.append(f"{prefix}.fit_quality is invalid")
+    if not isinstance(primitive.get("source"), str):
+        errors.append(f"{prefix}.source is invalid")
+    if not isinstance(primitive.get("snapped_to_gravity"), bool):
+        errors.append(f"{prefix}.snapped_to_gravity is invalid")
+    for key in ("radius", "half_height"):
+        value = primitive.get(key, 0.0)
+        if not _finite_number(value) or float(value) < 0.0:
+            errors.append(f"{prefix}.{key} is invalid")
+    extent = primitive.get("extent")
+    if extent is not None and not _finite_vector(extent, 3):
+        errors.append(f"{prefix}.extent is invalid")
+    return errors
+
+
+def _validate_surface_model(surface_model: Any, prefix: str) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(surface_model, dict):
+        return [f"{prefix} must be a map"]
+    if surface_model.get("type") != "cylinder":
+        errors.append(f"{prefix}.type is invalid")
+    for key in ("center_goal_m", "axis_goal"):
+        if not _finite_vector(surface_model.get(key), 3):
+            errors.append(f"{prefix}.{key} is invalid")
+    for key in (
+        "radius_m",
+        "height_m",
+        "fit_rmse_m",
+        "inlier_ratio",
+        "angular_coverage",
+    ):
+        if not _finite_number(surface_model.get(key)):
+            errors.append(f"{prefix}.{key} is invalid")
+    return errors
+
+
+def _validate_point_filter(point_filter: Any, prefix: str) -> list[str]:
+    if not isinstance(point_filter, dict):
+        return [f"{prefix} must be a map"]
+    errors: list[str] = []
+    if "valid" in point_filter and not isinstance(point_filter.get("valid"), bool):
+        errors.append(f"{prefix}.valid is invalid")
+    if "reason" in point_filter and not isinstance(point_filter.get("reason"), str):
+        errors.append(f"{prefix}.reason is invalid")
+    return errors
+
+
+def validate_result_soft(payload: dict[str, Any]) -> list[str]:
+    """Validate optional per-object geometry that must not invalidate a mask frame."""
+    errors: list[str] = []
+    objects = payload.get("objects")
+    if not isinstance(objects, list):
+        return errors
+    for index, obj in enumerate(objects):
+        if not isinstance(obj, dict):
+            continue
+        prefix = f"objects[{index}]"
+        candidates = obj.get("contact_candidates", [])
+        if candidates is not None:
+            if not isinstance(candidates, list):
+                errors.append(f"{prefix}.contact_candidates must be a list")
+            else:
+                for item_index, candidate in enumerate(candidates):
+                    errors.extend(
+                        _validate_contact_candidate(
+                            candidate, f"{prefix}.contact_candidates[{item_index}]"
+                        )
+                    )
+        primitives = obj.get("surface_primitives", [])
+        if primitives is not None:
+            if not isinstance(primitives, list):
+                errors.append(f"{prefix}.surface_primitives must be a list")
+            else:
+                for item_index, primitive in enumerate(primitives):
+                    errors.extend(
+                        _validate_surface_primitive(
+                            primitive, f"{prefix}.surface_primitives[{item_index}]"
+                        )
+                    )
+        if obj.get("surface_model") is not None:
+            errors.extend(
+                _validate_surface_model(obj.get("surface_model"), f"{prefix}.surface_model")
+            )
+        if obj.get("point_filter") is not None:
+            errors.extend(
+                _validate_point_filter(obj.get("point_filter"), f"{prefix}.point_filter")
+            )
+    return errors
+
+
+def strip_invalid_optional_fields(payload: dict[str, Any]) -> int:
+    """Remove only malformed optional geometry and return the removed item count."""
+    removed = 0
+    objects = payload.get("objects")
+    if not isinstance(objects, list):
+        return removed
+    for index, obj in enumerate(objects):
+        if not isinstance(obj, dict):
+            continue
+        prefix = f"objects[{index}]"
+        for field, validator in (
+            ("contact_candidates", _validate_contact_candidate),
+            ("surface_primitives", _validate_surface_primitive),
+        ):
+            values = obj.get(field)
+            if values is None:
+                continue
+            if not isinstance(values, list):
+                obj.pop(field, None)
+                removed += 1
+                continue
+            kept = []
+            for item_index, value in enumerate(values):
+                if validator(value, f"{prefix}.{field}[{item_index}]"):
+                    removed += 1
+                else:
+                    kept.append(value)
+            obj[field] = kept
+        if obj.get("surface_model") is not None and _validate_surface_model(
+            obj.get("surface_model"), f"{prefix}.surface_model"
+        ):
+            obj.pop("surface_model", None)
+            removed += 1
+        if obj.get("point_filter") is not None and _validate_point_filter(
+            obj.get("point_filter"), f"{prefix}.point_filter"
+        ):
+            obj.pop("point_filter", None)
+            removed += 1
+    return removed
 
 
 def encode_perception_result(payload: dict[str, Any]) -> bytes:
@@ -275,7 +460,12 @@ class ValidationContext:
     now_timestamp_us: int | None = None
 
 
-def validate_result(payload: dict[str, Any], context: ValidationContext) -> list[str]:
+def validate_result(
+    payload: dict[str, Any],
+    context: ValidationContext,
+    *,
+    include_soft: bool = True,
+) -> list[str]:
     errors: list[str] = []
     if payload.get("version") != VERSION:
         errors.append(f"unsupported version {payload.get('version')!r}")
@@ -392,79 +582,6 @@ def validate_result(payload: dict[str, Any], context: ValidationContext) -> list
             errors.append(f"{prefix}.missing_frames is invalid")
         if not _finite_vector(obj.get("target_contact_goal_m"), 3, allow_none=True):
             errors.append(f"{prefix}.target_contact_goal_m is invalid")
-        contact_candidates = obj.get("contact_candidates", [])
-        if contact_candidates is None:
-            contact_candidates = []
-        if not isinstance(contact_candidates, list):
-            errors.append(f"{prefix}.contact_candidates must be a list")
-            continue
-        for candidate_index, candidate in enumerate(contact_candidates):
-            candidate_prefix = f"{prefix}.contact_candidates[{candidate_index}]"
-            if not isinstance(candidate, dict):
-                errors.append(f"{candidate_prefix} is not a map")
-                continue
-            if not _finite_vector(candidate.get("center_goal_m"), 3):
-                errors.append(f"{candidate_prefix}.center_goal_m is invalid")
-            if not _finite_vector(candidate.get("approach_goal"), 3):
-                errors.append(f"{candidate_prefix}.approach_goal is invalid")
-            if not _finite_number(candidate.get("width_m")):
-                errors.append(f"{candidate_prefix}.width_m is invalid")
-            if not _finite_number(candidate.get("geom_score")):
-                errors.append(f"{candidate_prefix}.geom_score is invalid")
-            if "probability" in candidate and not _finite_number(candidate.get("probability")):
-                errors.append(f"{candidate_prefix}.probability is invalid")
-            if "track_id" in candidate and not isinstance(candidate.get("track_id"), str):
-                errors.append(f"{candidate_prefix}.track_id is invalid")
-            if "source" in candidate and not isinstance(candidate.get("source"), str):
-                errors.append(f"{candidate_prefix}.source is invalid")
-        primitives = obj.get("surface_primitives", [])
-        if primitives is None:
-            primitives = []
-        if not isinstance(primitives, list):
-            errors.append(f"{prefix}.surface_primitives must be a list")
-        else:
-            for primitive_index, primitive in enumerate(primitives):
-                primitive_prefix = f"{prefix}.surface_primitives[{primitive_index}]"
-                if not isinstance(primitive, dict):
-                    errors.append(f"{primitive_prefix} is not a map")
-                    continue
-                if primitive.get("kind") not in {"cylinder", "plane", "circle", "pca", "point"}:
-                    errors.append(f"{primitive_prefix}.kind is invalid")
-                for key in ("origin_goal_m", "axis_goal"):
-                    if not _finite_vector(primitive.get(key), 3):
-                        errors.append(f"{primitive_prefix}.{key} is invalid")
-                if not _finite_number(primitive.get("fit_quality")):
-                    errors.append(f"{primitive_prefix}.fit_quality is invalid")
-                if not isinstance(primitive.get("source"), str):
-                    errors.append(f"{primitive_prefix}.source is invalid")
-                if not isinstance(primitive.get("snapped_to_gravity"), bool):
-                    errors.append(
-                        f"{primitive_prefix}.snapped_to_gravity is invalid"
-                    )
-                for key in ("radius", "half_height"):
-                    value = primitive.get(key, 0.0)
-                    if not _finite_number(value) or float(value) < 0.0:
-                        errors.append(f"{primitive_prefix}.{key} is invalid")
-                extent = primitive.get("extent")
-                if extent is not None and not _finite_vector(extent, 3):
-                    errors.append(f"{primitive_prefix}.extent is invalid")
-        surface_model = obj.get("surface_model")
-        if surface_model is not None:
-            if not isinstance(surface_model, dict):
-                errors.append(f"{prefix}.surface_model must be a map")
-            else:
-                if surface_model.get("type") != "cylinder":
-                    errors.append(f"{prefix}.surface_model.type is invalid")
-                for key in ("center_goal_m", "axis_goal"):
-                    if not _finite_vector(surface_model.get(key), 3):
-                        errors.append(f"{prefix}.surface_model.{key} is invalid")
-                for key in (
-                    "radius_m",
-                    "height_m",
-                    "fit_rmse_m",
-                    "inlier_ratio",
-                    "angular_coverage",
-                ):
-                    if not _finite_number(surface_model.get(key)):
-                        errors.append(f"{prefix}.surface_model.{key} is invalid")
+    if include_soft:
+        errors.extend(validate_result_soft(payload))
     return errors

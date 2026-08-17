@@ -107,6 +107,9 @@ class LastValidGeometryFallback:
         fallback["geometry_fallback"] = True
         fallback["fallback_reason"] = self.fallback_reason
         fallback["missing_frames"] = missing
+        # Primitive coordinates were fitted in an older pelvis-identity frame.
+        # Reusing them after pelvis motion would corrupt orientation belief.
+        fallback.pop("surface_primitives", None)
         surface = surface_tracker.status(track_id)
         if surface is not None:
             fallback["surface_model"] = surface

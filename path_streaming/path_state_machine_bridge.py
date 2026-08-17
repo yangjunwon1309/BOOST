@@ -60,6 +60,7 @@ from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
     build_planner_message,
 )
 from path_core.intention.action_blending import (
+    ContactComplianceConfig,
     EETarget,
     LEFT_WRIST_LINK,
     RIGHT_WRIST_LINK,
@@ -68,6 +69,8 @@ from path_core.intention.action_blending import (
 )
 from perception.seg_web_node.robot_geometry import HAND_AXIS_LOCAL, hand_frame_profile
 from path_core.intention.reference_dynamics import (
+    BimanualCouplingCorrector,
+    ContactResistanceEstimator,
     OrientationTargetGate,
     SecondOrderOrientationReference,
     SecondOrderPositionReference,
@@ -1784,6 +1787,7 @@ def main() -> int:
         d_max_m=float(args.shared_d_max_m),
         waist_mode=str(args.shared_waist_mode),
     )
+    compliance_config = ContactComplianceConfig()
     position_reference = {side: SecondOrderPositionReference(
         zeta=shared_config.zeta_released, omega_n=shared_config.omega_n_position_released,
         max_speed_mps=shared_config.max_speed_mps, resync_distance_m=shared_config.resync_distance_m,
@@ -1795,6 +1799,33 @@ def main() -> int:
     hand_axis_local = np.asarray(args.hand_axis_local, dtype=np.float64).reshape(3)
     grasp_center_local = np.asarray(args.grasp_center_local, dtype=np.float64).reshape(3)
     latest_shared_result = None
+    latest_coupling_result = {
+        "engaged": False,
+        "latched_distance_m": None,
+        "correction_m": 0.0,
+    }
+    resistance = {
+        side: ContactResistanceEstimator(
+            efficiency_enter=compliance_config.efficiency_enter,
+            efficiency_exit=compliance_config.efficiency_exit,
+            min_commanded_mps=compliance_config.min_commanded_mps,
+            static_error_m=compliance_config.static_error_m,
+            static_error_rate_mps=compliance_config.static_error_rate_mps,
+            enter_ticks=compliance_config.enter_ticks,
+            block_ticks=compliance_config.block_ticks,
+            release_ticks=compliance_config.release_ticks,
+            ema_alpha=compliance_config.ema_alpha,
+        )
+        for side in ("left", "right")
+    }
+    coupling = BimanualCouplingCorrector(
+        engage_error_m=compliance_config.engage_error_m,
+        release_error_m=compliance_config.release_error_m,
+        gain=compliance_config.coupling_gain,
+        max_correction_m=compliance_config.max_correction_m,
+    )
+    ik_position_scale = {"left": 1.0, "right": 1.0}
+    ik_smooth_scale = 1.0
     orientation_gate = {
         side: OrientationTargetGate(
             max_angle_rad=shared_config.orientation_max_angle_rad,
@@ -1824,12 +1855,22 @@ def main() -> int:
 
     def resync_references(reason: str) -> None:
         """Re-seed only on session/state discontinuities, never A/B edges."""
+        nonlocal ik_smooth_scale, latest_coupling_result
         q = latest_robot_q if latest_robot_q is not None else last_ipopt_or_measured_hold()
         left_tf, right_tf = arm_nonlinear_ik.wrist_transforms_from_q29(q)
         for side, transform in (("left", left_tf), ("right", right_tf)):
             position_reference[side].reset(transform[:3, 3])
             orientation_reference[side].reset(transform[:3, :3])
             orientation_gate[side].reset()
+            resistance[side].reset()
+            ik_position_scale[side] = 1.0
+        coupling.reset()
+        ik_smooth_scale = 1.0
+        latest_coupling_result = {
+            "engaged": False,
+            "latched_distance_m": None,
+            "correction_m": 0.0,
+        }
         log(f"reference resync ({reason})")
     wrist_fk: MujocoWristFk | None = None
     try:
@@ -1869,6 +1910,9 @@ def main() -> int:
             q_seed29=q_seed,
             q_smooth29=q_smooth,
             base_quaternion_wxyz=latest_robot_base_quat,
+            left_position_weight_scale=ik_position_scale["left"],
+            right_position_weight_scale=ik_position_scale["right"],
+            smooth_weight_scale=ik_smooth_scale,
         )
         last_arm_ik_solve_ms = float(result.solve_time_ms)
         last_arm_ik_error_m = float(result.position_error_m)
@@ -2829,9 +2873,21 @@ def main() -> int:
                                 position_source = "belief_contact"
                                 zeta_pos = shared_config.zeta_armed
                                 omega_n_pos = shared_config.omega_n_position_armed
+                        current_position_reference = position_reference[side].position
+                        resistance_state = resistance[side].update(
+                            reference=(
+                                current_position_reference
+                                if current_position_reference is not None
+                                else measured_tf[side][:3, 3]
+                            ),
+                            measured=measured_tf[side][:3, 3],
+                            target=position_target,
+                            dt=dt,
+                        )
                         p_ref = position_reference[side].step(
                             position_target, dt, measured=measured_tf[side][:3, 3],
                             omega_n=omega_n_pos, zeta=zeta_pos,
+                            resistance_state=resistance_state,
                         )
                         human_tf[side][:3, :3] = r_ref
                         human_tf[side][:3, 3] = p_ref
@@ -2848,7 +2904,103 @@ def main() -> int:
                             "orientation_gate_rejects": int(orientation_gate[side].reject_count),
                             "zeta_position": float(zeta_pos),
                             "zeta_orientation": float(zeta_ori),
+                            "resistance": {
+                                "state": resistance_state,
+                                "efficiency": float(resistance[side].efficiency),
+                                "error_m": float(resistance[side].error_m),
+                                "error_rate_mps": float(
+                                    resistance[side].error_rate_mps
+                                ),
+                                "commanded_ema_mps": float(
+                                    resistance[side].commanded_ema
+                                ),
+                                "achieved_ema_mps": float(
+                                    resistance[side].achieved_ema
+                                ),
+                                "resisted_ticks": int(
+                                    resistance[side].resisted_ticks
+                                ),
+                            },
                         }
+
+                    position_scale_by_state = {
+                        "free": 1.0,
+                        "resisted": compliance_config.resisted_position_scale,
+                        "blocked": compliance_config.blocked_position_scale,
+                    }
+                    smooth_scale_by_state = {
+                        "free": 1.0,
+                        "resisted": compliance_config.resisted_smooth_scale,
+                        "blocked": compliance_config.blocked_smooth_scale,
+                    }
+                    # A weight step can make the IPOPT solution jump and add a
+                    # fresh excitation to the contact oscillation being reduced.
+                    ramp_step = max(
+                        0.0, float(compliance_config.weight_ramp_per_s) * dt
+                    )
+                    for side in ("left", "right"):
+                        target_scale = position_scale_by_state[resistance[side].state]
+                        ik_position_scale[side] += float(
+                            np.clip(
+                                target_scale - ik_position_scale[side],
+                                -ramp_step,
+                                ramp_step,
+                            )
+                        )
+                        reference_diagnostics[side]["ik_position_scale"] = float(
+                            ik_position_scale[side]
+                        )
+                    target_smooth_scale = max(
+                        smooth_scale_by_state[resistance[side].state]
+                        for side in ("left", "right")
+                    )
+                    ik_smooth_scale += float(
+                        np.clip(
+                            target_smooth_scale - ik_smooth_scale,
+                            -ramp_step,
+                            ramp_step,
+                        )
+                    )
+
+                    both_blocked = all(
+                        resistance[side].state == "blocked"
+                        for side in ("left", "right")
+                    )
+                    left_object_id = reference_diagnostics["left"]["object_id"]
+                    right_object_id = reference_diagnostics["right"]["object_id"]
+                    same_object = bool(
+                        left_object_id
+                        and left_object_id == right_object_id
+                    )
+                    both_armed = all(
+                        reference_diagnostics[side]["armed"]
+                        for side in ("left", "right")
+                    )
+                    measured_distance_m = float(
+                        np.linalg.norm(
+                            measured_tf["left"][:3, 3]
+                            - measured_tf["right"][:3, 3]
+                        )
+                    )
+                    left_corrected, right_corrected = coupling.update(
+                        human_tf["left"][:3, 3],
+                        human_tf["right"][:3, 3],
+                        both_blocked=both_blocked,
+                        same_object=same_object or both_armed,
+                        measured_distance_m=measured_distance_m,
+                        dt=dt,
+                    )
+                    human_tf["left"][:3, 3] = left_corrected
+                    human_tf["right"][:3, 3] = right_corrected
+                    latest_coupling_result = {
+                        "engaged": bool(coupling.engaged),
+                        "latched_distance_m": (
+                            None
+                            if coupling.latched_distance_m is None
+                            else float(coupling.latched_distance_m)
+                        ),
+                        "correction_m": float(coupling.correction_m),
+                    }
                     left_target_tf, right_target_tf = human_tf["left"], human_tf["right"]
                     latest_shared_result = reference_diagnostics
                     ik_result = solve_authoritative_ipopt_transforms(
@@ -2913,6 +3065,18 @@ def main() -> int:
                                 ),
                                 reference_left=latest_shared_result["left"],
                                 reference_right=latest_shared_result["right"],
+                                resistance_left=latest_shared_result["left"][
+                                    "resistance"
+                                ],
+                                resistance_right=latest_shared_result["right"][
+                                    "resistance"
+                                ],
+                                ik_position_scale={
+                                    side: float(ik_position_scale[side])
+                                    for side in ("left", "right")
+                                },
+                                ik_smooth_scale=float(ik_smooth_scale),
+                                coupling=dict(latest_coupling_result),
                                 orientation_gate={
                                     side: {
                                         "accepted": latest_shared_result[side]["orientation_gate_reason"] == "ok",
@@ -2967,6 +3131,22 @@ def main() -> int:
                             arm_target_valid=True,
                             arm_ik_solve_ms=float(ik_result.solve_time_ms),
                             arm_ik_status=str(ik_result.message),
+                        )
+                        qp_payload.update(
+                            reference_left=latest_shared_result["left"],
+                            reference_right=latest_shared_result["right"],
+                            resistance_left=latest_shared_result["left"][
+                                "resistance"
+                            ],
+                            resistance_right=latest_shared_result["right"][
+                                "resistance"
+                            ],
+                            ik_position_scale={
+                                side: float(ik_position_scale[side])
+                                for side in ("left", "right")
+                            },
+                            ik_smooth_scale=float(ik_smooth_scale),
+                            coupling=dict(latest_coupling_result),
                         )
                 else:
                     missing_pico_source_us = (
@@ -3344,6 +3524,11 @@ def main() -> int:
                 if latest_shared_result is not None:
                     left_ref = latest_shared_result["left"]
                     right_ref = latest_shared_result["right"]
+                    state_abbreviation = {
+                        "free": "free",
+                        "resisted": "res",
+                        "blocked": "blk",
+                    }
                     shared_log = (
                         f"shared_select={shared_selected_hand} "
                         f"ref_L[{left_ref['position_source'][:3]}/{left_ref['orientation_source'][:3]} "
@@ -3351,7 +3536,13 @@ def main() -> int:
                         f"gate={left_ref['orientation_gate_reason']}] "
                         f"ref_R[{right_ref['position_source'][:3]}/{right_ref['orientation_source'][:3]} "
                         f"e={right_ref['position_error_m'] * 100:.1f}cm/{np.rad2deg(right_ref['orientation_error_rad']):.1f}deg "
-                        f"gate={right_ref['orientation_gate_reason']}]"
+                        f"gate={right_ref['orientation_gate_reason']}] "
+                        f"res=L:{state_abbreviation[left_ref['resistance']['state']]}/"
+                        f"R:{state_abbreviation[right_ref['resistance']['state']]} "
+                        f"wp={ik_position_scale['left']:.2f}/"
+                        f"{ik_position_scale['right']:.2f} "
+                        f"ws={ik_smooth_scale:.2f} "
+                        f"cpl={100.0 * latest_coupling_result['correction_m']:+.1f}cm"
                     )
                 log(
                     f"state={current_state} pico_fresh={pico_body_fresh} "

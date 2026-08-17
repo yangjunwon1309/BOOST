@@ -1,22 +1,49 @@
-import numpy as np
+import collections
+import threading
 
-from remote_offload.protocol import ValidationContext, validate_result
-from remote_offload.remote_geometry_pipeline import RemoteRgbdGeometryPipeline
+import numpy as np
+from remote_offload.protocol import (
+    ValidationContext,
+    make_empty_result,
+    make_object,
+    now_us,
+    pack_result,
+    strip_invalid_optional_fields,
+    validate_result,
+    validate_result_soft,
+)
+from remote_offload.remote_geometry_pipeline import (
+    RemoteRgbdGeometryPipeline,
+    camera_geometry_metadata,
+)
 from remote_offload.remote_sam3_belief_input_worker import (
     RemoteSam3BeliefInputWorker,
 )
 from remote_offload.remote_sam3_worker import MatchedFrameGeometry, RemoteSam3Worker
-from remote_offload.remote_web_server import _belief_for_object, _draw_remote_belief_overlay
+from remote_offload.remote_web_server import (
+    RemoteWebRuntime,
+    _belief_for_object,
+    _draw_remote_belief_overlay,
+    _goal_to_pixel,
+    _project_axis_arrow,
+)
 from remote_offload.remote_yolo11_worker import RemoteYolo11Worker
-from remote_offload.thor_gateway import ThorRemoteGateway, _surface_primitive_from_dict
+from remote_offload.thor_gateway import (
+    ForwardedPairRecord,
+    RawFrame,
+    RawPair,
+    ThorRemoteGateway,
+    _surface_primitive_from_dict,
+)
 from seg_web_node.geometry import CameraIntrinsics
 from seg_web_node.grip_candidates import (
     GripCandidateConfig,
     PseudoContactConfig,
+    SurfacePrimitive,
     generate_grip_candidates,
 )
-from seg_web_node.object_point_filter import ObjectPointFilterConfig
 from seg_web_node.lcm_protocol import DEPTH_SOURCE_RAW_DEPTH_OPTICAL
+from seg_web_node.object_point_filter import ObjectPointFilterConfig
 
 
 def _pipeline(fallback_ttl=2):
@@ -169,6 +196,57 @@ def test_missing_geometry_context_keeps_mask_but_never_emits_cached_belief_geome
     assert diagnostic[0]["geometry_fallback"] is False
 
 
+def test_worker_warns_once_and_reports_geometry_status_when_context_is_missing(caplog):
+    frame = _frame_inputs()
+    pair = type(
+        "Pair",
+        (),
+        {
+            "rgb": type("Rgb", (), {"timestamp_us": 1_000_000, "width": 64, "height": 48})(),
+            "depth": type("Depth", (), {"timestamp_us": 1_000_000, "depth_scale_um": 1000})(),
+        },
+    )()
+    worker = RemoteSam3BeliefInputWorker.__new__(RemoteSam3BeliefInputWorker)
+    worker.sequence = 0
+    worker.calibration = type("Calibration", (), {"calibration_id": 1})()
+    worker.geometry_pipeline = _pipeline()
+    worker.frame_geometry = MatchedFrameGeometry(
+        timestamp_us=1_000_000,
+        state=None,
+        state_delta_ms=None,
+        t_goal_cam=None,
+        up_goal=None,
+    )
+    arguments = (
+        pair,
+        "sam3_tensorrt",
+        10.0,
+        frame["masks"],
+        frame["boxes"],
+        frame["scores"],
+        frame["labels"],
+        frame["depth_raw"],
+        frame["intrinsics"],
+    )
+    with caplog.at_level("WARNING"):
+        first = worker._build_result(*arguments)
+        worker._build_result(*arguments)
+    warnings = [
+        record
+        for record in caplog.records
+        if "publishing masks only" in record.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert first["geometry_status"] == {
+        "state_available": False,
+        "t_goal_cam_available": False,
+        "up_goal_available": False,
+        "state_delta_ms": None,
+        "primitive_count": 0,
+        "fallback_count": 0,
+    }
+
+
 def test_uncalibrated_raw_depth_still_allows_rgb_mask_diagnostics():
     worker = RemoteSam3Worker.__new__(RemoteSam3Worker)
     pair = type(
@@ -207,6 +285,150 @@ def test_detection_fallback_retains_track_and_original_geometry_timestamp():
     assert fallback[0]["track_id"] == current[0]["track_id"]
     assert fallback[0]["geometry_fallback"] is True
     assert fallback[0]["geometry_source_timestamp_us"] == 1_000_000
+    assert "surface_primitives" not in fallback[0]
+
+
+def _result_with_primitive(primitive: dict):
+    timestamp = now_us()
+    mask = np.ones((4, 6), dtype=bool)
+    payload = make_empty_result(
+        sequence=1,
+        published_timestamp_us=timestamp,
+        source_rgb_timestamp_us=100,
+        source_depth_timestamp_us=101,
+        calibration_id=7,
+        image_width=6,
+        image_height=4,
+        backend="sam3_tensorrt",
+        inference_ms=10.0,
+    )
+    payload["objects"] = [
+        make_object(
+            track_id="object:track0000",
+            label="object",
+            score=0.9,
+            box_xyxy=[0, 0, 5, 3],
+            mask=mask,
+            median_depth_m=1.0,
+            center_pixel_uv=[3, 2],
+            center_camera_m=[0.0, 0.0, 1.0],
+            center_goal_m=[0.0, 0.0, 1.0],
+            valid_depth_points=24,
+            surface_primitives=[primitive],
+            geometry_source_timestamp_us=100,
+        )
+    ]
+    return payload
+
+
+def test_surface_primitive_satisfies_wire_contract_for_all_kinds():
+    primitives = (
+        SurfacePrimitive("plane", np.zeros(3), np.array([0.0, 0.0, 1.0]), 0.8, "plane"),
+        SurfacePrimitive("cylinder", np.zeros(3), np.array([0.0, 0.0, 1.0]), 0.7, "cylinder_axis", radius=0.03, half_height=0.1),
+        SurfacePrimitive("circle", np.zeros(3), np.array([0.0, 1.0, 0.0]), 0.6, "hole_circle", radius=0.02),
+        SurfacePrimitive("pca", np.zeros(3), np.array([1.0, 0.0, 0.0]), 0.3, "pca"),
+        SurfacePrimitive("point", np.zeros(3), np.array([0.0, 0.0, 1.0]), 0.0, "center_fallback"),
+    )
+    for primitive in primitives:
+        wire = primitive.to_dict()
+        payload = _result_with_primitive(wire)
+        assert validate_result(
+            payload,
+            ValidationContext(
+                result_max_age_ms=float("inf"),
+                now_timestamp_us=payload["published_timestamp_us"],
+            ),
+        ) == []
+        restored = _surface_primitive_from_dict(wire)
+        assert restored is not None
+        assert restored.kind == primitive.kind
+
+
+def test_invalid_primitive_is_soft_and_does_not_discard_mask_frame():
+    payload = _result_with_primitive(
+        SurfacePrimitive(
+            "plane", np.zeros(3), np.array([0.0, 0.0, 1.0]), 0.8, "plane"
+        ).to_dict()
+    )
+    payload["objects"][0]["surface_primitives"][0]["kind"] = "bogus"
+    context = ValidationContext(
+        result_max_age_ms=float("inf"),
+        now_timestamp_us=payload["published_timestamp_us"],
+    )
+    assert validate_result(payload, context, include_soft=False) == []
+    assert any("kind is invalid" in error for error in validate_result_soft(payload))
+    mask_data = payload["objects"][0]["mask_data"]
+    assert strip_invalid_optional_fields(payload) == 1
+    assert payload["objects"][0]["surface_primitives"] == []
+    assert payload["objects"][0]["mask_data"] == mask_data
+    assert validate_result(payload, context) == []
+
+
+def test_thor_gateway_accepts_frame_after_stripping_invalid_primitive():
+    payload = _result_with_primitive(
+        SurfacePrimitive(
+            "plane", np.zeros(3), np.array([0.0, 0.0, 1.0]), 0.8, "plane"
+        ).to_dict()
+    )
+    payload["objects"][0]["surface_primitives"][0]["kind"] = "bogus"
+    pair = RawPair(
+        rgb=RawFrame(100, 6, 4, b"rgb"),
+        depth=RawFrame(101, 6, 4, b"depth"),
+        delta_us=1,
+    )
+    gateway = ThorRemoteGateway.__new__(ThorRemoteGateway)
+    gateway.lock = threading.Lock()
+    gateway.forwarded_pairs = collections.deque(
+        [ForwardedPairRecord(pair=pair, calibration_id=7, robot_state=None)]
+    )
+    gateway.last_result_sequence = None
+    gateway.result_max_age_ms = float("inf")
+    gateway.stats = {
+        "invalid_results": 0,
+        "valid_results": 0,
+        "soft_result_warnings": [],
+        "soft_optional_fields_dropped": 0,
+        "decode_errors": 0,
+    }
+    accepted = []
+    gateway._publish_ee_target_from_result = lambda value, record: accepted.append(value)
+    gateway._record_error = lambda error: (_ for _ in ()).throw(error)
+    gateway._on_remote_result("unused", pack_result(payload))
+    assert gateway.stats["invalid_results"] == 0
+    assert gateway.stats["valid_results"] == 1
+    assert gateway.stats["soft_optional_fields_dropped"] == 1
+    assert accepted[0]["objects"][0]["surface_primitives"] == []
+    assert accepted[0]["objects"][0]["mask_data"]
+
+
+def test_camera_metadata_supports_goal_reprojection_and_axis_foreshortening():
+    intrinsics = CameraIntrinsics(100, 80, 100.0, 100.0, 50.0, 40.0)
+    metadata = camera_geometry_metadata(np.eye(4), intrinsics)
+    transform = np.asarray(metadata["t_goal_cam"]).reshape(4, 4)
+    assert _goal_to_pixel([0.0, 0.0, 1.0], transform, metadata["intrinsics"]) == (50, 40)
+    parallel = _project_axis_arrow(
+        [0.0, 0.0, 1.0], [1.0, 0.0, 0.0], transform, metadata["intrinsics"]
+    )
+    toward_camera = _project_axis_arrow(
+        [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], transform, metadata["intrinsics"]
+    )
+    assert parallel is not None and parallel[0] != parallel[1]
+    assert toward_camera is not None and toward_camera[0] == toward_camera[1]
+
+
+def test_web_pairs_belief_telemetry_to_result_sequence_or_timestamp():
+    runtime = RemoteWebRuntime.__new__(RemoteWebRuntime)
+    runtime.lock = threading.Lock()
+    first = {"sequence": 10, "source_rgb_timestamp_us": 100}
+    second = {"sequence": 11, "source_rgb_timestamp_us": 200}
+    runtime.result = second
+    runtime.result_history = collections.OrderedDict(((10, first), (11, second)))
+    runtime.belief_telemetry = {"result_sequence": 10, "source_rgb_timestamp_us": 100}
+    assert runtime._select_belief_pair() == (second, first, "matched")
+    runtime.belief_telemetry = {"result_sequence": 9, "source_rgb_timestamp_us": 100}
+    assert runtime._select_belief_pair() == (second, first, "matched_ts")
+    runtime.belief_telemetry = {"result_sequence": 9, "source_rgb_timestamp_us": 99}
+    assert runtime._select_belief_pair() == (second, None, "unmatched")
 
 
 def test_fifteen_degree_gravity_tilt_controls_non_cylinder_grip_approach():
@@ -264,6 +486,31 @@ def test_thor_fallback_age_uses_source_frame_clock_domain():
     assert gateway._belief_inputs_from_result(payload) == []
 
 
+def test_bounded_telemetry_preserves_contact_and_orientation_origins():
+    gateway = ThorRemoteGateway.__new__(ThorRemoteGateway)
+    gateway.belief_telemetry_max_objects = 4
+    gateway.belief_telemetry_max_contacts = 4
+    gateway.belief_telemetry_max_orientations = 4
+    gateway.belief_orientation_min_confidence = 0.35
+    bounded = gateway._bounded_hand_telemetry(
+        {
+            "hand": {"armed": True, "alpha": 1.0},
+            "objects": [],
+            "target": {
+                "object_id": "object:1",
+                "position_goal_m": [0.1, 0.2, 0.3],
+                "orientation_axis_world": [0.0, 0.0, 1.0],
+                "orientation_relation": "parallel",
+                "orientation_confidence": 0.8,
+                "orientation_source_position_m": [0.1, 0.2, 0.31],
+            },
+        }
+    )
+    assert bounded["target"]["position_goal_m"] == [0.1, 0.2, 0.3]
+    assert bounded["target"]["orientation_source_position_m"] == [0.1, 0.2, 0.31]
+    assert bounded["target"]["orientation_valid"] is True
+
+
 def test_remote_web_reads_both_hands_and_draws_dim_or_armed_overlays():
     telemetry = {
         "selected_hand": "none",
@@ -310,3 +557,72 @@ def test_remote_web_reads_both_hands_and_draws_dim_or_armed_overlays():
     assert np.any(dim)
     assert np.any(armed)
     assert not np.array_equal(dim, armed)
+
+
+def test_remote_belief_cross_projects_published_contact_not_object_center():
+    overlay = np.zeros((80, 100, 3), dtype=np.uint8)
+    telemetry = {
+        "selected_hand": "left",
+        "hands": {
+            "left": {
+                "armed": True,
+                "object_probabilities": {"object:1": 0.8},
+                "objects": [
+                    {
+                        "object_id": "object:1",
+                        "object_probability": 0.8,
+                        "grip_probabilities": [0.5],
+                        "selected_grip_index": 0,
+                        "selected_contact_goal_m": [0.1, 0.0, 1.0],
+                    }
+                ],
+                "target": {
+                    "object_id": "object:1",
+                    "position_goal_m": [0.1, 0.0, 1.0],
+                },
+            },
+            "right": {"armed": False, "target": None, "objects": []},
+        },
+    }
+    intrinsics = {
+        "fx": 100.0,
+        "fy": 100.0,
+        "cx": 50.0,
+        "cy": 40.0,
+        "width": 100,
+        "height": 80,
+    }
+    _draw_remote_belief_overlay(
+        overlay,
+        [{"track_id": "object:1", "box_xyxy": [2, 60, 20, 76]}],
+        telemetry,
+        stale=False,
+        t_goal_cam=np.eye(4),
+        intrinsics=intrinsics,
+        match_state="matched",
+    )
+    assert np.any(overlay[38:43, 58:63])
+
+
+def test_dim_hands_share_one_alpha_blend_without_overlap_accumulation():
+    overlay = np.zeros((100, 120, 3), dtype=np.uint8)
+    hand = {
+        "armed": False,
+        "object_probabilities": {"object:1": 0.5},
+        "objects": [{"object_id": "object:1", "object_probability": 0.5}],
+        "target": {"object_id": "object:1"},
+    }
+    telemetry = {
+        "selected_hand": "none",
+        "hands": {"left": dict(hand), "right": dict(hand)},
+    }
+    _draw_remote_belief_overlay(
+        overlay,
+        [{"track_id": "object:1", "box_xyxy": [40, 50, 90, 85]}],
+        telemetry,
+        stale=False,
+        match_state="matched",
+    )
+    # A single 0.40 blend caps a fully saturated dim element near 102. Two
+    # element-wise blends would compound well above that at the shared box.
+    assert int(np.max(overlay[50, 52:59])) <= 103

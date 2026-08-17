@@ -188,6 +188,54 @@ result with an error string instead of reusing old coordinates.
 
 ## Desktop SAM3 Worker
 
+### Pixi-managed host commands
+
+The laptop host Python tooling is locked by the repository-root `pixi.toml`
+and `pixi.lock`. This environment contains only CPU-side validation and launch
+tools. CUDA, PyTorch, SAM3, TensorRT, and NVIDIA libraries remain inside the
+Docker image, so installing or updating the Pixi environment cannot change the
+host GPU driver or CUDA installation.
+
+Install Pixi once, then install the exact locked environment:
+
+```bash
+curl -fsSL https://pixi.sh/install.sh | sh
+export PATH="$HOME/.pixi/bin:$PATH"
+cd /path/to/PATH-G1
+pixi install --locked
+pixi run --locked verify-host
+pixi run --locked test-v6
+```
+
+Run the RTX 4060 TensorRT worker from terminal 1. The task uses host networking,
+mounts the current source tree and the engine at
+`perception/models/sam3_trt/rtx4060/sam3_fp16_4out.engine`, and automatically
+falls back to `sudo docker` when the current user cannot access the Docker
+socket:
+
+```bash
+cd /path/to/PATH-G1
+export WIFI_LCM_URL='udpm://239.255.77.67:7667?ttl=1'
+export SAM3_CONCEPTS='object'
+export SAM3_INFERENCE_HZ='3.5'
+pixi run --locked sam3-worker
+```
+
+Run the web viewer from terminal 2:
+
+```bash
+cd /path/to/PATH-G1
+export WIFI_LCM_URL='udpm://239.255.77.67:7667?ttl=1'
+export SAM3_WEB_PORT='8081'
+pixi run --locked web-viewer
+```
+
+Open `http://127.0.0.1:8081`. To override a launch default, set one of
+`SAM3_DOCKER_IMAGE`, `SAM3_TRT_ENGINE_HOST`, `SAM3_CONCEPTS`,
+`SAM3_INFERENCE_HZ`, `SAM3_WEB_HOST`, or `SAM3_WEB_PORT` before `pixi run`.
+The browser label input publishes `PATH_REMOTE_CONCEPT_CONTROL`, so labels can
+be changed without restarting the worker.
+
 Build and run the dedicated RTX 4060 container on the external laptop. Do not
 install SAM3 into the host/root Python environment:
 
@@ -297,6 +345,16 @@ PATH_REMOTE_OVERLAY_JPEG
   inference_ms: float,
   valid: bool,
   error: string | null,
+  t_goal_cam: [float x 16] | omitted,
+  intrinsics: {fx, fy, cx, cy, width, height} | omitted,
+  geometry_status: {
+    state_available: bool,
+    t_goal_cam_available: bool,
+    up_goal_available: bool,
+    state_delta_ms: float | null,
+    primitive_count: int,
+    fallback_count: int
+  },
   objects: [
     {
       track_id: string,
@@ -321,6 +379,19 @@ PATH_REMOTE_OVERLAY_JPEG
           geom_score: float,
           source: string
         }
+      ],
+      surface_primitives: [                                 # optional/advisory
+        {
+          kind: "cylinder" | "plane" | "circle" | "pca" | "point",
+          origin_goal_m: [float, float, float],
+          axis_goal: [float, float, float],
+          fit_quality: float,
+          source: string,
+          snapped_to_gravity: bool,
+          radius: float,
+          half_height: float,
+          extent: [float, float, float] | null
+        }
       ]
     }
   ],
@@ -330,6 +401,11 @@ PATH_REMOTE_OVERLAY_JPEG
 
 Masks are packed with `np.packbits(..., bitorder="little")`, compressed with
 zlib, and must decode to the source RGB resolution. Pickle is never used.
+Thor treats masks, identity, timestamps, calibration, boxes, scores, and
+centroids as fatal contract fields. Malformed `surface_primitives`,
+`contact_candidates`, `surface_model`, or `point_filter` entries are removed
+individually and recorded in `soft_result_warnings` without discarding the
+otherwise valid segmentation frame.
 
 ## Diagnostics
 

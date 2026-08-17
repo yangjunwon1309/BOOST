@@ -1560,6 +1560,7 @@ class SegmentationRuntime:
                         ray_origin=observation["ray_origin"],
                         ray_direction=observation["ray_direction"],
                         up_goal=observation.get("up_goal"),
+                        base_quat_wxyz=observation.get("base_quat_wxyz"),
                         stamp_us=observation["stamp_us"],
                     )
                     self.geometry_revision += 1
@@ -1580,6 +1581,11 @@ class SegmentationRuntime:
                 belief_telemetry["hands"] = per_hand
                 belief_telemetry["selected_hand"] = selected_hand
                 belief_telemetry["selection_active"] = self.shared_hand_selection.active
+                belief_telemetry["orientation_bank"] = (
+                    self.latest_belief_geometry.orientation_bank_status
+                    if self.latest_belief_geometry is not None
+                    else {}
+                )
                 auto_publisher = auto_payload = auto_position = auto_label = None
                 with self.target_lock, self.frame_ready:
                     self.status["tasc_belief"] = belief_telemetry
@@ -1951,9 +1957,19 @@ class SegmentationRuntime:
                     self.status["last_error"] = None
                     self.last_processed_monotonic = time.monotonic()
                     belief_up_goal = None
+                    belief_base_quat = None
                     if state_for_belief is not None:
+                        try:
+                            candidate_quat = np.asarray(
+                                state_for_belief.base_quat_wxyz,
+                                dtype=np.float64,
+                            ).reshape(4)
+                            if np.isfinite(candidate_quat).all():
+                                belief_base_quat = candidate_quat.copy()
+                        except (TypeError, ValueError):
+                            belief_base_quat = None
                         belief_up_goal = gravity_up_in_pelvis(
-                            getattr(state_for_belief, "base_quat_wxyz", None)
+                            belief_base_quat
                         )
                     if belief_up_goal is None and not self.tasc_gravity_warned:
                         LOG.warning("gravity up unavailable; normal snapping disabled")
@@ -1974,6 +1990,7 @@ class SegmentationRuntime:
                         "ray_direction": belief_ray_direction,
                         "stamp_us": int(pair.rgb.timestamp_us),
                         "up_goal": belief_up_goal,
+                        "base_quat_wxyz": belief_base_quat,
                     }
                     self.latest_visual = {
                         "masks": [np.asarray(mask, dtype=bool).copy() for mask in masks],

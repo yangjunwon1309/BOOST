@@ -1251,6 +1251,19 @@ class ThorRemoteGateway:
             hand_input = hand_inputs.get(side)
             if hand_input is None or not isinstance(hand_telemetry, dict):
                 continue
+            # Tracker telemetry can return early when there are no valid
+            # objects.  Preserve the actual gateway FK input on those ticks so
+            # timing/FK gaps remain diagnosable instead of appearing blank.
+            hand_telemetry["eef_position_m"] = np.asarray(
+                hand_input.eef_position, dtype=np.float64
+            ).reshape(3).tolist()
+            hand_telemetry["eef_velocity_mps"] = (
+                None
+                if hand_input.user_translation is None
+                else np.asarray(
+                    hand_input.user_translation, dtype=np.float64
+                ).reshape(3).tolist()
+            )
             hand_telemetry["hand_rotation_matrix"] = (
                 None
                 if hand_input.hand_rotation is None

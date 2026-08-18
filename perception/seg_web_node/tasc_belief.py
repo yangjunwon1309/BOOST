@@ -2354,6 +2354,38 @@ class ParallelTascBelief:
             state.alpha += ramp * (alpha_target - state.alpha)
             state.alpha = float(np.clip(state.alpha, 0.0, 1.0))
             telemetry["hand"] = {"side": side, "armed": state.armed, "beta": state.beta_current, "lambda0": state.lambda0_current, "alpha": state.alpha}
+            # HierarchicalTascBelief returns before its normal diagnostics block
+            # when no object geometry is valid.  Parallel inference still ran,
+            # so attach the updater parameters here for every hand/tick.
+            update_diagnostics = telemetry.setdefault("update", {})
+            update_diagnostics.update(
+                {
+                    "dt_s": float(dt),
+                    "beta": float(state.beta_current),
+                    "lambda0": float(state.lambda0_current),
+                    "w_sc": float(tracker.config.w_sc),
+                    "max_prob_any_goal": float(
+                        tracker.config.max_prob_any_goal
+                    ),
+                    "grip_update_hz": float(tracker.config.grip_update_hz),
+                    "feature_ema_alpha": float(
+                        tracker.config.feature_ema_alpha
+                    ),
+                    "orientation_beta": float(
+                        tracker.config.orientation_beta
+                    ),
+                    "orientation_w_sc": float(
+                        tracker.config.orientation_w_sc
+                    ),
+                    "orientation_max_prob": float(
+                        tracker.config.orientation_max_prob
+                    ),
+                    "orientation_advantage_scale": float(
+                        tracker.config.orientation_advantage_scale
+                    ),
+                }
+            )
+            update_diagnostics.setdefault("grip_update_applied", False)
             telemetry["orientation_bank"] = shared.orientation_bank_status
             output[side] = telemetry
         if self.config.dual_hand_exclusive and len(output) == 2:

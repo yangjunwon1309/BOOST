@@ -23,8 +23,11 @@ from seg_web_node.grip_candidates import (
 from seg_web_node.robot_geometry import g1_wrist_ee_position
 from seg_web_node.tasc_belief import (
     BeliefInputObject,
+    HandInput,
     HierarchicalTascBelief,
     OrientationCandidate,
+    ParallelTascBelief,
+    SharedGeometry,
     StableObjectIdTracker,
 )
 
@@ -326,6 +329,41 @@ def test_tasc_uses_fitted_cylinder_surface_as_contact_domain():
     candidates = telemetry["objects"][0]["grip_candidates"]
     assert len(candidates) == 6
     assert all(candidate["source"] == "cylinder_surface" for candidate in candidates)
+    assert all("advantage_standardized" in candidate for candidate in candidates)
+    assert telemetry["update"]["grip_update_applied"] is True
+
+
+def test_parallel_belief_keeps_update_diagnostics_without_objects():
+    belief = ParallelTascBelief({"beta_idle": 0.2, "lambda0_idle": 0.3})
+    shared = SharedGeometry(
+        objects=[],
+        grip_candidates={},
+        surface_primitives={},
+        ray_origin=None,
+        ray_direction=None,
+        stamp_us=1,
+    )
+    output = belief.update_hands(
+        shared,
+        {
+            "left": HandInput(
+                eef_position=np.array([0.1, 0.2, 0.3]),
+                user_translation=None,
+                hand_rotation=np.eye(3),
+                hand_axis=None,
+                approach_axis=np.array([0.0, 0.0, -1.0]),
+                angular_velocity=np.zeros(3),
+                button_pressed=False,
+            )
+        },
+        now_monotonic=1.0,
+    )
+
+    assert output["left"]["objects"] == []
+    assert output["left"]["update"]["dt_s"] == 0.0
+    assert output["left"]["update"]["beta"] == 0.2
+    assert output["left"]["update"]["lambda0"] == 0.3
+    assert output["left"]["update"]["grip_update_applied"] is False
 
 
 

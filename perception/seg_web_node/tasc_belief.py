@@ -1877,10 +1877,6 @@ class HierarchicalTascBelief:
             log_grip = self._align_grip_distribution(
                 obj.object_id, candidates, grip_match
             )
-            raw_grip_advantages = np.zeros(len(candidates), dtype=np.float64)
-            grip_advantages = self.grip_advantage_ema.get(
-                obj.object_id, raw_grip_advantages
-            )
             grip_feature_breakdowns = [
                 self.feature_cost.breakdown(
                     candidate.center,
@@ -1893,14 +1889,34 @@ class HierarchicalTascBelief:
                 )
                 for candidate in candidates
             ]
+            # Compute the raw diagnostic every tick, even though the posterior
+            # correction remains rate-limited below.  This does not change the
+            # update; it makes skipped grip ticks distinguishable from a true
+            # zero feature signal in telemetry/CSV.
+            raw_grip_advantages = np.asarray(
+                [
+                    float(breakdown["weighted_total"])
+                    for breakdown in grip_feature_breakdowns
+                ],
+                dtype=np.float64,
+            )
+            previous_grip_advantages = self.grip_advantage_ema.get(
+                obj.object_id
+            )
+            grip_advantages = raw_grip_advantages.copy()
+            if previous_grip_advantages is not None:
+                for new_index, previous_index in grip_match.items():
+                    if previous_index < previous_grip_advantages.shape[0]:
+                        grip_advantages[new_index] = previous_grip_advantages[
+                            previous_index
+                        ]
+            grip_update = robust_standardize(
+                grip_advantages,
+                min_signal_spread=self.config.robust_min_signal_spread,
+                scale_floor=self.config.robust_scale_floor,
+                clip=self.config.robust_clip,
+            )
             if should_update_grips:
-                raw_grip_advantages = np.asarray(
-                    [
-                        float(breakdown["weighted_total"])
-                        for breakdown in grip_feature_breakdowns
-                    ],
-                    dtype=np.float64,
-                )
                 grip_advantages = self._smooth_grip_advantages(
                     obj.object_id, raw_grip_advantages, grip_match
                 )
@@ -1966,6 +1982,7 @@ class HierarchicalTascBelief:
                             "probability": float(grip_probs[index]),
                             "advantage_raw": float(raw_grip_advantages[index]),
                             "advantage_ema": float(grip_advantages[index]),
+                            "advantage_standardized": float(grip_update[index]),
                             "feature_breakdown": grip_feature_breakdowns[index],
                         }
                         for index, candidate in enumerate(candidates)
@@ -2050,6 +2067,26 @@ class HierarchicalTascBelief:
                 "object_advantage_variance": float(object_variance),
                 "orientation_lambda_dt": float(ori_lambda_dt),
                 "orientation_advantage_variance": float(ori_variance),
+            },
+            "update": {
+                "dt_s": float(dt),
+                "beta": float(beta),
+                "lambda0": float(
+                    self.config.jump_lambda0
+                    if lambda0_override is None
+                    else lambda0_override
+                ),
+                "w_sc": float(self.config.w_sc),
+                "max_prob_any_goal": float(self.config.max_prob_any_goal),
+                "grip_update_applied": bool(should_update_grips),
+                "grip_update_hz": float(self.config.grip_update_hz),
+                "feature_ema_alpha": float(self.config.feature_ema_alpha),
+                "orientation_beta": float(self.config.orientation_beta),
+                "orientation_w_sc": float(self.config.orientation_w_sc),
+                "orientation_max_prob": float(self.config.orientation_max_prob),
+                "orientation_advantage_scale": float(
+                    self.config.orientation_advantage_scale
+                ),
             },
         }
         return self.last_telemetry

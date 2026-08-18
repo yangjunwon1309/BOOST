@@ -494,6 +494,88 @@ def test_thor_fallback_age_uses_source_frame_clock_domain():
     assert gateway._belief_inputs_from_result(payload) == []
 
 
+def test_gateway_keeps_unarmed_belief_and_csv_active_during_empty_detection():
+    class FakeParallelBelief:
+        class Config:
+            enabled = True
+
+        config = Config()
+
+        def __init__(self):
+            self.trackers = {"left": object(), "right": object()}
+            self.calls = []
+
+        def update_hands(self, shared_geometry, hand_inputs):
+            self.calls.append((shared_geometry, hand_inputs))
+            return {
+                side: {
+                    "hand": {
+                        "armed": hand.button_pressed,
+                        "alpha": 0.0,
+                    },
+                    "orientation": {
+                        "selected_index": 0,
+                        "selected_track_id": "bank:coasting",
+                        "candidates": [
+                            {
+                                "track_id": "bank:coasting",
+                                "probability": 1.0,
+                            }
+                        ],
+                    },
+                    "target": None,
+                }
+                for side, hand in hand_inputs.items()
+            }
+
+    gateway = ThorRemoteGateway.__new__(ThorRemoteGateway)
+    gateway.belief_enabled = True
+    gateway.parallel_tasc_belief = FakeParallelBelief()
+    gateway.belief_selected_hand = "none"
+    gateway.belief_selection_active = False
+    gateway.belief_hand_profile = {"approach_axis_local": [0.0, 1.0, 0.0]}
+    gateway.ee_target_link = "left_wrist_yaw_link"
+    gateway.lock = threading.Lock()
+    gateway.stats = {"last_belief": {}}
+    gateway._drain_shared_hand_selection = lambda: None
+    gateway._belief_inputs_from_result = lambda _payload: []
+    gateway._belief_state_features = lambda _packet, _side: (
+        np.zeros(3),
+        None,
+        np.eye(3),
+        np.zeros(3),
+    )
+    published = []
+    recorded = []
+    gateway._publish_belief_telemetry = (
+        lambda payload, hands: published.append((payload, hands))
+    )
+    gateway._record_belief_csv = (
+        lambda payload, telemetry: recorded.append((payload, telemetry))
+    )
+
+    shared_geometry = object()
+    selection = gateway._belief_selection_from_result(
+        {"sequence": 9, "valid": True},
+        None,
+        shared_geometry,
+    )
+
+    assert selection is None
+    assert len(gateway.parallel_tasc_belief.calls) == 1
+    assert gateway.parallel_tasc_belief.calls[0][0] is shared_geometry
+    assert set(gateway.parallel_tasc_belief.calls[0][1]) == {"left", "right"}
+    assert all(
+        not hand.button_pressed
+        for hand in gateway.parallel_tasc_belief.calls[0][1].values()
+    )
+    assert len(published) == 1
+    assert len(recorded) == 1
+    assert set(recorded[0][1]["hands"]) == {"left", "right"}
+    assert recorded[0][1]["selection_active"] is False
+    assert recorded[0][1]["reason"] == "no_valid_remote_geometry_coasting"
+
+
 def test_bounded_telemetry_preserves_contact_and_orientation_origins():
     gateway = ThorRemoteGateway.__new__(ThorRemoteGateway)
     gateway.belief_telemetry_max_objects = 4

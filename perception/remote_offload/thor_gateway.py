@@ -1186,20 +1186,11 @@ class ThorRemoteGateway:
             return None
         self._drain_shared_hand_selection()
         inputs = self._belief_inputs_from_result(payload)
-        if not inputs:
-            telemetry = {
-                "enabled": True,
-                "objects": [],
-                "target": None,
-                "hands": {},
-                "selected_hand": self.belief_selected_hand,
-                "selection_active": self.belief_selection_active,
-                "reason": "no_valid_remote_geometry",
-            }
-            with self.lock:
-                self.stats["last_belief"] = telemetry
-            self._record_belief_csv(payload, telemetry)
-            return None
+        # An empty detector frame must not stop the continuous belief update.
+        # Shared geometry can still contain coasting orientation-bank tracks (or
+        # the gravity candidate), and both unarmed hand posteriors remain useful
+        # diagnostics.  A/B only gates target publication below; it never gates
+        # inference or CSV recording.
         hand_inputs: dict[str, HandInput] = {}
         for side in ("left", "right"):
             eef_position, eef_velocity, hand_rotation, hand_omega = self._belief_state_features(robot_state_packet, side)
@@ -1232,9 +1223,15 @@ class ThorRemoteGateway:
         ray_direction = _finite_vec3(payload.get("camera_goal_forward_m"))
         up_goal = None
         base_quat_wxyz = None
+        belief_robot_state_timestamp_us = None
+        belief_robot_q = None
         if robot_state_packet is not None:
             try:
                 local_state = decode_robot_state(robot_state_packet)
+                belief_robot_state_timestamp_us = int(local_state.timestamp_us)
+                belief_robot_q = np.asarray(
+                    local_state.q, dtype=np.float64
+                ).reshape(-1).tolist()
                 base_quat_wxyz = local_state.base_quat_wxyz
                 # Remote geometry can be 100-200 ms old. Belief orientation
                 # uses Thor's current IMU; remote gravity is diagnostic only.
@@ -1250,6 +1247,24 @@ class ThorRemoteGateway:
                 stamp_us=int(payload.get("source_rgb_timestamp_us", 0) or 0),
             )
         per_hand = self.parallel_tasc_belief.update_hands(shared_geometry, hand_inputs)
+        for side, hand_telemetry in per_hand.items():
+            hand_input = hand_inputs.get(side)
+            if hand_input is None or not isinstance(hand_telemetry, dict):
+                continue
+            hand_telemetry["hand_rotation_matrix"] = (
+                None
+                if hand_input.hand_rotation is None
+                else np.asarray(
+                    hand_input.hand_rotation, dtype=np.float64
+                ).reshape(3, 3).tolist()
+            )
+            hand_telemetry["hand_approach_axis"] = (
+                None
+                if hand_input.approach_axis is None
+                else np.asarray(
+                    hand_input.approach_axis, dtype=np.float64
+                ).reshape(3).tolist()
+            )
         self._publish_belief_telemetry(payload, per_hand)
         selected = per_hand.get(self.belief_selected_hand)
         telemetry = (
@@ -1261,6 +1276,30 @@ class ThorRemoteGateway:
         telemetry["selected_hand"] = self.belief_selected_hand
         telemetry["selection_active"] = self.belief_selection_active
         telemetry["eef_target_link"] = self._belief_target_link()
+        telemetry["belief_robot_state_timestamp_us"] = (
+            belief_robot_state_timestamp_us
+        )
+        telemetry["belief_robot_q"] = belief_robot_q
+        telemetry["belief_base_quat_wxyz"] = (
+            None
+            if base_quat_wxyz is None
+            else np.asarray(base_quat_wxyz, dtype=np.float64).reshape(4).tolist()
+        )
+        telemetry["belief_hand_model"] = getattr(
+            self, "belief_hand_model", None
+        )
+        grasp_center_local_m = getattr(
+            self, "belief_grasp_center_local_m", None
+        )
+        telemetry["belief_grasp_center_local_m"] = (
+            None
+            if grasp_center_local_m is None
+            else np.asarray(
+                grasp_center_local_m, dtype=np.float64
+            ).reshape(3).tolist()
+        )
+        if not inputs:
+            telemetry["reason"] = "no_valid_remote_geometry_coasting"
         telemetry["ray_source"] = (
             "camera_optical_center" if ray_origin is not None and ray_direction is not None else "unavailable"
         )
@@ -1363,12 +1402,28 @@ class ThorRemoteGateway:
         payload = {
             "published_timestamp_us": int(time.time_ns() // 1000),
             "source_rgb_timestamp_us": int(result.get("source_rgb_timestamp_us", 0) or 0),
+            "source_depth_timestamp_us": int(result.get("source_depth_timestamp_us", 0) or 0),
+            "remote_published_timestamp_us": int(result.get("published_timestamp_us", 0) or 0),
             "remote_sequence": int(result.get("sequence", -1)),
             "result_valid": bool(result.get("valid", False)),
+            "backend": result.get("backend"),
+            "inference_ms": result.get("inference_ms"),
+            "image_width": result.get("image_width"),
+            "image_height": result.get("image_height"),
             "selected_hand": self.belief_selected_hand,
             "selection_active": bool(self.belief_selection_active),
             "hands": telemetry.get("hands", {}),
             "reason": telemetry.get("reason"),
+            "belief_robot_state_timestamp_us": telemetry.get(
+                "belief_robot_state_timestamp_us"
+            ),
+            "belief_robot_q": telemetry.get("belief_robot_q"),
+            "belief_base_quat_wxyz": telemetry.get("belief_base_quat_wxyz"),
+            "belief_hand_model": telemetry.get("belief_hand_model"),
+            "belief_grasp_center_local_m": telemetry.get(
+                "belief_grasp_center_local_m"
+            ),
+            "remote_objects": result.get("objects", []),
         }
         try:
             rows = self.belief_csv.record(payload)

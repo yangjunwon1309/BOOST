@@ -16,7 +16,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from seg_web_node.geometry import CameraIntrinsics, deproject
-from seg_web_node.depth_alignment import align_depth_to_color
+from seg_web_node.depth_alignment import align_depth_to_color, calibration_for_frame
 from seg_web_node.lcm_protocol import (
     DEPTH_SOURCE_RAW_DEPTH_OPTICAL,
     decode_calibration,
@@ -55,17 +55,37 @@ def main() -> int:
         if image is None:
             errors += 1
             return
+        frame_calibration = (
+            None
+            if calibration is None
+            else calibration_for_frame(
+                calibration,
+                color_width=pair.rgb.width,
+                color_height=pair.rgb.height,
+                depth_width=(
+                    pair.depth.width
+                    if pair.depth.source == DEPTH_SOURCE_RAW_DEPTH_OPTICAL
+                    else None
+                ),
+                depth_height=(
+                    pair.depth.height
+                    if pair.depth.source == DEPTH_SOURCE_RAW_DEPTH_OPTICAL
+                    else None
+                ),
+            )
+        )
         if pair.depth.source == DEPTH_SOURCE_RAW_DEPTH_OPTICAL:
             if calibration is None:
                 raise ValueError("raw depth arrived before camera calibration")
-            depth = align_depth_to_color(pair.depth, calibration)
+            assert frame_calibration is not None
+            depth = align_depth_to_color(pair.depth, frame_calibration)
         else:
             depth = depth_at_rgb_size(pair)
         h, w = depth.shape
-        if calibration is not None:
+        if frame_calibration is not None:
             intrinsics = CameraIntrinsics(
-                calibration.color_width, calibration.color_height,
-                *calibration.color_intrinsics,
+                frame_calibration.color_width, frame_calibration.color_height,
+                *frame_calibration.color_intrinsics,
             )
         elif args.camera_info is None:
             intrinsics = CameraIntrinsics(
@@ -83,6 +103,15 @@ def main() -> int:
         xyz = deproject(depth, intrinsics, pair.depth.depth_scale_um)
         center = xyz[h // 2, w // 2]
         valid = np.isfinite(xyz[..., 2])
+        depth_m = depth.astype(np.float64) * pair.depth.depth_scale_um / 1_000_000.0
+        nonzero = depth > 0
+        in_range = nonzero & (depth_m >= 0.15) & (depth_m <= 3.0)
+        nonzero_values = depth_m[nonzero]
+        percentiles = (
+            [float(value) for value in np.percentile(nonzero_values, [0, 50, 95, 100])]
+            if nonzero_values.size
+            else [None, None, None, None]
+        )
         normalized = np.zeros_like(depth, dtype=np.uint8)
         if np.any(valid):
             values = xyz[..., 2][valid]
@@ -96,7 +125,11 @@ def main() -> int:
         print(
             f"[rgbd-diagnostic] pair={pairs} ts={pair.rgb.timestamp_us} "
             f"delta_ms={pair.delta_us / 1000:.3f} valid={valid.mean():.3f} "
-            f"center_xyz={center.tolist()} source={pair.depth.source}"
+            f"nonzero={nonzero.mean():.3f} in_range_0.15_3m={in_range.mean():.3f} "
+            f"depth_m_min_p50_p95_max={percentiles} "
+            f"center_xyz={center.tolist()} source={pair.depth.source} "
+            f"rgb={pair.rgb.width}x{pair.rgb.height} "
+            f"depth={pair.depth.width}x{pair.depth.height}"
         )
 
     def on_rgb(_channel, data):

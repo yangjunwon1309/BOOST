@@ -531,6 +531,10 @@ class ThorRemoteGateway:
         self.belief_selected_hand = "none"
         self.belief_selection_active = False
         self.belief_selection_timestamp_us = 0
+        # v2 of the existing shared-hand heartbeat carries only visualization
+        # data.  Keeping it here lets the Wi-Fi telemetry mirror the current
+        # operator command and second-order reference without a new channel.
+        self.latest_hand_selection: dict[str, Any] = {}
         self.ee_target_pub = (
             ZmqEeTargetPublisher(endpoint=ee_target_endpoint, topic=ee_target_topic)
             if self.ee_target_enabled
@@ -1050,6 +1054,16 @@ class ThorRemoteGateway:
         source_rgb_timestamp_us = int(
             payload.get("source_rgb_timestamp_us", 0) or 0
         )
+        control = dict(getattr(self, "latest_hand_selection", {}) or {})
+        try:
+            control_timestamp_us = int(control.get("timestamp_us", 0) or 0)
+        except (TypeError, ValueError):
+            control_timestamp_us = 0
+        control_age_ms = (
+            max(0.0, (published_timestamp_us - control_timestamp_us) / 1000.0)
+            if control_timestamp_us > 0
+            else None
+        )
         packet = {
             "version": 1,
             "published_timestamp_us": published_timestamp_us,
@@ -1066,6 +1080,14 @@ class ThorRemoteGateway:
                 (published_timestamp_us - int(payload.get("published_timestamp_us", 0)))
                 / 1000.0,
             ),
+            "control": {
+                "schema": str(control.get("schema", "")),
+                "grasp_center_local_m": control.get("grasp_center_local_m"),
+                "hands": control.get("hands", {})
+                if isinstance(control.get("hands"), dict)
+                else {},
+                "age_ms": control_age_ms,
+            },
         }
         self.wifi_bus.publish(
             REMOTE_BELIEF_TELEMETRY_CHANNEL,
@@ -1095,6 +1117,14 @@ class ThorRemoteGateway:
                 self.belief_selected_hand = next_hand
                 self.belief_selection_active = active
                 self.belief_selection_timestamp_us = timestamp_us
+                self.latest_hand_selection = {
+                    "schema": str(payload.get("schema", "")),
+                    "timestamp_us": timestamp_us,
+                    "grasp_center_local_m": payload.get("grasp_center_local_m"),
+                    "hands": payload.get("hands", {})
+                    if isinstance(payload.get("hands"), dict)
+                    else {},
+                }
                 with self.lock:
                     self.stats["belief_selected_hand"] = self.belief_selected_hand
                     self.stats["belief_selection_active"] = active

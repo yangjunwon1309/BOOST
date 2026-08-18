@@ -2649,6 +2649,10 @@ def main() -> int:
             )
             static_target_usable = shared_target_available(tick_us)
             qp_payload: dict | None = None
+            # Published only for the tick that produced these transforms.  Do
+            # not retain an old command: a stale visual marker looks like a
+            # tracking error to the operator.
+            control_visual_hands: dict[str, dict] = {}
             if current_state in {"teleop", "intention"}:
                 if planner_lower_body_idle:
                     pose_to_send = None
@@ -2759,6 +2763,11 @@ def main() -> int:
                     measured_left_tf, measured_right_tf = arm_nonlinear_ik.wrist_transforms_from_q29(q_measured_for_hand)
                     measured_tf = {"left": measured_left_tf, "right": measured_right_tf}
                     human_tf = {"left": left_target_tf, "right": right_target_tf}
+                    # The reference loop below overwrites human_tf in place.
+                    # Preserve the raw operator command for visualization.
+                    human_raw_tf = {
+                        side: human_tf[side].copy() for side in ("left", "right")
+                    }
                     reference_diagnostics: dict[str, dict] = {}
                     for side in ("left", "right"):
                         belief_target = shared_target if shared_selection_armed and requested_hand == side else None
@@ -2856,6 +2865,23 @@ def main() -> int:
                             "zeta_position": float(zeta_pos),
                             "zeta_orientation": float(zeta_ori),
                         }
+                    control_visual_hands = {
+                        side: {
+                            "human_grasp_goal_m": (
+                                human_raw_tf[side][:3, 3]
+                                + human_raw_tf[side][:3, :3] @ grasp_center_local
+                            ).tolist(),
+                            "reference_grasp_goal_m": (
+                                human_tf[side][:3, 3]
+                                + human_tf[side][:3, :3] @ grasp_center_local
+                            ).tolist(),
+                            "armed": bool(shared_selected_hand == side),
+                            "position_source": reference_diagnostics[side][
+                                "position_source"
+                            ],
+                        }
+                        for side in ("left", "right")
+                    }
                     left_target_tf, right_target_tf = human_tf["left"], human_tf["right"]
                     latest_shared_result = reference_diagnostics
                     ik_result = solve_authoritative_ipopt_transforms(
@@ -3322,7 +3348,7 @@ def main() -> int:
                     pack_topic(
                         args.shared_hand_selection_topic,
                         {
-                            "schema": "path.shared_control_hand.v1",
+                            "schema": "path.shared_control_hand.v2",
                             "timestamp_us": int(tick_us),
                             "state": current_state,
                             "selected_hand": shared_selected_hand,
@@ -3331,6 +3357,10 @@ def main() -> int:
                                 and shared_selected_hand in {"left", "right"}
                             ),
                             "revision": int(shared_hand_selection_revision),
+                            "grasp_center_local_m": [
+                                float(value) for value in grasp_center_local
+                            ],
+                            "hands": control_visual_hands,
                         },
                     )
                 )

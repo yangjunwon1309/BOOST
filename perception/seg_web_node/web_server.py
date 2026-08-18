@@ -25,7 +25,11 @@ from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 from .ee_target import GoalPublisher, Workspace, make_goal_payload
-from .depth_alignment import align_depth_to_color
+from .depth_alignment import (
+    align_depth_to_color,
+    calibration_for_frame,
+    scale_camera_intrinsics,
+)
 from .geometry import (
     CameraIntrinsics,
     transform_points,
@@ -1737,25 +1741,47 @@ class SegmentationRuntime:
                 image_bgr = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
                 if image_bgr is None:
                     raise ValueError("JPEG decoding failed")
+                frame_calibration = (
+                    None
+                    if calibration is None
+                    else calibration_for_frame(
+                        calibration,
+                        color_width=pair.rgb.width,
+                        color_height=pair.rgb.height,
+                        depth_width=(
+                            pair.depth.width
+                            if pair.depth.source == DEPTH_SOURCE_RAW_DEPTH_OPTICAL
+                            else None
+                        ),
+                        depth_height=(
+                            pair.depth.height
+                            if pair.depth.source == DEPTH_SOURCE_RAW_DEPTH_OPTICAL
+                            else None
+                        ),
+                    )
+                )
                 if pair.depth.source == DEPTH_SOURCE_RAW_DEPTH_OPTICAL:
                     if calibration is None:
                         raise ValueError("raw depth received before G1_CAMERA_CALIBRATION")
-                    if (pair.rgb.width, pair.rgb.height) != (
-                        calibration.color_width, calibration.color_height
-                    ):
-                        raise ValueError("RGB dimensions do not match transmitted color calibration")
-                    depth = align_depth_to_color(pair.depth, calibration)
+                    assert frame_calibration is not None
+                    depth = align_depth_to_color(pair.depth, frame_calibration)
                     frame_intrinsics = CameraIntrinsics(
-                        calibration.color_width, calibration.color_height,
-                        *calibration.color_intrinsics,
+                        frame_calibration.color_width, frame_calibration.color_height,
+                        *frame_calibration.color_intrinsics,
                     )
                 else:
                     depth = depth_at_rgb_size(pair)
                     frame_intrinsics = self.intrinsics
-                    if calibration is not None:
+                    if frame_calibration is not None:
                         frame_intrinsics = CameraIntrinsics(
-                            calibration.color_width, calibration.color_height,
-                            *calibration.color_intrinsics,
+                            frame_calibration.color_width, frame_calibration.color_height,
+                            *frame_calibration.color_intrinsics,
+                        )
+                    elif frame_intrinsics is not None:
+                        frame_intrinsics = scale_camera_intrinsics(
+                            frame_intrinsics,
+                            width=pair.rgb.width,
+                            height=pair.rgb.height,
                         )
                 geometry_runtime_error = None
                 t_goal_cam = self.static_t_goal_cam

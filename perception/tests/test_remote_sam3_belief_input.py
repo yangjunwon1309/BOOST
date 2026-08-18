@@ -9,6 +9,7 @@ from remote_offload.protocol import (
     now_us,
     pack_result,
     strip_invalid_optional_fields,
+    unpack_belief_telemetry,
     validate_result,
     validate_result_soft,
 )
@@ -240,8 +241,15 @@ def test_worker_warns_once_and_reports_geometry_status_when_context_is_missing(c
     assert first["geometry_status"] == {
         "state_available": False,
         "t_goal_cam_available": False,
+        "calibration_available": True,
+        "intrinsics_available": True,
+        "image_size": [64, 48],
+        "depth_size": [64, 48],
+        "intrinsics_size": [64, 48],
         "up_goal_available": False,
         "state_delta_ms": None,
+        "objects_with_valid_depth": 0,
+        "contact_candidate_count": 0,
         "primitive_count": 0,
         "fallback_count": 0,
     }
@@ -599,9 +607,95 @@ def test_remote_belief_cross_projects_published_contact_not_object_center():
         stale=False,
         t_goal_cam=np.eye(4),
         intrinsics=intrinsics,
-        match_state="matched",
     )
     assert np.any(overlay[38:43, 58:63])
+
+    no_box = np.zeros_like(overlay)
+    _draw_remote_belief_overlay(
+        no_box,
+        [],
+        telemetry,
+        stale=False,
+        t_goal_cam=np.eye(4),
+        intrinsics=intrinsics,
+    )
+    # The target point survives a temporarily unavailable segmentation box.
+    assert np.any(no_box[38:43, 58:63])
+
+
+def test_remote_web_draws_fresh_control_markers_and_hides_stale_ones():
+    telemetry = {
+        "selected_hand": "left",
+        "hands": {
+            "left": {
+                "armed": True,
+                "objects": [{"object_id": "object:1", "grip_probabilities": [0.7], "selected_grip_index": 0}],
+                "target": {"object_id": "object:1", "position_goal_m": [0.2, 0.0, 1.0]},
+            },
+            "right": {"armed": False, "objects": [], "target": {}},
+        },
+    }
+    intrinsics = {"fx": 100.0, "fy": 100.0, "cx": 50.0, "cy": 40.0, "width": 100, "height": 80}
+    objects = [{"track_id": "object:1", "box_xyxy": [60, 40, 80, 65]}]
+    fresh = np.zeros((80, 100, 3), dtype=np.uint8)
+    control = {
+        "age_ms": 10.0,
+        "hands": {
+            "left": {
+                "human_grasp_goal_m": [-0.2, 0.25, 1.0],
+                "reference_grasp_goal_m": [-0.1, 0.25, 1.0],
+            }
+        },
+    }
+    _draw_remote_belief_overlay(
+        fresh, objects, telemetry, stale=False, t_goal_cam=np.eye(4),
+        intrinsics=intrinsics, control=control,
+    )
+    assert np.any(fresh[55:77, 20:41])
+    assert np.any(fresh[55:77, 30:51])
+
+    stale = np.zeros_like(fresh)
+    _draw_remote_belief_overlay(
+        stale, objects, telemetry, stale=False, t_goal_cam=np.eye(4),
+        intrinsics=intrinsics, control={**control, "age_ms": 501.0},
+    )
+    # The belief target remains, but the operator marker at u=30 is absent.
+    assert not np.any(stale[55:77, 22:39])
+
+
+def test_gateway_forwards_shared_control_v2_inside_belief_telemetry():
+    class FakeBus:
+        def __init__(self) -> None:
+            self.published: list[tuple[str, bytes]] = []
+
+        def publish(self, channel: str, payload: bytes) -> None:
+            self.published.append((channel, payload))
+
+    gateway = ThorRemoteGateway.__new__(ThorRemoteGateway)
+    gateway.last_belief_telemetry_monotonic = 0.0
+    gateway.belief_telemetry_period_sec = 0.0
+    gateway.belief_selected_hand = "left"
+    gateway.belief_telemetry_max_objects = 4
+    gateway.belief_telemetry_max_contacts = 4
+    gateway.belief_telemetry_max_orientations = 4
+    gateway.belief_orientation_min_confidence = 0.35
+    gateway.latest_hand_selection = {
+        "schema": "path.shared_control_hand.v2",
+        "timestamp_us": now_us(),
+        "grasp_center_local_m": [0.0, 0.0, 0.1],
+        "hands": {"left": {"human_grasp_goal_m": [0.1, 0.0, 1.0]}},
+    }
+    gateway.wifi_bus = FakeBus()
+    gateway.lock = threading.Lock()
+    gateway.stats = {"belief_telemetry_published": 0}
+    gateway._publish_belief_telemetry(
+        {"sequence": 7, "valid": True, "published_timestamp_us": now_us()},
+        {"left": {}, "right": {}},
+    )
+    packet = unpack_belief_telemetry(gateway.wifi_bus.published[0][1])
+    assert packet["control"]["schema"] == "path.shared_control_hand.v2"
+    assert packet["control"]["hands"]["left"]["human_grasp_goal_m"] == [0.1, 0.0, 1.0]
+    assert packet["control"]["age_ms"] is not None
 
 
 def test_dim_hands_share_one_alpha_blend_without_overlap_accumulation():
@@ -621,8 +715,7 @@ def test_dim_hands_share_one_alpha_blend_without_overlap_accumulation():
         [{"track_id": "object:1", "box_xyxy": [40, 50, 90, 85]}],
         telemetry,
         stale=False,
-        match_state="matched",
     )
-    # A single 0.40 blend caps a fully saturated dim element near 102. Two
+    # A single 0.75 blend caps a fully saturated dim element near 191. Two
     # element-wise blends would compound well above that at the shared box.
-    assert int(np.max(overlay[50, 52:59])) <= 103
+    assert int(np.max(overlay[50, 52:59])) <= 192

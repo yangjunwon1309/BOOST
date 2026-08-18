@@ -53,6 +53,25 @@ def main() -> int:
         result = unpack_result(payload)
         objects = result.get("objects", [])
         labels = [str(obj.get("label")) for obj in objects[:5] if isinstance(obj, dict)]
+        geometry = result.get("geometry_status")
+        geometry = geometry if isinstance(geometry, dict) else {}
+        object_geometry = []
+        if isinstance(objects, list):
+            for obj in objects[:5]:
+                if not isinstance(obj, dict):
+                    continue
+                point_filter = obj.get("point_filter")
+                point_filter = point_filter if isinstance(point_filter, dict) else {}
+                object_geometry.append(
+                    {
+                        "label": obj.get("label"),
+                        "depth": point_filter.get("valid"),
+                        "depth_reason": point_filter.get("reason"),
+                        "depth_points": obj.get("valid_depth_points"),
+                        "contacts": len(obj.get("contact_candidates") or []),
+                        "primitives": len(obj.get("surface_primitives") or []),
+                    }
+                )
         print(
             "[remote-monitor] result "
             f"seq={result.get('sequence')} "
@@ -60,6 +79,18 @@ def main() -> int:
             f"valid={result.get('valid')} "
             f"objects={len(objects) if isinstance(objects, list) else 'invalid'} "
             f"labels={labels} "
+            f"geometry={{state={geometry.get('state_available')}, "
+            f"T_goal_cam={geometry.get('t_goal_cam_available')}, "
+            f"calibration={geometry.get('calibration_available')}, "
+            f"intrinsics={geometry.get('intrinsics_available')}, "
+            f"image_size={geometry.get('image_size')}, "
+            f"depth_size={geometry.get('depth_size')}, "
+            f"intrinsics_size={geometry.get('intrinsics_size')}, "
+            f"state_delta_ms={geometry.get('state_delta_ms')}, "
+            f"valid_depth_objects={geometry.get('objects_with_valid_depth')}, "
+            f"contacts={geometry.get('contact_candidate_count')}, "
+            f"primitives={geometry.get('primitive_count')}}} "
+            f"object_geometry={object_geometry} "
             f"error={result.get('error')}",
             flush=True,
         )

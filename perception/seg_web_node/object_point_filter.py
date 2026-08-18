@@ -127,8 +127,12 @@ def extract_filtered_object_cloud(
     min_valid_points: int,
     max_points: int,
     erosion_px_override: int | None = None,
+    diagnostics: dict[str, Any] | None = None,
 ) -> FilteredObjectCloud | None:
     """Extract one robust cloud used by both center and surface estimation."""
+    if diagnostics is not None:
+        diagnostics.clear()
+        diagnostics["valid"] = False
     intrinsics.validate()
     depth = np.asarray(depth_m, dtype=np.float32)
     clean = np.asarray(mask, dtype=bool).copy()
@@ -136,19 +140,26 @@ def extract_filtered_object_cloud(
         raise ValueError("depth, mask, and intrinsics dimensions must match")
 
     input_pixels = int(clean.sum())
+    if diagnostics is not None:
+        diagnostics["input_mask_pixels"] = input_pixels
     erosion_px = config.erosion_px if erosion_px_override is None else max(0, int(erosion_px_override))
     if config.enabled and erosion_px > 0 and input_pixels:
         size = 2 * erosion_px + 1
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
         clean = cv2.erode(clean.astype(np.uint8), kernel, iterations=1).astype(bool)
     eroded_pixels = int(clean.sum())
+    if diagnostics is not None:
+        diagnostics["after_erosion_pixels"] = eroded_pixels
 
     valid_depth = (
         np.isfinite(depth)
         & (depth >= float(min_depth_m))
         & (depth <= float(max_depth_m))
     )
+    valid_depth_in_mask = int((clean & valid_depth).sum())
     clean &= valid_depth
+    if diagnostics is not None:
+        diagnostics["valid_depth_pixels_in_mask"] = valid_depth_in_mask
 
     if config.enabled and config.depth_edge_threshold_m > 0.0 and clean.any():
         padded = np.pad(depth, 1, mode="edge")
@@ -169,6 +180,8 @@ def extract_filtered_object_cloud(
             edge |= np.abs(depth - neighbor) > config.depth_edge_threshold_m
         clean &= ~edge
     edge_pixels = int(clean.sum())
+    if diagnostics is not None:
+        diagnostics["after_depth_edge_pixels"] = edge_pixels
 
     if config.enabled and config.mad_scale > 0.0 and clean.any():
         samples = depth[clean].astype(np.float64)
@@ -178,20 +191,32 @@ def extract_filtered_object_cloud(
         half_band = max(config.min_depth_band_m, config.mad_scale * robust_sigma)
         clean &= np.abs(depth - median) <= half_band
     mad_pixels = int(clean.sum())
+    if diagnostics is not None:
+        diagnostics["after_mad_pixels"] = mad_pixels
     if mad_pixels < max(1, int(min_valid_points)):
+        if diagnostics is not None:
+            diagnostics["reason"] = "insufficient_depth_after_pixel_filters"
+            diagnostics["required_points"] = max(1, int(min_valid_points))
         return None
 
     rows, cols = np.nonzero(clean)
     points = _deproject_selected(rows, cols, depth, intrinsics)
     points = _voxel_centroids(points, config.voxel_size_m if config.enabled else 0.0)
     voxel_points = int(points.shape[0])
+    if diagnostics is not None:
+        diagnostics["after_voxel_points"] = voxel_points
     points = _radius_filter(
         points,
         config.radius_outlier_m if config.enabled else 0.0,
         config.min_radius_neighbors if config.enabled else 0,
     )
     radius_points = int(points.shape[0])
+    if diagnostics is not None:
+        diagnostics["after_radius_points"] = radius_points
     if radius_points < max(1, int(min_valid_points)):
+        if diagnostics is not None:
+            diagnostics["reason"] = "insufficient_depth_after_point_filters"
+            diagnostics["required_points"] = max(1, int(min_valid_points))
         return None
     if points.shape[0] > max(1, int(max_points)):
         indices = np.linspace(0, points.shape[0] - 1, int(max_points), dtype=np.int64)
@@ -199,6 +224,12 @@ def extract_filtered_object_cloud(
 
     center = np.median(points, axis=0).astype(np.float64)
     pixel = project_camera_point_to_pixel(center, intrinsics)
+    if diagnostics is not None:
+        diagnostics.update(
+            valid=True,
+            reason=None,
+            output_points=int(points.shape[0]),
+        )
     return FilteredObjectCloud(
         points_camera_m=np.asarray(points, dtype=np.float64),
         center_camera_m=center,
@@ -209,6 +240,7 @@ def extract_filtered_object_cloud(
         stats={
             "input_mask_pixels": input_pixels,
             "after_erosion_pixels": eroded_pixels,
+            "valid_depth_pixels_in_mask": valid_depth_in_mask,
             "after_depth_edge_pixels": edge_pixels,
             "after_mad_pixels": mad_pixels,
             "after_voxel_points": voxel_points,

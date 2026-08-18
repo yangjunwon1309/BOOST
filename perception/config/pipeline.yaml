@@ -159,7 +159,10 @@ ee_target:
   # rotation. This is the most stable mode while the RGB-D extrinsics are still
   # only approximate. Alternatives: joint_fk, dual_imu.
   torso_estimator: identity
-  robot_state_max_delta_ms: 40.0
+  # Wi-Fi RGB frames can arrive 70–100 ms after the latest Thor state packet.
+  # Keep geometry enabled for a state sample up to 200 ms old; the worker still
+  # requires finite state, calibration, depth, and a configured camera transform.
+  robot_state_max_delta_ms: 200.0
   max_imu_fk_disagreement_deg: 12.0
   max_waist_speed_rad_s: 0.15
   side: left

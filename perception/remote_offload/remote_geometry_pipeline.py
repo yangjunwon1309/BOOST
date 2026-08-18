@@ -184,6 +184,7 @@ class RemoteRgbdGeometryPipeline:
             }
             cloud = None
             if intrinsics is not None and t_goal_cam is not None:
+                point_filter_diagnostics: dict[str, Any] = {}
                 try:
                     cloud = extract_filtered_object_cloud(
                         depth_m,
@@ -194,7 +195,9 @@ class RemoteRgbdGeometryPipeline:
                         max_depth_m=self.max_depth_m,
                         min_valid_points=self.min_depth_points,
                         max_points=self.contact_config.max_points,
+                        diagnostics=point_filter_diagnostics,
                     )
+                    detection["point_filter"] = point_filter_diagnostics
                 except (TypeError, ValueError) as error:
                     detection["point_filter"] = {
                         "valid": False,

@@ -108,9 +108,17 @@ class RemoteSam3BeliefInputWorker(RemoteSam3Worker):
         )
         if geometry_intrinsics is None:
             if not getattr(self, "_geometry_disabled_warned", False):
+                unavailable = []
+                if context.state is None:
+                    unavailable.append("robot_state")
+                if context.t_goal_cam is None:
+                    unavailable.append("T_goal_cam")
+                if intrinsics is None:
+                    unavailable.append("camera_intrinsics")
                 LOG.warning(
-                    "robot state or T_goal_cam unavailable; publishing masks only. "
-                    "Thor will receive no contact candidates and no surface primitives"
+                    "geometry unavailable (%s); publishing masks only. Thor will "
+                    "receive no contact candidates and no surface primitives",
+                    ", ".join(unavailable) or "unknown reason",
                 )
                 self._geometry_disabled_warned = True
         else:
@@ -140,8 +148,26 @@ class RemoteSam3BeliefInputWorker(RemoteSam3Worker):
         payload["geometry_status"] = {
             "state_available": context.state is not None,
             "t_goal_cam_available": context.t_goal_cam is not None,
+            "calibration_available": self.calibration is not None,
+            "intrinsics_available": intrinsics is not None,
+            "image_size": [int(pair.rgb.width), int(pair.rgb.height)],
+            "depth_size": [int(depth.shape[1]), int(depth.shape[0])],
+            "intrinsics_size": (
+                None
+                if intrinsics is None
+                else [int(intrinsics.width), int(intrinsics.height)]
+            ),
             "up_goal_available": context.up_goal is not None,
             "state_delta_ms": context.state_delta_ms,
+            "objects_with_valid_depth": sum(
+                1
+                for obj in payload["objects"]
+                if bool((obj.get("point_filter") or {}).get("valid", False))
+            ),
+            "contact_candidate_count": sum(
+                len(obj.get("contact_candidates") or [])
+                for obj in payload["objects"]
+            ),
             "primitive_count": sum(
                 len(obj.get("surface_primitives") or [])
                 for obj in payload["objects"]

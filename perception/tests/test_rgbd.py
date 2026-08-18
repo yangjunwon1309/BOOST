@@ -1,5 +1,6 @@
 import numpy as np
 import msgpack
+import pytest
 import struct
 import threading
 import zmq
@@ -24,7 +25,11 @@ from seg_web_node.lcm_protocol import (
     encode_camera,
     encode_depth,
 )
-from seg_web_node.depth_alignment import align_depth_to_color
+from seg_web_node.depth_alignment import (
+    align_depth_to_color,
+    calibration_for_frame,
+    scale_camera_intrinsics,
+)
 from seg_web_node.robot_geometry import pelvis_to_torso, waist_fk
 from seg_web_node.lcm_protocol import RobotState
 from seg_web_node.rgbd_sync import RgbdSynchronizer
@@ -146,6 +151,32 @@ def test_segmented_rgbd_renderer():
     assert objects[0]["mask_pixels"] == 60 * 80
     assert objects[0]["label"] == "object"
     assert abs(objects[0]["median_depth_m"] - 1.25) < 1e-6
+
+
+def test_segmented_rgbd_reviewer_mode_has_no_depth_panel_and_returns_mask_tint():
+    image = np.full((60, 80, 3), 80, dtype=np.uint8)
+    depth = np.full((60, 80), 1250, dtype=np.uint16)
+    masks = np.zeros((1, 60, 80), dtype=bool)
+    masks[0, 10:50, 20:60] = True
+    boxes = np.array([[20, 10, 59, 49]], dtype=np.float32)
+    output, _, colors = render_segmented_rgbd(
+        image,
+        depth,
+        masks,
+        boxes,
+        np.array([0.9], dtype=np.float32),
+        ["object"],
+        1000,
+        include_depth_panel=False,
+        draw_score=False,
+        draw_depth_text=False,
+        return_instance_colors=True,
+    )
+    assert output.shape == image.shape
+    assert colors == [(64, 64, 255)]
+    # The former depth inset occupies the bottom-right corner; in reviewer
+    # mode it remains the unmodified background.
+    np.testing.assert_array_equal(output[-1, -1], image[-1, -1])
 
 
 def test_multi_concept_parsing_and_duplicate_suppression():
@@ -272,6 +303,85 @@ def test_calibration_packet_and_thor_side_alignment():
     ))
     aligned = align_depth_to_color(frame, calibration)
     np.testing.assert_array_equal(aligned, frame.depth)
+
+
+def test_calibration_scales_for_proportional_rgbd_resize():
+    values = [2.0, 3.0, 0.5, 0.75, 4.0, 5.0, 1.0, 1.25]
+    values += np.eye(3).reshape(-1).tolist() + [0.0, 0.0, 0.0]
+    calibration = decode_calibration(
+        CALIBRATION_PACKET.pack(
+            0x4C414343, 1, 1, 9, 100, 640, 360, 640, 360, 1000, *values
+        )
+    )
+
+    scaled = calibration_for_frame(
+        calibration,
+        color_width=1280,
+        color_height=720,
+        depth_width=1280,
+        depth_height=720,
+    )
+
+    assert (scaled.color_width, scaled.color_height) == (1280, 720)
+    assert (scaled.depth_width, scaled.depth_height) == (1280, 720)
+    np.testing.assert_allclose(scaled.depth_intrinsics, [4.0, 6.0, 1.0, 1.5])
+    np.testing.assert_allclose(scaled.color_intrinsics, [8.0, 10.0, 2.0, 2.5])
+
+    intrinsics = scale_camera_intrinsics(
+        CameraIntrinsics(640, 360, 400.0, 401.0, 320.0, 180.0),
+        width=1280,
+        height=720,
+    )
+    assert (intrinsics.width, intrinsics.height) == (1280, 720)
+    np.testing.assert_allclose(
+        [intrinsics.fx, intrinsics.fy, intrinsics.cx, intrinsics.cy],
+        [800.0, 802.0, 640.0, 360.0],
+    )
+
+
+def test_calibration_rejects_non_proportional_resize():
+    values = [2.0, 2.0, 0.0, 0.0, 2.0, 2.0, 0.0, 0.0]
+    values += np.eye(3).reshape(-1).tolist() + [0.0, 0.0, 0.0]
+    calibration = decode_calibration(
+        CALIBRATION_PACKET.pack(
+            0x4C414343, 1, 1, 9, 100, 640, 360, 640, 360, 1000, *values
+        )
+    )
+    with pytest.raises(ValueError, match="aspect ratio changed"):
+        calibration_for_frame(
+            calibration,
+            color_width=1280,
+            color_height=720,
+            depth_width=640,
+            depth_height=480,
+        )
+
+
+def test_aligned_depth_ignores_raw_depth_camera_aspect_ratio():
+    values = [380.0, 380.0, 320.0, 240.0, 400.0, 401.0, 320.0, 180.0]
+    values += np.eye(3).reshape(-1).tolist() + [0.0, 0.0, 0.0]
+    calibration = decode_calibration(
+        CALIBRATION_PACKET.pack(
+            0x4C414343, 1, 1, 9, 100, 640, 480, 640, 360, 1000, *values
+        )
+    )
+
+    scaled = calibration_for_frame(
+        calibration,
+        color_width=1280,
+        color_height=720,
+    )
+
+    # The aligned 1280x720 depth packet uses the color pixel grid. The raw
+    # depth-camera calibration remains 640x480 and is not applied to it.
+    assert (scaled.depth_width, scaled.depth_height) == (640, 480)
+    np.testing.assert_allclose(
+        scaled.depth_intrinsics, [380.0, 380.0, 320.0, 240.0]
+    )
+    assert (scaled.color_width, scaled.color_height) == (1280, 720)
+    np.testing.assert_allclose(
+        scaled.color_intrinsics, [800.0, 802.0, 640.0, 360.0]
+    )
 
 
 def test_g1_waist_fk_and_dual_imu_estimator():

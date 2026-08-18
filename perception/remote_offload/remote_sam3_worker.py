@@ -15,7 +15,7 @@ import lcm
 import numpy as np
 import yaml
 
-from seg_web_node.depth_alignment import align_depth_to_color
+from seg_web_node.depth_alignment import align_depth_to_color, calibration_for_frame
 from seg_web_node.geometry import (
     CameraIntrinsics,
     deproject,
@@ -203,6 +203,8 @@ class RemoteSam3Worker:
             "last_inference_ms": None,
             "last_object_count": 0,
             "last_robot_state_delta_ms": None,
+            "last_geometry_status": {},
+            "last_object_geometry": [],
             "overlay_frames": 0,
             "overlay_dropped": 0,
             "overlay_errors": 0,
@@ -440,6 +442,28 @@ class RemoteSam3Worker:
         pair: RgbdPair,
         calibration: CameraCalibration | None,
     ) -> tuple[np.ndarray, CameraIntrinsics | None]:
+        frame_calibration = (
+            None
+            if calibration is None
+            else calibration_for_frame(
+                calibration,
+                color_width=pair.rgb.width,
+                color_height=pair.rgb.height,
+                # Aligned depth is already expressed on the color pixel grid;
+                # its original 4:3 depth-camera calibration is irrelevant.
+                # Raw optical depth still requires its own calibrated resize.
+                depth_width=(
+                    pair.depth.width
+                    if pair.depth.source == DEPTH_SOURCE_RAW_DEPTH_OPTICAL
+                    else None
+                ),
+                depth_height=(
+                    pair.depth.height
+                    if pair.depth.source == DEPTH_SOURCE_RAW_DEPTH_OPTICAL
+                    else None
+                ),
+            )
+        )
         if pair.depth.source == DEPTH_SOURCE_RAW_DEPTH_OPTICAL:
             if calibration is None:
                 # SAM3 segmentation itself needs only RGB.  Preserve that
@@ -448,22 +472,23 @@ class RemoteSam3Worker:
                 return np.zeros(
                     (pair.rgb.height, pair.rgb.width), dtype=pair.depth.depth.dtype
                 ), None
-            depth = align_depth_to_color(pair.depth, calibration)
+            assert frame_calibration is not None
+            depth = align_depth_to_color(pair.depth, frame_calibration)
             intrinsics = CameraIntrinsics(
-                calibration.color_width,
-                calibration.color_height,
-                *calibration.color_intrinsics,
+                frame_calibration.color_width,
+                frame_calibration.color_height,
+                *frame_calibration.color_intrinsics,
             )
             return depth, intrinsics
         depth = depth_at_rgb_size(pair)
-        if calibration is None:
+        if frame_calibration is None:
             return depth, None
         return (
             depth,
             CameraIntrinsics(
-                calibration.color_width,
-                calibration.color_height,
-                *calibration.color_intrinsics,
+                frame_calibration.color_width,
+                frame_calibration.color_height,
+                *frame_calibration.color_intrinsics,
             ),
         )
 
@@ -732,6 +757,33 @@ class RemoteSam3Worker:
                     self.status["last_source_timestamp_us"] = pair.rgb.timestamp_us
                     self.status["last_inference_ms"] = inference_ms
                     self.status["last_object_count"] = len(result.get("objects", []))
+                    self.status["last_geometry_status"] = dict(
+                        result.get("geometry_status") or {}
+                    )
+                    self.status["last_object_geometry"] = [
+                        {
+                            "label": obj.get("label"),
+                            "depth": (obj.get("point_filter") or {}).get("valid"),
+                            "reason": (obj.get("point_filter") or {}).get("reason"),
+                            "points": obj.get("valid_depth_points"),
+                            "mask_px": (obj.get("point_filter") or {}).get(
+                                "input_mask_pixels"
+                            ),
+                            "depth_px": (obj.get("point_filter") or {}).get(
+                                "valid_depth_pixels_in_mask"
+                            ),
+                            "edge_px": (obj.get("point_filter") or {}).get(
+                                "after_depth_edge_pixels"
+                            ),
+                            "radius_points": (obj.get("point_filter") or {}).get(
+                                "after_radius_points"
+                            ),
+                            "contacts": len(obj.get("contact_candidates") or []),
+                            "primitives": len(obj.get("surface_primitives") or []),
+                        }
+                        for obj in result.get("objects", [])[:5]
+                        if isinstance(obj, dict)
+                    ]
                     self.status["last_error"] = None
             except Exception as error:
                 self._record_error(error)
@@ -755,6 +807,9 @@ class RemoteSam3Worker:
                     "source_robot_state_delta_ms": self.status.get(
                         "last_robot_state_delta_ms"
                     ),
+                    "geometry_status": dict(
+                        self.status.get("last_geometry_status") or {}
+                    ),
                     "last_error": self.status.get("last_error"),
                     "overlay_count": int(self.status.get("overlay_frames", 0)),
                     "overlay_dropped_count": int(
@@ -774,7 +829,8 @@ class RemoteSam3Worker:
                 self.last_status_log_monotonic = now
                 LOG.info(
                     "%s status ready=%s input=%s processed=%s dropped=%s "
-                    "objects=%s latency_ms=%s last_error=%s",
+                    "objects=%s latency_ms=%s geometry=%s object_geometry=%s "
+                    "last_error=%s",
                     self._backend_display_name(),
                     payload["model_ready"],
                     payload["input_frame_count"],
@@ -782,6 +838,8 @@ class RemoteSam3Worker:
                     payload["dropped_count"],
                     self.status.get("last_object_count"),
                     payload["inference_latency_ms"],
+                    payload["geometry_status"],
+                    self.status.get("last_object_geometry"),
                     payload["last_error"],
                 )
             self.bus.publish(REMOTE_HEARTBEAT_CHANNEL, pack_heartbeat(payload))

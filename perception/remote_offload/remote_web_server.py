@@ -326,7 +326,6 @@ def _draw_belief_legend(
     for side in ("left", "right"):
         color = BELIEF_COLORS[side]
         initial = side[0].upper()
-        armed = side == selected_hand and not stale
         cv2.drawMarker(
             overlay, (18, y - 4), color, cv2.MARKER_TILTED_CROSS, 14, 2
         )
@@ -336,14 +335,11 @@ def _draw_belief_legend(
         cv2.drawMarker(
             overlay, (128, y - 4), color, cv2.MARKER_CROSS, 14, 2
         )
-        cv2.circle(
-            overlay, (128, y - 4), 9, color, -1 if armed else 1, cv2.LINE_AA
-        )
         _draw_text_with_halo(
             overlay, f"{initial} belief", (142, y), color, scale=0.48
         )
         y += 20
-    del control
+    del control, selected_hand, stale
 
 
 def _draw_hand_markers(
@@ -374,7 +370,10 @@ def _draw_hand_markers(
                 color,
                 scale=0.46,
             )
-    if control_fresh and armed:
+    # This reference is produced by the control loop, independently of
+    # whether depth geometry allowed belief inference on the same frame.
+    control_armed = bool(control_hand.get("armed", False))
+    if control_fresh and (armed or control_armed):
         pixel = _goal_to_pixel(
             control_hand.get("reference_grasp_goal_m"), t_goal_cam, intrinsics
         )

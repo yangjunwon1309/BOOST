@@ -745,6 +745,37 @@ def test_remote_web_draws_fresh_control_markers_and_hides_stale_ones():
     assert not np.any(stale[55:77, 22:39])
 
 
+def test_remote_web_draws_control_reference_without_belief_geometry():
+    overlay = np.zeros((80, 100, 3), dtype=np.uint8)
+    _draw_remote_belief_overlay(
+        overlay,
+        [],
+        {"selected_hand": "left", "hands": {"left": {}, "right": {}}},
+        stale=False,
+        t_goal_cam=np.eye(4),
+        intrinsics={
+            "fx": 100.0,
+            "fy": 100.0,
+            "cx": 50.0,
+            "cy": 40.0,
+            "width": 100,
+            "height": 80,
+        },
+        control={
+            "age_ms": 10.0,
+            "hands": {
+                "left": {
+                    "armed": True,
+                    "reference_grasp_goal_m": [-0.1, 0.25, 1.0],
+                }
+            },
+        },
+    )
+    # u=40, v=65: control reference remains visible without a depth-derived
+    # belief object or hand telemetry.
+    assert np.any(overlay[55:76, 30:51])
+
+
 def test_gateway_forwards_shared_control_v2_inside_belief_telemetry():
     class FakeBus:
         def __init__(self) -> None:
@@ -764,6 +795,10 @@ def test_gateway_forwards_shared_control_v2_inside_belief_telemetry():
     gateway.latest_hand_selection = {
         "schema": "path.shared_control_hand.v2",
         "timestamp_us": now_us(),
+        "state": "teleop",
+        "selected_hand": "left",
+        "active": True,
+        "revision": 3,
         "grasp_center_local_m": [0.0, 0.0, 0.1],
         "hands": {"left": {"human_grasp_goal_m": [0.1, 0.0, 1.0]}},
     }
@@ -776,6 +811,8 @@ def test_gateway_forwards_shared_control_v2_inside_belief_telemetry():
     )
     packet = unpack_belief_telemetry(gateway.wifi_bus.published[0][1])
     assert packet["control"]["schema"] == "path.shared_control_hand.v2"
+    assert packet["control"]["selected_hand"] == "left"
+    assert packet["control"]["active"] is True
     assert packet["control"]["hands"]["left"]["human_grasp_goal_m"] == [0.1, 0.0, 1.0]
     assert packet["control"]["age_ms"] is not None
 

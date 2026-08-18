@@ -1082,6 +1082,10 @@ class ThorRemoteGateway:
             ),
             "control": {
                 "schema": str(control.get("schema", "")),
+                "state": str(control.get("state", "")),
+                "selected_hand": str(control.get("selected_hand", "none")),
+                "active": bool(control.get("active", False)),
+                "revision": int(control.get("revision", 0) or 0),
                 "grasp_center_local_m": control.get("grasp_center_local_m"),
                 "hands": control.get("hands", {})
                 if isinstance(control.get("hands"), dict)
@@ -1120,6 +1124,10 @@ class ThorRemoteGateway:
                 self.latest_hand_selection = {
                     "schema": str(payload.get("schema", "")),
                     "timestamp_us": timestamp_us,
+                    "state": str(payload.get("state", "")),
+                    "selected_hand": hand,
+                    "active": active,
+                    "revision": int(payload.get("revision", 0) or 0),
                     "grasp_center_local_m": payload.get("grasp_center_local_m"),
                     "hands": payload.get("hands", {})
                     if isinstance(payload.get("hands"), dict)

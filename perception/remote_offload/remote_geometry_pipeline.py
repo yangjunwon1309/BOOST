@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
+import cv2
 import numpy as np
+from seg_web_node.depth_alignment import scale_camera_intrinsics
 from seg_web_node.geometry import CameraIntrinsics, transform_points
 from seg_web_node.geometry_fallback import LastValidGeometryFallback
 from seg_web_node.grip_candidates import (
@@ -16,12 +18,64 @@ from seg_web_node.grip_candidates import (
 )
 from seg_web_node.object_point_filter import (
     ObjectPointFilterConfig,
+    compute_depth_edge_mask,
     extract_filtered_object_cloud,
+    project_camera_point_to_pixel,
 )
 
 from .protocol import make_object
 
 GOAL_FRAME = "pelvis_identity_fk"
+GEOMETRY_COLOR_SIZE = (640, 360)
+
+
+def geometry_intrinsics_from_color(
+    color_intrinsics: CameraIntrinsics,
+    target_size: tuple[int, int] = GEOMETRY_COLOR_SIZE,
+) -> CameraIntrinsics:
+    """Scale colour intrinsics onto the calibration-native geometry grid."""
+    width, height = (int(target_size[0]), int(target_size[1]))
+    return scale_camera_intrinsics(
+        color_intrinsics,
+        width=width,
+        height=height,
+    )
+
+
+def masks_to_geometry_grid(
+    masks: np.ndarray,
+    target_size: tuple[int, int],
+) -> np.ndarray:
+    """Downsample boolean detector masks onto the geometry working grid."""
+    array = np.asarray(masks, dtype=bool)
+    if array.ndim != 3:
+        raise ValueError("masks must be an NxHxW array")
+    width, height = (int(target_size[0]), int(target_size[1]))
+    if min(width, height) <= 0:
+        raise ValueError("geometry target dimensions must be positive")
+    if array.size == 0 or array.shape[1:] == (height, width):
+        return array
+    return np.stack(
+        [
+            cv2.resize(
+                mask.astype(np.uint8),
+                (width, height),
+                interpolation=cv2.INTER_NEAREST,
+            ).astype(bool)
+            for mask in array
+        ]
+    )
+
+
+def _intrinsics_metadata(intrinsics: CameraIntrinsics) -> dict[str, Any]:
+    return {
+        "fx": float(intrinsics.fx),
+        "fy": float(intrinsics.fy),
+        "cx": float(intrinsics.cx),
+        "cy": float(intrinsics.cy),
+        "width": int(intrinsics.width),
+        "height": int(intrinsics.height),
+    }
 
 
 class Stable3DTracker:
@@ -77,6 +131,7 @@ class Stable3DTracker:
 def camera_geometry_metadata(
     t_goal_cam: np.ndarray | None,
     intrinsics: CameraIntrinsics | None = None,
+    geometry_intrinsics: CameraIntrinsics | None = None,
 ) -> dict[str, Any]:
     """Return the per-frame camera pose needed for goal-to-pixel projection."""
     if t_goal_cam is None:
@@ -90,14 +145,9 @@ def camera_geometry_metadata(
         "t_goal_cam": [float(value) for value in transform.reshape(16)],
     }
     if intrinsics is not None:
-        metadata["intrinsics"] = {
-            "fx": float(intrinsics.fx),
-            "fy": float(intrinsics.fy),
-            "cx": float(intrinsics.cx),
-            "cy": float(intrinsics.cy),
-            "width": int(intrinsics.width),
-            "height": int(intrinsics.height),
-        }
+        metadata["intrinsics"] = _intrinsics_metadata(intrinsics)
+    if geometry_intrinsics is not None:
+        metadata["geometry_intrinsics"] = _intrinsics_metadata(geometry_intrinsics)
     return metadata
 
 
@@ -113,7 +163,7 @@ class RemoteRgbdGeometryPipeline:
         contact_candidates: bool = True,
         min_depth_m: float = 0.15,
         max_depth_m: float = 3.0,
-        min_depth_points: int = 100,
+        min_depth_points: int = 80,
         tracker: Stable3DTracker | None = None,
         fallback_ttl_frames: int = 0,
         fallback_score_decay: float = 0.97,
@@ -153,6 +203,7 @@ class RemoteRgbdGeometryPipeline:
         depth_raw: np.ndarray,
         depth_scale_um: int,
         intrinsics: CameraIntrinsics | None,
+        color_intrinsics: CameraIntrinsics | None = None,
         t_goal_cam: np.ndarray | None,
         up_goal: np.ndarray | None,
         source_robot_state_delta_ms: float | None,
@@ -164,8 +215,26 @@ class RemoteRgbdGeometryPipeline:
         depth_m = np.asarray(depth_raw, dtype=np.float32) * (
             float(depth_scale_um) / 1_000_000.0
         )
+        geometry_masks = (
+            masks_to_geometry_grid(
+                masks,
+                (int(intrinsics.width), int(intrinsics.height)),
+            )
+            if intrinsics is not None
+            else np.asarray(masks, dtype=bool)
+        )
+        depth_edge_mask = None
+        if intrinsics is not None and t_goal_cam is not None:
+            depth_edge_mask = compute_depth_edge_mask(
+                depth_m,
+                min_depth_m=self.min_depth_m,
+                max_depth_m=self.max_depth_m,
+                threshold_m=self.object_point_filter.depth_edge_threshold_m,
+            )
         detections: list[dict[str, Any]] = []
-        for index, (mask, label, score) in enumerate(zip(masks, labels, scores)):
+        for index, (mask, label, score) in enumerate(
+            zip(geometry_masks, labels, scores)
+        ):
             detection: dict[str, Any] = {
                 "index": index,
                 "label": str(label),
@@ -196,6 +265,7 @@ class RemoteRgbdGeometryPipeline:
                         min_valid_points=self.min_depth_points,
                         max_points=self.contact_config.max_points,
                         diagnostics=point_filter_diagnostics,
+                        depth_edge_mask=depth_edge_mask,
                     )
                     detection["point_filter"] = point_filter_diagnostics
                 except (TypeError, ValueError) as error:
@@ -206,10 +276,13 @@ class RemoteRgbdGeometryPipeline:
             if cloud is not None:
                 detection["median_depth_m"] = cloud.median_depth_m
                 detection["center_camera_m"] = cloud.center_camera_m.tolist()
-                detection["center_pixel_uv"] = [
-                    int(cloud.center_pixel_uv[0]),
-                    int(cloud.center_pixel_uv[1]),
-                ]
+                output_intrinsics = color_intrinsics or intrinsics
+                detection["center_pixel_uv"] = list(
+                    project_camera_point_to_pixel(
+                        cloud.center_camera_m,
+                        output_intrinsics,
+                    )
+                )
                 detection["valid_depth_points"] = cloud.valid_depth_points
                 detection["point_filter"] = {"valid": True, **cloud.stats}
                 detection["center_goal_m"] = transform_points(

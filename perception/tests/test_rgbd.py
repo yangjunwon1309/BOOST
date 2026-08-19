@@ -192,6 +192,67 @@ def test_multi_concept_parsing_and_duplicate_suppression():
     assert kept_scores.tolist() == [np.float32(0.9)]
     assert kept_labels == ["box"]
 
+    disjoint_masks = np.zeros((2, 8, 8), dtype=bool)
+    disjoint_masks[0, 1:3, 1:3] = True
+    disjoint_masks[1, 5:7, 5:7] = True
+    disjoint_boxes = np.array([[1, 1, 2, 2], [5, 5, 6, 6]], dtype=np.float32)
+    kept_masks, _, kept_scores, kept_labels = suppress_duplicate_masks(
+        disjoint_masks,
+        disjoint_boxes,
+        scores,
+        ["left", "right"],
+    )
+    assert len(kept_masks) == 2
+    assert kept_scores.tolist() == [np.float32(0.9), np.float32(0.7)]
+    assert kept_labels == ["right", "left"]
+
+
+def test_box_prefilter_preserves_mask_dedup_results_for_100_frames():
+    rng = np.random.default_rng(90210)
+
+    def baseline_indices(masks, scores, threshold=0.7):
+        areas = masks.reshape(len(masks), -1).sum(axis=1)
+        kept = []
+        for index in np.argsort(-scores):
+            duplicate = False
+            for previous in kept:
+                intersection = np.logical_and(masks[index], masks[previous]).sum()
+                union = areas[index] + areas[previous] - intersection
+                if union > 0 and intersection / union >= threshold:
+                    duplicate = True
+                    break
+            if not duplicate:
+                kept.append(int(index))
+        return kept
+
+    for _frame in range(100):
+        masks = np.zeros((6, 48, 64), dtype=bool)
+        boxes = np.zeros((6, 4), dtype=np.float32)
+        for object_index in range(3):
+            x0 = int(rng.integers(0, 45))
+            y0 = int(rng.integers(0, 31))
+            width = int(rng.integers(8, 18))
+            height = int(rng.integers(8, 18))
+            x1 = min(63, x0 + width)
+            y1 = min(47, y0 + height)
+            for copy_index in (2 * object_index, 2 * object_index + 1):
+                masks[copy_index, y0 : y1 + 1, x0 : x1 + 1] = True
+                boxes[copy_index] = [x0, y0, x1, y1]
+        scores = rng.random(6, dtype=np.float32)
+        labels = [f"instance-{index}" for index in range(6)]
+        expected = baseline_indices(masks, scores)
+        kept_masks, kept_boxes, kept_scores, kept_labels = suppress_duplicate_masks(
+            masks,
+            boxes,
+            scores,
+            labels,
+        )
+
+        np.testing.assert_array_equal(kept_masks, masks[expected])
+        np.testing.assert_array_equal(kept_boxes, boxes[expected])
+        np.testing.assert_array_equal(kept_scores, scores[expected])
+        assert kept_labels == [labels[index] for index in expected]
+
 
 def test_continuous_tracking_keeps_nearest_same_label_instance():
     instances = [

@@ -125,7 +125,7 @@ cd /home/url/PATH-G1/perception
 python tools/thor_remote_rgbd_gateway.py \
   --g1-lcm-url "$G1_LCM_URL" \
   --wifi-lcm-url "$WIFI_LCM_URL" \
-  --forward-hz 5 \
+  --forward-hz 15 \
   --result-max-age-ms 800
 ```
 
@@ -135,7 +135,7 @@ Equivalent module form from the `perception` directory:
 python -m remote_offload.thor_gateway \
   --g1-lcm-url "$G1_LCM_URL" \
   --wifi-lcm-url "$WIFI_LCM_URL" \
-  --forward-hz 5 \
+  --forward-hz 15 \
   --result-max-age-ms 800
 ```
 
@@ -217,7 +217,7 @@ socket:
 cd /path/to/PATH-G1
 export WIFI_LCM_URL='udpm://239.255.77.67:7667?ttl=1'
 export SAM3_CONCEPTS='object'
-export SAM3_INFERENCE_HZ='3.5'
+export SAM3_INFERENCE_HZ='8'
 pixi run --locked sam3-worker
 ```
 
@@ -255,8 +255,7 @@ docker run --rm --gpus all --network host \
     --config config/pipeline.yaml \
     --backend pytorch \
     --concepts 'object' \
-    --inference-hz 3 \
-    --publish-overlay-jpeg
+    --inference-hz 8
 ```
 
 For transport-only validation without SAM3 weights:
@@ -270,7 +269,7 @@ docker run --rm --network host \
     --config config/pipeline.yaml \
     --backend mock \
     --concepts 'object' \
-    --inference-hz 3
+    --inference-hz 8
 ```
 
 If SAM3/model state is unavailable, the worker publishes a fresh

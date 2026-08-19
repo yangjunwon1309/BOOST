@@ -29,8 +29,10 @@ from seg_web_node.robot_geometry import (
     angular_velocity_from_rotations,
     g1_grasp_center_position,
     g1_hand_base_rotation,
+    grasp_center_from_wrist,
     gravity_up_in_pelvis,
     hand_frame_profile,
+    hand_rotation_from_wrist_rotation,
 )
 from seg_web_node.tasc_belief import (
     BeliefInputObject,
@@ -82,6 +84,10 @@ DEFAULT_SHARED_HAND_SELECTION_ENDPOINT = os.environ.get(
 DEFAULT_SHARED_HAND_SELECTION_TOPIC = os.environ.get(
     "PATH_SHARED_HAND_SELECTION_TOPIC", "path_shared_control_hand"
 )
+SHARED_HAND_PUBLISH_HZ = 50.0
+# Camera-frame lookup needs the complete pipeline history.  1.5 s covers the
+# pre-v9.1 639 ms path with more than 2x margin, while retaining 50 Hz samples.
+COMMAND_HISTORY_SPAN_S = 1.5
 
 
 def _topic_msgpack_unpack(raw: bytes, topic: str) -> dict[str, Any]:
@@ -453,6 +459,9 @@ class ThorRemoteGateway:
         belief_log_hz: float,
         shared_hand_selection_endpoint: str,
         shared_hand_selection_topic: str,
+        belief_use_operator_command: bool,
+        belief_command_divergence_max_m: float,
+        belief_command_max_delta_ms: float,
     ) -> None:
         if g1_lcm_url == wifi_lcm_url:
             raise ValueError("G1 and Wi-Fi LCM URLs must be distinct")
@@ -523,7 +532,9 @@ class ThorRemoteGateway:
         self.shared_hand_selection_topic = str(shared_hand_selection_topic)
         self.shared_hand_selection_socket = zmq.Context.instance().socket(zmq.SUB)
         self.shared_hand_selection_socket.setsockopt(zmq.LINGER, 0)
-        self.shared_hand_selection_socket.setsockopt(zmq.CONFLATE, 1)
+        # Do not conflate this 50 Hz stream: every timestamped sample is needed
+        # to reconstruct the operator command at the camera-frame epoch.
+        self.shared_hand_selection_socket.setsockopt(zmq.RCVHWM, 100)
         self.shared_hand_selection_socket.setsockopt_string(
             zmq.SUBSCRIBE, self.shared_hand_selection_topic
         )
@@ -531,9 +542,21 @@ class ThorRemoteGateway:
         self.belief_selected_hand = "none"
         self.belief_selection_active = False
         self.belief_selection_timestamp_us = 0
-        # v2 of the existing shared-hand heartbeat carries only visualization
-        # data.  Keeping it here lets the Wi-Fi telemetry mirror the current
-        # operator command and second-order reference without a new channel.
+        self.belief_use_operator_command = bool(belief_use_operator_command)
+        self.belief_command_divergence_max_m = max(
+            0.0, float(belief_command_divergence_max_m)
+        )
+        self.belief_command_max_delta_ms = max(
+            0.0, float(belief_command_max_delta_ms)
+        )
+        self.command_history: collections.deque[
+            tuple[int, dict[str, Any]]
+        ] = collections.deque(
+            maxlen=int(COMMAND_HISTORY_SPAN_S * SHARED_HAND_PUBLISH_HZ)
+        )
+        # v2 of the existing shared-hand heartbeat carries the timestamped raw
+        # operator command plus visualization/reference data.  Keeping the
+        # latest copy mirrors both to Wi-Fi telemetry without a new channel.
         self.latest_hand_selection: dict[str, Any] = {}
         self.ee_target_pub = (
             ZmqEeTargetPublisher(endpoint=ee_target_endpoint, topic=ee_target_topic)
@@ -550,6 +573,8 @@ class ThorRemoteGateway:
             self.sim_state_socket.connect(self.sim_state_zmq_endpoint)
         self.sync = RawRgbdSynchronizer(sync_tolerance_ms)
         self.lock = threading.Lock()
+        self.pair_ready = threading.Condition(self.lock)
+        self.last_forward_monotonic = 0.0
         self.running = False
         self.pending_pair: RawPair | None = None
         self.latest_pair: RawPair | None = None
@@ -572,6 +597,8 @@ class ThorRemoteGateway:
             "local_calibration": 0,
             "local_robot_state": 0,
             "forwarded_pairs": 0,
+            "forward_publish_bytes": 0,
+            "forward_publish_errors": 0,
             "forwarded_calibration": 0,
             "forwarded_robot_state": 0,
             "valid_results": 0,
@@ -605,9 +632,19 @@ class ThorRemoteGateway:
             "belief_update_hz": self.belief_update_hz,
             "belief_geometry_update_hz": self.geometry_update_hz,
             "belief_updates": 0,
+            "belief_input": {
+                "source": {},
+                "divergence_m": {},
+                "command_lookup_age_ms": {},
+                "command_lookup_failures": 0,
+            },
+            "belief_command_divergence_m": {},
+            "command_lookup_age_ms": {},
+            "command_lookup_failures": 0,
             "sim_robot_state": 0,
             "sim_robot_state_errors": 0,
             "last_sim_robot_state": None,
+            "last_stage_latency_ms": None,
         }
         self.threads: list[threading.Thread] = []
         self.g1_bus.subscribe(rgb_channel, self._on_local_rgb)
@@ -646,7 +683,9 @@ class ThorRemoteGateway:
             thread.start()
 
     def stop(self) -> None:
-        self.running = False
+        with self.pair_ready:
+            self.running = False
+            self.pair_ready.notify_all()
         for thread in self.threads:
             thread.join(timeout=2.0)
         if self.ee_target_pub is not None:
@@ -665,13 +704,14 @@ class ThorRemoteGateway:
     def _submit_pair(self, pair: RawPair | None) -> None:
         if pair is None:
             return
-        with self.lock:
+        with self.pair_ready:
             if self.pending_pair is not None:
                 self.stats["dropped_before_forward"] = (
                     int(self.stats.get("dropped_before_forward", 0)) + 1
                 )
             self.pending_pair = pair
             self.latest_pair = pair
+            self.pair_ready.notify()
 
     def _on_local_rgb(self, _channel: str, data: bytes) -> None:
         try:
@@ -814,8 +854,48 @@ class ThorRemoteGateway:
             }
 
     def _on_remote_result(self, _channel: str, data: bytes) -> None:
+        gateway_receive_us = time.time_ns() // 1000
         try:
             payload = unpack_result(data)
+            stages = dict(payload.get("stage_us") or {})
+            stages["gateway_receive"] = int(gateway_receive_us)
+            payload["stage_us"] = stages
+            stage_keys = (
+                "source_rgb",
+                "worker_dequeue",
+                "decode_done",
+                "infer_done",
+                "geometry_done",
+                "gateway_receive",
+            )
+            if all(isinstance(stages.get(key), int) for key in stage_keys):
+                with self.lock:
+                    self.stats["last_stage_latency_ms"] = {
+                        "transport_in": (
+                            stages["worker_dequeue"] - stages["source_rgb"]
+                        )
+                        / 1000.0,
+                        "decode": (
+                            stages["decode_done"] - stages["worker_dequeue"]
+                        )
+                        / 1000.0,
+                        "inference": (
+                            stages["infer_done"] - stages["decode_done"]
+                        )
+                        / 1000.0,
+                        "geometry": (
+                            stages["geometry_done"] - stages["infer_done"]
+                        )
+                        / 1000.0,
+                        "pack_transport": (
+                            stages["gateway_receive"] - stages["geometry_done"]
+                        )
+                        / 1000.0,
+                        "total": (
+                            stages["gateway_receive"] - stages["source_rgb"]
+                        )
+                        / 1000.0,
+                    }
             with self.lock:
                 source_rgb = payload.get("source_rgb_timestamp_us")
                 source_depth = payload.get("source_depth_timestamp_us")
@@ -1075,6 +1155,7 @@ class ThorRemoteGateway:
                 for side in ("left", "right")
             },
             "result_valid": bool(payload.get("valid", False)),
+            "geometry_status": payload.get("geometry_status", {}),
             "result_age_ms": max(
                 0.0,
                 (published_timestamp_us - int(payload.get("published_timestamp_us", 0)))
@@ -1087,11 +1168,15 @@ class ThorRemoteGateway:
                 "active": bool(control.get("active", False)),
                 "revision": int(control.get("revision", 0) or 0),
                 "grasp_center_local_m": control.get("grasp_center_local_m"),
+                "end_effector_model": control.get("end_effector_model"),
                 "hands": control.get("hands", {})
                 if isinstance(control.get("hands"), dict)
                 else {},
                 "age_ms": control_age_ms,
             },
+            "belief_input": dict(
+                getattr(self, "stats", {}).get("belief_input", {}) or {}
+            ),
         }
         self.wifi_bus.publish(
             REMOTE_BELIEF_TELEMETRY_CHANNEL,
@@ -1129,10 +1214,13 @@ class ThorRemoteGateway:
                     "active": active,
                     "revision": int(payload.get("revision", 0) or 0),
                     "grasp_center_local_m": payload.get("grasp_center_local_m"),
+                    "end_effector_model": payload.get("end_effector_model"),
                     "hands": payload.get("hands", {})
                     if isinstance(payload.get("hands"), dict)
                     else {},
                 }
+                if isinstance(payload.get("hands"), dict) and timestamp_us > 0:
+                    self.command_history.append((timestamp_us, payload["hands"]))
                 with self.lock:
                     self.stats["belief_selected_hand"] = self.belief_selected_hand
                     self.stats["belief_selection_active"] = active
@@ -1142,6 +1230,73 @@ class ThorRemoteGateway:
             except Exception as error:
                 with self.lock:
                     self.stats["last_belief_selection_error"] = str(error)
+
+    def _command_features_at(
+        self,
+        timestamp_us: int,
+        hand: str,
+        max_delta_ms: float | None = None,
+    ) -> tuple[
+        np.ndarray,
+        np.ndarray,
+        np.ndarray | None,
+        np.ndarray | None,
+    ] | None:
+        """Return the operator command nearest the geometry frame epoch.
+
+        CONVENTION: ``source_rgb_timestamp_us`` feeds two independent matchers:
+        robot-state matching supplies geometry/T_goal_cam, and this command
+        lookup supplies the belief hand state.  Changing the timestamp meaning
+        shifts both lookup targets and therefore requires validating both
+        ``geometry_status.state_delta_ms`` and ``command_lookup_age_ms``.
+        """
+        history = getattr(self, "command_history", ())
+        if not history:
+            self.stats["command_lookup_failures"] = int(
+                self.stats.get("command_lookup_failures", 0)
+            ) + 1
+            return None
+        limit_ms = (
+            float(getattr(self, "belief_command_max_delta_ms", 25.0))
+            if max_delta_ms is None
+            else float(max_delta_ms)
+        )
+        target_timestamp_us = int(timestamp_us)
+        best = min(
+            history,
+            key=lambda item: abs(int(item[0]) - target_timestamp_us),
+        )
+        age_ms = abs(int(best[0]) - target_timestamp_us) / 1000.0
+        self.stats.setdefault("command_lookup_age_ms", {})[hand] = age_ms
+        if age_ms > limit_ms:
+            self.stats["command_lookup_failures"] = int(
+                self.stats.get("command_lookup_failures", 0)
+            ) + 1
+            return None
+        entry = (best[1] or {}).get(hand) or {}
+        position = _finite_vec3(entry.get("command_wrist_position_m"))
+        raw_rotation = entry.get("command_wrist_rotation")
+        if (
+            position is None
+            or not isinstance(raw_rotation, list)
+            or len(raw_rotation) != 9
+        ):
+            self.stats["command_lookup_failures"] = int(
+                self.stats.get("command_lookup_failures", 0)
+            ) + 1
+            return None
+        rotation = np.asarray(raw_rotation, dtype=np.float64).reshape(3, 3)
+        if not np.isfinite(rotation).all():
+            self.stats["command_lookup_failures"] = int(
+                self.stats.get("command_lookup_failures", 0)
+            ) + 1
+            return None
+        return (
+            position,
+            rotation,
+            _finite_vec3(entry.get("command_velocity_mps")),
+            _finite_vec3(entry.get("command_omega_rps")),
+        )
 
     def _belief_target_link(self) -> str:
         if self.belief_selection_active and self.belief_selected_hand in {"left", "right"}:
@@ -1199,20 +1354,86 @@ class ThorRemoteGateway:
         # the gravity candidate), and both unarmed hand posteriors remain useful
         # diagnostics.  A/B only gates target publication below; it never gates
         # inference or CSV recording.
+        source_timestamp_us = int(
+            payload.get("source_rgb_timestamp_us", 0) or 0
+        )
         hand_inputs: dict[str, HandInput] = {}
+        input_sources: dict[str, str] = {}
         for side in ("left", "right"):
-            eef_position, eef_velocity, hand_rotation, hand_omega = self._belief_state_features(robot_state_packet, side)
-            if eef_position is None:
-                continue
+            command = (
+                self._command_features_at(source_timestamp_us, side)
+                if getattr(self, "belief_use_operator_command", False)
+                else None
+            )
+            (
+                fk_position,
+                fk_velocity,
+                fk_rotation,
+                fk_omega,
+            ) = self._belief_state_features(robot_state_packet, side)
+            source = "robot_fk"
+            position = None
+            velocity = None
+            hand_rotation = None
+            hand_omega = None
+            if command is not None:
+                wrist_position, wrist_rotation, velocity, hand_omega = command
+                position = grasp_center_from_wrist(
+                    wrist_position,
+                    wrist_rotation,
+                    side,
+                    self.belief_hand_model,
+                    self.belief_grasp_center_local_m,
+                )
+                hand_rotation = hand_rotation_from_wrist_rotation(
+                    wrist_rotation,
+                    side,
+                    self.belief_hand_model,
+                )
+                source = "operator_command"
+                if fk_position is not None:
+                    divergence = float(np.linalg.norm(position - fk_position))
+                    self.stats.setdefault(
+                        "belief_command_divergence_m", {}
+                    )[side] = divergence
+                    if divergence > float(
+                        getattr(
+                            self,
+                            "belief_command_divergence_max_m",
+                            0.20,
+                        )
+                    ):
+                        command = None
+                        source = "fk_divergence_fallback"
+            if command is None:
+                if fk_position is None:
+                    continue
+                position, velocity = fk_position, fk_velocity
+                hand_rotation, hand_omega = fk_rotation, fk_omega
+            input_sources[side] = source
             hand_inputs[side] = HandInput(
-                eef_position=eef_position,
-                user_translation=eef_velocity,
+                eef_position=position,
+                user_translation=velocity,
                 hand_rotation=hand_rotation,
                 hand_axis=None,
                 approach_axis=(hand_rotation @ np.asarray(self.belief_hand_profile["approach_axis_local"], dtype=np.float64) if hand_rotation is not None else None),
                 angular_velocity=hand_omega,
                 button_pressed=(self.belief_selection_active and self.belief_selected_hand == side),
+                input_source=source,
             )
+        belief_input_telemetry = {
+            "source": dict(input_sources),
+            "divergence_m": dict(
+                self.stats.get("belief_command_divergence_m", {})
+            ),
+            "command_lookup_age_ms": dict(
+                self.stats.get("command_lookup_age_ms", {})
+            ),
+            "command_lookup_failures": int(
+                self.stats.get("command_lookup_failures", 0)
+            ),
+        }
+        self.stats["belief_input"] = belief_input_telemetry
         if not hand_inputs:
             telemetry = {
                 "enabled": True,
@@ -1222,6 +1443,7 @@ class ThorRemoteGateway:
                 "selected_hand": self.belief_selected_hand,
                 "selection_active": self.belief_selection_active,
                 "reason": "robot_state_unavailable_for_both_hands",
+                "belief_input": belief_input_telemetry,
             }
             with self.lock:
                 self.stats["last_belief"] = telemetry
@@ -1286,6 +1508,7 @@ class ThorRemoteGateway:
                     hand_input.approach_axis, dtype=np.float64
                 ).reshape(3).tolist()
             )
+            hand_telemetry["input_source"] = input_sources.get(side, "robot_fk")
         self._publish_belief_telemetry(payload, per_hand)
         selected = per_hand.get(self.belief_selected_hand)
         telemetry = (
@@ -1296,6 +1519,7 @@ class ThorRemoteGateway:
         telemetry["hands"] = per_hand
         telemetry["selected_hand"] = self.belief_selected_hand
         telemetry["selection_active"] = self.belief_selection_active
+        telemetry["belief_input"] = belief_input_telemetry
         telemetry["eef_target_link"] = self._belief_target_link()
         telemetry["belief_robot_state_timestamp_us"] = (
             belief_robot_state_timestamp_us
@@ -1863,11 +2087,19 @@ class ThorRemoteGateway:
         last_calibration = 0.0
         last_robot_state = 0.0
         while self.running:
-            started = time.monotonic()
             pair = None
             calibration = None
             robot_state = None
-            with self.lock:
+            with self.pair_ready:
+                # Frames wake the forwarding loop immediately.  The timeout
+                # keeps calibration/state resend and shutdown responsive when
+                # the camera is idle.
+                self.pair_ready.wait_for(
+                    lambda: self.pending_pair is not None or not self.running,
+                    timeout=0.2,
+                )
+                if not self.running:
+                    break
                 pair = self.pending_pair
                 self.pending_pair = None
                 now = time.monotonic()
@@ -1901,6 +2133,13 @@ class ThorRemoteGateway:
                         "state_timestamp_us": pair.rgb.timestamp_us,
                         "rgb_timestamp_us": pair.rgb.timestamp_us,
                     }
+            # This period is a Wi-Fi bandwidth cap.  It throttles bursts but
+            # no longer makes each frame wait for an unrelated polling tick.
+            if pair is not None:
+                elapsed = time.monotonic() - self.last_forward_monotonic
+                if elapsed < self.forward_period:
+                    time.sleep(self.forward_period - elapsed)
+                self.last_forward_monotonic = time.monotonic()
             if calibration is not None:
                 self.wifi_bus.publish(REMOTE_CALIBRATION_CHANNEL, calibration)
                 with self.lock:
@@ -1910,30 +2149,35 @@ class ThorRemoteGateway:
                 with self.lock:
                     self.stats["forwarded_robot_state"] += 1
             if pair is not None:
-                self.wifi_bus.publish(REMOTE_RGB_CHANNEL, pair.rgb.data)
-                self.wifi_bus.publish(REMOTE_DEPTH_CHANNEL, pair.depth.data)
-                with self.lock:
-                    calibration_id = (
-                        self.latest_calibration[0]
-                        if self.latest_calibration is not None
-                        else None
-                    )
-                    self.forwarded_pairs.append(
-                        ForwardedPairRecord(
-                            pair=pair,
-                            calibration_id=calibration_id,
-                            robot_state=robot_state,
+                try:
+                    self.wifi_bus.publish(REMOTE_RGB_CHANNEL, pair.rgb.data)
+                    self.wifi_bus.publish(REMOTE_DEPTH_CHANNEL, pair.depth.data)
+                    with self.lock:
+                        calibration_id = (
+                            self.latest_calibration[0]
+                            if self.latest_calibration is not None
+                            else None
                         )
-                    )
-                    self.stats["forwarded_pairs"] += 1
-                    self.stats["last_forwarded"] = {
-                        "rgb_timestamp_us": pair.rgb.timestamp_us,
-                        "depth_timestamp_us": pair.depth.timestamp_us,
-                        "delta_ms": pair.delta_us / 1000.0,
-                        "width": pair.rgb.width,
-                        "height": pair.rgb.height,
-                    }
-            time.sleep(max(0.0, self.forward_period - (time.monotonic() - started)))
+                        self.forwarded_pairs.append(
+                            ForwardedPairRecord(
+                                pair=pair,
+                                calibration_id=calibration_id,
+                                robot_state=robot_state,
+                            )
+                        )
+                        self.stats["forward_publish_bytes"] = len(pair.depth.data)
+                        self.stats["forwarded_pairs"] += 1
+                        self.stats["last_forwarded"] = {
+                            "rgb_timestamp_us": pair.rgb.timestamp_us,
+                            "depth_timestamp_us": pair.depth.timestamp_us,
+                            "delta_ms": pair.delta_us / 1000.0,
+                            "width": pair.rgb.width,
+                            "height": pair.rgb.height,
+                        }
+                except Exception as error:
+                    with self.lock:
+                        self.stats["forward_publish_errors"] += 1
+                        self.stats["last_error"] = str(error)
 
     def _log_loop(self) -> None:
         while self.running:
@@ -1957,9 +2201,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--g1-lcm-url", required=True)
     parser.add_argument("--wifi-lcm-url", required=True)
-    parser.add_argument("--forward-hz", type=float, default=5.0)
+    parser.add_argument(
+        "--forward-hz",
+        type=float,
+        default=15.0,
+        help=(
+            "Wi-Fi link bandwidth cap, not a target rate. Frames are published "
+            "on arrival; this only throttles bursts."
+        ),
+    )
     parser.add_argument("--result-max-age-ms", type=float, default=800.0)
-    parser.add_argument("--sync-tolerance-ms", type=float, default=50.0)
+    parser.add_argument("--sync-tolerance-ms", type=float, default=20.0)
     parser.add_argument("--calibration-resend-sec", type=float, default=2.0)
     parser.add_argument("--robot-state-hz", type=float, default=20.0)
     parser.add_argument("--rgb-channel", default=LOCAL_RGB_CHANNEL)
@@ -2065,6 +2317,36 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Maximum Thor-side belief CSV logging rate.",
     )
     parser.add_argument(
+        "--belief-input-source",
+        choices=("operator_command", "robot_fk"),
+        default=os.environ.get(
+            "PATH_REMOTE_BELIEF_INPUT_SOURCE", "operator_command"
+        ),
+        help=(
+            "Hand state used by TASC belief. Operator command is aligned to "
+            "the RGB frame timestamp and falls back to robot FK on lookup or "
+            "divergence failure."
+        ),
+    )
+    parser.add_argument(
+        "--belief-command-divergence-max-m",
+        type=float,
+        default=float(
+            os.environ.get(
+                "PATH_REMOTE_BELIEF_COMMAND_DIVERGENCE_MAX_M", "0.20"
+            )
+        ),
+        help="Maximum command/FK grasp-centre separation before FK fallback.",
+    )
+    parser.add_argument(
+        "--belief-command-max-delta-ms",
+        type=float,
+        default=float(
+            os.environ.get("PATH_REMOTE_BELIEF_COMMAND_MAX_DELTA_MS", "25.0")
+        ),
+        help="Maximum command sample distance from source_rgb_timestamp_us.",
+    )
+    parser.add_argument(
         "--shared-hand-selection-endpoint",
         default=DEFAULT_SHARED_HAND_SELECTION_ENDPOINT,
         help="ZMQ state-machine A/B hand-selection heartbeat endpoint.",
@@ -2118,6 +2400,13 @@ def main(argv: list[str] | None = None) -> int:
         belief_log_hz=args.belief_log_hz,
         shared_hand_selection_endpoint=args.shared_hand_selection_endpoint,
         shared_hand_selection_topic=args.shared_hand_selection_topic,
+        belief_use_operator_command=(
+            args.belief_input_source == "operator_command"
+        ),
+        belief_command_divergence_max_m=(
+            args.belief_command_divergence_max_m
+        ),
+        belief_command_max_delta_ms=args.belief_command_max_delta_ms,
     )
     gateway.start()
     if args.ee_target_publishing:
@@ -2130,9 +2419,13 @@ def main(argv: list[str] | None = None) -> int:
     else:
         LOG.info("Thor remote RGB-D gateway started; EE target publishing disabled")
     LOG.info(
-        "Remote TASC belief inference %s using config=%s",
+        "Remote TASC belief inference %s using config=%s input=%s "
+        "command_delta_ms=%.1f divergence_m=%.3f",
         "enabled" if args.belief_inference else "disabled",
         args.config,
+        args.belief_input_source,
+        args.belief_command_max_delta_ms,
+        args.belief_command_divergence_max_m,
     )
     if args.belief_csv:
         LOG.info("Thor belief CSV logging enabled: %s at %.1f Hz", args.belief_csv, args.belief_log_hz)

@@ -1,5 +1,4 @@
 import numpy as np
-
 from seg_web_node.feature_cost import (
     FeatureConfig,
     MultiFeatureCost,
@@ -11,14 +10,14 @@ from seg_web_node.grip_candidates import (
     GripCandidate,
     GripCandidateConfig,
     PersistentCylinderSurfaceTracker,
-    fit_cylinder_surface,
-    generate_grip_candidates,
+    PseudoContactConfig,
+    _fit_plane_ransac,
     _merge_nearby_candidates,
     extract_pseudo_contacts,
     fit_circle_in_plane,
+    fit_cylinder_surface,
+    generate_grip_candidates,
     sample_cylinder_candidates,
-    PseudoContactConfig,
-    _fit_plane_ransac,
 )
 from seg_web_node.robot_geometry import g1_wrist_ee_position
 from seg_web_node.tasc_belief import (
@@ -354,6 +353,7 @@ def test_parallel_belief_keeps_update_diagnostics_without_objects():
                 approach_axis=np.array([0.0, 0.0, -1.0]),
                 angular_velocity=np.zeros(3),
                 button_pressed=False,
+                input_source="operator_command",
             )
         },
         now_monotonic=1.0,
@@ -364,6 +364,8 @@ def test_parallel_belief_keeps_update_diagnostics_without_objects():
     assert output["left"]["update"]["beta"] == 0.2
     assert output["left"]["update"]["lambda0"] == 0.3
     assert output["left"]["update"]["grip_update_applied"] is False
+    assert output["left"]["input_source"] == "operator_command"
+    assert output["left"]["hand"]["input_source"] == "operator_command"
 
 
 

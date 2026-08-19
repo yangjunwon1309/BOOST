@@ -3,7 +3,7 @@ web_port: 8080
 depth:
   min_depth_m: 0.15
   max_depth_m: 3.0
-  sync_tol_ms: 50
+  sync_tol_ms: 20
 segmentation:
   # `tensorrt` requires the board-local engine below. Use `--backend pytorch`
   # for an explicit diagnostic fallback.
@@ -14,7 +14,7 @@ segmentation:
   # The full TensorRT graph runs once per concept. Keep the default to one
   # broad prompt for minimum latency; add specific prompts from the web UI.
   concepts: [object]
-  target_hz: 3.5
+  target_hz: 8.0
   min_score: 0.5
   min_area_px: 400
   miss_ttl: 10
@@ -176,7 +176,7 @@ ee_target:
   tracking_lost_grace_frames: 3
   tracking_max_jump_m: 0.25
   max_frame_age_sec: 1.5
-  min_depth_points: 100
+  min_depth_points: 80
   goal_endpoint: tcp://127.0.0.1:5564
   goal_topic: path_static_ee_target
   # Direct PATH control consumes only path_static_ee_target.  Do not also
@@ -306,7 +306,9 @@ tasc_belief:
       hold_lambda: 1.0
       converge_lambda: 0.5
       omega_ref_rps: 0.5
-      min_hand_omega_rps: 0.02
+      # Filtered PICO command omega: ignore physiological hand tremor while
+      # retaining deliberate orientation motion.
+      min_hand_omega_rps: 0.08
   grip:
     enable: true
     top_k: 4

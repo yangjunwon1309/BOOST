@@ -269,6 +269,52 @@ def hand_frame_profile(hand_model: str = "dex1") -> dict[str, object]:
     }
 
 
+def hand_rotation_from_wrist_rotation(
+    wrist_rotation: np.ndarray,
+    side: str,
+    hand_model: str = "dex1",
+) -> np.ndarray:
+    """Apply the fixed wrist-to-hand-base mount rotation.
+
+    PICO/IK commands describe the wrist-yaw frame, while the orientation
+    belief scores axes fixed in the physical hand base.  Keeping this
+    conversion identical to :func:`g1_hand_base_rotation` makes operator and
+    measured-FK inputs interchangeable when the command is achieved.
+    """
+    profile = hand_frame_profile(hand_model)
+    key = "left" if str(side).lower().startswith("l") else "right"
+    return (
+        np.asarray(wrist_rotation, dtype=np.float64).reshape(3, 3)
+        @ profile["rotation"][key]
+    )
+
+
+def grasp_center_from_wrist(
+    wrist_position: np.ndarray,
+    wrist_rotation: np.ndarray,
+    side: str,
+    hand_model: str = "dex1",
+    grasp_center_local_m: np.ndarray | None = None,
+) -> np.ndarray:
+    """Convert a wrist-origin pose to the canonical grasp centre.
+
+    This is the pose-form equivalent of :func:`g1_grasp_center_position` and
+    includes both the wrist-to-hand translation and hand-base rotation.
+    """
+    profile = hand_frame_profile(hand_model)
+    key = "left" if str(side).lower().startswith("l") else "right"
+    local = (
+        profile["grasp_center_local"]
+        if grasp_center_local_m is None
+        else np.asarray(grasp_center_local_m, dtype=np.float64).reshape(3)
+    )
+    offset = profile["translation"][key] + profile["rotation"][key] @ local
+    return (
+        np.asarray(wrist_position, dtype=np.float64).reshape(3)
+        + np.asarray(wrist_rotation, dtype=np.float64).reshape(3, 3) @ offset
+    )
+
+
 def _hand_profile_for_link(hand_model: str, target_link: str) -> tuple[str, dict[str, object]]:
     side = "left" if str(target_link).startswith("left_") else "right"
     model = str(hand_model).strip().lower()

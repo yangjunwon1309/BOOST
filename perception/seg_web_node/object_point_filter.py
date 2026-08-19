@@ -52,6 +52,37 @@ class FilteredObjectCloud:
     stats: dict[str, Any]
 
 
+def compute_depth_edge_mask(
+    depth_m: np.ndarray,
+    *,
+    min_depth_m: float,
+    max_depth_m: float,
+    threshold_m: float,
+) -> np.ndarray:
+    """Compute the object-independent frame-level depth discontinuity mask."""
+    depth = np.asarray(depth_m, dtype=np.float32)
+    if depth.ndim != 2:
+        raise ValueError("depth must be a two-dimensional array")
+    if threshold_m <= 0.0:
+        return np.zeros(depth.shape, dtype=bool)
+    padded = np.pad(depth, 1, mode="edge")
+    edge = np.zeros(depth.shape, dtype=bool)
+    for neighbor in (
+        padded[:-2, 1:-1],
+        padded[2:, 1:-1],
+        padded[1:-1, :-2],
+        padded[1:-1, 2:],
+    ):
+        neighbor_valid = (
+            np.isfinite(neighbor)
+            & (neighbor >= float(min_depth_m))
+            & (neighbor <= float(max_depth_m))
+        )
+        edge |= ~neighbor_valid
+        edge |= np.abs(depth - neighbor) > float(threshold_m)
+    return edge
+
+
 def _deproject_selected(
     rows: np.ndarray,
     cols: np.ndarray,
@@ -128,6 +159,7 @@ def extract_filtered_object_cloud(
     max_points: int,
     erosion_px_override: int | None = None,
     diagnostics: dict[str, Any] | None = None,
+    depth_edge_mask: np.ndarray | None = None,
 ) -> FilteredObjectCloud | None:
     """Extract one robust cloud used by both center and surface estimation."""
     if diagnostics is not None:
@@ -162,22 +194,18 @@ def extract_filtered_object_cloud(
         diagnostics["valid_depth_pixels_in_mask"] = valid_depth_in_mask
 
     if config.enabled and config.depth_edge_threshold_m > 0.0 and clean.any():
-        padded = np.pad(depth, 1, mode="edge")
-        neighbors = (
-            padded[:-2, 1:-1],
-            padded[2:, 1:-1],
-            padded[1:-1, :-2],
-            padded[1:-1, 2:],
-        )
-        edge = np.zeros(depth.shape, dtype=bool)
-        for neighbor in neighbors:
-            neighbor_valid = (
-                np.isfinite(neighbor)
-                & (neighbor >= float(min_depth_m))
-                & (neighbor <= float(max_depth_m))
+        edge = (
+            compute_depth_edge_mask(
+                depth,
+                min_depth_m=min_depth_m,
+                max_depth_m=max_depth_m,
+                threshold_m=config.depth_edge_threshold_m,
             )
-            edge |= ~neighbor_valid
-            edge |= np.abs(depth - neighbor) > config.depth_edge_threshold_m
+            if depth_edge_mask is None
+            else np.asarray(depth_edge_mask, dtype=bool)
+        )
+        if edge.shape != depth.shape:
+            raise ValueError("depth edge mask dimensions must match depth")
         clean &= ~edge
     edge_pixels = int(clean.sum())
     if diagnostics is not None:

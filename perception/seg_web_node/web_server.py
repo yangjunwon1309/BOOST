@@ -56,6 +56,7 @@ from .robot_geometry import (
 from .rgbd_sync import RgbdPair, RgbdSynchronizer, depth_at_rgb_size
 from .object_point_filter import (
     ObjectPointFilterConfig,
+    compute_depth_edge_mask,
     extract_filtered_object_cloud,
     project_camera_point_to_pixel,
 )
@@ -691,7 +692,7 @@ class SegmentationRuntime:
             target_config.get("position_offset_goal_m", [0, 0, 0]), dtype=np.float64
         ).reshape(3)
         self.target_max_age_sec = float(target_config.get("max_frame_age_sec", 1.5))
-        self.target_min_depth_points = int(target_config.get("min_depth_points", 100))
+        self.target_min_depth_points = int(target_config.get("min_depth_points", 80))
         self.target_bypass_checks = bool(target_config.get("bypass_checks", False))
         self.target_auto_publish_hz = float(
             target_config.get("auto_publish_hz", target_config.get("publish_hz", 5.0))
@@ -1741,10 +1742,11 @@ class SegmentationRuntime:
                 image_bgr = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
                 if image_bgr is None:
                     raise ValueError("JPEG decoding failed")
-                frame_calibration = (
-                    None
-                    if calibration is None
-                    else calibration_for_frame(
+                geometry_width, geometry_height = 640, 360
+                frame_calibration = None
+                display_intrinsics = None
+                if calibration is not None:
+                    display_calibration = calibration_for_frame(
                         calibration,
                         color_width=pair.rgb.width,
                         color_height=pair.rgb.height,
@@ -1759,7 +1761,26 @@ class SegmentationRuntime:
                             else None
                         ),
                     )
-                )
+                    display_intrinsics = CameraIntrinsics(
+                        display_calibration.color_width,
+                        display_calibration.color_height,
+                        *display_calibration.color_intrinsics,
+                    )
+                    frame_calibration = calibration_for_frame(
+                        calibration,
+                        color_width=geometry_width,
+                        color_height=geometry_height,
+                        depth_width=(
+                            pair.depth.width
+                            if pair.depth.source == DEPTH_SOURCE_RAW_DEPTH_OPTICAL
+                            else None
+                        ),
+                        depth_height=(
+                            pair.depth.height
+                            if pair.depth.source == DEPTH_SOURCE_RAW_DEPTH_OPTICAL
+                            else None
+                        ),
+                    )
                 if pair.depth.source == DEPTH_SOURCE_RAW_DEPTH_OPTICAL:
                     if calibration is None:
                         raise ValueError("raw depth received before G1_CAMERA_CALIBRATION")
@@ -1771,7 +1792,7 @@ class SegmentationRuntime:
                     )
                 else:
                     depth = depth_at_rgb_size(pair)
-                    frame_intrinsics = self.intrinsics
+                    frame_intrinsics = display_intrinsics or self.intrinsics
                     if frame_calibration is not None:
                         frame_intrinsics = CameraIntrinsics(
                             frame_calibration.color_width, frame_calibration.color_height,
@@ -1780,9 +1801,21 @@ class SegmentationRuntime:
                     elif frame_intrinsics is not None:
                         frame_intrinsics = scale_camera_intrinsics(
                             frame_intrinsics,
-                            width=pair.rgb.width,
-                            height=pair.rgb.height,
+                            width=geometry_width,
+                            height=geometry_height,
                         )
+                    if depth.shape != (geometry_height, geometry_width):
+                        depth = cv2.resize(
+                            depth,
+                            (geometry_width, geometry_height),
+                            interpolation=cv2.INTER_NEAREST,
+                        )
+                if display_intrinsics is None and frame_intrinsics is not None:
+                    display_intrinsics = scale_camera_intrinsics(
+                        frame_intrinsics,
+                        width=pair.rgb.width,
+                        height=pair.rgb.height,
+                    )
                 geometry_runtime_error = None
                 t_goal_cam = self.static_t_goal_cam
                 transform_metadata = None
@@ -1849,8 +1882,13 @@ class SegmentationRuntime:
                     masks, boxes, scores, labels = suppress_duplicate_masks(
                         masks, boxes, scores, labels
                     )
+                display_depth = cv2.resize(
+                    depth,
+                    (pair.rgb.width, pair.rgb.height),
+                    interpolation=cv2.INTER_NEAREST,
+                )
                 overlay, objects = render_segmented_rgbd(
-                    image_bgr, depth, masks, boxes, scores, labels,
+                    image_bgr, display_depth, masks, boxes, scores, labels,
                     pair.depth.depth_scale_um, self.min_depth_m, self.max_depth_m,
                 )
                 belief_ray_origin = None
@@ -1870,7 +1908,23 @@ class SegmentationRuntime:
                         depth_m = depth.astype(np.float32) * (
                             pair.depth.depth_scale_um / 1_000_000.0
                         )
-                        for index, mask in enumerate(masks):
+                        depth_edge_mask = compute_depth_edge_mask(
+                            depth_m,
+                            min_depth_m=self.min_depth_m,
+                            max_depth_m=self.max_depth_m,
+                            threshold_m=self.object_point_filter.depth_edge_threshold_m,
+                        )
+                        geometry_masks = np.stack(
+                            [
+                                cv2.resize(
+                                    mask.astype(np.uint8),
+                                    (frame_intrinsics.width, frame_intrinsics.height),
+                                    interpolation=cv2.INTER_NEAREST,
+                                ).astype(bool)
+                                for mask in masks
+                            ]
+                        ) if len(masks) else masks
+                        for index, mask in enumerate(geometry_masks):
                             label_lower = str(labels[index]).lower()
                             cloud = extract_filtered_object_cloud(
                                 depth_m,
@@ -1882,6 +1936,7 @@ class SegmentationRuntime:
                                 min_valid_points=self.target_min_depth_points,
                                 max_points=self.tasc_pointcloud_max_points,
                                 erosion_px_override=0 if ("hole" in label_lower or "circle" in label_lower) else None,
+                                depth_edge_mask=depth_edge_mask,
                             )
                             objects[index]["center_camera_m"] = None
                             objects[index]["center_goal_m"] = None
@@ -1891,7 +1946,10 @@ class SegmentationRuntime:
                             if cloud is None:
                                 continue
                             point_camera = cloud.center_camera_m
-                            pixel_uv = cloud.center_pixel_uv
+                            pixel_uv = project_camera_point_to_pixel(
+                                point_camera,
+                                display_intrinsics or frame_intrinsics,
+                            )
                             objects[index]["center_camera_m"] = point_camera.tolist()
                             objects[index]["center_pixel_uv"] = list(pixel_uv)
                             objects[index]["valid_depth_points"] = cloud.valid_depth_points
@@ -2025,7 +2083,7 @@ class SegmentationRuntime:
                         "labels": [str(label) for label in labels],
                         "frame_timestamp_us": int(pair.rgb.timestamp_us),
                         "t_goal_cam": None if t_goal_cam is None else np.asarray(t_goal_cam).copy(),
-                        "intrinsics": frame_intrinsics,
+                        "intrinsics": display_intrinsics,
                     }
             except Exception as error:
                 self._record_error(f"inference failed: {error}")
@@ -2256,7 +2314,7 @@ def main() -> int:
         threshold=args.threshold if args.threshold is not None else segmentation_config.get("min_score", 0.5),
         min_area_px=args.min_area_px if args.min_area_px is not None else segmentation_config.get("min_area_px", 400),
         target_hz=args.target_hz if args.target_hz is not None else segmentation_config.get("target_hz", 3.5),
-        sync_tolerance_ms=depth_config.get("sync_tol_ms", 50),
+        sync_tolerance_ms=depth_config.get("sync_tol_ms", 20),
         min_depth_m=depth_config.get("min_depth_m", 0.15),
         max_depth_m=depth_config.get("max_depth_m", 3.0),
         allow_unaligned=args.allow_unaligned,

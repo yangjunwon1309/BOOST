@@ -2,7 +2,10 @@ import collections
 import threading
 
 import numpy as np
+import pytest
 from remote_offload.protocol import (
+    REMOTE_DEPTH_CHANNEL,
+    REMOTE_RGB_CHANNEL,
     ValidationContext,
     make_empty_result,
     make_object,
@@ -14,13 +17,22 @@ from remote_offload.protocol import (
     validate_result_soft,
 )
 from remote_offload.remote_geometry_pipeline import (
+    GEOMETRY_COLOR_SIZE,
     RemoteRgbdGeometryPipeline,
     camera_geometry_metadata,
+    geometry_intrinsics_from_color,
+    masks_to_geometry_grid,
 )
 from remote_offload.remote_sam3_belief_input_worker import (
     RemoteSam3BeliefInputWorker,
 )
-from remote_offload.remote_sam3_worker import MatchedFrameGeometry, RemoteSam3Worker
+from remote_offload.remote_sam3_worker import (
+    MatchedFrameGeometry,
+    RemoteSam3Worker,
+)
+from remote_offload.remote_sam3_worker import (
+    build_arg_parser as build_base_worker_arg_parser,
+)
 from remote_offload.remote_web_server import (
     RemoteWebRuntime,
     _belief_for_object,
@@ -30,12 +42,18 @@ from remote_offload.remote_web_server import (
 )
 from remote_offload.remote_yolo11_worker import RemoteYolo11Worker
 from remote_offload.thor_gateway import (
+    COMMAND_HISTORY_SPAN_S,
+    SHARED_HAND_PUBLISH_HZ,
     ForwardedPairRecord,
     RawFrame,
     RawPair,
     ThorRemoteGateway,
     _surface_primitive_from_dict,
 )
+from remote_offload.thor_gateway import (
+    build_arg_parser as build_gateway_arg_parser,
+)
+from seg_web_node.feature_cost import FeatureConfig
 from seg_web_node.geometry import CameraIntrinsics
 from seg_web_node.grip_candidates import (
     GripCandidateConfig,
@@ -43,8 +61,19 @@ from seg_web_node.grip_candidates import (
     SurfacePrimitive,
     generate_grip_candidates,
 )
-from seg_web_node.lcm_protocol import DEPTH_SOURCE_RAW_DEPTH_OPTICAL
+from seg_web_node.lcm_protocol import (
+    DEPTH_SOURCE_RAW_DEPTH_OPTICAL,
+    CameraCalibration,
+)
 from seg_web_node.object_point_filter import ObjectPointFilterConfig
+from seg_web_node.robot_geometry import (
+    g1_grasp_center_position,
+    g1_hand_base_rotation,
+    g1_link_transforms,
+    grasp_center_from_wrist,
+    hand_frame_profile,
+    hand_rotation_from_wrist_rotation,
+)
 
 
 def _pipeline(fallback_ttl=2):
@@ -85,6 +114,298 @@ def _frame_inputs():
         "image_width": width,
         "image_height": height,
     }
+
+
+def test_v91_revised_gateway_and_worker_defaults():
+    gateway = build_gateway_arg_parser().parse_args(
+        ["--g1-lcm-url", "udpm://g1", "--wifi-lcm-url", "udpm://wifi"]
+    )
+    worker = build_base_worker_arg_parser().parse_args(
+        ["--wifi-lcm-url", "udpm://wifi"]
+    )
+    assert gateway.forward_hz == 15.0
+    assert gateway.sync_tolerance_ms == 20.0
+    assert worker.inference_hz == 8.0
+    assert worker.sync_tolerance_ms == 20.0
+    assert worker.min_depth_points == 80
+
+
+def test_v101_command_belief_defaults():
+    gateway = build_gateway_arg_parser().parse_args(
+        ["--g1-lcm-url", "udpm://g1", "--wifi-lcm-url", "udpm://wifi"]
+    )
+    assert gateway.belief_input_source == "operator_command"
+    assert gateway.belief_command_divergence_max_m == 0.20
+    assert gateway.belief_command_max_delta_ms == 25.0
+    assert FeatureConfig().min_hand_omega_rps == 0.08
+
+
+def test_command_path_matches_fk_path_for_both_hands():
+    q = np.linspace(-0.15, 0.15, 29, dtype=np.float64)
+    transforms = g1_link_transforms(q)
+    for side in ("left", "right"):
+        link = f"{side}_wrist_yaw_link"
+        wrist = transforms[link]
+        np.testing.assert_allclose(
+            grasp_center_from_wrist(
+                wrist[:3, 3], wrist[:3, :3], side, "dex1"
+            ),
+            g1_grasp_center_position(q, link, None, "dex1"),
+            atol=1.0e-9,
+        )
+        np.testing.assert_allclose(
+            hand_rotation_from_wrist_rotation(
+                wrist[:3, :3], side, "dex1"
+            ),
+            g1_hand_base_rotation(q, link, "dex1"),
+            atol=1.0e-9,
+        )
+
+
+def _command_gateway() -> ThorRemoteGateway:
+    gateway = ThorRemoteGateway.__new__(ThorRemoteGateway)
+    gateway.command_history = collections.deque(
+        maxlen=int(COMMAND_HISTORY_SPAN_S * SHARED_HAND_PUBLISH_HZ)
+    )
+    gateway.belief_command_max_delta_ms = 25.0
+    gateway.stats = {
+        "command_lookup_failures": 0,
+        "command_lookup_age_ms": {},
+    }
+    return gateway
+
+
+def test_command_lookup_empty_and_outside_25_ms_fail_cleanly():
+    gateway = _command_gateway()
+    assert gateway._command_features_at(1_000_000, "left") is None
+    assert gateway.stats["command_lookup_failures"] == 1
+    gateway.command_history.append(
+        (
+            1_000_000,
+            {
+                "left": {
+                    "command_wrist_position_m": [0.1, 0.2, 0.3],
+                    "command_wrist_rotation": np.eye(3).reshape(9).tolist(),
+                }
+            },
+        )
+    )
+    assert gateway._command_features_at(1_025_001, "left") is None
+    assert gateway.stats["command_lookup_failures"] == 2
+    assert gateway.stats["command_lookup_age_ms"]["left"] == pytest.approx(
+        25.001
+    )
+
+
+def test_command_history_span_and_rotation_round_trip():
+    gateway = _command_gateway()
+    start_us = 2_000_000
+    interval_us = int(1.0e6 / SHARED_HAND_PUBLISH_HZ)
+    rotation = np.array(
+        [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+    for index in range(100):
+        timestamp_us = start_us + index * interval_us
+        gateway.command_history.append(
+            (
+                timestamp_us,
+                {
+                    "left": {
+                        "command_wrist_position_m": [0.1, 0.2, 0.3],
+                        "command_wrist_rotation": rotation.reshape(9).tolist(),
+                        "command_velocity_mps": [0.01, 0.0, 0.0],
+                        "command_omega_rps": [0.0, 0.0, 0.2],
+                    }
+                },
+            )
+        )
+    assert len(gateway.command_history) == 75
+    assert (
+        gateway.command_history[-1][0] - gateway.command_history[0][0]
+    ) / 1.0e6 <= COMMAND_HISTORY_SPAN_S
+    features = gateway._command_features_at(
+        gateway.command_history[-1][0], "left"
+    )
+    assert features is not None
+    recovered_rotation = features[1]
+    assert np.linalg.norm(
+        recovered_rotation @ recovered_rotation.T - np.eye(3)
+    ) < 1.0e-9
+
+
+def test_operator_command_divergence_uses_fk_fallback():
+    class FakeParallelBelief:
+        class Config:
+            enabled = True
+
+        config = Config()
+
+        def __init__(self):
+            self.trackers = {"left": object(), "right": object()}
+            self.hand_inputs = None
+
+        def update_hands(self, _geometry, hand_inputs):
+            self.hand_inputs = hand_inputs
+            return {
+                side: {"hand": {"armed": False}, "target": None}
+                for side in hand_inputs
+            }
+
+    gateway = _command_gateway()
+    gateway.belief_enabled = True
+    gateway.belief_use_operator_command = True
+    gateway.belief_command_divergence_max_m = 0.20
+    gateway.belief_hand_model = "dex1"
+    gateway.belief_hand_profile = hand_frame_profile("dex1")
+    gateway.belief_grasp_center_local_m = np.asarray(
+        gateway.belief_hand_profile["grasp_center_local"], dtype=np.float64
+    )
+    gateway.parallel_tasc_belief = FakeParallelBelief()
+    gateway.belief_selected_hand = "none"
+    gateway.belief_selection_active = False
+    gateway.ee_target_link = "left_wrist_yaw_link"
+    gateway.lock = threading.Lock()
+    gateway.stats.update(
+        belief_command_divergence_m={},
+        belief_input={},
+        last_belief={},
+    )
+    timestamp_us = 3_000_000
+    command_entry = {
+        side: {
+            "command_wrist_position_m": [1.0, 0.0, 0.0],
+            "command_wrist_rotation": np.eye(3).reshape(9).tolist(),
+            "command_velocity_mps": [0.4, 0.0, 0.0],
+            "command_omega_rps": [0.0, 0.0, 0.3],
+        }
+        for side in ("left", "right")
+    }
+    gateway.command_history.append((timestamp_us, command_entry))
+    gateway._drain_shared_hand_selection = lambda: None
+    gateway._belief_inputs_from_result = lambda _payload: []
+    gateway._belief_state_features = lambda _packet, _side: (
+        np.zeros(3),
+        np.array([0.01, 0.0, 0.0]),
+        np.eye(3),
+        np.zeros(3),
+    )
+    gateway._publish_belief_telemetry = lambda _payload, _hands: None
+    gateway._record_belief_csv = lambda _payload, _telemetry: None
+
+    selection = gateway._belief_selection_from_result(
+        {"sequence": 1, "source_rgb_timestamp_us": timestamp_us},
+        None,
+        object(),
+    )
+
+    assert selection is None
+    assert gateway.parallel_tasc_belief.hand_inputs is not None
+    for side, hand in gateway.parallel_tasc_belief.hand_inputs.items():
+        assert hand.input_source == "fk_divergence_fallback"
+        np.testing.assert_allclose(hand.eef_position, np.zeros(3))
+        np.testing.assert_allclose(hand.user_translation, [0.01, 0.0, 0.0])
+        assert gateway.stats["belief_input"]["source"][side] == (
+            "fk_divergence_fallback"
+        )
+        assert gateway.stats["belief_input"]["divergence_m"][side] > 0.20
+
+
+def test_v91_geometry_grid_scales_intrinsics_and_masks_with_nearest_neighbor():
+    color = CameraIntrinsics(1280, 720, 908.216, 908.216, 640.0, 360.0)
+    geometry = geometry_intrinsics_from_color(color)
+    assert (geometry.width, geometry.height) == GEOMETRY_COLOR_SIZE
+    np.testing.assert_allclose(
+        [geometry.fx, geometry.fy, geometry.cx, geometry.cy],
+        [454.108, 454.108, 320.0, 180.0],
+    )
+    masks = np.zeros((1, 720, 1280), dtype=bool)
+    masks[0, 200:520, 400:880] = True
+    reduced = masks_to_geometry_grid(masks, GEOMETRY_COLOR_SIZE)
+    assert reduced.shape == (1, 360, 640)
+    assert reduced[0, 100:260, 200:440].all()
+    assert not reduced[0, :99].any()
+    with pytest.raises(ValueError, match="aspect ratio changed"):
+        geometry_intrinsics_from_color(
+            CameraIntrinsics(640, 480, 386.3, 386.3, 320.0, 240.0)
+        )
+
+
+def test_v91_geometry_outputs_full_resolution_mask_and_center_coordinates():
+    masks = np.zeros((1, 720, 1280), dtype=bool)
+    masks[0, 200:520, 400:880] = True
+    arguments = {
+        "masks": masks,
+        "boxes": np.asarray([[400, 200, 879, 519]], dtype=np.float32),
+        "scores": np.asarray([0.95], dtype=np.float32),
+        "labels": ["bottle"],
+        "depth_raw": np.full((360, 640), 1000, dtype=np.uint16),
+        "depth_scale_um": 1000,
+        "intrinsics": CameraIntrinsics(
+            640, 360, 454.108, 454.108, 320.0, 180.0
+        ),
+        "color_intrinsics": CameraIntrinsics(
+            1280, 720, 908.216, 908.216, 640.0, 360.0
+        ),
+        "t_goal_cam": np.eye(4),
+        "up_goal": np.array([0.0, 0.0, 1.0]),
+        "source_robot_state_delta_ms": 8.0,
+        "source_timestamp_us": 1_000_000,
+        "image_width": 1280,
+        "image_height": 720,
+    }
+    obj = _pipeline().build_object_geometry(**arguments)[0]
+    assert obj["mask_width"] == 1280
+    assert obj["mask_height"] == 720
+    assert 630 <= obj["center_pixel_uv"][0] <= 650
+    assert 350 <= obj["center_pixel_uv"][1] <= 370
+    assert obj["valid_depth_points"] >= 80
+
+
+def test_v91_worker_reprojects_raw_depth_directly_to_geometry_grid():
+    worker = RemoteSam3Worker.__new__(RemoteSam3Worker)
+    depth = np.full((360, 640), 1000, dtype=np.uint16)
+    pair = type(
+        "Pair",
+        (),
+        {
+            "rgb": type("Rgb", (), {"width": 1280, "height": 720})(),
+            "depth": type(
+                "Depth",
+                (),
+                {
+                    "source": DEPTH_SOURCE_RAW_DEPTH_OPTICAL,
+                    "width": 640,
+                    "height": 360,
+                    "depth_scale_um": 1000,
+                    "depth": depth,
+                },
+            )(),
+        },
+    )()
+    calibration = CameraCalibration(
+        calibration_id=1,
+        timestamp_us=1,
+        depth_width=640,
+        depth_height=360,
+        color_width=640,
+        color_height=360,
+        depth_scale_um=1000,
+        depth_intrinsics=np.asarray([454.108, 454.108, 320.0, 180.0]),
+        color_intrinsics=np.asarray([454.108, 454.108, 320.0, 180.0]),
+        rotation_color_depth=np.eye(3),
+        translation_color_depth_m=np.zeros(3),
+        rectified=True,
+    )
+    aligned, intrinsics = worker._prepare_depth_and_intrinsics(
+        pair,
+        calibration,
+        target_size=GEOMETRY_COLOR_SIZE,
+    )
+    assert aligned.shape == (360, 640)
+    assert np.count_nonzero(aligned) / aligned.size > 0.99
+    assert intrinsics is not None
+    assert (intrinsics.width, intrinsics.height) == (640, 360)
 
 
 def test_shared_geometry_pipeline_is_backend_agnostic_and_protocol_valid():
@@ -246,6 +567,8 @@ def test_worker_warns_once_and_reports_geometry_status_when_context_is_missing(c
         "image_size": [64, 48],
         "depth_size": [64, 48],
         "intrinsics_size": [64, 48],
+        "geometry_intrinsics_size": [64, 48],
+        "geometry_valid_depth_ratio": 1.0,
         "up_goal_available": False,
         "state_delta_ms": None,
         "objects_with_valid_depth": 0,
@@ -379,6 +702,14 @@ def test_thor_gateway_accepts_frame_after_stripping_invalid_primitive():
         ).to_dict()
     )
     payload["objects"][0]["surface_primitives"][0]["kind"] = "bogus"
+    payload["stage_us"] = {
+        "source_rgb": 100,
+        "worker_dequeue": 200,
+        "decode_done": 300,
+        "infer_done": 500,
+        "geometry_done": 800,
+        "packed": 900,
+    }
     pair = RawPair(
         rgb=RawFrame(100, 6, 4, b"rgb"),
         depth=RawFrame(101, 6, 4, b"depth"),
@@ -405,14 +736,80 @@ def test_thor_gateway_accepts_frame_after_stripping_invalid_primitive():
     assert gateway.stats["invalid_results"] == 0
     assert gateway.stats["valid_results"] == 1
     assert gateway.stats["soft_optional_fields_dropped"] == 1
+    assert gateway.stats["last_stage_latency_ms"]["inference"] == 0.2
     assert accepted[0]["objects"][0]["surface_primitives"] == []
     assert accepted[0]["objects"][0]["mask_data"]
+    assert accepted[0]["stage_us"]["gateway_receive"] > 0
+
+
+def test_thor_gateway_forwards_immediately_when_pair_is_submitted():
+    published = []
+    depth_published = threading.Event()
+
+    class FakeBus:
+        def publish(self, channel, data):
+            published.append((channel, data))
+            if channel == REMOTE_DEPTH_CHANNEL:
+                depth_published.set()
+
+    gateway = ThorRemoteGateway.__new__(ThorRemoteGateway)
+    gateway.lock = threading.Lock()
+    gateway.pair_ready = threading.Condition(gateway.lock)
+    gateway.running = True
+    gateway.pending_pair = None
+    gateway.latest_pair = None
+    gateway.latest_calibration = None
+    gateway.latest_robot_state = None
+    gateway.sim_state_socket = None
+    gateway.forward_period = 0.0
+    gateway.last_forward_monotonic = 0.0
+    gateway.calibration_resend_sec = 2.0
+    gateway.robot_state_period = 0.05
+    gateway.forwarded_pairs = collections.deque(maxlen=60)
+    gateway.wifi_bus = FakeBus()
+    gateway.stats = {
+        "dropped_before_forward": 0,
+        "forwarded_pairs": 0,
+        "forwarded_calibration": 0,
+        "forwarded_robot_state": 0,
+        "forward_publish_bytes": 0,
+        "forward_publish_errors": 0,
+    }
+    thread = threading.Thread(target=gateway._forward_loop, daemon=True)
+    thread.start()
+    pair = RawPair(
+        rgb=RawFrame(10, 6, 4, b"rgb"),
+        depth=RawFrame(11, 6, 4, b"depth"),
+        delta_us=1,
+    )
+    gateway._submit_pair(pair)
+
+    assert depth_published.wait(timeout=1.0)
+    with gateway.pair_ready:
+        gateway.running = False
+        gateway.pair_ready.notify_all()
+    thread.join(timeout=1.0)
+    assert not thread.is_alive()
+    assert published == [
+        (REMOTE_RGB_CHANNEL, b"rgb"),
+        (REMOTE_DEPTH_CHANNEL, b"depth"),
+    ]
+    assert gateway.stats["forwarded_pairs"] == 1
+    assert gateway.stats["forward_publish_bytes"] == len(b"depth")
+    assert gateway.stats["forward_publish_errors"] == 0
 
 
 def test_camera_metadata_supports_goal_reprojection_and_axis_foreshortening():
     intrinsics = CameraIntrinsics(100, 80, 100.0, 100.0, 50.0, 40.0)
-    metadata = camera_geometry_metadata(np.eye(4), intrinsics)
+    geometry_intrinsics = CameraIntrinsics(50, 40, 50.0, 50.0, 25.0, 20.0)
+    metadata = camera_geometry_metadata(
+        np.eye(4),
+        intrinsics,
+        geometry_intrinsics,
+    )
     transform = np.asarray(metadata["t_goal_cam"]).reshape(4, 4)
+    assert metadata["intrinsics"]["width"] == 100
+    assert metadata["geometry_intrinsics"]["width"] == 50
     assert _goal_to_pixel([0.0, 0.0, 1.0], transform, metadata["intrinsics"]) == (50, 40)
     parallel = _project_axis_arrow(
         [0.0, 0.0, 1.0], [1.0, 0.0, 0.0], transform, metadata["intrinsics"]

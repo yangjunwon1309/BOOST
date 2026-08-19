@@ -30,6 +30,7 @@ from seg_web_node.lcm_protocol import (
     decode_depth,
     decode_robot_state,
 )
+from seg_web_node.object_point_filter import project_camera_point_to_pixel
 from seg_web_node.rgbd_sync import RgbdPair, RgbdSynchronizer, depth_at_rgb_size
 from seg_web_node.robot_geometry import (
     RobotStateBuffer,
@@ -56,7 +57,12 @@ from .protocol import (
     pack_result,
     unpack_concept_control,
 )
-from .remote_geometry_pipeline import Stable3DTracker
+from .remote_geometry_pipeline import (
+    GEOMETRY_COLOR_SIZE,
+    Stable3DTracker,
+    geometry_intrinsics_from_color,
+    masks_to_geometry_grid,
+)
 
 
 LOG = logging.getLogger("remote_offload.remote_sam3_worker")
@@ -78,6 +84,20 @@ def parse_concepts(text: str) -> list[str]:
     return concepts
 
 
+def _box_iou(a: np.ndarray, b: np.ndarray) -> float:
+    ax0, ay0, ax1, ay1 = [float(value) for value in a]
+    bx0, by0, bx1, by1 = [float(value) for value in b]
+    intersection_width = max(0.0, min(ax1, bx1) - max(ax0, bx0))
+    intersection_height = max(0.0, min(ay1, by1) - max(ay0, by0))
+    intersection = intersection_width * intersection_height
+    union = (
+        max(0.0, ax1 - ax0) * max(0.0, ay1 - ay0)
+        + max(0.0, bx1 - bx0) * max(0.0, by1 - by0)
+        - intersection
+    )
+    return 0.0 if union <= 0.0 else intersection / union
+
+
 def suppress_duplicate_masks(
     masks: np.ndarray,
     boxes: np.ndarray,
@@ -92,6 +112,10 @@ def suppress_duplicate_masks(
     for index in np.argsort(-scores):
         duplicate = False
         for kept in keep:
+            # Reject nearly all unrelated pairs with an O(1) box comparison
+            # before performing a full-resolution mask intersection.
+            if _box_iou(boxes[index], boxes[kept]) < iou_threshold * 0.5:
+                continue
             intersection = np.logical_and(masks[index], masks[kept]).sum()
             union = areas[index] + areas[kept] - intersection
             if union > 0 and intersection / union >= iou_threshold:
@@ -205,6 +229,7 @@ class RemoteSam3Worker:
             "last_robot_state_delta_ms": None,
             "last_geometry_status": {},
             "last_object_geometry": [],
+            "last_stage_us": {},
             "overlay_frames": 0,
             "overlay_dropped": 0,
             "overlay_errors": 0,
@@ -441,14 +466,20 @@ class RemoteSam3Worker:
         self,
         pair: RgbdPair,
         calibration: CameraCalibration | None,
+        target_size: tuple[int, int] | None = None,
     ) -> tuple[np.ndarray, CameraIntrinsics | None]:
+        target_width, target_height = (
+            (pair.rgb.width, pair.rgb.height)
+            if target_size is None
+            else (int(target_size[0]), int(target_size[1]))
+        )
         frame_calibration = (
             None
             if calibration is None
             else calibration_for_frame(
                 calibration,
-                color_width=pair.rgb.width,
-                color_height=pair.rgb.height,
+                color_width=target_width,
+                color_height=target_height,
                 # Aligned depth is already expressed on the color pixel grid;
                 # its original 4:3 depth-camera calibration is irrelevant.
                 # Raw optical depth still requires its own calibrated resize.
@@ -470,7 +501,7 @@ class RemoteSam3Worker:
                 # diagnostic path while withholding every 3-D field until the
                 # raw optical depth can be calibrated and aligned to color.
                 return np.zeros(
-                    (pair.rgb.height, pair.rgb.width), dtype=pair.depth.depth.dtype
+                    (target_height, target_width), dtype=pair.depth.depth.dtype
                 ), None
             assert frame_calibration is not None
             depth = align_depth_to_color(pair.depth, frame_calibration)
@@ -482,15 +513,25 @@ class RemoteSam3Worker:
             return depth, intrinsics
         depth = depth_at_rgb_size(pair)
         if frame_calibration is None:
+            if depth.shape != (target_height, target_width):
+                depth = cv2.resize(
+                    depth,
+                    (target_width, target_height),
+                    interpolation=cv2.INTER_NEAREST,
+                )
             return depth, None
-        return (
-            depth,
-            CameraIntrinsics(
-                frame_calibration.color_width,
-                frame_calibration.color_height,
-                *frame_calibration.color_intrinsics,
-            ),
+        intrinsics = CameraIntrinsics(
+            frame_calibration.color_width,
+            frame_calibration.color_height,
+            *frame_calibration.color_intrinsics,
         )
+        if depth.shape != (target_height, target_width):
+            depth = cv2.resize(
+                depth,
+                (target_width, target_height),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        return depth, intrinsics
 
     def _goal_transform(self, timestamp_us: int) -> np.ndarray | None:
         return camera_goal_transform(
@@ -534,9 +575,22 @@ class RemoteSam3Worker:
                 self.max_depth_m,
             )
         t_goal_cam = self._goal_transform(pair.rgb.timestamp_us)
+        geometry_masks = (
+            masks_to_geometry_grid(masks, (intrinsics.width, intrinsics.height))
+            if intrinsics is not None
+            else np.asarray(masks, dtype=bool)
+        )
+        color_intrinsics = (
+            geometry_intrinsics_from_color(
+                intrinsics,
+                (pair.rgb.width, pair.rgb.height),
+            )
+            if intrinsics is not None
+            else None
+        )
 
         detections: list[dict[str, Any]] = []
-        for index, (mask, label) in enumerate(zip(masks, labels)):
+        for index, (mask, label) in enumerate(zip(geometry_masks, labels)):
             center_camera = None
             center_goal = None
             if xyz_camera is not None:
@@ -578,7 +632,7 @@ class RemoteSam3Worker:
         # Fill depth fields from the detections in a second pass to keep the
         # tracking assignment independent of transport serialization.
         for index, obj in enumerate(payload["objects"]):
-            mask = masks[index].astype(bool)
+            mask = geometry_masks[index].astype(bool)
             depth_m = depth.astype(np.float32) * (pair.depth.depth_scale_um / 1_000_000.0)
             valid_depth = mask & (depth > 0) & np.isfinite(depth_m)
             values = depth_m[valid_depth]
@@ -590,8 +644,13 @@ class RemoteSam3Worker:
                     min_valid_points=self.min_depth_points,
                 )
                 if center is not None:
-                    center_camera_array, pixel, valid_points = center
-                    obj["center_pixel_uv"] = [int(pixel[0]), int(pixel[1])]
+                    center_camera_array, _pixel, valid_points = center
+                    obj["center_pixel_uv"] = list(
+                        project_camera_point_to_pixel(
+                            center_camera_array,
+                            color_intrinsics or intrinsics,
+                        )
+                    )
                     obj["center_camera_m"] = center_camera_array.tolist()
                     obj["center_goal_m"] = (
                         transform_points(center_camera_array, t_goal_cam).tolist()
@@ -613,12 +672,19 @@ class RemoteSam3Worker:
     ) -> None:
         if not self.publish_overlay_jpeg:
             return
+        overlay_depth = np.asarray(depth)
+        if overlay_depth.shape != image_bgr.shape[:2]:
+            overlay_depth = cv2.resize(
+                overlay_depth,
+                (image_bgr.shape[1], image_bgr.shape[0]),
+                interpolation=cv2.INTER_NEAREST,
+            )
         with self.overlay_ready:
             if self.pending_overlay is not None:
                 self.status["overlay_dropped"] += 1
             self.pending_overlay = (
                 image_bgr.copy(),
-                depth.copy(),
+                overlay_depth.copy(),
                 masks.copy(),
                 boxes.copy(),
                 scores.copy(),
@@ -681,6 +747,11 @@ class RemoteSam3Worker:
 
         last_started = 0.0
         while self.running:
+            # Apply the rate cap before dequeuing so inference always consumes
+            # the newest pair accumulated while the previous frame ran.
+            delay = self.inference_period - (time.monotonic() - last_started)
+            if delay > 0:
+                time.sleep(delay)
             with self.pair_ready:
                 self.pair_ready.wait_for(
                     lambda: self.pending_pair is not None or not self.running,
@@ -693,10 +764,10 @@ class RemoteSam3Worker:
                 calibration = self.calibration
             if pair is None:
                 continue
-            delay = self.inference_period - (time.monotonic() - last_started)
-            if delay > 0:
-                time.sleep(delay)
             last_started = time.monotonic()
+            dequeue_us = time.time_ns() // 1000
+            decode_us = dequeue_us
+            infer_us = dequeue_us
 
             try:
                 if self.backend_error is not None or self.backend is None:
@@ -705,13 +776,26 @@ class RemoteSam3Worker:
                         self.backend_error
                         or f"{self._backend_display_name()} backend unavailable",
                     )
+                    result["stage_us"] = {
+                        "source_rgb": int(pair.rgb.timestamp_us),
+                        "worker_dequeue": int(dequeue_us),
+                        "decode_done": int(decode_us),
+                        "infer_done": int(infer_us),
+                        "geometry_done": int(time.time_ns() // 1000),
+                    }
+                    result["stage_us"]["packed"] = int(time.time_ns() // 1000)
                     self.bus.publish(REMOTE_RESULT_CHANNEL, pack_result(result))
                     continue
                 encoded = np.frombuffer(pair.rgb.jpeg, dtype=np.uint8)
                 image_bgr = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
                 if image_bgr is None:
                     raise ValueError("JPEG decoding failed")
-                depth, intrinsics = self._prepare_depth_and_intrinsics(pair, calibration)
+                depth, intrinsics = self._prepare_depth_and_intrinsics(
+                    pair,
+                    calibration,
+                    target_size=GEOMETRY_COLOR_SIZE,
+                )
+                decode_us = time.time_ns() // 1000
                 self._prepare_backend_for_frame(
                     self.backend,
                     image_bgr,
@@ -722,6 +806,7 @@ class RemoteSam3Worker:
                 started = time.perf_counter()
                 concepts = self._apply_pending_concepts()
                 masks, boxes, scores, labels = self.backend.infer(image_bgr, concepts)
+                infer_us = time.time_ns() // 1000
                 inference_ms = (time.perf_counter() - started) * 1000.0
                 if len(masks):
                     masks, boxes, scores, labels = suppress_duplicate_masks(
@@ -741,6 +826,14 @@ class RemoteSam3Worker:
                     depth,
                     intrinsics,
                 )
+                result["stage_us"] = {
+                    "source_rgb": int(pair.rgb.timestamp_us),
+                    "worker_dequeue": int(dequeue_us),
+                    "decode_done": int(decode_us),
+                    "infer_done": int(infer_us),
+                    "geometry_done": int(time.time_ns() // 1000),
+                }
+                result["stage_us"]["packed"] = int(time.time_ns() // 1000)
                 result_bytes = pack_result(result)
                 self.bus.publish(REMOTE_RESULT_CHANNEL, result_bytes)
                 self._publish_overlay(
@@ -760,6 +853,7 @@ class RemoteSam3Worker:
                     self.status["last_geometry_status"] = dict(
                         result.get("geometry_status") or {}
                     )
+                    self.status["last_stage_us"] = dict(result.get("stage_us") or {})
                     self.status["last_object_geometry"] = [
                         {
                             "label": obj.get("label"),
@@ -788,6 +882,14 @@ class RemoteSam3Worker:
             except Exception as error:
                 self._record_error(error)
                 result = self._invalid_result(pair, str(error))
+                result["stage_us"] = {
+                    "source_rgb": int(pair.rgb.timestamp_us),
+                    "worker_dequeue": int(dequeue_us),
+                    "decode_done": int(decode_us),
+                    "infer_done": int(infer_us),
+                    "geometry_done": int(time.time_ns() // 1000),
+                }
+                result["stage_us"]["packed"] = int(time.time_ns() // 1000)
                 self.bus.publish(REMOTE_RESULT_CHANNEL, pack_result(result))
 
     def _heartbeat_loop(self) -> None:
@@ -810,6 +912,7 @@ class RemoteSam3Worker:
                     "geometry_status": dict(
                         self.status.get("last_geometry_status") or {}
                     ),
+                    "stage_us": dict(self.status.get("last_stage_us") or {}),
                     "last_error": self.status.get("last_error"),
                     "overlay_count": int(self.status.get("overlay_frames", 0)),
                     "overlay_dropped_count": int(
@@ -856,11 +959,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trt-model-id", default="facebook/sam3")
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--min-area-px", type=int, default=400)
-    parser.add_argument("--inference-hz", type=float, default=3.0)
-    parser.add_argument("--sync-tolerance-ms", type=float, default=50.0)
+    parser.add_argument("--inference-hz", type=float, default=8.0)
+    parser.add_argument("--sync-tolerance-ms", type=float, default=20.0)
     parser.add_argument("--min-depth-m", type=float, default=0.15)
     parser.add_argument("--max-depth-m", type=float, default=3.0)
-    parser.add_argument("--min-depth-points", type=int, default=100)
+    parser.add_argument("--min-depth-points", type=int, default=80)
     parser.add_argument("--robot-state-max-delta-ms", type=float, default=40.0)
     parser.add_argument("--torso-estimator", default="dual_imu")
     parser.add_argument("--extrinsics", type=Path, default=None)

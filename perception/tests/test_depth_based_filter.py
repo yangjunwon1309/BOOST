@@ -48,3 +48,18 @@ def test_filter_mask_uses_current_robot_mask():
     assert filtered is not None
     assert int(filtered.sum()) == 12
     assert filt.metadata()["trimmed_masks"] == 1
+
+
+def test_filter_mask_scales_geometry_robot_mask_to_full_rgb_mask_grid():
+    filt = DepthBasedRobotFilter({"enabled": True})
+    filt._robot_mask = np.zeros((2, 2), dtype=bool)
+    filt._robot_mask[0, 0] = True
+    filt.last_status = filt._empty_status(None)
+    mask = np.ones((4, 4), dtype=bool)
+
+    filtered = filt.filter_mask(mask, min_area_px=4)
+
+    assert filtered is not None
+    assert not filtered[:2, :2].any()
+    assert filtered[2:, 2:].all()
+    assert int(filtered.sum()) == 12

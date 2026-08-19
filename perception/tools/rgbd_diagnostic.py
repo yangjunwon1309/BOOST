@@ -32,7 +32,7 @@ def main() -> int:
     parser.add_argument("--rgb-channel", default="G1_CAMERA_FRAME")
     parser.add_argument("--depth-channel", default="G1_DEPTH_FRAME")
     parser.add_argument("--calibration-channel", default="G1_CAMERA_CALIBRATION")
-    parser.add_argument("--sync-tolerance-ms", type=float, default=50.0)
+    parser.add_argument("--sync-tolerance-ms", type=float, default=20.0)
     parser.add_argument("--count", type=int, default=10)
     parser.add_argument("--timeout-s", type=float, default=15.0)
     parser.add_argument("--output-dir", type=Path, default=Path("output/rgbd_diagnostic"))

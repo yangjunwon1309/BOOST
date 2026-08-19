@@ -44,8 +44,7 @@ docker run --rm --gpus all --network host \
     --config config/pipeline.yaml \
     --backend pytorch \
     --concepts bottle \
-    --inference-hz 3 \
-    --publish-overlay-jpeg
+    --inference-hz 8
 ```
 
 Run the viewer and perception prompt controller from the same isolated image:

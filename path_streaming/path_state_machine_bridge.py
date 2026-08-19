@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import argparse
 import atexit
-from dataclasses import dataclass
 import json
 import os
 import select
@@ -46,32 +45,39 @@ import termios
 import threading
 import time
 import tty
+from dataclasses import dataclass
 from pathlib import Path
 
+import lcm
 import msgpack
 import numpy as np
 import zmq
-
-import lcm
-
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
     HEADER_SIZE,
     build_command_message,
     build_planner_message,
 )
+
 from path_core.intention.action_blending import (
-    EETarget,
     LEFT_WRIST_LINK,
     RIGHT_WRIST_LINK,
+    EETarget,
     SharedControlConfig,
     rotation_target_from_relation,
 )
-from perception.seg_web_node.robot_geometry import HAND_AXIS_LOCAL, hand_frame_profile
 from path_core.intention.reference_dynamics import (
     OrientationTargetGate,
     SecondOrderOrientationReference,
     SecondOrderPositionReference,
     rotation_vector,
+)
+from path_core.messaging.g1_direct_protocol import (
+    ARM_START,
+    MOTOR_COMMAND_CHANNEL,
+    ROBOT_STATE_CHANNEL,
+    UPPER_COMMAND_CHANNEL,
+    pack_upper_command,
+    unpack_robot_state,
 )
 from path_core.messaging.path_schema import (
     QP_REFERENCE_TOPIC,
@@ -82,14 +88,6 @@ from path_core.messaging.path_schema import (
     qp_none_reference,
     qp_sample_reference,
 )
-from path_core.messaging.g1_direct_protocol import (
-    ARM_START,
-    MOTOR_COMMAND_CHANNEL,
-    ROBOT_STATE_CHANNEL,
-    UPPER_COMMAND_CHANNEL,
-    pack_upper_command,
-    unpack_robot_state,
-)
 from path_core.messaging.zmq_bus import pack_topic, unpack_topic
 from path_core.teleop.pico_joystick_locomotion import (
     PicoJoystickLocomotionConfig,
@@ -99,10 +97,16 @@ from path_core.teleop.pico_joystick_locomotion import (
 )
 from path_planning.unitree_arm_nonlinear_ik import UnitreeG1ArmNonlinearIK
 from path_streaming.path_smpl_thread_server import UPPER_BODY_PLANNER_INDICES
+from perception.seg_web_node.robot_geometry import (
+    HAND_AXIS_LOCAL,
+    angular_velocity_from_rotations,
+    hand_frame_profile,
+)
 
 # ``auto_planning`` remains an accepted external compatibility value, but is
 # canonicalized to teleop.  A/B is now the sole shared-control gate.
 VALID_STATES = {"teleop", "intention", "auto_planning", "damped_return"}
+SHARED_HAND_PUBLISH_HZ = 50.0
 
 # Retained only for legacy compatibility helpers. The direct backend never
 # publishes a SONIC planner message.
@@ -1807,6 +1811,10 @@ def main() -> int:
     shared_selected_hand = "none"
     shared_hand_selection_revision = 0
     next_shared_hand_publish = 0.0
+    # Per-hand raw operator command history: (position, rotation, tick_us,
+    # filtered angular velocity).  This is intentionally separate from the
+    # assisted second-order reference history.
+    command_history = {side: None for side in ("left", "right")}
     log(
         "PICO absolute waist-frame controller targets enabled: "
         f"topic={args.pico_vr_endpoint}/vr_pose_debug "
@@ -2764,10 +2772,54 @@ def main() -> int:
                     measured_tf = {"left": measured_left_tf, "right": measured_right_tf}
                     human_tf = {"left": left_target_tf, "right": right_target_tf}
                     # The reference loop below overwrites human_tf in place.
-                    # Preserve the raw operator command for visualization.
-                    human_raw_tf = {
+                    # Belief must see the operator's raw command, not the
+                    # assisted reference, or it recreates a self-confirming
+                    # intent loop through the controlled robot motion.
+                    command_tf = {
                         side: human_tf[side].copy() for side in ("left", "right")
                     }
+                    command_features: dict[
+                        str,
+                        tuple[
+                            np.ndarray,
+                            np.ndarray,
+                            np.ndarray | None,
+                            np.ndarray | None,
+                        ],
+                    ] = {}
+                    for side in ("left", "right"):
+                        p_cmd = command_tf[side][:3, 3]
+                        r_cmd = command_tf[side][:3, :3]
+                        velocity = None
+                        omega = None
+                        previous = command_history[side]
+                        if previous is not None:
+                            p_prev, r_prev, t_prev, omega_prev = previous
+                            delta = (tick_us - t_prev) / 1.0e6
+                            if 1.0e-4 <= delta <= 0.5:
+                                velocity = (p_cmd - p_prev) / delta
+                                raw_omega = angular_velocity_from_rotations(
+                                    r_prev, r_cmd, delta
+                                )
+                                if raw_omega is not None:
+                                    omega = (
+                                        raw_omega
+                                        if omega_prev is None
+                                        else 0.25 * raw_omega
+                                        + 0.75 * omega_prev
+                                    )
+                        command_history[side] = (
+                            p_cmd.copy(),
+                            r_cmd.copy(),
+                            int(tick_us),
+                            None if omega is None else omega.copy(),
+                        )
+                        command_features[side] = (
+                            p_cmd,
+                            r_cmd,
+                            velocity,
+                            omega,
+                        )
                     reference_diagnostics: dict[str, dict] = {}
                     for side in ("left", "right"):
                         belief_target = shared_target if shared_selection_armed and requested_hand == side else None
@@ -2867,20 +2919,38 @@ def main() -> int:
                         }
                     control_visual_hands = {
                         side: {
+                            "command_wrist_position_m": p_cmd.tolist(),
+                            "command_wrist_rotation": r_cmd.reshape(9).tolist(),
+                            "command_velocity_mps": (
+                                None if velocity is None else velocity.tolist()
+                            ),
+                            "command_omega_rps": (
+                                None if omega is None else omega.tolist()
+                            ),
+                            # Compatibility marker retained for the v8 web
+                            # viewer; it is derived from the same raw command.
                             "human_grasp_goal_m": (
-                                human_raw_tf[side][:3, 3]
-                                + human_raw_tf[side][:3, :3] @ grasp_center_local
+                                command_tf[side][:3, 3]
+                                + command_tf[side][:3, :3] @ grasp_center_local
                             ).tolist(),
                             "reference_grasp_goal_m": (
                                 human_tf[side][:3, 3]
                                 + human_tf[side][:3, :3] @ grasp_center_local
                             ).tolist(),
+                            "measured_wrist_position_m": measured_tf[side][
+                                :3, 3
+                            ].tolist(),
                             "armed": bool(shared_selected_hand == side),
                             "position_source": reference_diagnostics[side][
                                 "position_source"
                             ],
                         }
-                        for side in ("left", "right")
+                        for side, (
+                            p_cmd,
+                            r_cmd,
+                            velocity,
+                            omega,
+                        ) in command_features.items()
                     }
                     left_target_tf, right_target_tf = human_tf["left"], human_tf["right"]
                     latest_shared_result = reference_diagnostics
@@ -3360,11 +3430,16 @@ def main() -> int:
                             "grasp_center_local_m": [
                                 float(value) for value in grasp_center_local
                             ],
+                            "end_effector_model": str(
+                                args.end_effector_model
+                            ).lower(),
                             "hands": control_visual_hands,
                         },
                     )
                 )
-                next_shared_hand_publish = now + 0.1
+                next_shared_hand_publish = (
+                    now + 1.0 / SHARED_HAND_PUBLISH_HZ
+                )
 
             if now - last_log > 1.0:
                 shared_log = "shared=none"

@@ -20,6 +20,7 @@ from .protocol import make_empty_result
 from .remote_geometry_pipeline import (
     RemoteRgbdGeometryPipeline,
     camera_geometry_metadata,
+    geometry_intrinsics_from_color,
 )
 from .remote_sam3_worker import RemoteSam3Worker, load_extrinsics, parse_concepts
 
@@ -184,6 +185,14 @@ class RemoteYolo11Worker(RemoteSam3Worker):
             if context.state is not None and context.t_goal_cam is not None
             else None
         )
+        color_intrinsics = (
+            geometry_intrinsics_from_color(
+                intrinsics,
+                (pair.rgb.width, pair.rgb.height),
+            )
+            if intrinsics is not None
+            else None
+        )
         if geometry_intrinsics is None:
             if not getattr(self, "_geometry_disabled_warned", False):
                 LOG.warning(
@@ -194,7 +203,11 @@ class RemoteYolo11Worker(RemoteSam3Worker):
         else:
             self._geometry_disabled_warned = False
         payload.update(
-            camera_geometry_metadata(context.t_goal_cam, geometry_intrinsics)
+            camera_geometry_metadata(
+                context.t_goal_cam,
+                color_intrinsics if geometry_intrinsics is not None else None,
+                geometry_intrinsics,
+            )
         )
         payload["gravity_up_goal"] = (
             None if context.up_goal is None else context.up_goal.tolist()
@@ -207,6 +220,7 @@ class RemoteYolo11Worker(RemoteSam3Worker):
             depth_raw=depth,
             depth_scale_um=pair.depth.depth_scale_um,
             intrinsics=geometry_intrinsics,
+            color_intrinsics=color_intrinsics,
             t_goal_cam=context.t_goal_cam if geometry_intrinsics is not None else None,
             up_goal=context.up_goal,
             source_robot_state_delta_ms=context.state_delta_ms,
@@ -215,11 +229,34 @@ class RemoteYolo11Worker(RemoteSam3Worker):
             image_height=pair.rgb.height,
             allow_geometry_fallback=geometry_intrinsics is not None,
         )
+        depth_m = np.asarray(depth, dtype=np.float32) * (
+            float(pair.depth.depth_scale_um) / 1_000_000.0
+        )
+        valid_depth_ratio = float(
+            np.mean(
+                np.isfinite(depth_m)
+                & (depth_m >= self.geometry_pipeline.min_depth_m)
+                & (depth_m <= self.geometry_pipeline.max_depth_m)
+            )
+        )
         payload["geometry_status"] = {
             "state_available": context.state is not None,
             "t_goal_cam_available": context.t_goal_cam is not None,
             "up_goal_available": context.up_goal is not None,
             "state_delta_ms": context.state_delta_ms,
+            "image_size": [int(pair.rgb.width), int(pair.rgb.height)],
+            "depth_size": [int(depth.shape[1]), int(depth.shape[0])],
+            "intrinsics_size": (
+                None
+                if color_intrinsics is None
+                else [int(color_intrinsics.width), int(color_intrinsics.height)]
+            ),
+            "geometry_intrinsics_size": (
+                None
+                if intrinsics is None
+                else [int(intrinsics.width), int(intrinsics.height)]
+            ),
+            "geometry_valid_depth_ratio": valid_depth_ratio,
             "primitive_count": sum(
                 len(obj.get("surface_primitives") or [])
                 for obj in payload["objects"]
@@ -342,7 +379,7 @@ def main(argv: list[str] | None = None) -> int:
         sync_tolerance_ms=float(
             args.sync_tolerance_ms
             if args.sync_tolerance_ms is not None
-            else depth_config.get("sync_tol_ms", 50.0)
+            else depth_config.get("sync_tol_ms", 20.0)
         ),
         min_depth_m=float(
             args.min_depth_m
@@ -357,7 +394,7 @@ def main(argv: list[str] | None = None) -> int:
         min_depth_points=int(
             args.min_depth_points
             if args.min_depth_points is not None
-            else target_config.get("min_depth_points", 100)
+            else target_config.get("min_depth_points", 80)
         ),
         robot_state_max_delta_ms=float(
             args.robot_state_max_delta_ms

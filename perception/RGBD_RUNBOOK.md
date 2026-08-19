@@ -19,17 +19,25 @@ cd /home/unitree/URL/29_dof_g1_deploy/g1_ws
 export LCM_DEFAULT_URL='udpm://239.255.76.67:7667?ttl=1'
 
 ./build_rgbd_clean/g1_videohub_lcm_bridge eth0 \
+  --rgb-width 1280 \
+  --rgb-height 720 \
+  --poll-rate 30 \
+  --jpeg-quality 85 \
   --depth-device /dev/video0 \
   --depth-width 640 \
-  --depth-height 480 \
+  --depth-height 360 \
   --depth-fps 30 \
   --depth-scale-um 1000 \
-  --rgb-width 640 \
-  --rgb-height 360 \
   --alignment-mode thor-calibrated \
-  --calibration config/d435_depth_to_videohub.yaml \
+  --calibration config/d435_depth_to_videohub_640x360.yaml \
   --sync-tolerance-ms 20
 ```
+
+The startup log must show `640x360 Z16 requested_fps=30` and must not contain
+`Scaled depth calibration`. In each five-second report, verify
+`depth_capture_fps` is near 30, `depth / rgb` is near 1.0, and inspect the real
+`sync_delta_ms[min/mean/max]` values. Depth packets retain their own capture
+timestamp; they are no longer retimestamped to RGB.
 
 Then start Thor:
 

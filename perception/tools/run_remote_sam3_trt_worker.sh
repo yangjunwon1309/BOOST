@@ -5,7 +5,7 @@ repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 image="${SAM3_DOCKER_IMAGE:-path-g1-remote-sam3-trt:rtx4060}"
 lcm_url="${WIFI_LCM_URL:-udpm://239.255.77.67:7667?ttl=1}"
 concepts="${SAM3_CONCEPTS:-object}"
-inference_hz="${SAM3_INFERENCE_HZ:-3.5}"
+inference_hz="${SAM3_INFERENCE_HZ:-8}"
 engine_host="${SAM3_TRT_ENGINE_HOST:-${repo_dir}/models/sam3_trt/rtx4060/sam3_fp16_4out.engine}"
 
 docker_cmd=(docker)
@@ -39,4 +39,5 @@ exec "${docker_cmd[@]}" run --rm --gpus all --network host \
         --trt-engine /models/sam3_trt/remote.engine \
         --concepts "${concepts}" \
         --inference-hz "${inference_hz}" \
-        --publish-overlay-jpeg
+        --min-depth-points 80 \
+        --sync-tolerance-ms 20

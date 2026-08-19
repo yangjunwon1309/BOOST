@@ -30,6 +30,14 @@ REMOTE_CONCEPT_CONTROL_CHANNEL = "PATH_REMOTE_CONCEPT_CONTROL"
 
 MASK_ENCODING = "bitpack-zlib-row-major"
 BACKENDS = {"sam3_pytorch", "sam3_tensorrt", "yolo11_pytorch", "mock"}
+WORKER_STAGE_KEYS = (
+    "source_rgb",
+    "worker_dequeue",
+    "decode_done",
+    "infer_done",
+    "geometry_done",
+    "packed",
+)
 
 
 def now_us() -> int:
@@ -506,6 +514,27 @@ def validate_result(
         errors.append("error must be string or null")
     if not _finite_number(payload.get("inference_ms")):
         errors.append("inference_ms must be finite")
+
+    if "stage_us" in payload:
+        stages = payload.get("stage_us")
+        if not isinstance(stages, dict):
+            errors.append("stage_us must be a map")
+        else:
+            worker_stages_present = any(key in stages for key in WORKER_STAGE_KEYS)
+            if worker_stages_present:
+                for key in WORKER_STAGE_KEYS:
+                    value = stages.get(key)
+                    if not isinstance(value, int) or value <= 0:
+                        errors.append(f"stage_us.{key} is invalid")
+            gateway_receive = stages.get("gateway_receive")
+            if gateway_receive is not None and (
+                not isinstance(gateway_receive, int) or gateway_receive <= 0
+            ):
+                errors.append("stage_us.gateway_receive is invalid")
+            if worker_stages_present and stages.get("source_rgb") != payload.get(
+                "source_rgb_timestamp_us"
+            ):
+                errors.append("stage_us.source_rgb does not match source RGB timestamp")
 
     width = payload.get("image_width")
     height = payload.get("image_height")

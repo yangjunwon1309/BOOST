@@ -111,6 +111,14 @@ def test_remote_result_msgpack_schema_validates():
             valid_depth_points=6,
         )
     )
+    payload["stage_us"] = {
+        "source_rgb": 111,
+        "worker_dequeue": timestamp + 100,
+        "decode_done": timestamp + 200,
+        "infer_done": timestamp + 300,
+        "geometry_done": timestamp + 400,
+        "packed": timestamp + 500,
+    }
     unpacked = unpack_result(pack_result(payload))
     errors = validate_result(
         unpacked,
@@ -128,6 +136,27 @@ def test_remote_result_msgpack_schema_validates():
     assert errors == []
     decoded = decode_mask(unpacked["objects"][0]["mask_data"], 4, 6)
     np.testing.assert_array_equal(decoded, mask)
+
+
+def test_remote_result_stage_timestamps_are_optional_but_validated_when_present():
+    timestamp = now_us()
+    payload = make_empty_result(
+        sequence=1,
+        published_timestamp_us=timestamp,
+        source_rgb_timestamp_us=101,
+        source_depth_timestamp_us=102,
+        image_width=8,
+        image_height=8,
+        backend="mock",
+    )
+    context = ValidationContext(
+        result_max_age_ms=800,
+        now_timestamp_us=timestamp,
+    )
+    assert validate_result(payload, context) == []
+    payload["stage_us"] = {"source_rgb": 101}
+    errors = validate_result(payload, context)
+    assert any("stage_us.worker_dequeue is invalid" in error for error in errors)
 
 
 def test_remote_result_validator_rejects_stale_mismatched_or_nonmonotonic():

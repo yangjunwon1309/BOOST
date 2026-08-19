@@ -305,6 +305,7 @@ class HandInput:
     angular_velocity: np.ndarray | None
     button_pressed: bool
     shoulder_position: np.ndarray | None = None
+    input_source: str = "robot_fk"
 
 
 @dataclass(frozen=True)
@@ -2353,7 +2354,15 @@ class ParallelTascBelief:
             # a button edge must not turn into a Cartesian reference step.
             state.alpha += ramp * (alpha_target - state.alpha)
             state.alpha = float(np.clip(state.alpha, 0.0, 1.0))
-            telemetry["hand"] = {"side": side, "armed": state.armed, "beta": state.beta_current, "lambda0": state.lambda0_current, "alpha": state.alpha}
+            telemetry["hand"] = {
+                "side": side,
+                "armed": state.armed,
+                "beta": state.beta_current,
+                "lambda0": state.lambda0_current,
+                "alpha": state.alpha,
+                "input_source": str(hand.input_source),
+            }
+            telemetry["input_source"] = str(hand.input_source)
             # HierarchicalTascBelief returns before its normal diagnostics block
             # when no object geometry is valid.  Parallel inference still ran,
             # so attach the updater parameters here for every hand/tick.

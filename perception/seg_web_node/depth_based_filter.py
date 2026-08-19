@@ -176,8 +176,14 @@ class DepthBasedRobotFilter:
         if int(mask.sum()) < int(min_area_px):
             return None
         robot_mask = self._robot_mask
-        if robot_mask is None or robot_mask.shape != mask.shape:
+        if robot_mask is None:
             return mask
+        if robot_mask.shape != mask.shape:
+            robot_mask = cv2.resize(
+                robot_mask.astype(np.uint8),
+                (mask.shape[1], mask.shape[0]),
+                interpolation=cv2.INTER_NEAREST,
+            ).astype(bool)
         trimmed = mask & ~robot_mask
         if int(trimmed.sum()) != int(mask.sum()):
             self.last_status["trimmed_masks"] = int(self.last_status.get("trimmed_masks", 0)) + 1

@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import logging
+from dataclasses import dataclass
 
 import numpy as np
-
 
 EPS = 1.0e-9
 LOG = logging.getLogger(__name__)
@@ -130,7 +129,9 @@ class FeatureConfig:
     ori_hold_lambda: float = 1.0
     ori_converge_lambda: float = 0.5
     ori_omega_ref_rps: float = 0.5
-    min_hand_omega_rps: float = 0.02
+    # Raw PICO command rotations retain more physiological tremor than
+    # measured robot FK, even after the shared 0.25/0.75 omega filter.
+    min_hand_omega_rps: float = 0.08
 
     @classmethod
     def from_dict(cls, data: dict | None) -> "FeatureConfig":
@@ -169,7 +170,7 @@ class FeatureConfig:
             ori_hold_lambda=float(orientation.get("hold_lambda", 1.0)),
             ori_converge_lambda=float(orientation.get("converge_lambda", 0.5)),
             ori_omega_ref_rps=float(orientation.get("omega_ref_rps", 0.5)),
-            min_hand_omega_rps=float(orientation.get("min_hand_omega_rps", 0.02)),
+            min_hand_omega_rps=float(orientation.get("min_hand_omega_rps", 0.08)),
         )
 
 

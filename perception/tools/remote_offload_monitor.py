@@ -86,6 +86,8 @@ def main() -> int:
             f"image_size={geometry.get('image_size')}, "
             f"depth_size={geometry.get('depth_size')}, "
             f"intrinsics_size={geometry.get('intrinsics_size')}, "
+            f"geometry_intrinsics_size={geometry.get('geometry_intrinsics_size')}, "
+            f"geometry_valid_depth_ratio={geometry.get('geometry_valid_depth_ratio')}, "
             f"state_delta_ms={geometry.get('state_delta_ms')}, "
             f"valid_depth_objects={geometry.get('objects_with_valid_depth')}, "
             f"contacts={geometry.get('contact_candidate_count')}, "

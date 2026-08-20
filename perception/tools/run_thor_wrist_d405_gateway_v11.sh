@@ -3,6 +3,7 @@ set -euo pipefail
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 perception_dir="$(cd -- "${script_dir}/.." && pwd)"
 image="${G1_PERCEPTION_D405_IMAGE:-g1-perception-sam3:d435i-thor-jp71}"
+container_name="${G1_PERCEPTION_CONTAINER_NAME:-g1-perception-wrist-d405-v11}"
 
 # Export comma-separated nodes found during Thor preflight, for example:
 # D405_VIDEO_DEVICES=/dev/video0,/dev/video1 D405_USB_DEVICES=/dev/bus/usb/001/038,/dev/bus/usb/001/039
@@ -25,6 +26,7 @@ done
 # consistently. Run this dedicated capture process as root, but expose only
 # the explicitly supplied D405 nodes (never --privileged or all of /dev).
 exec docker run --rm --network host --ipc host \
+    --name "${container_name}" \
     --user 0:0 \
     -e D405_VIDEO_DEVICES \
     -e D405_USB_DEVICES \

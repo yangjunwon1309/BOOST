@@ -89,9 +89,10 @@ def assert_video_nodes_unowned() -> None:
 
 
 class ThorWristD405Gateway:
-    def __init__(self, *, lcm_url: str, config: Path, jpeg_quality: int, one_camera_diagnostic: bool,
+    def __init__(self, *, g1_lcm_url: str, wifi_lcm_url: str, config: Path, jpeg_quality: int, one_camera_diagnostic: bool,
                  robot_state_channel: str) -> None:
-        self.bus = lcm.LCM(lcm_url)
+        self.g1_bus = lcm.LCM(g1_lcm_url)
+        self.wifi_bus = lcm.LCM(wifi_lcm_url)
         self.config = config
         self.jpeg_quality = int(np.clip(jpeg_quality, 1, 100))
         self.one_camera_diagnostic = bool(one_camera_diagnostic)
@@ -100,14 +101,14 @@ class ThorWristD405Gateway:
         self.capture: WristD405Capture | None = None
         capture_config = _load_yaml(config).get("capture", {})
         self.max_inter_wrist_skew_us = int(float(capture_config.get("max_inter_wrist_skew_ms", 80.0)) * 1000.0)
-        self.bus.subscribe(WRIST_RESULT_CHANNEL, self._on_result)
-        self.bus.subscribe(self.robot_state_channel, self._on_robot_state)
+        self.wifi_bus.subscribe(WRIST_RESULT_CHANNEL, self._on_result)
+        self.g1_bus.subscribe(self.robot_state_channel, self._on_robot_state)
 
     def _on_robot_state(self, _channel: str, data: bytes) -> None:
         # Robot state is the only legacy LCM input retained in v11. It is
         # forwarded unchanged for remote timestamp matching; no head image,
         # depth, or head calibration channel is subscribed.
-        self.bus.publish(WRIST_ROBOT_STATE_CHANNEL, data)
+        self.wifi_bus.publish(WRIST_ROBOT_STATE_CHANNEL, data)
 
     def preflight(self) -> None:
         rs = _import_realsense()
@@ -176,7 +177,7 @@ class ThorWristD405Gateway:
             )
         self.sequence += 1
         payload = {"version": 1, "sequence": self.sequence, "bundle_timestamp_us": now_us(), "split_y": frames["left_wrist"]["height"], "inter_wrist_skew_us": skew, "cameras": frames}
-        self.bus.publish(WRIST_BUNDLE_CHANNEL, pack_bundle(payload))
+        self.wifi_bus.publish(WRIST_BUNDLE_CHANNEL, pack_bundle(payload))
 
     def run(self, *, max_hz: float) -> None:
         self.start()
@@ -184,8 +185,14 @@ class ThorWristD405Gateway:
         try:
             while True:
                 started = time.monotonic()
+                # Keep the newest robot state: at 50 Hz a single callback per
+                # 15 Hz capture tick would otherwise violate the 15 ms v11 FK
+                # matching budget before the remote worker even receives it.
+                while self.g1_bus.handle_timeout(0) > 0:
+                    pass
                 self.publish_once()
-                self.bus.handle_timeout(0)
+                while self.wifi_bus.handle_timeout(0) > 0:
+                    pass
                 time.sleep(max(0.0, period - (time.monotonic() - started)))
         finally:
             self.stop()
@@ -193,7 +200,16 @@ class ThorWristD405Gateway:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--lcm-url", default=os.environ.get("PATH_LCM_URL", "udpm://239.255.76.67:7667?ttl=1"))
+    parser.add_argument(
+        "--g1-lcm-url",
+        default=os.environ.get("G1_LCM_URL", "udpm://239.255.76.67:7667?ttl=1"),
+        help="G1-side LCM input carrying timestamped robot state.",
+    )
+    parser.add_argument(
+        "--wifi-lcm-url",
+        default=os.environ.get("WIFI_LCM_URL", "udpm://239.255.77.67:7667?ttl=1"),
+        help="Wi-Fi LCM transport for PATH_V11_WRIST_* bundles and results.",
+    )
     parser.add_argument("--config", type=Path, default=Path("config/wrist_d405_v11.yaml"))
     parser.add_argument("--preflight", action="store_true", help="enumerate both configured D405s without streaming")
     parser.add_argument("--diagnose", action="store_true", help="log container-visible D405 devices, V4L2 sysfs, and USB node mounts")
@@ -203,7 +219,7 @@ def main() -> None:
     parser.add_argument("--one-camera-diagnostic", action="store_true", help="reserved explicit diagnostic mode; normal v11 requires both cameras")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    gateway = ThorWristD405Gateway(lcm_url=args.lcm_url, config=args.config, jpeg_quality=args.jpeg_quality, one_camera_diagnostic=args.one_camera_diagnostic, robot_state_channel=args.robot_state_channel)
+    gateway = ThorWristD405Gateway(g1_lcm_url=args.g1_lcm_url, wifi_lcm_url=args.wifi_lcm_url, config=args.config, jpeg_quality=args.jpeg_quality, one_camera_diagnostic=args.one_camera_diagnostic, robot_state_channel=args.robot_state_channel)
     if args.diagnose:
         diagnose_runtime(_import_realsense())
     if args.preflight:

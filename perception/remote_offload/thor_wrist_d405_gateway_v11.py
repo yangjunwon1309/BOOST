@@ -53,7 +53,10 @@ def diagnose_runtime(rs: Any) -> None:
     LOG.info("pyrealsense2 version=%s", getattr(rs, "__version__", "unknown"))
     for variable in ("D405_VIDEO_DEVICES", "D405_USB_DEVICES"):
         values = [item for item in os.environ.get(variable, "").split(",") if item]
-        LOG.info("%s=%s", variable, [(item, Path(item).exists()) for item in values])
+        LOG.info(
+            "%s=%s", variable,
+            [(item, Path(item).exists(), os.access(item, os.R_OK | os.W_OK)) for item in values],
+        )
     video_sysfs = []
     for node in sorted(Path("/sys/class/video4linux").glob("video*")):
         try:

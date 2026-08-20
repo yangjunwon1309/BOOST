@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import logging
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -151,6 +152,7 @@ class WristD405Sam3Worker:
         self.latest_bundle: dict[str, Any] | None = None
         self.running = False
         self.sequence = 0
+        self.last_geometry_log_monotonic = 0.0
         self.concept_revision = -1
         self.next_track_id = {camera_id: 0 for camera_id in CAMERA_IDS}
         self.tracks: dict[str, dict[str, tuple[np.ndarray, int]]] = {camera_id: {} for camera_id in CAMERA_IDS}
@@ -211,6 +213,8 @@ class WristD405Sam3Worker:
             concepts = list(self.concepts)
         if bundle is None:
             return None
+        paired_state = decode_robot_state(bundle["robot_state_packet"])
+        paired_state_received_us = int(bundle["robot_state_host_received_us"])
         frames = bundle["cameras"]
         stacked, split_y = stack_wrist_images(frames)
         masks, boxes, scores, labels = self.backend.infer(stacked, concepts)
@@ -219,8 +223,13 @@ class WristD405Sam3Worker:
         active_surface_tracks = {camera_id: set() for camera_id in CAMERA_IDS}
         for camera_id in CAMERA_IDS:
             frame = frames[camera_id]
-            state_match = self.states.nearest(int(frame["host_timestamp_us"]), self.robot_state_max_delta_ms)
-            state, state_age_ms = state_match if state_match is not None else (None, None)
+            # The state is captured by Thor alongside this atomic RGB-D bundle,
+            # as in the legacy forwarded-pair record. Its source timestamp may
+            # use a different clock, so age is measured using Thor receipt time.
+            state = paired_state
+            state_age_ms = abs(
+                int(frame["host_timestamp_us"]) - paired_state_received_us
+            ) / 1000.0
             depth = unpack_depth_z16(frame["depth_z16_zlib"], width=int(frame["width"]), height=int(frame["height"]))
             for detected in attributed[camera_id]:
                 obj = object_geometry(
@@ -250,6 +259,19 @@ class WristD405Sam3Worker:
         result = make_result(sequence=self.sequence, source_bundle_timestamp_us=int(bundle["bundle_timestamp_us"]),
                              objects=objects, discarded_seam_masks=discarded)
         self.bus.publish(WRIST_RESULT_CHANNEL, pack_result(result))
+        now_monotonic = time.monotonic()
+        if now_monotonic - self.last_geometry_log_monotonic >= 5.0:
+            centers = sum(obj.get("center_goal_m") is not None for obj in objects)
+            primitives = sum(bool(obj.get("surface_primitives")) for obj in objects)
+            reasons: dict[str, int] = {}
+            for obj in objects:
+                reason = str((obj.get("geometry") or {}).get("reason") or "valid")
+                reasons[reason] = reasons.get(reason, 0) + 1
+            LOG.info(
+                "WRIST_GEOMETRY sequence=%d masks=%d center_goal=%d primitives=%d reasons=%s",
+                self.sequence, len(objects), centers, primitives, reasons,
+            )
+            self.last_geometry_log_monotonic = now_monotonic
         return result
 
     def _assign_track(self, camera_id: str, obj: dict[str, Any]) -> str:

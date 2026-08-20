@@ -105,6 +105,7 @@ class ThorWristD405Gateway:
         self.last_publish_log_monotonic = 0.0
         self.capture: WristD405Capture | None = None
         self.belief: WristBeliefGateway | None = None
+        self.latest_robot_state_packet: tuple[int, bytes] | None = None
         capture_config = _load_yaml(config).get("capture", {})
         self.max_inter_wrist_skew_us = int(float(capture_config.get("max_inter_wrist_skew_ms", 80.0)) * 1000.0)
         self.wifi_bus.subscribe(WRIST_RESULT_CHANNEL, self._on_result)
@@ -129,6 +130,7 @@ class ThorWristD405Gateway:
         # forwarded unchanged for remote timestamp matching; no head image,
         # depth, or head calibration channel is subscribed.
         self.wifi_bus.publish(WRIST_ROBOT_STATE_CHANNEL, data)
+        self.latest_robot_state_packet = (now_us(), bytes(data))
         if self.belief is not None:
             self.belief.update_robot_state(data)
 
@@ -190,7 +192,14 @@ class ThorWristD405Gateway:
     def _on_result(self, _channel: str, data: bytes) -> None:
         try:
             result = unpack_result(data)
-            LOG.info("v11 result sequence=%s objects=%s seam_discarded=%s", result.get("sequence"), len(result.get("objects", [])), result.get("discarded_seam_masks"))
+            objects = [obj for obj in result.get("objects", []) if isinstance(obj, dict)]
+            valid_centers = sum(obj.get("center_goal_m") is not None for obj in objects)
+            primitives = sum(bool(obj.get("surface_primitives")) for obj in objects)
+            LOG.info(
+                "v11 result sequence=%s objects=%s center_goal=%s primitives=%s seam_discarded=%s",
+                result.get("sequence"), len(objects), valid_centers, primitives,
+                result.get("discarded_seam_masks"),
+            )
             if self.belief is not None:
                 self.belief.update_result(result)
         except Exception as error:
@@ -199,6 +208,11 @@ class ThorWristD405Gateway:
     def publish_once(self) -> None:
         if self.capture is None:
             raise RuntimeError("D405 gateway is not started")
+        if self.latest_robot_state_packet is None:
+            raise RuntimeError(
+                f"no robot state received on {self.robot_state_channel}; "
+                "refusing RGB-D without the FK snapshot required for belief geometry"
+            )
         frames: dict[str, dict[str, Any]] = {}
         for camera_id in CAMERA_IDS:
             bundle = self.capture.wait_for_bundle(camera_id)
@@ -227,7 +241,17 @@ class ThorWristD405Gateway:
                 f"{self.max_inter_wrist_skew_us / 1000.0:.1f} ms"
             )
         self.sequence += 1
-        payload = {"version": 1, "sequence": self.sequence, "bundle_timestamp_us": now_us(), "split_y": frames["left_wrist"]["height"], "inter_wrist_skew_us": skew, "cameras": frames}
+        state_received_us, state_packet = self.latest_robot_state_packet
+        payload = {
+            "version": 1,
+            "sequence": self.sequence,
+            "bundle_timestamp_us": now_us(),
+            "split_y": frames["left_wrist"]["height"],
+            "inter_wrist_skew_us": skew,
+            "robot_state_packet": state_packet,
+            "robot_state_host_received_us": int(state_received_us),
+            "cameras": frames,
+        }
         encoded = pack_bundle(payload)
         self.wifi_bus.publish(WRIST_BUNDLE_CHANNEL, encoded)
         if time.monotonic() - self.last_publish_log_monotonic >= 5.0:

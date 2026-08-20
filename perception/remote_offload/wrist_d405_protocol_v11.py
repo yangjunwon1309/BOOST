@@ -165,6 +165,10 @@ def validate_bundle(payload: dict[str, Any], *, require_two: bool = True) -> dic
     cameras = payload.get("cameras")
     if not isinstance(cameras, dict):
         raise ValueError("wrist D405 bundle is missing cameras")
+    if not isinstance(payload.get("robot_state_packet"), (bytes, bytearray)):
+        raise ValueError("wrist D405 bundle is missing its paired robot-state packet")
+    if int(payload.get("robot_state_host_received_us", 0)) <= 0:
+        raise ValueError("wrist D405 bundle has no robot-state host timestamp")
     ids = set(cameras)
     allowed = set(CAMERA_IDS)
     if not ids.issubset(allowed) or (require_two and ids != allowed):

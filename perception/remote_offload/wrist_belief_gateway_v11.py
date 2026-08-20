@@ -29,7 +29,7 @@ from .thor_gateway_head_d435i_legacy import (
     DEFAULT_SHARED_HAND_SELECTION_ENDPOINT,
     DEFAULT_SHARED_HAND_SELECTION_TOPIC,
     SHARED_HAND_PUBLISH_HZ,
-    ThorGateway,
+    ThorRemoteGateway,
     _msgpack_safe,
 )
 from .wrist_d405_protocol_v11 import (
@@ -42,8 +42,8 @@ from .wrist_d405_protocol_v11 import (
 LOG = logging.getLogger(__name__)
 
 
-class WristBeliefGateway(ThorGateway):
-    """Run the preserved ThorGateway belief methods on wrist-v11 results."""
+class WristBeliefGateway(ThorRemoteGateway):
+    """Run the preserved ThorRemoteGateway belief methods on wrist-v11 results."""
 
     def __init__(
         self,
@@ -56,7 +56,7 @@ class WristBeliefGateway(ThorGateway):
         belief_command_divergence_max_m: float = 0.20,
         belief_command_max_delta_ms: float = 25.0,
     ) -> None:
-        # Calling ThorGateway.__init__ would subscribe the legacy head-camera
+        # Calling ThorRemoteGateway.__init__ would subscribe the legacy head-camera
         # path. These are the exact fields consumed by its belief methods,
         # initialized with the same expressions/defaults.
         self.wifi_bus = wifi_bus
@@ -162,7 +162,7 @@ class WristBeliefGateway(ThorGateway):
 
     def start(self) -> None:
         self.running = True
-        # This is ThorGateway._belief_loop itself, not a reimplementation.
+        # This is ThorRemoteGateway._belief_loop itself, not a reimplementation.
         self.thread = threading.Thread(
             target=self._belief_loop,
             name="wrist-legacy-tasc-belief",

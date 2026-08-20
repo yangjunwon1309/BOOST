@@ -6,7 +6,7 @@ from remote_offload.remote_sam3_wrist_d405_worker_v11 import (
     attribute_stacked_masks,
     stack_wrist_images,
 )
-from remote_offload.thor_gateway_head_d435i_legacy import ThorGateway
+from remote_offload.thor_gateway_head_d435i_legacy import ThorRemoteGateway
 from remote_offload.wrist_belief_gateway_v11 import WristBeliefGateway
 from remote_offload.wrist_d405_protocol_v11 import (
     pack_depth_z16,
@@ -57,4 +57,4 @@ def test_wrist_gateway_executes_preserved_thor_belief_methods_directly() -> None
         "_belief_selection_from_result",
         "_publish_belief_target",
     ):
-        assert getattr(WristBeliefGateway, method) is getattr(ThorGateway, method)
+        assert getattr(WristBeliefGateway, method) is getattr(ThorRemoteGateway, method)

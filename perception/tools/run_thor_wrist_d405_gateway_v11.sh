@@ -20,6 +20,15 @@ for device in "${video_devices[@]}" "${usb_devices[@]}"; do
     [[ -e "${device}" ]] || { echo "Missing D405 device: ${device}" >&2; exit 2; }
     device_args+=(--device "${device}:${device}:rwm")
 done
+if command -v fuser >/dev/null 2>&1; then
+    # Check on the host: a normal Docker PID namespace cannot report a host
+    # service (for example teleimager-serv) that already opened D405 UVC nodes.
+    # Never terminate that service automatically.
+    if fuser -v "${video_devices[@]}"; then
+        echo "A process already owns a configured D405 V4L2 node. Stop it manually, then retry." >&2
+        exit 2
+    fi
+fi
 # Capture and JPEG transport do not use CUDA. Omitting GPU passthrough also
 # avoids unrelated CUDA compatibility failures on a Thor driver mismatch.
 # The host udev ACL for USB bus nodes does not survive Docker's user namespace

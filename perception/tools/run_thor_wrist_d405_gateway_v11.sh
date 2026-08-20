@@ -19,18 +19,13 @@ for device in "${video_devices[@]}" "${usb_devices[@]}"; do
     [[ -e "${device}" ]] || { echo "Missing D405 device: ${device}" >&2; exit 2; }
     device_args+=(--device "${device}:${device}:rwm")
 done
-group_args=()
-# ``--user uid:gid`` otherwise discards the caller's supplementary `video`,
-# `plugdev`, or equivalent udev-access groups inside Docker.
-for group_id in $(id -G); do
-    group_args+=(--group-add "${group_id}")
-done
-
 # Capture and JPEG transport do not use CUDA. Omitting GPU passthrough also
 # avoids unrelated CUDA compatibility failures on a Thor driver mismatch.
+# The host udev ACL for USB bus nodes does not survive Docker's user namespace
+# consistently. Run this dedicated capture process as root, but expose only
+# the explicitly supplied D405 nodes (never --privileged or all of /dev).
 exec docker run --rm --network host --ipc host \
-    --user "$(id -u):$(id -g)" \
-    "${group_args[@]}" \
+    --user 0:0 \
     -e D405_VIDEO_DEVICES \
     -e D405_USB_DEVICES \
     -v "${perception_dir}:/workspace/perception" \

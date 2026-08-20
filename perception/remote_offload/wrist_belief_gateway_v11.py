@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import threading
 import time
+import logging
 from typing import Any
 
 import lcm
@@ -33,6 +34,9 @@ from .wrist_d405_protocol_v11 import (
     now_us,
     pack_belief_telemetry,
 )
+
+
+LOG = logging.getLogger(__name__)
 
 
 def _vec3(value: Any) -> np.ndarray | None:
@@ -120,6 +124,7 @@ class WristBeliefGateway:
         self.last_eef: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray | None, int]] = {}
         self.running = False
         self.thread: threading.Thread | None = None
+        self.last_publish_log_monotonic = 0.0
 
     def start(self) -> None:
         self.running = True
@@ -181,10 +186,33 @@ class WristBeliefGateway:
 
     def _publish(self, result: dict[str, Any], per_hand: dict[str, dict[str, Any]], state: Any) -> None:
         hands: dict[str, dict[str, Any]] = {}
+        objects_by_track = {
+            str(obj.get("track_id", "")): obj
+            for obj in result.get("objects", [])
+            if isinstance(obj, dict)
+        }
         for side in ("left", "right"):
             hand = dict(per_hand.get(side, {}))
             hand["armed"] = False
+            target = hand.get("target")
+            if isinstance(target, dict):
+                source = objects_by_track.get(str(target.get("object_id", "")))
+                if source is not None:
+                    # Keep all projection data in the telemetry packet.  The
+                    # viewer intentionally renders this latest target even
+                    # after its image/result has advanced to another frame.
+                    hand["target"] = {
+                        **target,
+                        "camera_id": source.get("camera_id"),
+                        "box_xyxy": source.get("box_xyxy"),
+                        "t_goal_cam": source.get("t_goal_cam"),
+                        "intrinsics": source.get("intrinsics"),
+                    }
             hands[side] = hand
+        targets = {
+            side: bool((hands.get(side) or {}).get("target"))
+            for side in ("left", "right")
+        }
         self.wifi_bus.publish(
             WRIST_BELIEF_TELEMETRY_CHANNEL,
             pack_belief_telemetry(_wire_safe({
@@ -197,6 +225,10 @@ class WristBeliefGateway:
                 "belief_grasp_center_local_m": self.grasp_center_local_m.tolist(),
             })),
         )
+        now = time.monotonic()
+        if now - self.last_publish_log_monotonic >= 5.0:
+            LOG.info("BELIEF_TELEMETRY result_sequence=%s targets=%s channel=%s", result.get("sequence"), targets, WRIST_BELIEF_TELEMETRY_CHANNEL)
+            self.last_publish_log_monotonic = now
 
     def _loop(self) -> None:
         belief_period, geometry_period, telemetry_period = 1.0 / self.belief_hz, 1.0 / self.geometry_hz, 1.0 / self.telemetry_hz

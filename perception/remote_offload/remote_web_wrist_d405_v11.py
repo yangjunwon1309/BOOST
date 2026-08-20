@@ -203,10 +203,15 @@ class WristV11WebViewer:
             hand = hands.get(side) or {}
             target = hand.get("target") or {}
             track_id = str(target.get("object_id", ""))
-            obj = by_track.get(track_id)
-            if obj is None or obj.get("camera_id") not in images:
+            # The Thor telemetry includes its own geometry projection context,
+            # exactly so this target remains visible without result/image time
+            # matching.  Fall back to the latest matching SAM3 object only for
+            # old telemetry during a rolling restart.
+            obj = target if target.get("camera_id") else by_track.get(track_id)
+            camera_id = obj.get("camera_id") if isinstance(obj, dict) else None
+            if not isinstance(obj, dict) or camera_id not in images:
                 continue
-            image = images[obj["camera_id"]]
+            image = images[camera_id]
             color = colors[side]
             try:
                 x0, y0, x1, y1 = np.asarray(obj.get("box_xyxy"), dtype=int).reshape(4)
@@ -238,11 +243,17 @@ class WristV11WebViewer:
     def status(self) -> dict[str, Any]:
         with self.lock:
             age = None if self.bundle_timestamp_us is None else round((time.time_ns() // 1000 - self.bundle_timestamp_us) / 1000.0, 1)
+            hands = (self.belief or {}).get("hands", {}) if isinstance(self.belief, dict) else {}
             return {
                 "heartbeat": dict(self.heartbeat),
                 "bundle_sequence": self.bundle_sequence,
                 "bundle_age_ms": age,
                 "object_count": self.object_count,
+                "belief_result_sequence": (self.belief or {}).get("result_sequence") if isinstance(self.belief, dict) else None,
+                "belief_targets": {
+                    side: (hands.get(side) or {}).get("target")
+                    for side in ("left", "right")
+                },
             }
 
     def set_concepts(self, value: Any) -> list[str]:

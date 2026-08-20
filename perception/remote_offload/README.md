@@ -30,3 +30,7 @@ not kill a conflicting V4L2 owner such as `teleimager-serv`.
 Before first capture, run `python3 tools/query_d405_intrinsics.py --ssh
 url@thor --json --raw`, confirm left/right physical mounting with a covered
 lens, and validate the CAD-only wrist extrinsics with a hand-eye procedure.
+
+The checked-in configuration is the USB-2 reduced mode: native left-imager
+UYVY + Z16 at 480×270@15 and an 8 Hz latest-frame dispatch. Restore
+640×360@30 only after both cameras negotiate USB 3.x/SuperSpeed.

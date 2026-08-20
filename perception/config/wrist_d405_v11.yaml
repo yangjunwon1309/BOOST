@@ -19,25 +19,25 @@ cameras:
       # This is intentionally not the separate YUYV Color+ISP endpoint.
       stream: infrared
       format: uyvy
-      width: 640
-      height: 360
-      fps: 30
+      width: 480
+      height: 270
+      fps: 15
     depth:
       format: z16
-      width: 640
-      height: 360
-      fps: 30
+      width: 480
+      height: 270
+      fps: 15
     # Native factory calibration for the selected UYVY direct-left-imager and
     # Z16 depth grids. They are the same imager basis at this profile.
     factory_intrinsics:
       source: rs-enumerate-devices-c_2026-08-20
       frame: d405_left_imager_optical
-      width: 640
-      height: 360
-      fx: 329.263488769531
-      fy: 329.263488769531
-      ppx: 321.001251220703
-      ppy: 187.030487060547
+      width: 480
+      height: 270
+      fx: 246.947616577148
+      fy: 246.947616577148
+      ppx: 240.750930786133
+      ppy: 140.272872924805
       distortion_model: brown_conrady
       distortion_coeffs: [0.0, 0.0, 0.0, 0.0, 0.0]
   right_wrist:
@@ -45,33 +45,36 @@ cameras:
     color:
       stream: infrared
       format: uyvy
-      width: 640
-      height: 360
-      fps: 30
+      width: 480
+      height: 270
+      fps: 15
     # Native factory calibration for the selected UYVY direct-left-imager and
     # Z16 depth grids. They are the same imager basis at this profile.
     factory_intrinsics:
       source: rs-enumerate-devices-c_2026-08-20
       frame: d405_left_imager_optical
-      width: 640
-      height: 360
-      fx: 327.039276123047
-      fy: 327.039276123047
-      ppx: 318.095275878906
-      ppy: 176.814102172852
+      width: 480
+      height: 270
+      fx: 245.27946472168
+      fy: 245.27946472168
+      ppx: 238.57145690918
+      ppy: 132.610580444336
       distortion_model: brown_conrady
       distortion_coeffs: [0.0, 0.0, 0.0, 0.0, 0.0]
     depth:
       format: z16
-      width: 640
-      height: 360
-      fps: 30
+      width: 480
+      height: 270
+      fps: 15
 
 capture:
   require_native_left_imager_rgbd: true
+  # Both D405s currently negotiate USB 2.1. This reduced 480x270@15 profile
+  # is the only approved USB-2 mode; USB 3.x is required for 640x360@30.
+  allow_usb2_reduced_profile: true
   max_rgb_depth_delta_ms: 20
   stale_frame_ms: 150
-  max_inter_wrist_skew_ms: 80
+  max_inter_wrist_skew_ms: 120
 
 geometry:
   min_depth_m: 0.07

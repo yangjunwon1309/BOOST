@@ -199,6 +199,10 @@ class WristD405Sam3Worker:
         self.running = True
         while self.running:
             self.bus.handle_timeout(20)
+            # SAM3 is slower than capture. Drain queued UDP packets and retain
+            # only the most recent atomic pair, never an inference backlog.
+            while self.bus.handle_timeout(0) > 0:
+                pass
             self.process_latest()
 
 

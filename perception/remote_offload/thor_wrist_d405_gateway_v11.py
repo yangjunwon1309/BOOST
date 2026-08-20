@@ -113,12 +113,34 @@ class ThorWristD405Gateway:
     def preflight(self) -> None:
         rs = _import_realsense()
         specs = load_camera_specs(self.config)
+        capture_config = _load_yaml(self.config).get("capture", {})
         visible = discover_d405_serials(rs)
         missing = [spec.serial for spec in specs.values() if spec.serial not in visible]
         unexpected = set(visible) - {spec.serial for spec in specs.values()}
         if missing or unexpected or len(visible) != 2:
             raise RuntimeError(f"D405 preflight requires exactly configured pair; missing={missing}, unexpected={sorted(unexpected)}")
         for side, spec in specs.items():
+            usb_type = str(visible[spec.serial].get("usb_type", ""))
+            try:
+                usb_major = int(usb_type.split(".", 1)[0])
+            except ValueError:
+                usb_major = 0
+            reduced_usb2_profile = (
+                spec.color.width <= 480 and spec.color.height <= 270 and spec.color.fps <= 15
+                and spec.depth.width <= 480 and spec.depth.height <= 270 and spec.depth.fps <= 15
+            )
+            if usb_major < 3 and not (
+                bool(capture_config.get("allow_usb2_reduced_profile", False)) and reduced_usb2_profile
+            ):
+                raise RuntimeError(
+                    f"{side} serial={spec.serial} is negotiated at USB {usb_type or 'unknown'}; "
+                    "v11 requires a SuperSpeed (USB 3.x) path for two 640x360@30 UYVY+Z16 D405 streams"
+                )
+            if usb_major < 3:
+                LOG.warning(
+                    "%s uses approved reduced USB-2 profile UYVY/Z16 %dx%d@%d",
+                    side, spec.color.width, spec.color.height, spec.color.fps,
+                )
             LOG.info("%s serial=%s port=%s profile=UYVY/Z16 %dx%d@%d", side, spec.serial,
                      visible[spec.serial].get("physical_port", ""), spec.color.width, spec.color.height, spec.color.fps)
 
@@ -213,7 +235,7 @@ def main() -> None:
     parser.add_argument("--config", type=Path, default=Path("config/wrist_d405_v11.yaml"))
     parser.add_argument("--preflight", action="store_true", help="enumerate both configured D405s without streaming")
     parser.add_argument("--diagnose", action="store_true", help="log container-visible D405 devices, V4L2 sysfs, and USB node mounts")
-    parser.add_argument("--max-hz", type=float, default=15.0)
+    parser.add_argument("--max-hz", type=float, default=8.0)
     parser.add_argument("--jpeg-quality", type=int, default=85)
     parser.add_argument("--robot-state-channel", default="G1_ROBOT_STATE")
     parser.add_argument("--one-camera-diagnostic", action="store_true", help="reserved explicit diagnostic mode; normal v11 requires both cameras")

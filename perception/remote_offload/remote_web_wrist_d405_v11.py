@@ -14,6 +14,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
+from .remote_web_server_head_d435i_legacy import _draw_remote_belief_overlay
 from .wrist_d405_protocol_v11 import (
     CAMERA_IDS,
     WRIST_BUNDLE_CHANNEL,
@@ -177,53 +178,55 @@ class WristV11WebViewer:
             self.jpeg = encoded.tobytes()
             self.lock.notify_all()
 
-    @staticmethod
-    def _goal_to_pixel(point_goal_m: Any, obj: dict[str, Any]) -> tuple[int, int] | None:
-        try:
-            point = np.asarray(point_goal_m, dtype=np.float64).reshape(3)
-            transform = np.asarray(obj["t_goal_cam"], dtype=np.float64).reshape(4, 4)
-            intrinsics = obj["intrinsics"]
-            camera = np.linalg.inv(transform) @ np.array([*point, 1.0], dtype=np.float64)
-            if camera[2] <= 1.0e-6:
-                return None
-            u = int(round(float(intrinsics["fx"]) * camera[0] / camera[2] + float(intrinsics["ppx"])))
-            v = int(round(float(intrinsics["fy"]) * camera[1] / camera[2] + float(intrinsics["ppy"])))
-            return u, v
-        except (KeyError, TypeError, ValueError, np.linalg.LinAlgError):
-            return None
-
     def _draw_latest_belief_locked(self, images: dict[str, np.ndarray]) -> None:
         belief = self.belief or {}
         hands = belief.get("hands") if isinstance(belief, dict) else None
         if not isinstance(hands, dict):
             return
-        by_track = {str(obj.get("track_id", "")): obj for obj in self.objects}
-        colors = {"left": (255, 170, 20), "right": (40, 140, 255)}
-        for side in ("left", "right"):
-            hand = hands.get(side) or {}
-            target = hand.get("target") or {}
-            track_id = str(target.get("object_id", ""))
-            # The Thor telemetry includes its own geometry projection context,
-            # exactly so this target remains visible without result/image time
-            # matching.  Fall back to the latest matching SAM3 object only for
-            # old telemetry during a rolling restart.
-            obj = target if target.get("camera_id") else by_track.get(track_id)
-            camera_id = obj.get("camera_id") if isinstance(obj, dict) else None
-            if not isinstance(obj, dict) or camera_id not in images:
-                continue
-            image = images[camera_id]
-            color = colors[side]
-            try:
-                x0, y0, x1, y1 = np.asarray(obj.get("box_xyxy"), dtype=int).reshape(4)
-                cv2.rectangle(image, (x0, y0), (x1, y1), color, 2)
-            except (TypeError, ValueError):
-                pass
-            pixel = self._goal_to_pixel(target.get("position_goal_m"), obj)
-            if pixel is not None:
-                cv2.drawMarker(image, pixel, color, cv2.MARKER_CROSS, 26, 2)
-                probability = float(target.get("joint_confidence", 0.0) or 0.0)
-                cv2.putText(image, f"{side[0].upper()} belief {probability:.2f}", (pixel[0] + 12, pixel[1] - 8),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA)
+        for camera_id in CAMERA_IDS:
+            camera_objects = [
+                obj for obj in self.objects if obj.get("camera_id") == camera_id
+            ]
+            camera_hands: dict[str, Any] = {}
+            projection: dict[str, Any] | None = None
+            known_ids = {str(obj.get("track_id", "")) for obj in camera_objects}
+            for side in ("left", "right"):
+                hand = dict(hands.get(side) or {})
+                target = hand.get("target")
+                if not isinstance(target, dict) or target.get("camera_id") != camera_id:
+                    hand["target"] = None
+                    camera_hands[side] = hand
+                    continue
+                projection = target
+                track_id = str(target.get("object_id", ""))
+                if track_id and track_id not in known_ids:
+                    camera_objects.append(
+                        {
+                            "track_id": track_id,
+                            "box_xyxy": target.get("box_xyxy"),
+                            "camera_id": camera_id,
+                        }
+                    )
+                camera_hands[side] = hand
+            if projection is None:
+                projection = next(
+                    (obj for obj in camera_objects if obj.get("t_goal_cam") and obj.get("intrinsics")),
+                    None,
+                )
+            transform = projection.get("t_goal_cam") if projection else None
+            intrinsics = dict(projection.get("intrinsics") or {}) if projection else None
+            if intrinsics:
+                intrinsics.setdefault("cx", intrinsics.get("ppx"))
+                intrinsics.setdefault("cy", intrinsics.get("ppy"))
+            _draw_remote_belief_overlay(
+                images[camera_id],
+                camera_objects,
+                {**belief, "hands": camera_hands},
+                stale=False,
+                t_goal_cam=transform,
+                intrinsics=intrinsics,
+                control=belief.get("control"),
+            )
 
     def lcm_loop(self) -> None:
         while True:

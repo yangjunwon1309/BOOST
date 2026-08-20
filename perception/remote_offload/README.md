@@ -24,8 +24,15 @@ export D405_USB_DEVICES=/dev/bus/usb/001/038,/dev/bus/usb/001/039
 
 The v11 gateway opens D405s directly by serial and publishes only
 `PATH_V11_WRIST_*` camera messages. It never subscribes to head RGB, depth, or
-calibration channels. It requires both configured cameras by default and will
-not kill a conflicting V4L2 owner such as `teleimager-serv`.
+calibration channels. It receives wrist SAM3 geometry results and executes the
+preserved head-gateway belief methods directly: 8 Hz shared geometry, 30 Hz
+two-hand `ParallelTascBelief`, timestamp-matched operator commands with FK
+fallback, selected-hand authority, and bounded telemetry on
+`PATH_V11_WRIST_BELIEF_TELEMETRY`. The wrist viewer calls the preserved head
+viewer belief-overlay routine on each camera using the newest telemetry; it
+does not require image/result sequence matching. The gateway requires both
+configured cameras by default and will not kill a conflicting V4L2 owner such
+as `teleimager-serv`.
 
 Before first capture, run `python3 tools/query_d405_intrinsics.py --ssh
 url@thor --json --raw`, confirm left/right physical mounting with a covered

@@ -91,7 +91,10 @@ def assert_video_nodes_unowned() -> None:
 
 class ThorWristD405Gateway:
     def __init__(self, *, g1_lcm_url: str, wifi_lcm_url: str, config: Path, jpeg_quality: int, one_camera_diagnostic: bool,
-                 robot_state_channel: str, belief_inference: bool, belief_config: Path) -> None:
+                 robot_state_channel: str, belief_inference: bool, belief_config: Path,
+                 belief_input_source: str, belief_command_max_delta_ms: float,
+                 belief_command_divergence_max_m: float,
+                 shared_hand_selection_endpoint: str, shared_hand_selection_topic: str) -> None:
         self.g1_bus = lcm.LCM(g1_lcm_url)
         self.wifi_bus = lcm.LCM(wifi_lcm_url)
         self.config = config
@@ -111,7 +114,15 @@ class ThorWristD405Gateway:
             belief_settings = belief_data.get("tasc_belief", belief_data.get("belief", {}))
             if not isinstance(belief_settings, dict):
                 raise ValueError(f"belief config must contain a tasc_belief mapping: {belief_config}")
-            self.belief = WristBeliefGateway(wifi_bus=self.wifi_bus, belief_config=belief_settings)
+            self.belief = WristBeliefGateway(
+                wifi_bus=self.wifi_bus,
+                belief_config=belief_settings,
+                shared_hand_selection_endpoint=shared_hand_selection_endpoint,
+                shared_hand_selection_topic=shared_hand_selection_topic,
+                belief_use_operator_command=(belief_input_source == "operator_command"),
+                belief_command_max_delta_ms=belief_command_max_delta_ms,
+                belief_command_divergence_max_m=belief_command_divergence_max_m,
+            )
 
     def _on_robot_state(self, _channel: str, data: bytes) -> None:
         # Robot state is the only legacy LCM input retained in v11. It is
@@ -285,10 +296,30 @@ def main() -> None:
                         help="existing TASC belief settings reused for both wrists")
     parser.add_argument("--belief-inference", action=argparse.BooleanOptionalAction, default=True,
                         help="run two-hand TASC belief on Thor and publish telemetry to Wi-Fi")
+    parser.add_argument("--belief-input-source", choices=("operator_command", "robot_fk"),
+                        default="operator_command",
+                        help="match the legacy gateway's belief hand-input selection")
+    parser.add_argument("--belief-command-max-delta-ms", type=float, default=25.0)
+    parser.add_argument("--belief-command-divergence-max-m", type=float, default=0.20)
+    parser.add_argument("--shared-hand-selection-endpoint",
+                        default=os.environ.get("PATH_SHARED_HAND_SELECTION_ENDPOINT", "tcp://127.0.0.1:5567"))
+    parser.add_argument("--shared-hand-selection-topic",
+                        default=os.environ.get("PATH_SHARED_HAND_SELECTION_TOPIC", "path_shared_control_hand"))
     parser.add_argument("--one-camera-diagnostic", action="store_true", help="reserved explicit diagnostic mode; normal v11 requires both cameras")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    gateway = ThorWristD405Gateway(g1_lcm_url=args.g1_lcm_url, wifi_lcm_url=args.wifi_lcm_url, config=args.config, jpeg_quality=args.jpeg_quality, one_camera_diagnostic=args.one_camera_diagnostic, robot_state_channel=args.robot_state_channel, belief_inference=args.belief_inference, belief_config=args.belief_config)
+    gateway = ThorWristD405Gateway(
+        g1_lcm_url=args.g1_lcm_url, wifi_lcm_url=args.wifi_lcm_url,
+        config=args.config, jpeg_quality=args.jpeg_quality,
+        one_camera_diagnostic=args.one_camera_diagnostic,
+        robot_state_channel=args.robot_state_channel,
+        belief_inference=args.belief_inference, belief_config=args.belief_config,
+        belief_input_source=args.belief_input_source,
+        belief_command_max_delta_ms=args.belief_command_max_delta_ms,
+        belief_command_divergence_max_m=args.belief_command_divergence_max_m,
+        shared_hand_selection_endpoint=args.shared_hand_selection_endpoint,
+        shared_hand_selection_topic=args.shared_hand_selection_topic,
+    )
     if args.diagnose:
         diagnose_runtime(_import_realsense())
     if args.preflight:

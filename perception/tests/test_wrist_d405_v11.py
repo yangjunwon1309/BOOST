@@ -6,6 +6,8 @@ from remote_offload.remote_sam3_wrist_d405_worker_v11 import (
     attribute_stacked_masks,
     stack_wrist_images,
 )
+from remote_offload.thor_gateway_head_d435i_legacy import ThorGateway
+from remote_offload.wrist_belief_gateway_v11 import WristBeliefGateway
 from remote_offload.wrist_d405_protocol_v11 import (
     pack_depth_z16,
     unpack_depth_z16,
@@ -42,3 +44,17 @@ def test_seam_touching_mask_is_discarded_not_split() -> None:
     )
     assert discarded == 1
     assert not attributed["left_wrist"] and not attributed["right_wrist"]
+
+
+def test_wrist_gateway_executes_preserved_thor_belief_methods_directly() -> None:
+    """Prevent a simplified wrist-only belief implementation from drifting."""
+    for method in (
+        "_belief_loop",
+        "_belief_inputs_from_result",
+        "_drain_shared_hand_selection",
+        "_command_features_at",
+        "_belief_state_features",
+        "_belief_selection_from_result",
+        "_publish_belief_target",
+    ):
+        assert getattr(WristBeliefGateway, method) is getattr(ThorGateway, method)

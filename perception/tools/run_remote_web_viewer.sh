@@ -19,7 +19,7 @@ fi
 exec "${docker_cmd[@]}" run --rm --network host \
     -v "${repo_dir}:/workspace/perception:ro" \
     "${image}" \
-    python -m remote_offload.remote_web_server \
+    python -m remote_offload.remote_web_server_head_d435i_legacy \
         --wifi-lcm-url "${lcm_url}" \
         --host "${web_host}" \
         --port "${web_port}"

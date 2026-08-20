@@ -32,7 +32,7 @@ exec "${docker_cmd[@]}" run --rm --gpus all --network host \
     -v "${HOME}/.cache/huggingface:/cache/huggingface" \
     -v "${HOME}/.cache/torch:/cache/torch" \
     "${image}" \
-    python -m remote_offload.remote_sam3_belief_input_worker \
+    python -m remote_offload.remote_sam3_belief_input_worker_head_d435i_legacy \
         --wifi-lcm-url "${lcm_url}" \
         --config config/pipeline.yaml \
         --backend tensorrt \

@@ -1,4 +1,7 @@
-# RTX 4060 Remote SAM3 Belief-Input Worker
+# RTX 4060 Remote SAM3 Belief-Input Worker (head-D435i legacy ablation)
+
+This worker remains for head-D435i ablation. The wrist-only production worker
+is `remote_offload.remote_sam3_wrist_d405_worker_v11`.
 
 This runtime keeps SAM3 and all Python dependencies inside a laptop-specific
 Docker image. It publishes perception geometry only; it contains no robot
@@ -39,7 +42,7 @@ docker run --rm --gpus all --network host \
   -v "$HOME/.cache/huggingface:/cache/huggingface" \
   -v "$HOME/.cache/torch:/cache/torch" \
   path-g1-remote-sam3:rtx4060 \
-  python -m remote_offload.remote_sam3_belief_input_worker \
+  python -m remote_offload.remote_sam3_belief_input_worker_head_d435i_legacy \
     --wifi-lcm-url 'udpm://239.255.77.67:7667?ttl=1' \
     --config config/pipeline.yaml \
     --backend pytorch \
@@ -53,7 +56,7 @@ Run the viewer and perception prompt controller from the same isolated image:
 docker run --rm --network host \
   -v "$PWD:/workspace/perception:ro" \
   path-g1-remote-sam3:rtx4060 \
-  python -m remote_offload.remote_web_server \
+  python -m remote_offload.remote_web_server_head_d435i_legacy \
     --wifi-lcm-url 'udpm://239.255.77.67:7667?ttl=1' \
     --host 0.0.0.0 --port 8081
 ```

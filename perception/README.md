@@ -249,3 +249,25 @@ On 2026-07-21 the final image passed:
 The NGC image prints a CUDA 13.3-on-driver-13.0 minor-compatibility warning.
 The actual `sm_110` kernel tests above pass, so this is not currently a runtime
 failure. Re-run `tools/verify_environment.py` after any JetPack or image update.
+
+# Verify D405 stereo topology
+
+On Thor, D405 depth uses its left and right stereo imagers; RGB/color comes
+from the left imager. RGB itself is not a stereo pair, but it has no separate
+RGB-to-depth baseline. Verify the two directly attached cameras without
+interrupting a process that owns `/dev/video*`:
+
+```bash
+cd /home/url/PATH-G1
+# From the machine physically connected to the cameras:
+python3 perception/tools/check_d405_stereo_basis.py --require-two
+
+# From your laptop; replace url@thor with Thor's SSH destination:
+python3 perception/tools/check_d405_stereo_basis.py --ssh url@thor --require-two
+```
+
+Use `--json` for monitoring/automation, or `--serial SERIAL` to inspect one
+camera. `--ssh` sends this script to Thor over standard input, so no remote
+checkout is required. Without `pyrealsense2`, its default Linux sysfs/V4L2
+probe still identifies the attached D405s without opening a stream. The report
+names left + right as the depth stereo basis and RGB as the left-imager stream.

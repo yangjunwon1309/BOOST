@@ -48,6 +48,54 @@ def rotation_from_vector(vector: np.ndarray) -> np.ndarray:
     return np.eye(3) + np.sin(angle) * skew + (1.0 - np.cos(angle)) * (skew @ skew)
 
 
+def slerp_so3(source: np.ndarray, target: np.ndarray, weight: float) -> np.ndarray:
+    """Geodesically interpolate finite SO(3) rotations without quaternion sign rules."""
+    source = np.asarray(source, dtype=np.float64).reshape(3, 3)
+    target = np.asarray(target, dtype=np.float64).reshape(3, 3)
+    if not np.isfinite(source).all() or not np.isfinite(target).all():
+        raise ValueError("SO(3) interpolation requires finite rotations")
+    fraction = float(np.clip(weight if np.isfinite(weight) else 0.0, 0.0, 1.0))
+    return rotation_from_vector(fraction * rotation_vector(target @ source.T)) @ source
+
+
+@dataclass
+class OrientationAuthority:
+    """Smooth, hysteretic, rate-limited perception orientation authority."""
+
+    enter_confidence: float = 0.45
+    exit_confidence: float = 0.25
+    ema_alpha: float = 0.15
+    max_authority_rate_per_s: float = 1.2
+    smoothed_confidence: float = 0.0
+    authority_weight: float = 0.0
+    engaged: bool = False
+
+    def reset(self) -> None:
+        self.smoothed_confidence = 0.0
+        self.authority_weight = 0.0
+        self.engaged = False
+
+    def update(self, confidence: float | None, *, gate_ok: bool, dt: float) -> float:
+        value = float(confidence) if confidence is not None else 0.0
+        value = value if np.isfinite(value) else 0.0
+        value = float(np.clip(value, 0.0, 1.0))
+        alpha = float(np.clip(self.ema_alpha, 0.0, 1.0))
+        self.smoothed_confidence += alpha * (value - self.smoothed_confidence)
+        enter = float(np.clip(self.enter_confidence, 0.0, 1.0))
+        exit_ = float(np.clip(min(self.exit_confidence, enter), 0.0, 1.0))
+        if not self.engaged and self.smoothed_confidence >= enter:
+            self.engaged = True
+        elif self.engaged and self.smoothed_confidence < exit_:
+            self.engaged = False
+        requested = 0.0
+        if self.engaged and gate_ok:
+            requested = (self.smoothed_confidence - exit_) / max(EPS, 1.0 - exit_)
+        requested = float(np.clip(requested, 0.0, 1.0))
+        delta_limit = max(0.0, float(self.max_authority_rate_per_s)) * max(0.0, float(dt))
+        self.authority_weight += float(np.clip(requested - self.authority_weight, -delta_limit, delta_limit))
+        return float(np.clip(self.authority_weight, 0.0, 1.0))
+
+
 @dataclass
 class SecondOrderPositionReference:
     zeta: float = 2.0
@@ -126,6 +174,7 @@ class OrientationTargetGate:
     max_angle_rad: float = 1.047
     max_step_rate_rps: float = 3.0
     accept_dwell: int = 3
+    taper_start_fraction: float = 0.667
     previous_target: np.ndarray | None = None
     pending_count: int = 0
     reject_count: int = 0
@@ -136,22 +185,29 @@ class OrientationTargetGate:
         self.pending_count = 0
         self.last_reason = ""
 
-    def accept(self, target: np.ndarray | None, reference: np.ndarray, dt: float) -> bool:
+    def authority(self, target: np.ndarray | None, reference: np.ndarray, dt: float) -> float:
         if target is None:
             self.previous_target = None
             self.pending_count = 0
             self.last_reason = "no_target"
-            return False
+            return 0.0
 
-        target = np.asarray(target, dtype=np.float64).reshape(3, 3)
-        reference = np.asarray(reference, dtype=np.float64).reshape(3, 3)
+        try:
+            target = np.asarray(target, dtype=np.float64).reshape(3, 3)
+            reference = np.asarray(reference, dtype=np.float64).reshape(3, 3)
+        except (TypeError, ValueError):
+            self.last_reason = "invalid_target"
+            return 0.0
+        if not np.isfinite(target).all() or not np.isfinite(reference).all():
+            self.last_reason = "invalid_target"
+            return 0.0
         angle = float(np.linalg.norm(rotation_vector(target @ reference.T)))
         if angle > float(self.max_angle_rad):
             self.previous_target = None
             self.pending_count = 0
             self.reject_count += 1
             self.last_reason = f"angle_{np.degrees(angle):.0f}deg"
-            return False
+            return 0.0
 
         if self.previous_target is not None and dt > 0.0:
             step = float(np.linalg.norm(rotation_vector(target @ self.previous_target.T)))
@@ -160,12 +216,22 @@ class OrientationTargetGate:
                 self.pending_count = 0
                 self.reject_count += 1
                 self.last_reason = f"jump_{np.degrees(step):.0f}deg"
-                return False
+                return 0.0
 
         self.previous_target = target.copy()
         self.pending_count += 1
         if self.pending_count < max(1, int(self.accept_dwell)):
             self.last_reason = f"dwell_{self.pending_count}"
-            return False
+            return 0.0
+        taper_start = float(np.clip(self.taper_start_fraction, 0.0, 0.999999))
+        taper_angle = taper_start * float(self.max_angle_rad)
+        if angle > taper_angle:
+            weight = (float(self.max_angle_rad) - angle) / max(EPS, float(self.max_angle_rad) - taper_angle)
+            self.last_reason = "angle_taper"
+            return float(np.clip(weight, 0.0, 1.0))
         self.last_reason = "ok"
-        return True
+        return 1.0
+
+    def accept(self, target: np.ndarray | None, reference: np.ndarray, dt: float) -> bool:
+        """Compatibility predicate for callers migrating to :meth:`authority`."""
+        return self.authority(target, reference, dt) > 0.0

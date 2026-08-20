@@ -1,4 +1,7 @@
-# PATH-G1 Remote Vision Wi-Fi Offload
+# PATH-G1 Remote Vision Wi-Fi Offload (head-D435i legacy ablation)
+
+This document describes the preserved head-camera ablation path. Production
+two-wrist D405 deployment is documented in `remote_offload/README.md`.
 
 This mode moves vision inference and the visualization webview from Thor to an
 external x86 desktop with a Titan XP. Thor stays responsible for G1 Ethernet
@@ -132,7 +135,7 @@ python tools/thor_remote_rgbd_gateway.py \
 Equivalent module form from the `perception` directory:
 
 ```bash
-python -m remote_offload.thor_gateway \
+python -m remote_offload.thor_gateway_head_d435i_legacy \
   --g1-lcm-url "$G1_LCM_URL" \
   --wifi-lcm-url "$WIFI_LCM_URL" \
   --forward-hz 15 \
@@ -250,7 +253,7 @@ docker run --rm --gpus all --network host \
   -v "$HOME/.cache/huggingface:/cache/huggingface" \
   -v "$HOME/.cache/torch:/cache/torch" \
   path-g1-remote-sam3:rtx4060 \
-  python -m remote_offload.remote_sam3_belief_input_worker \
+  python -m remote_offload.remote_sam3_belief_input_worker_head_d435i_legacy \
     --wifi-lcm-url "$WIFI_LCM_URL" \
     --config config/pipeline.yaml \
     --backend pytorch \
@@ -264,7 +267,7 @@ For transport-only validation without SAM3 weights:
 docker run --rm --network host \
   -v "$PWD/config:/workspace/perception/config:ro" \
   path-g1-remote-sam3:rtx4060 \
-  python -m remote_offload.remote_sam3_belief_input_worker \
+  python -m remote_offload.remote_sam3_belief_input_worker_head_d435i_legacy \
     --wifi-lcm-url "$WIFI_LCM_URL" \
     --config config/pipeline.yaml \
     --backend mock \
@@ -283,7 +286,7 @@ Run this on the external desktop:
 cd /path/to/PATH-G1/perception
 docker run --rm --network host \
   path-g1-remote-sam3:rtx4060 \
-  python -m remote_offload.remote_web_server \
+  python -m remote_offload.remote_web_server_head_d435i_legacy \
     --wifi-lcm-url "$WIFI_LCM_URL" \
     --host 0.0.0.0 \
     --port 8081
@@ -420,7 +423,7 @@ python tools/thor_remote_rgbd_gateway.py \
 docker run --rm --network host \
   -v "$PWD/config:/workspace/perception/config:ro" \
   path-g1-remote-sam3:rtx4060 \
-  python -m remote_offload.remote_sam3_belief_input_worker \
+  python -m remote_offload.remote_sam3_belief_input_worker_head_d435i_legacy \
     --wifi-lcm-url "$WIFI_LCM_URL" \
     --config config/pipeline.yaml \
     --backend mock
@@ -428,7 +431,7 @@ docker run --rm --network host \
 # Terminal 3, desktop
 docker run --rm --network host \
   path-g1-remote-sam3:rtx4060 \
-  python -m remote_offload.remote_web_server \
+  python -m remote_offload.remote_web_server_head_d435i_legacy \
     --wifi-lcm-url "$WIFI_LCM_URL" \
     --host 0.0.0.0 \
     --port 8081

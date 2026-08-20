@@ -16,12 +16,12 @@ from seg_web_node.object_point_filter import ObjectPointFilterConfig
 from seg_web_node.rgbd_sync import RgbdPair
 
 from .protocol import make_empty_result
-from .remote_geometry_pipeline import (
+from .remote_geometry_pipeline_head_d435i_legacy import (
     RemoteRgbdGeometryPipeline,
     camera_geometry_metadata,
     geometry_intrinsics_from_color,
 )
-from .remote_sam3_worker import RemoteSam3Worker, load_extrinsics, parse_concepts
+from .remote_sam3_worker_head_d435i_legacy import RemoteSam3Worker, load_extrinsics, parse_concepts
 
 LOG = logging.getLogger("remote_offload.remote_sam3_belief_input_worker")
 

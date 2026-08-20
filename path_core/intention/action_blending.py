@@ -28,6 +28,11 @@ class SharedControlConfig:
     orientation_max_angle_rad: float = 1.047
     orientation_max_step_rate_rps: float = 3.0
     orientation_accept_dwell: int = 3
+    orientation_enter_confidence: float = 0.45
+    orientation_exit_confidence: float = 0.25
+    orientation_ema_alpha: float = 0.15
+    orientation_max_authority_rate_per_s: float = 1.2
+    orientation_gate_taper_start_fraction: float = 0.667
     waist_mode: str = "sonic_passthrough"
 
     @classmethod

@@ -1,0 +1,96 @@
+# Production v11 input: two D405s physically attached to Thor.
+#
+# Factory calibration captured on Thor with `rs-enumerate-devices -c`:
+# - 260322274380: USB path 1-4.2.3 (firmware 5.15.1.55)
+# - 260322274973: USB path 1-4.2.4 (firmware 5.15.1.55)
+#
+# The rs-enumerate log identifies USB paths but not the robot's left/right
+# mechanical installation. The assignment below is provisional: confirm it
+# with a covered-lens live-capture test before enabling the wrist transforms.
+# Do not replace serials with /dev/video numbers: node numbering changes across
+# boots and USB reconnects.
+cameras:
+  left_wrist:
+    serial: "260322274380"  # USB path 1-4.2.3; verify physical left wrist.
+    color:
+      # Direct color stream from the D405 left imager. This is the v11 geometry
+      # source: it shares the depth imager basis, unlike the YUYV RGB+ISP node.
+      # librealsense exposes D405's direct UYVY left imager as `Infrared`.
+      # This is intentionally not the separate YUYV Color+ISP endpoint.
+      stream: infrared
+      format: uyvy
+      width: 640
+      height: 360
+      fps: 30
+    depth:
+      format: z16
+      width: 640
+      height: 360
+      fps: 30
+    # Native factory calibration for the selected UYVY direct-left-imager and
+    # Z16 depth grids. They are the same imager basis at this profile.
+    factory_intrinsics:
+      source: rs-enumerate-devices-c_2026-08-20
+      frame: d405_left_imager_optical
+      width: 640
+      height: 360
+      fx: 329.263488769531
+      fy: 329.263488769531
+      ppx: 321.001251220703
+      ppy: 187.030487060547
+      distortion_model: brown_conrady
+      distortion_coeffs: [0.0, 0.0, 0.0, 0.0, 0.0]
+  right_wrist:
+    serial: "260322274973"  # USB path 1-4.2.4; verify physical right wrist.
+    color:
+      stream: infrared
+      format: uyvy
+      width: 640
+      height: 360
+      fps: 30
+    # Native factory calibration for the selected UYVY direct-left-imager and
+    # Z16 depth grids. They are the same imager basis at this profile.
+    factory_intrinsics:
+      source: rs-enumerate-devices-c_2026-08-20
+      frame: d405_left_imager_optical
+      width: 640
+      height: 360
+      fx: 327.039276123047
+      fy: 327.039276123047
+      ppx: 318.095275878906
+      ppy: 176.814102172852
+      distortion_model: brown_conrady
+      distortion_coeffs: [0.0, 0.0, 0.0, 0.0, 0.0]
+    depth:
+      format: z16
+      width: 640
+      height: 360
+      fps: 30
+
+capture:
+  require_native_left_imager_rgbd: true
+  max_rgb_depth_delta_ms: 20
+  stale_frame_ms: 150
+  max_inter_wrist_skew_ms: 80
+
+geometry:
+  min_depth_m: 0.07
+  max_depth_m: 0.50
+  min_depth_points: 100
+  robot_state_max_delta_ms: 15
+  seam_guard_px: 8
+  allow_cross_wrist_candidate_merge: false
+
+orientation:
+  floor_normal_source: live_gravity
+  use_fitted_surface_normals_for_floor_constraint: false
+
+orientation_shared_control:
+  enter_confidence: 0.45
+  exit_confidence: 0.25
+  ema_alpha: 0.15
+  max_authority_rate_per_s: 1.2
+  gate_max_angle_rad: 1.047
+  gate_taper_start_fraction: 0.667
+
+extrinsics: config/wrist_d405_extrinsics_v11.yaml

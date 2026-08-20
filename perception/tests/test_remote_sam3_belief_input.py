@@ -16,24 +16,24 @@ from remote_offload.protocol import (
     validate_result,
     validate_result_soft,
 )
-from remote_offload.remote_geometry_pipeline import (
+from remote_offload.remote_geometry_pipeline_head_d435i_legacy import (
     GEOMETRY_COLOR_SIZE,
     RemoteRgbdGeometryPipeline,
     camera_geometry_metadata,
     geometry_intrinsics_from_color,
     masks_to_geometry_grid,
 )
-from remote_offload.remote_sam3_belief_input_worker import (
+from remote_offload.remote_sam3_belief_input_worker_head_d435i_legacy import (
     RemoteSam3BeliefInputWorker,
 )
-from remote_offload.remote_sam3_worker import (
+from remote_offload.remote_sam3_worker_head_d435i_legacy import (
     MatchedFrameGeometry,
     RemoteSam3Worker,
 )
-from remote_offload.remote_sam3_worker import (
+from remote_offload.remote_sam3_worker_head_d435i_legacy import (
     build_arg_parser as build_base_worker_arg_parser,
 )
-from remote_offload.remote_web_server import (
+from remote_offload.remote_web_server_head_d435i_legacy import (
     RemoteWebRuntime,
     _belief_for_object,
     _draw_remote_belief_overlay,
@@ -41,7 +41,7 @@ from remote_offload.remote_web_server import (
     _project_axis_arrow,
 )
 from remote_offload.remote_yolo11_worker import RemoteYolo11Worker
-from remote_offload.thor_gateway import (
+from remote_offload.thor_gateway_head_d435i_legacy import (
     COMMAND_HISTORY_SPAN_S,
     SHARED_HAND_PUBLISH_HZ,
     ForwardedPairRecord,
@@ -50,7 +50,7 @@ from remote_offload.thor_gateway import (
     ThorRemoteGateway,
     _surface_primitive_from_dict,
 )
-from remote_offload.thor_gateway import (
+from remote_offload.thor_gateway_head_d435i_legacy import (
     build_arg_parser as build_gateway_arg_parser,
 )
 from seg_web_node.feature_cost import FeatureConfig

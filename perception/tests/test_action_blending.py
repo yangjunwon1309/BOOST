@@ -7,12 +7,14 @@ from path_core.intention.action_blending import (
     rotation_target_from_relation,
 )
 from path_core.intention.reference_dynamics import (
+    OrientationAuthority,
     OrientationTargetGate,
     SecondOrderOrientationReference,
     SecondOrderPositionReference,
     _second_order_transition,
     rotation_from_vector,
     rotation_vector,
+    slerp_so3,
 )
 
 
@@ -82,3 +84,30 @@ def test_orientation_gate_rejects_large_target_and_accepts_dwell():
     assert not gate.accept(target, identity, 0.02)
     assert not gate.accept(target, identity, 0.02)
     assert gate.accept(target, identity, 0.02)
+
+
+def test_slerp_so3_endpoints_and_geodesic_midpoint():
+    source = np.eye(3)
+    target = rotation_from_vector(np.array([0.0, 0.0, np.pi / 2.0]))
+    np.testing.assert_allclose(slerp_so3(source, target, 0.0), source)
+    np.testing.assert_allclose(slerp_so3(source, target, 1.0), target)
+    midpoint = slerp_so3(source, target, 0.5)
+    assert abs(np.linalg.norm(rotation_vector(midpoint)) - np.pi / 4.0) < 1.0e-9
+
+
+def test_orientation_authority_is_continuous_and_rate_limited():
+    authority = OrientationAuthority(ema_alpha=1.0, max_authority_rate_per_s=1.2)
+    assert authority.update(0.44, gate_ok=True, dt=0.1) == 0.0
+    # It engages above enter confidence but can only ramp 0.12 per tick.
+    assert authority.update(1.0, gate_ok=True, dt=0.1) == 0.12
+    assert authority.update(1.0, gate_ok=True, dt=0.1) == 0.24
+    # Leaving the Schmitt band releases continuously at the same rate.
+    assert authority.update(0.0, gate_ok=True, dt=0.1) == 0.12
+
+
+def test_orientation_gate_tapers_before_max_angle():
+    gate = OrientationTargetGate(max_angle_rad=1.0, taper_start_fraction=0.5, accept_dwell=1)
+    identity = np.eye(3)
+    taper = gate.authority(rotation_from_vector(np.array([0.0, 0.0, 0.75])), identity, 1.0)
+    assert 0.0 < taper < 1.0
+    assert gate.authority(rotation_from_vector(np.array([0.0, 0.0, 1.01])), identity, 1.0) == 0.0

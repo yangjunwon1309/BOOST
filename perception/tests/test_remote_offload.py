@@ -17,8 +17,8 @@ from remote_offload.protocol import (
     unpack_result,
     validate_result,
 )
-from remote_offload.remote_sam3_worker import RemoteSam3Worker
-from remote_offload.remote_web_server import RemoteWebRuntime
+from remote_offload.remote_sam3_worker_head_d435i_legacy import RemoteSam3Worker
+from remote_offload.remote_web_server_head_d435i_legacy import RemoteWebRuntime
 
 
 class _ResetRecorder:

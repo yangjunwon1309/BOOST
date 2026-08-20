@@ -1,0 +1,30 @@
+# Camera optical -> G1 wrist-yaw-link transforms, in metres.
+#
+# p_wrist = T_wrist_camera @ p_camera
+#
+# CAD initial estimate from the assembled Dex1 holder:
+# - wrist-yaw origin: center of the two-ring hull, (0, 0, 0) mm;
+# - camera optical-center approximation: midpoint of the symmetric camera
+#   mount screw pair, (0, -70.878, -11.106) mm;
+# - camera looks away from the wrist along the negative of the 25-degree mount
+#   face normal. The 3x3 block is wrist<-camera in the RealSense optical frame
+#   (x right, y down, z forward), and is right handed (determinant +1).
+#
+# This applies the same upright printed-holder orientation on each side. It is
+# not a hand-eye calibration: verify the actual left/right installation and
+# replace both transforms with correspondence-fit values before autonomous
+# contact geometry/control is enabled.
+extrinsics_source: CAD_APPROXIMATE_G1_DEX1_D405_HOLDER_2026_08_20
+calibration_status: provisional_cad_only
+translation_uncertainty_m: 0.025
+orientation_uncertainty_deg: 10.0
+T_left_wrist_camera:
+  - [-1.0, 0.0, 0.0, 0.0]
+  - [0.0, -0.9063077870, -0.4226182617, -0.070878]
+  - [0.0, -0.4226182617, 0.9063077870, -0.011106]
+  - [0.0, 0.0, 0.0, 1.0]
+T_right_wrist_camera:
+  - [-1.0, 0.0, 0.0, 0.0]
+  - [0.0, -0.9063077870, -0.4226182617, -0.070878]
+  - [0.0, -0.4226182617, 0.9063077870, -0.011106]
+  - [0.0, 0.0, 0.0, 1.0]

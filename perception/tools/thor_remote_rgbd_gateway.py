@@ -8,7 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from remote_offload.thor_gateway import main
+from remote_offload.thor_gateway_head_d435i_legacy import main
 
 
 if __name__ == "__main__":

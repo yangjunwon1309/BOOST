@@ -66,10 +66,12 @@ from path_core.intention.action_blending import (
     rotation_target_from_relation,
 )
 from path_core.intention.reference_dynamics import (
+    OrientationAuthority,
     OrientationTargetGate,
     SecondOrderOrientationReference,
     SecondOrderPositionReference,
     rotation_vector,
+    slerp_so3,
 )
 from path_core.messaging.g1_direct_protocol import (
     ARM_START,
@@ -394,6 +396,12 @@ def parse_args() -> argparse.Namespace:
         choices=("gmr_prior", "normal_assist"),
         default="gmr_prior",
     )
+    parser.add_argument("--orientation-enter-confidence", type=float, default=0.45)
+    parser.add_argument("--orientation-exit-confidence", type=float, default=0.25)
+    parser.add_argument("--orientation-ema-alpha", type=float, default=0.15)
+    parser.add_argument("--orientation-max-authority-rate-per-s", type=float, default=1.2)
+    parser.add_argument("--orientation-gate-max-angle-rad", type=float, default=1.047)
+    parser.add_argument("--orientation-gate-taper-start-fraction", type=float, default=0.667)
     parser.add_argument(
         "--shared-waist-mode",
         choices=("sonic_passthrough", "hold_identity"),
@@ -1279,11 +1287,14 @@ def ee_target_from_static_payload(
         grip_index=grip_index,
         goal_uid=str(payload.get("goal_uid", "")),
         timestamp_us=int(received_us),
-        orientation_axis_world=axis_vector if bool(payload.get("orientation_valid", False)) else None,
+        # ``orientation_valid`` is retained as producer telemetry only.  A
+        # finite axis/frame plus confidence is the continuous-authority input;
+        # an old binary field must not abruptly remove a valid constraint.
+        orientation_axis_world=axis_vector,
         orientation_relation=str(payload.get("orientation_relation", "") or ""),
         orientation_confidence=_float_field(payload, "orientation_confidence", default=0.0),
         orientation_policy=str(payload.get("orientation_policy", "minimal_rotation") or "minimal_rotation"),
-        orientation_frame_world=frame_world if bool(payload.get("orientation_valid", False)) else None,
+        orientation_frame_world=frame_world,
         position_point=str(payload.get("position_point", "wrist_origin")),
     )
 
@@ -1787,6 +1798,12 @@ def main() -> int:
         stale_after_s=float(args.shared_stale_after_sec),
         d_max_m=float(args.shared_d_max_m),
         waist_mode=str(args.shared_waist_mode),
+        orientation_enter_confidence=float(args.orientation_enter_confidence),
+        orientation_exit_confidence=float(args.orientation_exit_confidence),
+        orientation_ema_alpha=float(args.orientation_ema_alpha),
+        orientation_max_authority_rate_per_s=float(args.orientation_max_authority_rate_per_s),
+        orientation_max_angle_rad=float(args.orientation_gate_max_angle_rad),
+        orientation_gate_taper_start_fraction=float(args.orientation_gate_taper_start_fraction),
     )
     position_reference = {side: SecondOrderPositionReference(
         zeta=shared_config.zeta_released, omega_n=shared_config.omega_n_position_released,
@@ -1804,6 +1821,16 @@ def main() -> int:
             max_angle_rad=shared_config.orientation_max_angle_rad,
             max_step_rate_rps=shared_config.orientation_max_step_rate_rps,
             accept_dwell=shared_config.orientation_accept_dwell,
+            taper_start_fraction=shared_config.orientation_gate_taper_start_fraction,
+        )
+        for side in ("left", "right")
+    }
+    orientation_authority = {
+        side: OrientationAuthority(
+            enter_confidence=shared_config.orientation_enter_confidence,
+            exit_confidence=shared_config.orientation_exit_confidence,
+            ema_alpha=shared_config.orientation_ema_alpha,
+            max_authority_rate_per_s=shared_config.orientation_max_authority_rate_per_s,
         )
         for side in ("left", "right")
     }
@@ -1838,6 +1865,7 @@ def main() -> int:
             position_reference[side].reset(transform[:3, 3])
             orientation_reference[side].reset(transform[:3, :3])
             orientation_gate[side].reset()
+            orientation_authority[side].reset()
         log(f"reference resync ({reason})")
     wrist_fk: MujocoWristFk | None = None
     try:
@@ -2823,11 +2851,15 @@ def main() -> int:
                     reference_diagnostics: dict[str, dict] = {}
                     for side in ("left", "right"):
                         belief_target = shared_target if shared_selection_armed and requested_hand == side else None
-                        rotation_target = human_tf[side][:3, :3]
+                        rotation_command = human_tf[side][:3, :3]
+                        rotation_target = rotation_command
                         orientation_source = "operator"
                         zeta_ori = shared_config.zeta_released
                         omega_n_ori = shared_config.omega_n_orientation_released
                         gate_reason = "no_constraint"
+                        gate_weight = 0.0
+                        belief_weight = 0.0
+                        final_orientation_weight = 0.0
                         current_rotation = orientation_reference[side].rotation if orientation_reference[side].rotation is not None else measured_tf[side][:3, :3]
                         if belief_target is not None and belief_target.has_orientation_constraint:
                             target_model = str(args.end_effector_model).lower()
@@ -2853,19 +2885,34 @@ def main() -> int:
                                 )
                             )
                             gate = orientation_gate[side]
-                            if gate.accept(constrained, current_rotation, dt):
-                                rotation_target = constrained
+                            gate_weight = orientation_gate[side].authority(
+                                constrained, current_rotation, dt
+                            )
+                            belief_weight = orientation_authority[side].update(
+                                belief_target.orientation_confidence,
+                                gate_ok=gate_weight > 0.0,
+                                dt=dt,
+                            )
+                            final_orientation_weight = belief_weight * gate_weight
+                            if constrained is not None and final_orientation_weight > 0.0:
+                                rotation_target = slerp_so3(
+                                    rotation_command, constrained, final_orientation_weight
+                                )
                                 orientation_source = f"belief_{belief_target.orientation_policy}"
-                                zeta_ori = shared_config.zeta_armed
-                                omega_n_ori = shared_config.omega_n_orientation_armed
-                            else:
-                                rotation_target = current_rotation
-                                orientation_source = "gate_hold"
-                                zeta_ori = shared_config.zeta_armed
-                                omega_n_ori = shared_config.omega_n_orientation_armed
                             gate_reason = gate.last_reason
                         else:
-                            orientation_gate[side].accept(None, current_rotation, dt)
+                            orientation_gate[side].authority(None, current_rotation, dt)
+                            orientation_authority[side].update(0.0, gate_ok=False, dt=dt)
+                        # Modulate reference dynamics continuously. The state
+                        # itself is never blended or reset on authority edges.
+                        zeta_ori = (
+                            (1.0 - final_orientation_weight) * shared_config.zeta_released
+                            + final_orientation_weight * shared_config.zeta_armed
+                        )
+                        omega_n_ori = (
+                            (1.0 - final_orientation_weight) * shared_config.omega_n_orientation_released
+                            + final_orientation_weight * shared_config.omega_n_orientation_armed
+                        )
                         r_ref = orientation_reference[side].step(
                             rotation_target, dt, measured=measured_tf[side][:3, :3],
                             omega_n=omega_n_ori, zeta=zeta_ori,
@@ -2914,6 +2961,10 @@ def main() -> int:
                             "relation": "" if belief_target is None else belief_target.orientation_relation,
                             "orientation_gate_reason": gate_reason,
                             "orientation_gate_rejects": int(orientation_gate[side].reject_count),
+                            "orientation_gate_weight": float(gate_weight),
+                            "orientation_belief_weight": float(belief_weight),
+                            "orientation_authority_weight": float(final_orientation_weight),
+                            "orientation_smoothed_confidence": float(orientation_authority[side].smoothed_confidence),
                             "zeta_position": float(zeta_pos),
                             "zeta_orientation": float(zeta_ori),
                         }

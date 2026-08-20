@@ -57,7 +57,7 @@ from .protocol import (
     pack_result,
     unpack_concept_control,
 )
-from .remote_geometry_pipeline import (
+from .remote_geometry_pipeline_head_d435i_legacy import (
     GEOMETRY_COLOR_SIZE,
     Stable3DTracker,
     geometry_intrinsics_from_color,

@@ -98,6 +98,7 @@ class ThorWristD405Gateway:
         self.one_camera_diagnostic = bool(one_camera_diagnostic)
         self.robot_state_channel = str(robot_state_channel)
         self.sequence = 0
+        self.last_publish_log_monotonic = 0.0
         self.capture: WristD405Capture | None = None
         capture_config = _load_yaml(config).get("capture", {})
         self.max_inter_wrist_skew_us = int(float(capture_config.get("max_inter_wrist_skew_ms", 80.0)) * 1000.0)
@@ -154,6 +155,7 @@ class ThorWristD405Gateway:
             max_rgb_depth_delta_ms=float(capture_config.get("max_rgb_depth_delta_ms", 20.0)),
         )
         self.capture.start()
+        LOG.info("direct D405 capture started for %s", sorted(self.capture.specs))
 
     def stop(self) -> None:
         if self.capture is not None:
@@ -199,7 +201,14 @@ class ThorWristD405Gateway:
             )
         self.sequence += 1
         payload = {"version": 1, "sequence": self.sequence, "bundle_timestamp_us": now_us(), "split_y": frames["left_wrist"]["height"], "inter_wrist_skew_us": skew, "cameras": frames}
-        self.wifi_bus.publish(WRIST_BUNDLE_CHANNEL, pack_bundle(payload))
+        encoded = pack_bundle(payload)
+        self.wifi_bus.publish(WRIST_BUNDLE_CHANNEL, encoded)
+        if time.monotonic() - self.last_publish_log_monotonic >= 5.0:
+            LOG.info(
+                "Wrist bundle published sequence=%d bytes=%d skew_ms=%.2f channel=%s",
+                self.sequence, len(encoded), skew / 1000.0, WRIST_BUNDLE_CHANNEL,
+            )
+            self.last_publish_log_monotonic = time.monotonic()
 
     def capture_smoke(self) -> None:
         """Verify both direct camera streams without sending any LCM traffic."""

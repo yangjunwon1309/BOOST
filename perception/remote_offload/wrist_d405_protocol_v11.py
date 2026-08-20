@@ -165,10 +165,15 @@ def validate_bundle(payload: dict[str, Any], *, require_two: bool = True) -> dic
     cameras = payload.get("cameras")
     if not isinstance(cameras, dict):
         raise ValueError("wrist D405 bundle is missing cameras")
-    if not isinstance(payload.get("robot_state_packet"), (bytes, bytearray)):
-        raise ValueError("wrist D405 bundle is missing its paired robot-state packet")
-    if int(payload.get("robot_state_host_received_us", 0)) <= 0:
-        raise ValueError("wrist D405 bundle has no robot-state host timestamp")
+    # Added after initial v11 deployment. Keep it optional so a laptop worker
+    # can be restarted before Thor; the worker falls back to the separately
+    # forwarded PATH_V11_WRIST_ROBOT_STATE stream during a rolling update.
+    state_packet = payload.get("robot_state_packet")
+    if state_packet is not None:
+        if not isinstance(state_packet, (bytes, bytearray)):
+            raise ValueError("wrist D405 bundle has an invalid paired robot-state packet")
+        if int(payload.get("robot_state_host_received_us", 0)) <= 0:
+            raise ValueError("paired wrist robot state has no host timestamp")
     ids = set(cameras)
     allowed = set(CAMERA_IDS)
     if not ids.issubset(allowed) or (require_two and ids != allowed):
@@ -210,16 +215,29 @@ def unpack_bundle(data: bytes, *, require_two: bool = True) -> dict[str, Any]:
     return validate_bundle(payload, require_two=require_two)
 
 
-def make_result(*, sequence: int, source_bundle_timestamp_us: int, objects: list[dict[str, Any]],
-                discarded_seam_masks: int, valid: bool = True, error: str | None = None) -> dict[str, Any]:
+def make_result(
+    *,
+    sequence: int,
+    source_bundle_timestamp_us: int,
+    source_bundle_sequence: int | None = None,
+    objects: list[dict[str, Any]],
+    discarded_seam_masks: int,
+    geometry_status: dict[str, Any] | None = None,
+    valid: bool = True,
+    error: str | None = None,
+) -> dict[str, Any]:
     return {
         "version": VERSION,
         "sequence": int(sequence),
         "published_timestamp_us": now_us(),
         "source_bundle_timestamp_us": int(source_bundle_timestamp_us),
+        "source_bundle_sequence": (
+            None if source_bundle_sequence is None else int(source_bundle_sequence)
+        ),
         "valid": bool(valid),
         "error": error,
         "discarded_seam_masks": int(discarded_seam_masks),
+        "geometry_status": dict(geometry_status or {}),
         "objects": list(objects),
     }
 

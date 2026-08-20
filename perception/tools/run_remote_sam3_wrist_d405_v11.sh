@@ -23,4 +23,8 @@ exec "${docker_cmd[@]}" run --rm --gpus all --network host --ipc host \
     -w /workspace/perception "${image}" \
     python -m remote_offload.remote_sam3_wrist_d405_worker_v11 \
       --wifi-lcm-url "${lcm_url}" --backend tensorrt \
-      --trt-engine /models/sam3_trt/remote.engine --concepts "${concepts}" "$@"
+      --trt-engine /models/sam3_trt/remote.engine --concepts "${concepts}" \
+      --seam-minority-ratio "${WRIST_D405_SEAM_MINORITY_RATIO:-0.05}" \
+      --track-association-radius-m "${WRIST_D405_TRACK_ASSOCIATION_RADIUS_M:-0.06}" \
+      --geometry-fallback-ttl-frames "${WRIST_D405_GEOMETRY_FALLBACK_TTL_FRAMES:-3}" \
+      --geometry-fallback-score-decay "${WRIST_D405_GEOMETRY_FALLBACK_SCORE_DECAY:-0.97}" "$@"

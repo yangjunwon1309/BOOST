@@ -26,10 +26,13 @@ from seg_web_node.tasc_belief import ParallelTascBelief
 
 from .thor_gateway_head_d435i_legacy import (
     COMMAND_HISTORY_SPAN_S,
+    DEFAULT_EE_TARGET_ENDPOINT,
+    DEFAULT_EE_TARGET_TOPIC,
     DEFAULT_SHARED_HAND_SELECTION_ENDPOINT,
     DEFAULT_SHARED_HAND_SELECTION_TOPIC,
     SHARED_HAND_PUBLISH_HZ,
     ThorRemoteGateway,
+    ZmqEeTargetPublisher,
     _msgpack_safe,
 )
 from .wrist_d405_protocol_v11 import (
@@ -55,6 +58,21 @@ class WristBeliefGateway(ThorRemoteGateway):
         belief_use_operator_command: bool = True,
         belief_command_divergence_max_m: float = 0.20,
         belief_command_max_delta_ms: float = 25.0,
+        ee_target_enabled: bool = True,
+        ee_target_endpoint: str = DEFAULT_EE_TARGET_ENDPOINT,
+        ee_target_topic: str = DEFAULT_EE_TARGET_TOPIC,
+        ee_target_link: str = "left_wrist_yaw_link",
+        ee_target_label: str = "",
+        ee_target_min_score: float = 0.0,
+        ee_target_position_field: str = "auto",
+        ee_target_duration_sec: float = 2.0,
+        ee_target_final_hold_sec: float = 1.0,
+        ee_target_quaternion_wxyz: tuple[float, float, float, float] = (
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+        ),
     ) -> None:
         # Calling ThorRemoteGateway.__init__ would subscribe the legacy head-camera
         # path. These are the exact fields consumed by its belief methods,
@@ -121,15 +139,29 @@ class WristBeliefGateway(ThorRemoteGateway):
         self.latest_belief_geometry_sequence = -1
         self._zero_primitives_warned = False
         self.result_max_age_ms = 800.0
-        self.ee_target_label = ""
-        self.ee_target_min_score = 0.0
-        self.ee_target_link = "left_wrist_yaw_link"
-        # Inference and visualization targets are active. Robot target output
-        # stays disabled until provisional CAD extrinsics are hand-eye checked.
-        self.ee_target_pub = None
-        self.ee_target_duration_sec = 0.35
-        self.ee_target_final_hold_sec = 0.15
-        self.ee_target_quaternion_wxyz = (1.0, 0.0, 0.0, 0.0)
+        # Keep the exact legacy head-gateway output contract. The PATH state
+        # machine consumes this topic, applies the common position/orientation
+        # reference dynamics, and owns the subsequent IPOPT solve.
+        self.ee_target_enabled = bool(ee_target_enabled)
+        self.ee_target_label = str(ee_target_label)
+        self.ee_target_min_score = float(ee_target_min_score)
+        self.ee_target_position_field = str(ee_target_position_field)
+        self.ee_target_link = str(ee_target_link)
+        self.ee_target_endpoint = str(ee_target_endpoint)
+        self.ee_target_topic = str(ee_target_topic)
+        self.ee_target_pub = (
+            ZmqEeTargetPublisher(
+                endpoint=self.ee_target_endpoint,
+                topic=self.ee_target_topic,
+            )
+            if self.ee_target_enabled
+            else None
+        )
+        self.ee_target_duration_sec = float(ee_target_duration_sec)
+        self.ee_target_final_hold_sec = float(ee_target_final_hold_sec)
+        self.ee_target_quaternion_wxyz = tuple(
+            float(value) for value in ee_target_quaternion_wxyz
+        )
         self.belief_csv = None
         self.belief_log_period = 1.0
         self.last_belief_log_monotonic = 0.0
@@ -138,6 +170,10 @@ class WristBeliefGateway(ThorRemoteGateway):
             "last_error": None,
             "belief_enabled": True,
             "belief_targets": 0,
+            "ee_targets_published": 0,
+            "ee_targets_skipped": 0,
+            "last_ee_target": None,
+            "last_ee_target_skip": None,
             "last_belief": {
                 "enabled": self.parallel_tasc_belief.config.enabled,
                 "hands": {},
@@ -175,11 +211,22 @@ class WristBeliefGateway(ThorRemoteGateway):
             self.geometry_update_hz,
             "operator_command" if self.belief_use_operator_command else "robot_fk",
         )
+        if self.ee_target_pub is not None:
+            LOG.info(
+                "legacy IPOPT target publisher enabled endpoint=%s topic=%s "
+                "selected-hand-link=A:left/B:right",
+                self.ee_target_endpoint,
+                self.ee_target_topic,
+            )
+        else:
+            LOG.info("legacy IPOPT target publisher disabled")
 
     def stop(self) -> None:
         self.running = False
         if self.thread is not None:
             self.thread.join(timeout=2.0)
+        if self.ee_target_pub is not None:
+            self.ee_target_pub.close()
         self.shared_hand_selection_socket.close(0)
 
     def update_robot_state(self, data: bytes) -> None:
@@ -198,6 +245,20 @@ class WristBeliefGateway(ThorRemoteGateway):
         objects = [
             obj for obj in payload.get("objects", []) if isinstance(obj, dict)
         ]
+        # Wrist geometry attaches gravity to each object because it is produced
+        # beside the object cloud. The inherited belief loop reads the frame
+        # value from the result top level; hoist the first finite producer so
+        # its persistent __gravity__ orientation candidates are available.
+        for obj in objects:
+            up_goal = obj.get("gravity_up_goal")
+            if up_goal is not None:
+                try:
+                    candidate = np.asarray(up_goal, dtype=np.float64).reshape(3)
+                    if np.isfinite(candidate).all() and np.linalg.norm(candidate) > 1.0e-9:
+                        payload.setdefault("gravity_up_goal", candidate.tolist())
+                        break
+                except (TypeError, ValueError):
+                    continue
         if objects:
             first = objects[0]
             payload.setdefault("image_width", first.get("mask_width"))

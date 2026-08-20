@@ -4,11 +4,13 @@ import numpy as np
 
 from remote_offload.remote_sam3_wrist_d405_worker_v11 import (
     attribute_stacked_masks,
+    suppress_camera_duplicate_masks,
     stack_wrist_images,
 )
 from remote_offload.thor_gateway_head_d435i_legacy import ThorRemoteGateway
 from remote_offload.wrist_belief_gateway_v11 import WristBeliefGateway
 from remote_offload.wrist_d405_protocol_v11 import (
+    make_result,
     pack_depth_z16,
     unpack_depth_z16,
 )
@@ -44,6 +46,49 @@ def test_seam_touching_mask_is_discarded_not_split() -> None:
     )
     assert discarded == 1
     assert not attributed["left_wrist"] and not attributed["right_wrist"]
+
+
+def test_wrist_bottom_edge_mask_is_kept_when_it_is_only_in_one_camera() -> None:
+    masks = np.zeros((1, 720, 640), dtype=bool)
+    # A grasp object commonly occupies the bottom edge of the left wrist view.
+    # It touches the stack seam but is not a cross-camera SAM3 merge.
+    masks[0, 350:360, 100:120] = True
+    attributed, discarded = attribute_stacked_masks(
+        masks,
+        np.array([[100, 350, 120, 360]], dtype=float),
+        np.array([0.9]),
+        ["object"],
+        split_y=360,
+        seam_guard_px=8,
+    )
+    assert discarded == 0
+    assert len(attributed["left_wrist"]) == 1
+
+
+def test_duplicate_masks_are_suppressed_only_within_one_camera() -> None:
+    mask = np.zeros((20, 20), dtype=bool)
+    mask[3:15, 4:16] = True
+    kept, suppressed = suppress_camera_duplicate_masks(
+        [
+            {"mask": mask, "box": np.array([4, 3, 16, 15]), "score": 0.9, "label": "cup"},
+            {"mask": mask.copy(), "box": np.array([4, 3, 16, 15]), "score": 0.8, "label": "container"},
+        ]
+    )
+    assert len(kept) == 1
+    assert suppressed == 1
+
+
+def test_result_carries_sequence_match_and_geometry_diagnostics() -> None:
+    result = make_result(
+        sequence=11,
+        source_bundle_timestamp_us=123,
+        source_bundle_sequence=7,
+        objects=[],
+        discarded_seam_masks=0,
+        geometry_status={"state_age_rejects": 2, "up_goal_available": True},
+    )
+    assert result["source_bundle_sequence"] == 7
+    assert result["geometry_status"]["state_age_rejects"] == 2
 
 
 def test_wrist_gateway_executes_preserved_thor_belief_methods_directly() -> None:

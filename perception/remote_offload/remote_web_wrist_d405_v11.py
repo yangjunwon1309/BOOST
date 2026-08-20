@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import threading
 import time
 from typing import Any
@@ -92,9 +93,17 @@ class WristV11WebViewer:
         # A viewer may restart while the worker remains running.  A wall-clock
         # revision stays newer than any previously acknowledged command.
         self.next_concept_revision = now_us()
-        self.images: dict[str, np.ndarray] = {}
-        self.objects: list[dict[str, Any]] = []
-        self.belief: dict[str, Any] | None = None
+        self.image_history: collections.OrderedDict[
+            int, dict[str, np.ndarray]
+        ] = collections.OrderedDict()
+        self.result_history: collections.OrderedDict[int, dict[str, Any]] = (
+            collections.OrderedDict()
+        )
+        self.belief_history: collections.OrderedDict[int, dict[str, Any]] = (
+            collections.OrderedDict()
+        )
+        self.rendered_result_sequence: int | None = None
+        self.rendered_belief: dict[str, Any] | None = None
         self.bus.subscribe(WRIST_BUNDLE_CHANNEL, self._on_bundle)
         self.bus.subscribe(WRIST_RESULT_CHANNEL, self._on_result)
         self.bus.subscribe(WRIST_HEARTBEAT_CHANNEL, self._on_heartbeat)
@@ -112,19 +121,21 @@ class WristV11WebViewer:
                 cv2.putText(image, f"{camera_id} {frame['serial']} {frame['width']}x{frame['height']}", (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
                 images[camera_id] = image
             with self.lock:
-                self.images = images
                 self.bundle_timestamp_us = int(bundle["bundle_timestamp_us"])
                 self.bundle_sequence = int(bundle["sequence"])
-                self._render_locked()
+                self._bounded_store(self.image_history, self.bundle_sequence, images)
+                self._render_matching_locked()
         except Exception:
             return
 
     def _on_result(self, _channel: str, data: bytes) -> None:
         try:
             with self.lock:
-                self.objects = list(unpack_result(data).get("objects", []))
-                self.object_count = len(self.objects)
-                self._render_locked()
+                result = unpack_result(data)
+                self._bounded_store(
+                    self.result_history, int(result.get("sequence", -1)), result
+                )
+                self._render_matching_locked()
         except Exception:
             return
 
@@ -143,18 +154,80 @@ class WristV11WebViewer:
     def _on_belief(self, _channel: str, data: bytes) -> None:
         try:
             with self.lock:
-                # Deliberately do not sequence-match: the requested UI shows
-                # the newest Thor belief on the newest available wrist image.
-                self.belief = unpack_belief_telemetry(data)
-                self._render_locked()
+                belief = unpack_belief_telemetry(data)
+                sequence = int(belief.get("result_sequence", -1))
+                if sequence >= 0:
+                    self._bounded_store(self.belief_history, sequence, belief)
+                self._render_matching_locked()
         except Exception:
             return
 
-    def _render_locked(self) -> None:
-        if set(self.images) != set(CAMERA_IDS):
+    @staticmethod
+    def _bounded_store(
+        history: collections.OrderedDict[int, Any], key: int, value: Any
+    ) -> None:
+        if key < 0:
             return
-        images = {camera_id: image.copy() for camera_id, image in self.images.items()}
-        for obj in self.objects:
+        history[key] = value
+        history.move_to_end(key)
+        while len(history) > 60:
+            history.popitem(last=False)
+
+    def _matched_triplet_locked(
+        self,
+    ) -> tuple[dict[str, np.ndarray], dict[str, Any], dict[str, Any]] | None:
+        """Return only an image/result/belief triple from the same result epoch."""
+        for result_sequence in reversed(self.result_history):
+            result = self.result_history[result_sequence]
+            belief = self.belief_history.get(result_sequence)
+            source_sequence = result.get("source_bundle_sequence")
+            try:
+                images = self.image_history.get(int(source_sequence))
+            except (TypeError, ValueError):
+                images = None
+            if belief is not None and images is not None:
+                return images, result, belief
+        return None
+
+    def _encode_locked(self, images: dict[str, np.ndarray]) -> None:
+        stacked = np.vstack([images[camera_id] for camera_id in CAMERA_IDS])
+        split_y = images["left_wrist"].shape[0]
+        cv2.line(
+            stacked,
+            (0, split_y),
+            (stacked.shape[1] - 1, split_y),
+            (0, 0, 255),
+            2,
+        )
+        ok, encoded = cv2.imencode(
+            ".jpg", stacked, [cv2.IMWRITE_JPEG_QUALITY, 85]
+        )
+        if ok:
+            self.jpeg = encoded.tobytes()
+            self.lock.notify_all()
+
+    def _render_matching_locked(self) -> None:
+        matched = self._matched_triplet_locked()
+        if matched is None:
+            # It is useful to keep video live while SAM3/belief catches up, but
+            # never place stale masks or a belief marker onto that newer image.
+            if not self.image_history:
+                return
+            latest_key = next(reversed(self.image_history))
+            latest_images = self.image_history[latest_key]
+            self.rendered_result_sequence = None
+            self.rendered_belief = None
+            self.object_count = None
+            self._encode_locked(
+                {camera_id: image.copy() for camera_id, image in latest_images.items()}
+            )
+            return
+        source_images, result, belief = matched
+        images = {
+            camera_id: image.copy() for camera_id, image in source_images.items()
+        }
+        objects = list(result.get("objects", []))
+        for obj in objects:
             camera_id = obj.get("camera_id")
             if camera_id not in images or obj.get("mask_encoding") != "bitpack-zlib-row-major":
                 continue
@@ -169,23 +242,24 @@ class WristV11WebViewer:
                 cv2.putText(image, f"{obj.get('label', 'object')} {float(obj.get('score', 0.0)):.2f}", (max(0, x0), max(32, y0)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color.tolist(), 1, cv2.LINE_AA)
             except Exception:
                 continue
-        self._draw_latest_belief_locked(images)
-        stacked = np.vstack([images[camera_id] for camera_id in CAMERA_IDS])
-        split_y = images["left_wrist"].shape[0]
-        cv2.line(stacked, (0, split_y), (stacked.shape[1] - 1, split_y), (0, 0, 255), 2)
-        ok, encoded = cv2.imencode(".jpg", stacked, [cv2.IMWRITE_JPEG_QUALITY, 85])
-        if ok:
-            self.jpeg = encoded.tobytes()
-            self.lock.notify_all()
+        self._draw_belief_locked(images, objects, belief)
+        self.rendered_result_sequence = int(result.get("sequence", -1))
+        self.rendered_belief = belief
+        self.object_count = len(objects)
+        self._encode_locked(images)
 
-    def _draw_latest_belief_locked(self, images: dict[str, np.ndarray]) -> None:
-        belief = self.belief or {}
+    def _draw_belief_locked(
+        self,
+        images: dict[str, np.ndarray],
+        objects: list[dict[str, Any]],
+        belief: dict[str, Any],
+    ) -> None:
         hands = belief.get("hands") if isinstance(belief, dict) else None
         if not isinstance(hands, dict):
             return
         for camera_id in CAMERA_IDS:
             camera_objects = [
-                obj for obj in self.objects if obj.get("camera_id") == camera_id
+                obj for obj in objects if obj.get("camera_id") == camera_id
             ]
             camera_hands: dict[str, Any] = {}
             projection: dict[str, Any] | None = None
@@ -246,13 +320,18 @@ class WristV11WebViewer:
     def status(self) -> dict[str, Any]:
         with self.lock:
             age = None if self.bundle_timestamp_us is None else round((time.time_ns() // 1000 - self.bundle_timestamp_us) / 1000.0, 1)
-            hands = (self.belief or {}).get("hands", {}) if isinstance(self.belief, dict) else {}
+            hands = (
+                (self.rendered_belief or {}).get("hands", {})
+                if isinstance(self.rendered_belief, dict)
+                else {}
+            )
             return {
                 "heartbeat": dict(self.heartbeat),
                 "bundle_sequence": self.bundle_sequence,
                 "bundle_age_ms": age,
                 "object_count": self.object_count,
-                "belief_result_sequence": (self.belief or {}).get("result_sequence") if isinstance(self.belief, dict) else None,
+                "belief_result_sequence": self.rendered_result_sequence,
+                "overlay_sequence_matched": self.rendered_result_sequence is not None,
                 "belief_targets": {
                     side: (hands.get(side) or {}).get("target")
                     for side in ("left", "right")

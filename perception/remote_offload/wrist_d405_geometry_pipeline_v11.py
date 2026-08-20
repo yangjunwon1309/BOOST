@@ -45,6 +45,11 @@ def load_wrist_extrinsics(path: Path) -> dict[str, np.ndarray]:
             raise ValueError(f"extrinsics missing finite T_{camera_id}_camera")
         if not np.allclose(matrix[3], [0.0, 0.0, 0.0, 1.0], atol=1.0e-8):
             raise ValueError(f"T_{camera_id}_camera has invalid homogeneous row")
+        rotation = matrix[:3, :3]
+        if not np.allclose(rotation @ rotation.T, np.eye(3), atol=1.0e-6):
+            raise ValueError(f"T_{camera_id}_camera rotation is not orthonormal")
+        if abs(float(np.linalg.det(rotation)) - 1.0) > 1.0e-6:
+            raise ValueError(f"T_{camera_id}_camera is not a proper rotation")
         transforms[camera_id] = matrix
     return transforms
 
@@ -58,41 +63,17 @@ def t_goal_camera(camera_id: str, state: RobotState, wrist_extrinsics: dict[str,
     return wrist @ wrist_extrinsics[camera_id]
 
 
-def deproject_mask(*, mask: np.ndarray, depth_z16: np.ndarray, depth_scale_m: float,
-                   intrinsics: dict[str, float | int], min_depth_m: float, max_depth_m: float,
-                   min_depth_points: int) -> tuple[np.ndarray | None, dict[str, Any]]:
-    mask = np.asarray(mask, dtype=bool)
-    depth = np.asarray(depth_z16, dtype=np.uint16)
-    height, width = mask.shape
-    if depth.shape != (height, width):
-        raise ValueError("D405 mask/depth grids differ; refusing geometry")
-    if (int(intrinsics["width"]), int(intrinsics["height"])) != (width, height):
-        raise ValueError("D405 intrinsics/grid differ; refusing geometry")
-    z = depth.astype(np.float32) * float(depth_scale_m)
-    valid = mask & np.isfinite(z) & (z >= float(min_depth_m)) & (z <= float(max_depth_m))
-    rows, cols = np.nonzero(valid)
-    if len(rows) < int(min_depth_points):
-        return None, {"valid": False, "reason": "too_few_depth_points", "count": int(len(rows))}
-    values = z[rows, cols]
-    fx, fy = float(intrinsics["fx"]), float(intrinsics["fy"])
-    ppx, ppy = float(intrinsics["ppx"]), float(intrinsics["ppy"])
-    points = np.column_stack(((cols - ppx) * values / fx, (rows - ppy) * values / fy, values))
-    # Reject the outer 10% of depth samples before the robust centre. This is a
-    # bounded near-contact outlier gate, not a cross-camera fusion operation.
-    lo, hi = np.quantile(values, [0.05, 0.95])
-    points = points[(values >= lo) & (values <= hi)]
-    if len(points) < int(min_depth_points):
-        return None, {"valid": False, "reason": "too_few_filtered_points", "count": int(len(points))}
-    return points.astype(np.float64), {"valid": True, "count": int(len(points)), "depth_lo_m": float(lo), "depth_hi_m": float(hi)}
-
-
 def object_geometry(*, camera_id: str, serial: str, mask: np.ndarray, box_xyxy: list[float],
                     label: str, score: float, depth_z16: np.ndarray, depth_scale_m: float,
                     intrinsics: dict[str, float | int], source_timestamp_us: int,
                     calibration_id: str, state: RobotState | None, state_age_ms: float | None,
                     wrist_extrinsics: dict[str, np.ndarray], min_depth_m: float,
                     max_depth_m: float, min_depth_points: int,
-                    point_filter: ObjectPointFilterConfig | None = None) -> dict[str, Any]:
+                    point_filter: ObjectPointFilterConfig | None = None,
+                    depth_edge_mask: np.ndarray | None = None,
+                    t_goal_cam: np.ndarray | None = None,
+                    gravity_up_goal: np.ndarray | None = None,
+                    max_points: int = 8000) -> dict[str, Any]:
     """Create geometry from the directly aligned D405 left-imager RGB-D grid.
 
     This deliberately uses the legacy robust object-cloud extractor: mask
@@ -107,6 +88,7 @@ def object_geometry(*, camera_id: str, serial: str, mask: np.ndarray, box_xyxy: 
         cx=float(intrinsics["ppx"]), cy=float(intrinsics["ppy"]),
     )
     depth_m = np.asarray(depth_z16, dtype=np.float32) * float(depth_scale_m)
+    filter_config = point_filter or ObjectPointFilterConfig()
     diagnostics: dict[str, Any] = {}
     cloud = None
     try:
@@ -114,42 +96,67 @@ def object_geometry(*, camera_id: str, serial: str, mask: np.ndarray, box_xyxy: 
             depth_m,
             np.asarray(mask, dtype=bool),
             pinhole,
-            point_filter or ObjectPointFilterConfig(),
+            filter_config,
             min_depth_m=float(min_depth_m), max_depth_m=float(max_depth_m),
-            min_valid_points=int(min_depth_points), max_points=8000,
+            min_valid_points=int(min_depth_points), max_points=int(max_points),
             diagnostics=diagnostics,
-            depth_edge_mask=compute_depth_edge_mask(
-                depth_m, min_depth_m=float(min_depth_m), max_depth_m=float(max_depth_m),
-                threshold_m=(point_filter or ObjectPointFilterConfig()).depth_edge_threshold_m,
+            depth_edge_mask=(
+                compute_depth_edge_mask(
+                    depth_m,
+                    min_depth_m=float(min_depth_m),
+                    max_depth_m=float(max_depth_m),
+                    threshold_m=filter_config.depth_edge_threshold_m,
+                )
+                if depth_edge_mask is None
+                else depth_edge_mask
             ),
         )
     except (TypeError, ValueError) as error:
         diagnostics = {"valid": False, "reason": f"{type(error).__name__}: {error}"}
+    if cloud is None:
+        # A None return without a populated diagnostic must never look valid in
+        # the worker log, which uses ``reason`` as its success discriminator.
+        diagnostics.setdefault("valid", False)
+        diagnostics.setdefault("reason", "extractor_returned_none")
     result: dict[str, Any] = {
         "camera_id": camera_id, "serial": serial, "label": str(label), "score": float(score),
         "box_xyxy": [float(v) for v in box_xyxy], "source_timestamp_us": int(source_timestamp_us),
         "calibration_id": str(calibration_id), "state_age_ms": state_age_ms,
         "intrinsics": {key: float(value) if key not in {"width", "height"} else int(value) for key, value in intrinsics.items()},
         "mask_height": int(mask.shape[0]), "mask_width": int(mask.shape[1]),
-        "valid_depth_points": 0, "geometry": diagnostics,
+        "valid_depth_points": 0, "geometry": dict(diagnostics),
         "center_camera_m": None, "center_goal_m": None, "t_goal_cam": None,
+        "center_pixel_uv": None,
         "gravity_up_goal": None, "contact_candidates": [], "surface_primitives": [],
-        "surface_model": None, "point_filter": diagnostics,
+        "surface_model": None, "point_filter": dict(diagnostics),
     }
     if cloud is None or state is None:
         if state is None:
-            result["geometry"] = {"valid": False, "reason": "robot_state_unavailable"}
+            unavailable = {"valid": False, "reason": "robot_state_unavailable"}
+            result["geometry"] = dict(unavailable)
+            result["point_filter"] = dict(unavailable)
         return result
-    transform = t_goal_camera(camera_id, state, wrist_extrinsics)
+    transform = (
+        np.asarray(t_goal_cam, dtype=np.float64).reshape(4, 4)
+        if t_goal_cam is not None
+        else t_goal_camera(camera_id, state, wrist_extrinsics)
+    )
     points_goal = transform_points(cloud.points_camera_m, transform)
     result.update(
         valid_depth_points=int(cloud.valid_depth_points),
-        center_camera_m=cloud.center_camera_m.tolist(), center_goal_m=np.median(points_goal, axis=0).tolist(),
+        center_camera_m=cloud.center_camera_m.tolist(),
+        center_goal_m=transform_points(cloud.center_camera_m, transform).tolist(),
+        center_pixel_uv=list(cloud.center_pixel_uv),
         t_goal_cam=transform.reshape(-1).astype(float).tolist(),
+        geometry={"valid": True, **cloud.stats},
         point_filter={"valid": True, **cloud.stats},
         _points_goal_m=points_goal,
     )
-    up_goal = gravity_up_in_pelvis(state.base_quat_wxyz)
+    up_goal = (
+        gravity_up_in_pelvis(state.base_quat_wxyz)
+        if gravity_up_goal is None
+        else gravity_up_goal
+    )
     if up_goal is not None:
         result["gravity_up_goal"] = np.asarray(up_goal, dtype=float).reshape(3).tolist()
     return result
@@ -164,6 +171,7 @@ def attach_surface_geometry(
     surface_tracker: PersistentCylinderSurfaceTracker,
     contact_config: GripCandidateConfig,
     pseudo_config: PseudoContactConfig,
+    up_goal: np.ndarray | None = None,
 ) -> bool:
     """Attach legacy cylinder/RANSAC geometry and remove non-wire point data."""
     points_goal = result.pop("_points_goal_m", None)
@@ -173,7 +181,11 @@ def attach_surface_geometry(
     if points.size == 0 or not np.isfinite(points).all():
         return False
     fitted_candidates = surface_tracker.update(track_id, str(label), points)
-    candidates = fitted_candidates or generate_grip_candidates(points, contact_config)
+    candidates = fitted_candidates or generate_grip_candidates(
+        points,
+        contact_config,
+        up_goal=up_goal,
+    )
     result["contact_candidates"] = [candidate.to_dict() for candidate in candidates]
     if candidates:
         result["target_contact_goal_m"] = candidates[0].center.tolist()

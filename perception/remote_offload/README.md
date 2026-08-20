@@ -15,7 +15,13 @@ export D405_VIDEO_DEVICES=/dev/video0,/dev/video1,/dev/video2,/dev/video3,/dev/v
 export D405_USB_DEVICES=/dev/bus/usb/001/038,/dev/bus/usb/001/039
 ./tools/run_thor_wrist_d405_gateway_v11.sh --preflight
 ./tools/run_thor_wrist_d405_gateway_v11.sh \
-  --g1-lcm-url "$G1_LCM_URL" --wifi-lcm-url "$WIFI_LCM_URL"
+  --g1-lcm-url "$G1_LCM_URL" --wifi-lcm-url "$WIFI_LCM_URL" \
+  --belief-inference --belief-input-source operator_command \
+  --belief-command-max-delta-ms 25 \
+  --belief-command-divergence-max-m 0.20 \
+  --ee-target-publishing \
+  --ee-target-endpoint tcp://127.0.0.1:5564 \
+  --ee-target-topic path_static_ee_target
 
 # On the remote SAM3 host.
 ./tools/run_remote_sam3_wrist_d405_v11.sh --wifi-lcm-url "$WIFI_LCM_URL" \
@@ -34,6 +40,16 @@ does not require image/result sequence matching. The gateway requires both
 configured cameras by default and will not kill a conflicting V4L2 owner such
 as `teleimager-serv`.
 
+The selected belief target is published through the same legacy ZMQ contract
+used by the head pipeline: `tcp://127.0.0.1:5564/path_static_ee_target`. The
+unchanged PATH state-machine bridge applies `SecondOrderPositionReference` to
+the selected position and the confidence-weighted `OrientationTargetGate`,
+`OrientationAuthority`, and `SecondOrderOrientationReference` path to the
+orientation. It then passes both absolute wrist transforms to the common
+CasADi/IPOPT bimanual solver. A/B remains the dead-man selection for left/right;
+without an active selection, belief telemetry is still visible but no control
+target is emitted.
+
 Before first capture, run `python3 tools/query_d405_intrinsics.py --ssh
 url@thor --json --raw`, confirm left/right physical mounting with a covered
 lens, and validate the CAD-only wrist extrinsics with a hand-eye procedure.
@@ -41,3 +57,10 @@ lens, and validate the CAD-only wrist extrinsics with a hand-eye procedure.
 The checked-in configuration is the USB-2 reduced mode: native left-imager
 UYVY + Z16 at 480×270@15 and an 8 Hz latest-frame dispatch. Restore
 640×360@30 only after both cameras negotiate USB 3.x/SuperSpeed.
+
+The worker rejects an entire bundle when its paired Thor robot-state receipt is
+older than 15 ms, reports this in `geometry_status.state_age_rejects`, and
+publishes `source_bundle_sequence` with every result. The viewer retains a
+bounded image/result/belief history and draws masks and belief targets only
+when all three refer to that same result epoch. Its live raw image therefore
+continues during SAM3 latency, but it deliberately has no stale overlay.

@@ -15,6 +15,10 @@ import numpy as np
 
 from .wrist_d405_capture_v11 import WristD405Capture, discover_d405_serials, load_camera_specs
 from .wrist_belief_gateway_v11 import WristBeliefGateway
+from .thor_gateway_head_d435i_legacy import (
+    DEFAULT_EE_TARGET_ENDPOINT,
+    DEFAULT_EE_TARGET_TOPIC,
+)
 from .wrist_d405_protocol_v11 import (
     CAMERA_IDS,
     WRIST_BUNDLE_CHANNEL,
@@ -94,7 +98,13 @@ class ThorWristD405Gateway:
                  robot_state_channel: str, belief_inference: bool, belief_config: Path,
                  belief_input_source: str, belief_command_max_delta_ms: float,
                  belief_command_divergence_max_m: float,
-                 shared_hand_selection_endpoint: str, shared_hand_selection_topic: str) -> None:
+                 shared_hand_selection_endpoint: str, shared_hand_selection_topic: str,
+                 ee_target_enabled: bool, ee_target_endpoint: str,
+                 ee_target_topic: str, ee_target_link: str,
+                 ee_target_label: str, ee_target_min_score: float,
+                 ee_target_position_field: str, ee_target_duration_sec: float,
+                 ee_target_final_hold_sec: float,
+                 ee_target_quaternion_wxyz: tuple[float, float, float, float]) -> None:
         self.g1_bus = lcm.LCM(g1_lcm_url)
         self.wifi_bus = lcm.LCM(wifi_lcm_url)
         self.config = config
@@ -103,9 +113,14 @@ class ThorWristD405Gateway:
         self.robot_state_channel = str(robot_state_channel)
         self.sequence = 0
         self.last_publish_log_monotonic = 0.0
+        self.last_skip_log_monotonic = 0.0
+        self.stats: dict[str, Any] = {"skipped_frames": 0, "last_skip": None}
         self.capture: WristD405Capture | None = None
         self.belief: WristBeliefGateway | None = None
         self.latest_robot_state_packet: tuple[int, bytes] | None = None
+        self.last_robot_state_received_us: int | None = None
+        self.robot_state_arrival_interval_us: int | None = None
+        self.robot_state_max_arrival_interval_us = 0
         capture_config = _load_yaml(config).get("capture", {})
         self.max_inter_wrist_skew_us = int(float(capture_config.get("max_inter_wrist_skew_ms", 80.0)) * 1000.0)
         self.wifi_bus.subscribe(WRIST_RESULT_CHANNEL, self._on_result)
@@ -123,6 +138,16 @@ class ThorWristD405Gateway:
                 belief_use_operator_command=(belief_input_source == "operator_command"),
                 belief_command_max_delta_ms=belief_command_max_delta_ms,
                 belief_command_divergence_max_m=belief_command_divergence_max_m,
+                ee_target_enabled=ee_target_enabled,
+                ee_target_endpoint=ee_target_endpoint,
+                ee_target_topic=ee_target_topic,
+                ee_target_link=ee_target_link,
+                ee_target_label=ee_target_label,
+                ee_target_min_score=ee_target_min_score,
+                ee_target_position_field=ee_target_position_field,
+                ee_target_duration_sec=ee_target_duration_sec,
+                ee_target_final_hold_sec=ee_target_final_hold_sec,
+                ee_target_quaternion_wxyz=ee_target_quaternion_wxyz,
             )
 
     def _on_robot_state(self, _channel: str, data: bytes) -> None:
@@ -130,7 +155,17 @@ class ThorWristD405Gateway:
         # forwarded unchanged for remote timestamp matching; no head image,
         # depth, or head calibration channel is subscribed.
         self.wifi_bus.publish(WRIST_ROBOT_STATE_CHANNEL, data)
-        self.latest_robot_state_packet = (now_us(), bytes(data))
+        received_us = now_us()
+        if self.last_robot_state_received_us is not None:
+            self.robot_state_arrival_interval_us = max(
+                0, received_us - self.last_robot_state_received_us
+            )
+            self.robot_state_max_arrival_interval_us = max(
+                self.robot_state_max_arrival_interval_us,
+                self.robot_state_arrival_interval_us,
+            )
+        self.last_robot_state_received_us = received_us
+        self.latest_robot_state_packet = (received_us, bytes(data))
         if self.belief is not None:
             self.belief.update_robot_state(data)
 
@@ -195,10 +230,12 @@ class ThorWristD405Gateway:
             objects = [obj for obj in result.get("objects", []) if isinstance(obj, dict)]
             valid_centers = sum(obj.get("center_goal_m") is not None for obj in objects)
             primitives = sum(bool(obj.get("surface_primitives")) for obj in objects)
+            geometry_status = dict(result.get("geometry_status") or {})
             LOG.info(
-                "v11 result sequence=%s objects=%s center_goal=%s primitives=%s seam_discarded=%s",
+                "v11 result sequence=%s objects=%s center_goal=%s primitives=%s "
+                "seam_discarded=%s geometry_status=%s",
                 result.get("sequence"), len(objects), valid_centers, primitives,
-                result.get("discarded_seam_masks"),
+                result.get("discarded_seam_masks"), geometry_status,
             )
             if self.belief is not None:
                 self.belief.update_result(result)
@@ -213,9 +250,10 @@ class ThorWristD405Gateway:
                 f"no robot state received on {self.robot_state_channel}; "
                 "refusing RGB-D without the FK snapshot required for belief geometry"
             )
+        captured = self.capture.wait_for_bundles()
         frames: dict[str, dict[str, Any]] = {}
         for camera_id in CAMERA_IDS:
-            bundle = self.capture.wait_for_bundle(camera_id)
+            bundle = captured[camera_id]
             import cv2
             ok, encoded = cv2.imencode(".jpg", bundle.color_bgr, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
             if not ok:
@@ -234,7 +272,12 @@ class ThorWristD405Gateway:
                 "calibration_id": "d405_factory_2026-08-20",
                 "diagnostics": {"rgb_depth_delta_ms": abs(bundle.color_timestamp_ms - bundle.depth_timestamp_ms)},
             }
-        skew = abs(frames["left_wrist"]["host_timestamp_us"] - frames["right_wrist"]["host_timestamp_us"])
+        # Use the capture timestamps, not sequential JPEG/packet construction,
+        # to measure actual inter-camera timing after concurrent waits.
+        skew = abs(
+            int(captured["left_wrist"].host_timestamp_us)
+            - int(captured["right_wrist"].host_timestamp_us)
+        )
         if skew > self.max_inter_wrist_skew_us:
             raise RuntimeError(
                 f"inter-wrist capture skew {skew / 1000.0:.1f} ms exceeds "
@@ -250,14 +293,40 @@ class ThorWristD405Gateway:
             "inter_wrist_skew_us": skew,
             "robot_state_packet": state_packet,
             "robot_state_host_received_us": int(state_received_us),
+            "robot_state_arrival_interval_us": self.robot_state_arrival_interval_us,
+            "robot_state_max_arrival_interval_us": self.robot_state_max_arrival_interval_us,
             "cameras": frames,
         }
         encoded = pack_bundle(payload)
         self.wifi_bus.publish(WRIST_BUNDLE_CHANNEL, encoded)
         if time.monotonic() - self.last_publish_log_monotonic >= 5.0:
+            belief_status = {}
+            if self.belief is not None:
+                with self.belief.lock:
+                    belief_status = {
+                        "selected_hand": self.belief.belief_selected_hand,
+                        "selection_active": self.belief.belief_selection_active,
+                        "belief_targets": int(self.belief.stats.get("belief_targets", 0)),
+                        "ee_targets_published": int(
+                            self.belief.stats.get("ee_targets_published", 0)
+                        ),
+                    }
             LOG.info(
-                "Wrist bundle published sequence=%d bytes=%d skew_ms=%.2f channel=%s",
-                self.sequence, len(encoded), skew / 1000.0, WRIST_BUNDLE_CHANNEL,
+                "Wrist bundle published sequence=%d bytes=%d skew_ms=%.2f "
+                "channel=%s control=%s capture=%s",
+                self.sequence, len(encoded), skew / 1000.0,
+                WRIST_BUNDLE_CHANNEL, belief_status,
+                {
+                    "skipped_frames": self.stats["skipped_frames"],
+                    "state_arrival_interval_ms": (
+                        None
+                        if self.robot_state_arrival_interval_us is None
+                        else round(self.robot_state_arrival_interval_us / 1000.0, 2)
+                    ),
+                    "state_max_arrival_interval_ms": round(
+                        self.robot_state_max_arrival_interval_us / 1000.0, 2
+                    ),
+                },
             )
             self.last_publish_log_monotonic = time.monotonic()
 
@@ -266,8 +335,9 @@ class ThorWristD405Gateway:
         self.start()
         try:
             assert self.capture is not None
-            for camera_id in CAMERA_IDS:
-                bundle = self.capture.wait_for_bundle(camera_id, timeout_ms=5000)
+            for camera_id, bundle in self.capture.wait_for_bundles(
+                timeout_ms=5000
+            ).items():
                 LOG.info(
                     "CAPTURE_OK camera=%s serial=%s grid=%dx%d rgb_ts_ms=%.3f "
                     "depth_ts_ms=%.3f delta_ms=%.3f depth_scale_m=%g",
@@ -289,7 +359,16 @@ class ThorWristD405Gateway:
                 # matching budget before the remote worker even receives it.
                 while self.g1_bus.handle_timeout(0) > 0:
                     pass
-                self.publish_once()
+                try:
+                    self.publish_once()
+                except RuntimeError as error:
+                    self.stats["skipped_frames"] = int(
+                        self.stats.get("skipped_frames", 0)
+                    ) + 1
+                    self.stats["last_skip"] = str(error)
+                    if time.monotonic() - self.last_skip_log_monotonic >= 5.0:
+                        LOG.warning("frame skipped: %s", error)
+                        self.last_skip_log_monotonic = time.monotonic()
                 while self.wifi_bus.handle_timeout(0) > 0:
                     pass
                 time.sleep(max(0.0, period - (time.monotonic() - started)))
@@ -329,9 +408,74 @@ def main() -> None:
                         default=os.environ.get("PATH_SHARED_HAND_SELECTION_ENDPOINT", "tcp://127.0.0.1:5567"))
     parser.add_argument("--shared-hand-selection-topic",
                         default=os.environ.get("PATH_SHARED_HAND_SELECTION_TOPIC", "path_shared_control_hand"))
+    parser.add_argument(
+        "--ee-target-publishing",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("PATH_REMOTE_EE_TARGET_ENABLED", "1").lower()
+        not in {"0", "false", "no", "off"},
+        help=(
+            "publish selected wrist belief targets to the existing PATH "
+            "state-machine/IPOPT input (default: enabled)"
+        ),
+    )
+    parser.add_argument(
+        "--ee-target-endpoint",
+        default=DEFAULT_EE_TARGET_ENDPOINT,
+        help="existing PATH state-machine static-target endpoint",
+    )
+    parser.add_argument(
+        "--ee-target-topic",
+        default=DEFAULT_EE_TARGET_TOPIC,
+        help="existing PATH state-machine static-target topic",
+    )
+    parser.add_argument(
+        "--ee-target-link",
+        default=os.environ.get("PATH_EE_TARGET_LINK", "left_wrist_yaw_link"),
+        help="fallback link before A/B selects left/right",
+    )
+    parser.add_argument(
+        "--ee-target-label",
+        default=os.environ.get("PATH_EE_TARGET_LABEL", ""),
+    )
+    parser.add_argument(
+        "--ee-target-min-score",
+        type=float,
+        default=float(os.environ.get("PATH_EE_TARGET_MIN_SCORE", "0.0")),
+    )
+    parser.add_argument(
+        "--ee-target-position-field",
+        choices=("auto", "contact", "center"),
+        default=os.environ.get("PATH_EE_TARGET_POSITION_FIELD", "auto"),
+    )
+    parser.add_argument(
+        "--ee-target-duration-sec",
+        type=float,
+        default=float(os.environ.get("PATH_EE_TARGET_DURATION_SEC", "2.0")),
+    )
+    parser.add_argument(
+        "--ee-target-final-hold-sec",
+        type=float,
+        default=float(os.environ.get("PATH_EE_TARGET_FINAL_HOLD_SEC", "1.0")),
+    )
+    parser.add_argument(
+        "--ee-target-quaternion-wxyz",
+        type=float,
+        nargs=4,
+        metavar=("W", "X", "Y", "Z"),
+        default=tuple(
+            float(value)
+            for value in os.environ.get(
+                "PATH_EE_TARGET_QUATERNION_WXYZ", "1.0 0.0 0.0 0.0"
+            ).split()
+        ),
+    )
     parser.add_argument("--one-camera-diagnostic", action="store_true", help="reserved explicit diagnostic mode; normal v11 requires both cameras")
+    parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(
+        level=getattr(logging, str(args.log_level).upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     gateway = ThorWristD405Gateway(
         g1_lcm_url=args.g1_lcm_url, wifi_lcm_url=args.wifi_lcm_url,
         config=args.config, jpeg_quality=args.jpeg_quality,
@@ -343,6 +487,16 @@ def main() -> None:
         belief_command_divergence_max_m=args.belief_command_divergence_max_m,
         shared_hand_selection_endpoint=args.shared_hand_selection_endpoint,
         shared_hand_selection_topic=args.shared_hand_selection_topic,
+        ee_target_enabled=args.ee_target_publishing,
+        ee_target_endpoint=args.ee_target_endpoint,
+        ee_target_topic=args.ee_target_topic,
+        ee_target_link=args.ee_target_link,
+        ee_target_label=args.ee_target_label,
+        ee_target_min_score=args.ee_target_min_score,
+        ee_target_position_field=args.ee_target_position_field,
+        ee_target_duration_sec=args.ee_target_duration_sec,
+        ee_target_final_hold_sec=args.ee_target_final_hold_sec,
+        ee_target_quaternion_wxyz=tuple(args.ee_target_quaternion_wxyz),
     )
     if args.diagnose:
         diagnose_runtime(_import_realsense())

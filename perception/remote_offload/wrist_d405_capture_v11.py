@@ -8,6 +8,7 @@ the direct left-imager basis, not the D405 RGB+ISP endpoint.
 from __future__ import annotations
 
 import dataclasses
+import concurrent.futures
 import time
 from pathlib import Path
 from typing import Any
@@ -126,6 +127,7 @@ class WristD405Capture:
         self.pipelines: dict[str, Any] = {}
         self.depth_scales: dict[str, float] = {}
         self.max_rgb_depth_delta_ms = float(max_rgb_depth_delta_ms)
+        self._bundle_executor: concurrent.futures.ThreadPoolExecutor | None = None
 
     def start(self) -> None:
         visible = discover_d405_serials(self.rs)
@@ -157,8 +159,15 @@ class WristD405Capture:
             profile = pipeline.start(config)
             self.pipelines[side] = pipeline
             self.depth_scales[side] = float(profile.get_device().first_depth_sensor().get_depth_scale())
+        self._bundle_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(self.pipelines),
+            thread_name_prefix="d405-rgbd",
+        )
 
     def stop(self) -> None:
+        if self._bundle_executor is not None:
+            self._bundle_executor.shutdown(wait=True, cancel_futures=True)
+            self._bundle_executor = None
         for pipeline in self.pipelines.values():
             try:
                 pipeline.stop()
@@ -217,3 +226,24 @@ class WristD405Capture:
             },
             depth_scale_m=self.depth_scales[side],
         )
+
+    def wait_for_bundles(self, timeout_ms: int = 2000) -> dict[str, FrameBundle]:
+        """Wait for both independent D405 pipelines concurrently.
+
+        Sequential waits impose a frame-period skew even when both cameras are
+        healthy. Each RealSense pipeline is independent, so request the newest
+        native RGB-D pair in parallel and let the gateway enforce the remaining
+        measured skew budget.
+        """
+        if self._bundle_executor is None:
+            raise RuntimeError("capture has not started")
+        futures = {
+            side: self._bundle_executor.submit(self.wait_for_bundle, side, timeout_ms)
+            for side in self.specs
+        }
+        try:
+            return {side: future.result() for side, future in futures.items()}
+        except Exception:
+            for future in futures.values():
+                future.cancel()
+            raise

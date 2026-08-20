@@ -81,7 +81,13 @@ geometry:
   max_depth_m: 0.50
   min_depth_points: 100
   robot_state_max_delta_ms: 15
-  seam_guard_px: 8
+  # A seam touch is valid. Reject only a mask with substantial area in both
+  # independently mounted wrist cameras.
+  seam_guard_px: 0  # deprecated launcher compatibility only
+  seam_minority_ratio: 0.05
+  track_association_radius_m: 0.06
+  geometry_fallback_ttl_frames: 3
+  geometry_fallback_score_decay: 0.97
   allow_cross_wrist_candidate_merge: false
 
 orientation:

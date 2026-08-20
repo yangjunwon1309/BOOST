@@ -2261,9 +2261,16 @@ class ParallelTascBelief:
         shared: SharedGeometry,
         inputs: dict[str, HandInput],
         *,
+        geometry_by_hand: dict[str, SharedGeometry] | None = None,
         now_monotonic: float | None = None,
     ) -> dict[str, dict]:
-        """Update both hand posteriors every tick; buttons only gate authority."""
+        """Update both hand posteriors every tick; buttons only gate authority.
+
+        ``geometry_by_hand`` is an optional ownership partition.  It keeps the
+        legacy single shared geometry behaviour by default, while allowing a
+        multi-camera gateway to give each independent hand tracker only the
+        candidates originating from its own camera.
+        """
         now = time.monotonic() if now_monotonic is None else float(now_monotonic)
         dt = 0.0 if self.last_update_monotonic is None else float(np.clip(now - self.last_update_monotonic, 0.0, 0.2))
         self.last_update_monotonic = now
@@ -2272,6 +2279,11 @@ class ParallelTascBelief:
             hand = inputs.get(side)
             if hand is None:
                 continue
+            side_geometry = (
+                geometry_by_hand.get(side, shared)
+                if geometry_by_hand is not None
+                else shared
+            )
             state = self.states[side]
             state.armed = bool(hand.button_pressed)
             beta_target = self.config.beta_armed if state.armed else self.config.beta_idle
@@ -2284,8 +2296,8 @@ class ParallelTascBelief:
                 # No orientation target can be synthesized from an axis alone.
                 hand_rotation = None
             contact_frames: dict[str, ContactFrame] = {}
-            for obj in shared.objects:
-                primitives = shared.surface_primitives.get(obj.object_id, [])
+            for obj in side_geometry.objects:
+                primitives = side_geometry.surface_primitives.get(obj.object_id, [])
                 if not primitives:
                     continue
                 primitive = primitives[0]
@@ -2308,7 +2320,7 @@ class ParallelTascBelief:
                     continue
                 contact_frames[obj.object_id] = frame
             orientation_candidates: list[OrientationCandidate] = []
-            for candidate in shared.orientation_candidates:
+            for candidate in side_geometry.orientation_candidates:
                 if candidate.role == "HELD" and self.config.role_hard_filter:
                     continue
                 active_frame = contact_frames.get(candidate.object_id)
@@ -2330,19 +2342,19 @@ class ParallelTascBelief:
                 else:
                     orientation_candidates.append(candidate)
             telemetry = tracker.update(
-                shared.objects,
+                side_geometry.objects,
                 eef_position_m=hand.eef_position,
                 shoulder_position_m=hand.shoulder_position,
                 user_translation_mps=hand.user_translation,
-                ray_origin_m=shared.ray_origin,
-                ray_direction=shared.ray_direction,
+                ray_origin_m=side_geometry.ray_origin,
+                ray_direction=side_geometry.ray_direction,
                 hand_rotation_matrix=hand_rotation,
                 hand_angular_velocity=hand.angular_velocity,
                 hand_approach_axis=hand.approach_axis,
                 contact_frames=contact_frames,
-                up_goal=shared.up_goal,
+                up_goal=side_geometry.up_goal,
                 orientation_candidates=orientation_candidates,
-                surface_status=shared.surface_status,
+                surface_status=side_geometry.surface_status,
                 beta_override=state.beta_current,
                 lambda0_override=state.lambda0_current,
                 now_monotonic=now,
@@ -2395,7 +2407,7 @@ class ParallelTascBelief:
                 }
             )
             update_diagnostics.setdefault("grip_update_applied", False)
-            telemetry["orientation_bank"] = shared.orientation_bank_status
+            telemetry["orientation_bank"] = side_geometry.orientation_bank_status
             output[side] = telemetry
         if self.config.dual_hand_exclusive and len(output) == 2:
             left, right = output.get("left"), output.get("right")

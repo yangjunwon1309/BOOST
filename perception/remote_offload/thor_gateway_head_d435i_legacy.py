@@ -1339,6 +1339,23 @@ class ThorRemoteGateway:
                 self.stats["last_belief_state_error"] = str(error)
             return None, None, None, None
 
+    def _belief_update_hands(
+        self,
+        shared_geometry: Any,
+        hand_inputs: dict[str, HandInput],
+        payload: dict[str, Any],
+    ) -> dict[str, dict]:
+        """Update belief with the legacy, globally shared geometry.
+
+        Camera-specific gateways may override this narrow hook to partition
+        geometry without duplicating the established head-camera belief,
+        selection, logging, or target-publication pipeline.
+        """
+        del payload
+        return self.parallel_tasc_belief.update_hands(
+            shared_geometry, hand_inputs
+        )
+
     def _belief_selection_from_result(
         self,
         payload: dict[str, Any],
@@ -1476,7 +1493,9 @@ class ThorRemoteGateway:
                 base_quat_wxyz=base_quat_wxyz,
                 stamp_us=int(payload.get("source_rgb_timestamp_us", 0) or 0),
             )
-        per_hand = self.parallel_tasc_belief.update_hands(shared_geometry, hand_inputs)
+        per_hand = self._belief_update_hands(
+            shared_geometry, hand_inputs, payload
+        )
         for side, hand_telemetry in per_hand.items():
             hand_input = hand_inputs.get(side)
             if hand_input is None or not isinstance(hand_telemetry, dict):

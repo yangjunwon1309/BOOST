@@ -63,6 +63,39 @@ def t_goal_camera(camera_id: str, state: RobotState, wrist_extrinsics: dict[str,
     return wrist @ wrist_extrinsics[camera_id]
 
 
+def camera_transform_diagnostics(
+    camera_id: str,
+    state: RobotState,
+    wrist_extrinsics: dict[str, np.ndarray],
+) -> dict[str, Any]:
+    """Expose the exact D405-optical -> wrist -> pelvis transform chain.
+
+    D405 points are always RealSense optical coordinates: +X right, +Y down,
+    +Z forward.  Publishing the three resulting pelvis-frame basis vectors
+    makes an axis/sign issue observable in a captured result instead of
+    silently folding it into a belief or IPOPT target.
+    """
+    wrist_link = CAMERA_TO_WRIST_LINK[camera_id]
+    goal_wrist = g1_link_transforms(np.asarray(state.q, dtype=np.float64))[wrist_link]
+    wrist_camera = wrist_extrinsics[camera_id]
+    goal_camera = goal_wrist @ wrist_camera
+    return {
+        "convention": (
+            "p_goal=T_goal_wrist@T_wrist_camera@p_d405_optical; "
+            "D405 optical axes: +x right, +y down, +z forward"
+        ),
+        "wrist_link": wrist_link,
+        "t_goal_wrist": goal_wrist.reshape(-1).astype(float).tolist(),
+        "t_wrist_camera": wrist_camera.reshape(-1).astype(float).tolist(),
+        "t_goal_camera": goal_camera.reshape(-1).astype(float).tolist(),
+        "camera_basis_goal": {
+            "x_right": goal_camera[:3, 0].astype(float).tolist(),
+            "y_down": goal_camera[:3, 1].astype(float).tolist(),
+            "z_forward": goal_camera[:3, 2].astype(float).tolist(),
+        },
+    }
+
+
 def object_geometry(*, camera_id: str, serial: str, mask: np.ndarray, box_xyxy: list[float],
                     label: str, score: float, depth_z16: np.ndarray, depth_scale_m: float,
                     intrinsics: dict[str, float | int], source_timestamp_us: int,
@@ -126,6 +159,7 @@ def object_geometry(*, camera_id: str, serial: str, mask: np.ndarray, box_xyxy: 
         "mask_height": int(mask.shape[0]), "mask_width": int(mask.shape[1]),
         "valid_depth_points": 0, "geometry": dict(diagnostics),
         "center_camera_m": None, "center_goal_m": None, "t_goal_cam": None,
+        "transform_diagnostics": None,
         "center_pixel_uv": None,
         "gravity_up_goal": None, "contact_candidates": [], "surface_primitives": [],
         "surface_model": None, "point_filter": dict(diagnostics),
@@ -141,6 +175,9 @@ def object_geometry(*, camera_id: str, serial: str, mask: np.ndarray, box_xyxy: 
         if t_goal_cam is not None
         else t_goal_camera(camera_id, state, wrist_extrinsics)
     )
+    transform_diagnostics = camera_transform_diagnostics(
+        camera_id, state, wrist_extrinsics
+    )
     points_goal = transform_points(cloud.points_camera_m, transform)
     result.update(
         valid_depth_points=int(cloud.valid_depth_points),
@@ -148,6 +185,7 @@ def object_geometry(*, camera_id: str, serial: str, mask: np.ndarray, box_xyxy: 
         center_goal_m=transform_points(cloud.center_camera_m, transform).tolist(),
         center_pixel_uv=list(cloud.center_pixel_uv),
         t_goal_cam=transform.reshape(-1).astype(float).tolist(),
+        transform_diagnostics=transform_diagnostics,
         geometry={"valid": True, **cloud.stats},
         point_filter={"valid": True, **cloud.stats},
         _points_goal_m=points_goal,

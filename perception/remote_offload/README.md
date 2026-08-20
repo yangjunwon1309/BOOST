@@ -53,6 +53,27 @@ target is emitted.
 Before first capture, run `python3 tools/query_d405_intrinsics.py --ssh
 url@thor --json --raw`, confirm left/right physical mounting with a covered
 lens, and validate the CAD-only wrist extrinsics with a hand-eye procedure.
+The production belief partition is strict: left belief receives only objects
+segmented on `left_wrist`, and right belief only `right_wrist`; the global
+gravity orientation reference remains available to both because it is not an
+object/contact candidate. The telemetry fields `candidate_camera_id` and
+`candidate_object_ids` expose that ownership.
+
+For a measured replacement transform, record independently known pelvis-frame
+fixture points together with D405 3-D points and the corresponding 29-DoF
+robot state, then run:
+
+```bash
+cd ~/PATH-G1/perception
+python3 tools/calibrate_wrist_d405_extrinsics_v11.py observations.yaml \
+  --side left_wrist \
+  --output config/wrist_d405_extrinsics_v11_calibrated.yaml
+```
+
+It solves `p_wrist = T_wrist_camera p_d405_optical`, rejects gross matching
+outliers, and refuses output above 10 mm RMS by default. The result packet
+also carries `transform_diagnostics` with the current camera-to-pelvis basis
+vectors, so a recorded frame can be inspected before control is enabled.
 
 The checked-in configuration is the USB-2 reduced mode: native left-imager
 UYVY + Z16 at 480×270@15 and an 8 Hz latest-frame dispatch. Restore

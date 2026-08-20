@@ -14,6 +14,7 @@ import collections
 import logging
 import threading
 import time
+from dataclasses import replace
 from typing import Any
 
 import lcm
@@ -22,7 +23,7 @@ import zmq
 
 from seg_web_node.lcm_protocol import decode_robot_state
 from seg_web_node.robot_geometry import hand_frame_profile
-from seg_web_node.tasc_belief import ParallelTascBelief
+from seg_web_node.tasc_belief import ParallelTascBelief, SharedGeometry
 
 from .thor_gateway_head_d435i_legacy import (
     COMMAND_HISTORY_SPAN_S,
@@ -43,6 +44,65 @@ from .wrist_d405_protocol_v11 import (
 
 
 LOG = logging.getLogger(__name__)
+
+_GLOBAL_ORIENTATION_OBJECT_IDS = {"__gravity__"}
+
+
+def wrist_camera_for_hand(side: str) -> str:
+    """Return the sole D405 whose segmented objects may drive ``side``."""
+    if side not in {"left", "right"}:
+        raise ValueError(f"unknown wrist side {side!r}")
+    return f"{side}_wrist"
+
+
+def wrist_object_ids_for_hand(payload: dict[str, Any], side: str) -> set[str]:
+    """Track IDs segmented on this hand's own D405 image only."""
+    camera_id = wrist_camera_for_hand(side)
+    return {
+        str(item.get("track_id"))
+        for item in payload.get("objects", [])
+        if isinstance(item, dict)
+        and str(item.get("camera_id", "")) == camera_id
+        and item.get("track_id") not in (None, "")
+    }
+
+
+def wrist_geometry_for_hand(
+    shared: SharedGeometry,
+    payload: dict[str, Any],
+    side: str,
+) -> SharedGeometry:
+    """Copy immutable shared geometry with only one wrist's object candidates.
+
+    ``__gravity__`` remains available to both hands because it is a global
+    orientation reference, not a segmented object or a contact target.
+    """
+    allowed_ids = wrist_object_ids_for_hand(payload, side)
+    allowed_orientation_ids = allowed_ids | _GLOBAL_ORIENTATION_OBJECT_IDS
+    return replace(
+        shared,
+        objects=[obj for obj in shared.objects if obj.object_id in allowed_ids],
+        grip_candidates={
+            object_id: candidates
+            for object_id, candidates in shared.grip_candidates.items()
+            if object_id in allowed_ids
+        },
+        surface_primitives={
+            object_id: primitives
+            for object_id, primitives in shared.surface_primitives.items()
+            if object_id in allowed_ids
+        },
+        surface_status={
+            object_id: status
+            for object_id, status in shared.surface_status.items()
+            if object_id in allowed_ids
+        },
+        orientation_candidates=[
+            candidate
+            for candidate in shared.orientation_candidates
+            if candidate.object_id in allowed_orientation_ids
+        ],
+    )
 
 
 class WristBeliefGateway(ThorRemoteGateway):
@@ -233,6 +293,46 @@ class WristBeliefGateway(ThorRemoteGateway):
         state = decode_robot_state(data)
         with self.lock:
             self.latest_robot_state = (int(state.timestamp_us), bytes(data))
+
+    def _belief_update_hands(
+        self,
+        shared_geometry: SharedGeometry,
+        hand_inputs: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> dict[str, dict]:
+        """Run the legacy parallel update with strict wrist-camera ownership.
+
+        The two trackers still update in one call (therefore share the same
+        timestamp/dynamics tick), but their candidate sets are independent:
+        left can only select tracks detected in ``left_wrist`` and right can
+        only select tracks detected in ``right_wrist``.
+        """
+        geometry_by_hand = {
+            side: wrist_geometry_for_hand(shared_geometry, payload, side)
+            for side in ("left", "right")
+        }
+        ownership = {
+            side: {
+                "camera_id": wrist_camera_for_hand(side),
+                "object_ids": sorted(wrist_object_ids_for_hand(payload, side)),
+                "object_count": len(geometry_by_hand[side].objects),
+                "orientation_candidate_count": len(
+                    geometry_by_hand[side].orientation_candidates
+                ),
+            }
+            for side in ("left", "right")
+        }
+        self.stats["belief_candidate_camera_filter"] = ownership
+        per_hand = self.parallel_tasc_belief.update_hands(
+            shared_geometry,
+            hand_inputs,
+            geometry_by_hand=geometry_by_hand,
+        )
+        for side, telemetry in per_hand.items():
+            if isinstance(telemetry, dict):
+                telemetry["candidate_camera_id"] = ownership[side]["camera_id"]
+                telemetry["candidate_object_ids"] = ownership[side]["object_ids"]
+        return per_hand
 
     def update_result(self, result: dict[str, Any]) -> None:
         """Adapt v11 timestamps/metadata, then feed the exact legacy cache."""

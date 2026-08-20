@@ -1,0 +1,33 @@
+observations:
+- camera_point_m:
+  - 0.0015852369622245141
+  - -0.02743334898489955
+  - 0.08689999780472135
+  wrist_point_m:
+  - 0.2
+  - 0.0
+  - 0.0
+  camera_id: right_wrist
+  track_id: right_wrist:red oval dot:track0138
+  label: red oval dot
+  raw_mask_depth_points: 209
+  raw_mask_median_pixel_uv:
+  - 243.0
+  - 55.0
+  source_bundle_sequence: 18029
+- camera_point_m:
+  - 0.0015852369622245141
+  - -0.027496632373561376
+  - 0.08699999780219514
+  wrist_point_m:
+  - 0.2
+  - 0.0
+  - 0.0
+  camera_id: right_wrist
+  track_id: right_wrist:red oval dot:track0147
+  label: red oval dot
+  raw_mask_depth_points: 207
+  raw_mask_median_pixel_uv:
+  - 243.0
+  - 55.0
+  source_bundle_sequence: 18042

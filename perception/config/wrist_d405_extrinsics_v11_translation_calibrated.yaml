@@ -1,0 +1,41 @@
+extrinsics_source: translation_fit_fixed_rotation_wrist_d405_v11
+calibration_status: translation_fit_fixed_rotation
+translation_uncertainty_m: 0.025
+orientation_uncertainty_deg: 10.0
+T_left_wrist_camera:
+- - -1.0
+  - 0.0
+  - 0.0
+  - 0.0
+- - 0.0
+  - -0.906307787
+  - -0.4226182617
+  - -0.070878
+- - 0.0
+  - -0.4226182617
+  - 0.906307787
+  - -0.011106
+- - 0.0
+  - 0.0
+  - 0.0
+  - 1.0
+T_right_wrist_camera:
+- - -1.0
+  - 0.0
+  - 0.0
+  - 0.20158523696222452
+- - 0.0
+  - -0.906307787
+  - -0.4226182617
+  - 0.011854922004047353
+- - 0.0
+  - -0.4226182617
+  - 0.906307787
+  - -0.09041066670737019
+- - 0.0
+  - 0.0
+  - 0.0
+  - 1.0
+right_wrist_calibration_rms_m: 5.917091087238178e-05
+right_wrist_calibration_max_error_m: 5.9170910872388655e-05
+right_wrist_calibration_observations: 2

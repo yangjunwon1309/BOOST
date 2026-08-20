@@ -60,8 +60,8 @@ object/contact candidate. The telemetry fields `candidate_camera_id` and
 `candidate_object_ids` expose that ownership.
 
 For a measured replacement transform, record independently known pelvis-frame
-fixture points together with D405 3-D points and the corresponding 29-DoF
-robot state, then run:
+fixture points together with D405 3-D points and either the corresponding
+29-DoF robot state or `transform_diagnostics.t_goal_wrist`, then run:
 
 ```bash
 cd ~/PATH-G1/perception
@@ -74,6 +74,28 @@ It solves `p_wrist = T_wrist_camera p_d405_optical`, rejects gross matching
 outliers, and refuses output above 10 mm RMS by default. The result packet
 also carries `transform_diagnostics` with the current camera-to-pelvis basis
 vectors, so a recorded frame can be inspected before control is enabled.
+For a fixed calibration target that SAM3 segments, this helper appends the
+timestamp-matched `center_camera_m` and `t_goal_wrist` directly from the v11
+result stream; repeat it for each target view:
+
+```bash
+pixi run --locked python tools/record_wrist_d405_calibration_observation_v11.py \
+  --lcm-url "$WIFI_LCM_URL" --side left_wrist --label calibration_ball \
+  --goal-point-m 0.420 0.180 0.260 \
+  --output observations_left.yaml
+```
+
+For a dot initially placed exactly 20 cm along `+X` from
+`left_wrist_yaw_link`, use the wrist-local form **once** to print its pelvis
+coordinate. Then leave the dot fixed in the environment, move the wrist, and
+use the printed value with `--goal-point-m` for the remaining views. Repeating
+a dot mounted on the same wrist cannot calibrate the full transform:
+
+```bash
+pixi run --locked python tools/record_wrist_d405_calibration_observation_v11.py \
+  --lcm-url "$WIFI_LCM_URL" --side left_wrist --wrist-point-m 0.20 0 0 \
+  --output observations_left.yaml
+```
 
 The checked-in configuration is the USB-2 reduced mode: native left-imager
 UYVY + Z16 at 480×270@15 and an 8 Hz latest-frame dispatch. Restore

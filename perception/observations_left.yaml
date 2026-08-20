@@ -1,0 +1,49 @@
+observations:
+- camera_point_m:
+  - -0.010247671241031306
+  - -0.02469955195770117
+  - 0.09489999760262435
+  wrist_point_m:
+  - 0.2
+  - 0.0
+  - 0.0
+  camera_id: left_wrist
+  track_id: left_wrist:red oval dot:track1127
+  label: red oval dot
+  raw_mask_depth_points: 174
+  raw_mask_median_pixel_uv:
+  - 214.0
+  - 76.0
+  source_bundle_sequence: 17471
+- camera_point_m:
+  - -0.010269336507925664
+  - -0.02482968658340033
+  - 0.09519999759504572
+  wrist_point_m:
+  - 0.2
+  - 0.0
+  - 0.0
+  camera_id: left_wrist
+  track_id: left_wrist:red oval dot:track1226
+  label: red oval dot
+  raw_mask_depth_points: 175
+  raw_mask_median_pixel_uv:
+  - 214.0
+  - 76.0
+  source_bundle_sequence: 17617
+- camera_point_m:
+  - -0.010247671241031306
+  - -0.024790646195690585
+  - 0.09509999759757193
+  wrist_point_m:
+  - 0.2
+  - 0.0
+  - 0.0
+  camera_id: left_wrist
+  track_id: left_wrist:red oval dot:track1247
+  label: red oval dot
+  raw_mask_depth_points: 176
+  raw_mask_median_pixel_uv:
+  - 214.0
+  - 76.0
+  source_bundle_sequence: 17648

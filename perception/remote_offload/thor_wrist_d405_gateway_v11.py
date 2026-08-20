@@ -14,6 +14,7 @@ import lcm
 import numpy as np
 
 from .wrist_d405_capture_v11 import WristD405Capture, discover_d405_serials, load_camera_specs
+from .wrist_belief_gateway_v11 import WristBeliefGateway
 from .wrist_d405_protocol_v11 import (
     CAMERA_IDS,
     WRIST_BUNDLE_CHANNEL,
@@ -90,7 +91,7 @@ def assert_video_nodes_unowned() -> None:
 
 class ThorWristD405Gateway:
     def __init__(self, *, g1_lcm_url: str, wifi_lcm_url: str, config: Path, jpeg_quality: int, one_camera_diagnostic: bool,
-                 robot_state_channel: str) -> None:
+                 robot_state_channel: str, belief_inference: bool, belief_config: Path) -> None:
         self.g1_bus = lcm.LCM(g1_lcm_url)
         self.wifi_bus = lcm.LCM(wifi_lcm_url)
         self.config = config
@@ -100,16 +101,25 @@ class ThorWristD405Gateway:
         self.sequence = 0
         self.last_publish_log_monotonic = 0.0
         self.capture: WristD405Capture | None = None
+        self.belief: WristBeliefGateway | None = None
         capture_config = _load_yaml(config).get("capture", {})
         self.max_inter_wrist_skew_us = int(float(capture_config.get("max_inter_wrist_skew_ms", 80.0)) * 1000.0)
         self.wifi_bus.subscribe(WRIST_RESULT_CHANNEL, self._on_result)
         self.g1_bus.subscribe(self.robot_state_channel, self._on_robot_state)
+        if belief_inference:
+            belief_data = _load_yaml(belief_config)
+            belief_settings = belief_data.get("tasc_belief", belief_data.get("belief", {}))
+            if not isinstance(belief_settings, dict):
+                raise ValueError(f"belief config must contain a tasc_belief mapping: {belief_config}")
+            self.belief = WristBeliefGateway(wifi_bus=self.wifi_bus, belief_config=belief_settings)
 
     def _on_robot_state(self, _channel: str, data: bytes) -> None:
         # Robot state is the only legacy LCM input retained in v11. It is
         # forwarded unchanged for remote timestamp matching; no head image,
         # depth, or head calibration channel is subscribed.
         self.wifi_bus.publish(WRIST_ROBOT_STATE_CHANNEL, data)
+        if self.belief is not None:
+            self.belief.update_robot_state(data)
 
     def preflight(self) -> None:
         rs = _import_realsense()
@@ -155,9 +165,13 @@ class ThorWristD405Gateway:
             max_rgb_depth_delta_ms=float(capture_config.get("max_rgb_depth_delta_ms", 20.0)),
         )
         self.capture.start()
+        if self.belief is not None:
+            self.belief.start()
         LOG.info("direct D405 capture started for %s", sorted(self.capture.specs))
 
     def stop(self) -> None:
+        if self.belief is not None:
+            self.belief.stop()
         if self.capture is not None:
             self.capture.stop()
             self.capture = None
@@ -166,6 +180,8 @@ class ThorWristD405Gateway:
         try:
             result = unpack_result(data)
             LOG.info("v11 result sequence=%s objects=%s seam_discarded=%s", result.get("sequence"), len(result.get("objects", [])), result.get("discarded_seam_masks"))
+            if self.belief is not None:
+                self.belief.update_result(result)
         except Exception as error:
             LOG.warning("rejected v11 worker result: %s", error)
 
@@ -265,10 +281,14 @@ def main() -> None:
     parser.add_argument("--max-hz", type=float, default=8.0)
     parser.add_argument("--jpeg-quality", type=int, default=85)
     parser.add_argument("--robot-state-channel", default="G1_ROBOT_STATE")
+    parser.add_argument("--belief-config", type=Path, default=Path("config/pipeline.yaml"),
+                        help="existing TASC belief settings reused for both wrists")
+    parser.add_argument("--belief-inference", action=argparse.BooleanOptionalAction, default=True,
+                        help="run two-hand TASC belief on Thor and publish telemetry to Wi-Fi")
     parser.add_argument("--one-camera-diagnostic", action="store_true", help="reserved explicit diagnostic mode; normal v11 requires both cameras")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    gateway = ThorWristD405Gateway(g1_lcm_url=args.g1_lcm_url, wifi_lcm_url=args.wifi_lcm_url, config=args.config, jpeg_quality=args.jpeg_quality, one_camera_diagnostic=args.one_camera_diagnostic, robot_state_channel=args.robot_state_channel)
+    gateway = ThorWristD405Gateway(g1_lcm_url=args.g1_lcm_url, wifi_lcm_url=args.wifi_lcm_url, config=args.config, jpeg_quality=args.jpeg_quality, one_camera_diagnostic=args.one_camera_diagnostic, robot_state_channel=args.robot_state_channel, belief_inference=args.belief_inference, belief_config=args.belief_config)
     if args.diagnose:
         diagnose_runtime(_import_realsense())
     if args.preflight:

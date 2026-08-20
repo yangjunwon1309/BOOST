@@ -23,10 +23,86 @@ WRIST_RESULT_CHANNEL = "PATH_V11_WRIST_PERCEPTION_RESULT"
 WRIST_HEARTBEAT_CHANNEL = "PATH_V11_WRIST_PERCEPTION_HEARTBEAT"
 WRIST_ROBOT_STATE_CHANNEL = "PATH_V11_WRIST_ROBOT_STATE"
 WRIST_CONCEPT_CONTROL_CHANNEL = "PATH_V11_WRIST_CONCEPT_CONTROL"
+WRIST_BELIEF_TELEMETRY_CHANNEL = "PATH_V11_WRIST_BELIEF_TELEMETRY"
 
 
 def now_us() -> int:
     return time.time_ns() // 1_000
+
+
+def normalize_concepts(value: Any, *, max_concepts: int = 8) -> list[str]:
+    """Validate the bounded text-prompt vocabulary used by the wrist worker."""
+    if isinstance(value, str):
+        raw = value.split(",")
+    elif isinstance(value, (list, tuple)):
+        raw = value
+    else:
+        raise ValueError("concepts must be a string or list")
+    concepts: list[str] = []
+    for item in raw:
+        concept = " ".join(str(item).strip().split())
+        if not concept:
+            continue
+        if len(concept) > 80 or any(ord(char) < 32 for char in concept):
+            raise ValueError("each concept must be printable and at most 80 characters")
+        if concept not in concepts:
+            concepts.append(concept)
+    if not concepts:
+        raise ValueError("at least one concept is required")
+    if len(concepts) > max_concepts:
+        raise ValueError(f"at most {max_concepts} concepts are allowed")
+    return concepts
+
+
+def pack_concept_control(payload: dict[str, Any]) -> bytes:
+    concepts = normalize_concepts(payload.get("concepts"))
+    revision = payload.get("revision")
+    if not isinstance(revision, int) or revision < 0:
+        raise ValueError("revision must be a non-negative integer")
+    return msgpack.packb(
+        {
+            "version": VERSION,
+            "published_timestamp_us": int(payload.get("published_timestamp_us", now_us())),
+            "revision": revision,
+            "concepts": concepts,
+        },
+        use_bin_type=True,
+    )
+
+
+def unpack_concept_control(data: bytes) -> dict[str, Any]:
+    payload = msgpack.unpackb(data, raw=False, strict_map_key=False)
+    if not isinstance(payload, dict) or payload.get("version") != VERSION:
+        raise ValueError("unsupported wrist concept-control payload")
+    if not isinstance(payload.get("revision"), int) or payload["revision"] < 0:
+        raise ValueError("wrist concept-control revision is invalid")
+    if not isinstance(payload.get("published_timestamp_us"), int) or payload["published_timestamp_us"] <= 0:
+        raise ValueError("wrist concept-control timestamp is invalid")
+    payload["concepts"] = normalize_concepts(payload.get("concepts"))
+    return payload
+
+
+def pack_heartbeat(payload: dict[str, Any]) -> bytes:
+    return msgpack.packb(payload, use_bin_type=True, strict_types=False)
+
+
+def unpack_heartbeat(data: bytes) -> dict[str, Any]:
+    payload = msgpack.unpackb(data, raw=False, strict_map_key=False)
+    if not isinstance(payload, dict) or payload.get("version") != VERSION:
+        raise ValueError("unsupported wrist heartbeat payload")
+    return payload
+
+
+def pack_belief_telemetry(payload: dict[str, Any]) -> bytes:
+    """Wire-safe v11 telemetry for laptop-only visualization."""
+    return msgpack.packb(payload, use_bin_type=True, strict_types=False)
+
+
+def unpack_belief_telemetry(data: bytes) -> dict[str, Any]:
+    payload = msgpack.unpackb(data, raw=False, strict_map_key=False)
+    if not isinstance(payload, dict) or payload.get("version") != VERSION:
+        raise ValueError("unsupported wrist belief telemetry payload")
+    return payload
 
 
 def _finite(value: Any) -> bool:
@@ -55,6 +131,15 @@ def pack_mask(mask: np.ndarray) -> bytes:
     if array.ndim != 2:
         raise ValueError("D405 local mask must be HxW")
     return zlib.compress(np.packbits(array.reshape(-1), bitorder="little").tobytes(), level=1)
+
+
+def unpack_mask(data: bytes, *, width: int, height: int) -> np.ndarray:
+    expected_bits = int(width) * int(height)
+    expected_bytes = (expected_bits + 7) // 8
+    raw = zlib.decompress(data, bufsize=expected_bytes)
+    if len(raw) != expected_bytes:
+        raise ValueError("D405 mask has an invalid packed length")
+    return np.unpackbits(np.frombuffer(raw, dtype=np.uint8), bitorder="little")[:expected_bits].reshape(height, width).astype(bool)
 
 
 def _validate_intrinsics(value: Any, *, width: int, height: int) -> dict[str, float | int]:

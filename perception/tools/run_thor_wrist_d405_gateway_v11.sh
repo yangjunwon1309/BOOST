@@ -20,7 +20,9 @@ for device in "${video_devices[@]}" "${usb_devices[@]}"; do
     device_args+=(--device "${device}:${device}:rwm")
 done
 
-exec docker run --rm --network host --ipc host --gpus all \
+# Capture and JPEG transport do not use CUDA. Omitting GPU passthrough also
+# avoids unrelated CUDA compatibility failures on a Thor driver mismatch.
+exec docker run --rm --network host --ipc host \
     --user "$(id -u):$(id -g)" \
     -v "${perception_dir}:/workspace/perception" \
     -v /run/udev:/run/udev:ro \

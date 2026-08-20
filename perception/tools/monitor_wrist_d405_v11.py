@@ -4,9 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import time
+from pathlib import Path
 
 import lcm
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from remote_offload.wrist_d405_protocol_v11 import (
     CAMERA_IDS,

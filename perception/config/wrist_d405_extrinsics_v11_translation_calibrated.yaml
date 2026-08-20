@@ -6,15 +6,15 @@ T_left_wrist_camera:
 - - -1.0
   - 0.0
   - 0.0
-  - 0.0
+  - 0.1897523287589687
 - - 0.0
   - -0.906307787
   - -0.4226182617
-  - -0.070878
+  - 0.017723039980443722
 - - 0.0
   - -0.4226182617
   - 0.906307787
-  - -0.011106
+  - -0.09666684816800321
 - - 0.0
   - 0.0
   - 0.0
@@ -36,6 +36,9 @@ T_right_wrist_camera:
   - 0.0
   - 0.0
   - 1.0
+left_wrist_calibration_rms_m: 0.0001417647033229782
+left_wrist_calibration_max_error_m: 0.00021976841940786539
+left_wrist_calibration_observations: 3
 right_wrist_calibration_rms_m: 5.917091087238178e-05
 right_wrist_calibration_max_error_m: 5.9170910872388655e-05
 right_wrist_calibration_observations: 2

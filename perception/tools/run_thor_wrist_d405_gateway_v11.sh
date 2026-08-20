@@ -26,6 +26,7 @@ exec docker run --rm --network host --ipc host \
     --user "$(id -u):$(id -g)" \
     -v "${perception_dir}:/workspace/perception" \
     -v /run/udev:/run/udev:ro \
+    -v /sys:/sys:ro \
     "${device_args[@]}" \
     -w /workspace/perception "${image}" \
     python -m remote_offload.thor_wrist_d405_gateway_v11 "$@"

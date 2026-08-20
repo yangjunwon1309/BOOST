@@ -48,6 +48,29 @@ def _import_realsense() -> Any:
     return rs
 
 
+def diagnose_runtime(rs: Any) -> None:
+    """Report the container's view of exactly the devices given to Docker."""
+    LOG.info("pyrealsense2 version=%s", getattr(rs, "__version__", "unknown"))
+    for variable in ("D405_VIDEO_DEVICES", "D405_USB_DEVICES"):
+        values = [item for item in os.environ.get(variable, "").split(",") if item]
+        LOG.info("%s=%s", variable, [(item, Path(item).exists()) for item in values])
+    video_sysfs = []
+    for node in sorted(Path("/sys/class/video4linux").glob("video*")):
+        try:
+            video_sysfs.append((node.name, (node / "name").read_text(encoding="utf-8").strip()))
+        except OSError:
+            continue
+    LOG.info("visible V4L2 sysfs nodes=%s", video_sysfs)
+    LOG.info("librealsense devices=%s", [
+        {"name": _safe_info(device, rs.camera_info.name), "serial": _safe_info(device, rs.camera_info.serial_number)}
+        for device in rs.context().query_devices()
+    ])
+
+
+def _safe_info(device: Any, info: Any) -> str:
+    return device.get_info(info) if device.supports(info) else ""
+
+
 def assert_video_nodes_unowned() -> None:
     """Fail clearly before opening a camera; never terminate another service."""
     try:
@@ -170,6 +193,7 @@ def main() -> None:
     parser.add_argument("--lcm-url", default=os.environ.get("PATH_LCM_URL", "udpm://239.255.76.67:7667?ttl=1"))
     parser.add_argument("--config", type=Path, default=Path("config/wrist_d405_v11.yaml"))
     parser.add_argument("--preflight", action="store_true", help="enumerate both configured D405s without streaming")
+    parser.add_argument("--diagnose", action="store_true", help="log container-visible D405 devices, V4L2 sysfs, and USB node mounts")
     parser.add_argument("--max-hz", type=float, default=15.0)
     parser.add_argument("--jpeg-quality", type=int, default=85)
     parser.add_argument("--robot-state-channel", default="G1_ROBOT_STATE")
@@ -177,6 +201,8 @@ def main() -> None:
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     gateway = ThorWristD405Gateway(lcm_url=args.lcm_url, config=args.config, jpeg_quality=args.jpeg_quality, one_camera_diagnostic=args.one_camera_diagnostic, robot_state_channel=args.robot_state_channel)
+    if args.diagnose:
+        diagnose_runtime(_import_realsense())
     if args.preflight:
         gateway.preflight()
     else:

@@ -201,6 +201,23 @@ class ThorWristD405Gateway:
         payload = {"version": 1, "sequence": self.sequence, "bundle_timestamp_us": now_us(), "split_y": frames["left_wrist"]["height"], "inter_wrist_skew_us": skew, "cameras": frames}
         self.wifi_bus.publish(WRIST_BUNDLE_CHANNEL, pack_bundle(payload))
 
+    def capture_smoke(self) -> None:
+        """Verify both direct camera streams without sending any LCM traffic."""
+        self.start()
+        try:
+            assert self.capture is not None
+            for camera_id in CAMERA_IDS:
+                bundle = self.capture.wait_for_bundle(camera_id, timeout_ms=5000)
+                LOG.info(
+                    "CAPTURE_OK camera=%s serial=%s grid=%dx%d rgb_ts_ms=%.3f "
+                    "depth_ts_ms=%.3f delta_ms=%.3f depth_scale_m=%g",
+                    camera_id, bundle.serial, bundle.intrinsics["width"], bundle.intrinsics["height"],
+                    bundle.color_timestamp_ms, bundle.depth_timestamp_ms,
+                    abs(bundle.color_timestamp_ms - bundle.depth_timestamp_ms), bundle.depth_scale_m,
+                )
+        finally:
+            self.stop()
+
     def run(self, *, max_hz: float) -> None:
         self.start()
         period = 1.0 / max(0.1, float(max_hz))
@@ -234,6 +251,7 @@ def main() -> None:
     )
     parser.add_argument("--config", type=Path, default=Path("config/wrist_d405_v11.yaml"))
     parser.add_argument("--preflight", action="store_true", help="enumerate both configured D405s without streaming")
+    parser.add_argument("--capture-smoke", action="store_true", help="capture one RGB-D frame from each D405, then exit without LCM publishing")
     parser.add_argument("--diagnose", action="store_true", help="log container-visible D405 devices, V4L2 sysfs, and USB node mounts")
     parser.add_argument("--max-hz", type=float, default=8.0)
     parser.add_argument("--jpeg-quality", type=int, default=85)
@@ -246,6 +264,8 @@ def main() -> None:
         diagnose_runtime(_import_realsense())
     if args.preflight:
         gateway.preflight()
+    elif args.capture_smoke:
+        gateway.capture_smoke()
     else:
         gateway.run(max_hz=args.max_hz)
 

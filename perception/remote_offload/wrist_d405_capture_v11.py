@@ -191,15 +191,24 @@ class WristD405Capture:
         if (color.get_width(), color.get_height()) != (depth.get_width(), depth.get_height()):
             raise RuntimeError(f"{side} color/depth grids differ; refusing unaligned v11 capture")
         intrinsics = color_profile.get_intrinsics()
+        width, height = int(color.get_width()), int(color.get_height())
+        # pyrealsense exposes packed UYVY as a flat/one-channel byte buffer.
+        # OpenCV's UYVY conversion requires the explicit two bytes per pixel.
+        uyvy = np.frombuffer(color.get_data(), dtype=np.uint8)
+        expected_uyvy_bytes = width * height * 2
+        if uyvy.size != expected_uyvy_bytes:
+            raise RuntimeError(
+                f"{side} did not deliver packed UYVY: got {uyvy.size} bytes, "
+                f"expected {expected_uyvy_bytes} for {width}x{height}"
+            )
+        uyvy = uyvy.reshape(height, width, 2)
         return FrameBundle(
             side=side,
             serial=self.specs[side].serial,
             host_timestamp_us=time.monotonic_ns() // 1000,
             color_timestamp_ms=float(color.get_timestamp()),
             depth_timestamp_ms=float(depth.get_timestamp()),
-            color_bgr=cv2.cvtColor(
-                np.asanyarray(color.get_data()), cv2.COLOR_YUV2BGR_UYVY
-            ).copy(),
+            color_bgr=cv2.cvtColor(uyvy, cv2.COLOR_YUV2BGR_UYVY).copy(),
             depth_z16=np.asanyarray(depth.get_data()).copy(),
             intrinsics={
                 "width": int(intrinsics.width), "height": int(intrinsics.height),

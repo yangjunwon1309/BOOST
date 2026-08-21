@@ -223,6 +223,8 @@ def make_result(
     objects: list[dict[str, Any]],
     discarded_seam_masks: int,
     geometry_status: dict[str, Any] | None = None,
+    t_goal_cam: dict[str, list[float]] | None = None,
+    transform_diagnostics: dict[str, dict[str, Any]] | None = None,
     valid: bool = True,
     error: str | None = None,
 ) -> dict[str, Any]:
@@ -238,18 +240,54 @@ def make_result(
         "error": error,
         "discarded_seam_masks": int(discarded_seam_masks),
         "geometry_status": dict(geometry_status or {}),
+        # Frame-level camera transforms are deliberately not copied into every
+        # object. They are required even on a no-detection frame so the viewer
+        # can project a pelvis-frame belief onto its newest camera image.
+        "t_goal_cam": dict(t_goal_cam or {}),
+        "transform_diagnostics": dict(transform_diagnostics or {}),
         "objects": list(objects),
     }
 
 
-def pack_result(payload: dict[str, Any]) -> bytes:
+def _validate_transform_matrix(value: Any, *, name: str) -> None:
+    try:
+        matrix = np.asarray(value, dtype=np.float64).reshape(4, 4)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be a finite 4x4 matrix") from error
+    if not np.isfinite(matrix).all():
+        raise ValueError(f"{name} must be finite")
+
+
+def validate_result(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(payload, dict) or payload.get("version") != VERSION:
         raise ValueError("unsupported wrist D405 result version")
+    if not isinstance(payload.get("objects"), list):
+        raise ValueError("wrist D405 result objects must be a list")
+    transforms = payload.get("t_goal_cam", {})
+    diagnostics = payload.get("transform_diagnostics", {})
+    if not isinstance(transforms, dict) or not isinstance(diagnostics, dict):
+        raise ValueError("wrist D405 result transforms must be mappings")
+    for camera_id, transform in transforms.items():
+        if camera_id not in CAMERA_IDS:
+            raise ValueError(f"unknown result camera transform {camera_id!r}")
+        _validate_transform_matrix(transform, name=f"t_goal_cam[{camera_id}]")
+        diagnostic = diagnostics.get(camera_id)
+        if not isinstance(diagnostic, dict):
+            raise ValueError(f"missing transform diagnostics for {camera_id}")
+        diagnostic_transform = diagnostic.get("t_goal_camera")
+        _validate_transform_matrix(
+            diagnostic_transform, name=f"transform_diagnostics[{camera_id}].t_goal_camera"
+        )
+        if list(transform) != list(diagnostic_transform):
+            raise ValueError(f"frame transform mismatch for {camera_id}")
+    return payload
+
+
+def pack_result(payload: dict[str, Any]) -> bytes:
+    validate_result(payload)
     return msgpack.packb(payload, use_bin_type=True, strict_types=False)
 
 
 def unpack_result(data: bytes) -> dict[str, Any]:
     payload = msgpack.unpackb(data, raw=False, strict_map_key=False)
-    if not isinstance(payload, dict) or payload.get("version") != VERSION:
-        raise ValueError("unsupported wrist D405 result version")
-    return payload
+    return validate_result(payload)

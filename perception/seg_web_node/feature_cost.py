@@ -105,12 +105,16 @@ def clip_log_probs(log_probs: np.ndarray, max_prob: float) -> np.ndarray:
 @dataclass(frozen=True)
 class FeatureConfig:
     action_apply_time: float = 0.01
-    w_distance: float = 1.4
+    # Position evidence: proximity is the bounded, monotone dominant term.
+    # The retained distance/agreement terms are diagnostics or A/B regressions.
+    w_proximity: float = 2.0
     w_progress: float = 1.0
-    w_agreement: float = 0.4
-    w_reach: float = 1.0
+    w_agreement: float = 0.0
+    w_distance: float = 0.0
+    w_reach: float = 0.3
     w_delta: float = 0.0
     w_align: float = 0.9
+    proximity_scale_m: float = 0.15
     align_min_quality: float = 0.25
     distance_k: float = 1.5
     distance_delta: float = 0.10
@@ -144,14 +148,29 @@ class FeatureConfig:
         agreement = dict(features.get("agreement", {}))
         delta = dict(features.get("delta", {}))
         orientation = dict(features.get("orientation", {}))
+        if float(features.get("w_agreement", 0.0)) > 0.0:
+            LOG.warning(
+                "w_agreement > 0: this term equals const + "
+                "2*lambda*kappa*|u| * A_progress, so it only rescales "
+                "progress and adds no independent evidence"
+            )
+        if float(features.get("w_distance", 0.0)) > 0.0:
+            LOG.warning(
+                "w_distance > 0: distance_advantage measures improvement "
+                "over a %.0f ms lookahead, not proximity, and its Huber "
+                "gradient is smallest near contact",
+                1000.0 * float(data.get("action_apply_time", 0.01)),
+            )
         return cls(
             action_apply_time=float(data.get("action_apply_time", 0.01)),
-            w_distance=float(features.get("w_distance", 1.4)),
+            w_proximity=float(features.get("w_proximity", 2.0)),
             w_progress=float(features.get("w_progress", 1.0)),
-            w_agreement=float(features.get("w_agreement", 0.4)),
-            w_reach=float(features.get("w_reach", 1.0)),
+            w_agreement=float(features.get("w_agreement", 0.0)),
+            w_distance=float(features.get("w_distance", 0.0)),
+            w_reach=float(features.get("w_reach", 0.3)),
             w_delta=float(features.get("w_delta", 0.0)),
             w_align=float(features.get("w_align", 0.9)),
+            proximity_scale_m=float(features.get("proximity_scale_m", 0.15)),
             align_min_quality=float(features.get("align_min_quality", 0.25)),
             distance_k=float(distance.get("k", 1.5)),
             distance_delta=float(distance.get("delta", 0.10)),
@@ -180,6 +199,20 @@ class MultiFeatureCost:
     def __init__(self, config: FeatureConfig):
         self.config = config
         self.previous_direction: np.ndarray | None = None
+
+    def proximity_advantage(
+        self,
+        target: np.ndarray,
+        eef_position: np.ndarray,
+    ) -> float:
+        """Bounded, monotone proximity that cannot invert near contact."""
+        distance = float(np.linalg.norm(
+            np.asarray(eef_position, dtype=np.float64).reshape(3)
+            - np.asarray(target, dtype=np.float64).reshape(3)
+        ))
+        if not np.isfinite(distance):
+            return 0.0
+        return float(np.exp(-distance / max(EPS, self.config.proximity_scale_m)))
 
     def distance_advantage(
         self,
@@ -419,6 +452,7 @@ class MultiFeatureCost:
                 agreement_cost = cfg.agreement_lambda * float(np.dot(error, error))
                 u_opt = u_opt_arr.tolist()
         a_agreement = -agreement_cost
+        a_proximity = self.proximity_advantage(target, eef_position)
         a_progress = self.progress_advantage(target, eef_position, user_translation)
         a_reach, shoulder_distance = self.reach_advantage(target, shoulder_position)
 
@@ -429,6 +463,7 @@ class MultiFeatureCost:
             fit_quality=contact_fit_quality,
         )
         weighted = {
+            "proximity": cfg.w_proximity * a_proximity,
             "distance": cfg.w_distance * a_dist,
             "ray": 0.0,
             "progress": cfg.w_progress * a_progress,
@@ -447,6 +482,8 @@ class MultiFeatureCost:
                 else None
             ),
             "distance_m": d_now,
+            "proximity_distance_m": d_now,
+            "proximity_advantage": a_proximity,
             "distance_after_action_m": d_after,
             "distance_value": v_dist,
             "distance_value_after_action": v_dist_after,
@@ -474,6 +511,7 @@ class MultiFeatureCost:
             "hand_approach_axis": None if hand_approach_axis is None else np.asarray(hand_approach_axis, dtype=np.float64).reshape(3).tolist(),
             "contact_fit_quality": float(contact_fit_quality),
             "weights": {
+                "proximity": cfg.w_proximity,
                 "distance": cfg.w_distance,
                 "ray": 0.0,
                 "progress": cfg.w_progress,

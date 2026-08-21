@@ -27,7 +27,7 @@ from seg_web_node.object_point_filter import (
     compute_depth_edge_mask,
     extract_filtered_object_cloud,
 )
-from seg_web_node.robot_geometry import g1_link_transforms, gravity_up_in_pelvis
+from seg_web_node.robot_geometry import gravity_up_in_pelvis
 
 
 CAMERA_TO_WRIST_LINK = {
@@ -54,21 +54,18 @@ def load_wrist_extrinsics(path: Path) -> dict[str, np.ndarray]:
     return transforms
 
 
-def t_goal_camera(camera_id: str, state: RobotState, wrist_extrinsics: dict[str, np.ndarray]) -> np.ndarray:
-    if camera_id not in CAMERA_TO_WRIST_LINK:
-        raise ValueError(f"unknown D405 camera_id {camera_id!r}")
-    wrist = g1_link_transforms(np.asarray(state.q, dtype=np.float64)).get(CAMERA_TO_WRIST_LINK[camera_id])
-    if wrist is None:
-        raise ValueError(f"missing FK link for {camera_id}")
-    return wrist @ wrist_extrinsics[camera_id]
-
-
 def camera_transform_diagnostics(
     camera_id: str,
-    state: RobotState,
     wrist_extrinsics: dict[str, np.ndarray],
+    *,
+    goal_wrist: np.ndarray,
+    goal_camera: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """Expose the exact D405-optical -> wrist -> pelvis transform chain.
+
+    ``goal_wrist`` is the FK result already evaluated for the atomic bundle.
+    It must not be recomputed for every detected object: every object from a
+    camera shares this one robot-state snapshot.
 
     D405 points are always RealSense optical coordinates: +X right, +Y down,
     +Z forward.  Publishing the three resulting pelvis-frame basis vectors
@@ -76,9 +73,13 @@ def camera_transform_diagnostics(
     silently folding it into a belief or IPOPT target.
     """
     wrist_link = CAMERA_TO_WRIST_LINK[camera_id]
-    goal_wrist = g1_link_transforms(np.asarray(state.q, dtype=np.float64))[wrist_link]
+    goal_wrist = np.asarray(goal_wrist, dtype=np.float64).reshape(4, 4)
     wrist_camera = wrist_extrinsics[camera_id]
-    goal_camera = goal_wrist @ wrist_camera
+    goal_camera = (
+        goal_wrist @ wrist_camera
+        if goal_camera is None
+        else np.asarray(goal_camera, dtype=np.float64).reshape(4, 4)
+    )
     return {
         "convention": (
             "p_goal=T_goal_wrist@T_wrist_camera@p_d405_optical; "
@@ -100,7 +101,7 @@ def object_geometry(*, camera_id: str, serial: str, mask: np.ndarray, box_xyxy: 
                     label: str, score: float, depth_z16: np.ndarray, depth_scale_m: float,
                     intrinsics: dict[str, float | int], source_timestamp_us: int,
                     calibration_id: str, state: RobotState | None, state_age_ms: float | None,
-                    wrist_extrinsics: dict[str, np.ndarray], min_depth_m: float,
+                    min_depth_m: float,
                     max_depth_m: float, min_depth_points: int,
                     point_filter: ObjectPointFilterConfig | None = None,
                     depth_edge_mask: np.ndarray | None = None,
@@ -158,8 +159,7 @@ def object_geometry(*, camera_id: str, serial: str, mask: np.ndarray, box_xyxy: 
         "intrinsics": {key: float(value) if key not in {"width", "height"} else int(value) for key, value in intrinsics.items()},
         "mask_height": int(mask.shape[0]), "mask_width": int(mask.shape[1]),
         "valid_depth_points": 0, "geometry": dict(diagnostics),
-        "center_camera_m": None, "center_goal_m": None, "t_goal_cam": None,
-        "transform_diagnostics": None,
+        "center_camera_m": None, "center_goal_m": None,
         "center_pixel_uv": None,
         "gravity_up_goal": None, "contact_candidates": [], "surface_primitives": [],
         "surface_model": None, "point_filter": dict(diagnostics),
@@ -176,22 +176,15 @@ def object_geometry(*, camera_id: str, serial: str, mask: np.ndarray, box_xyxy: 
             result["geometry"] = dict(unavailable)
             result["point_filter"] = dict(unavailable)
         return result
-    transform = (
-        np.asarray(t_goal_cam, dtype=np.float64).reshape(4, 4)
-        if t_goal_cam is not None
-        else t_goal_camera(camera_id, state, wrist_extrinsics)
-    )
-    transform_diagnostics = camera_transform_diagnostics(
-        camera_id, state, wrist_extrinsics
-    )
+    if t_goal_cam is None:
+        raise ValueError("object_geometry requires the bundle-level t_goal_cam")
+    transform = np.asarray(t_goal_cam, dtype=np.float64).reshape(4, 4)
     points_goal = transform_points(cloud.points_camera_m, transform)
     result.update(
         valid_depth_points=int(cloud.valid_depth_points),
         center_camera_m=cloud.center_camera_m.tolist(),
         center_goal_m=transform_points(cloud.center_camera_m, transform).tolist(),
         center_pixel_uv=list(cloud.center_pixel_uv),
-        t_goal_cam=transform.reshape(-1).astype(float).tolist(),
-        transform_diagnostics=transform_diagnostics,
         geometry={"valid": True, **cloud.stats},
         point_filter={"valid": True, **cloud.stats},
         _points_goal_m=points_goal,
@@ -216,6 +209,7 @@ def attach_surface_geometry(
     contact_config: GripCandidateConfig,
     pseudo_config: PseudoContactConfig,
     up_goal: np.ndarray | None = None,
+    t_goal_cam: np.ndarray | None = None,
 ) -> bool:
     """Attach legacy cylinder/RANSAC geometry and remove non-wire point data."""
     points_goal = result.pop("_points_goal_m", None)
@@ -236,10 +230,11 @@ def attach_surface_geometry(
     model = surface_tracker.models.get(track_id)
     result["surface_model"] = surface_tracker.status(track_id)
     view_origin = None
-    try:
-        view_origin = np.asarray(result["t_goal_cam"], dtype=np.float64).reshape(4, 4)[:3, 3]
-    except (KeyError, TypeError, ValueError):
-        pass
+    if t_goal_cam is not None:
+        try:
+            view_origin = np.asarray(t_goal_cam, dtype=np.float64).reshape(4, 4)[:3, 3]
+        except (TypeError, ValueError):
+            pass
     primitives = extract_surface_primitives(
         points, pseudo_config, cylinder_model=model, view_origin=view_origin, label=str(label),
         up_goal=np.asarray(result["gravity_up_goal"], dtype=np.float64)

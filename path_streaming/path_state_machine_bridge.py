@@ -65,6 +65,7 @@ from path_core.intention.action_blending import (
     SharedControlConfig,
     rotation_target_from_relation,
 )
+from path_core.intention.grasp_engagement import GraspEngagementDetector
 from path_core.intention.reference_dynamics import (
     OrientationAuthority,
     OrientationTargetGate,
@@ -1306,6 +1307,7 @@ def ee_target_from_static_payload(
     return EETarget(
         position=position,
         confidence=confidence,
+        position_valid=bool(payload.get("position_valid", True)),
         # Dynamic orientation is controlled exclusively by the surface-normal
         # relation below; legacy payload quaternions can be arbitrary at the
         # perpendicular singularity and must never reach the IK objective.
@@ -1771,6 +1773,9 @@ def main() -> int:
     latest_hand_us = 0
     latest_hand_control_us = 0
     latest_hand_meta: dict[str, float] = {}
+    grasp_engagement = {
+        side: GraspEngagementDetector() for side in ("left", "right")
+    }
     latest_controller_left_axis = np.zeros(2, dtype=np.float64)
     latest_controller_right_axis = np.zeros(2, dtype=np.float64)
     latest_controller_a = False
@@ -2625,6 +2630,20 @@ def main() -> int:
             try_complete_pico_arm_request()
 
             left_hand_cmd, right_hand_cmd, hand_fresh = current_pico_hand_joints(tick_us)
+            grasp_commanded = {
+                side: pico_grip_active(side, tick_us) for side in ("left", "right")
+            }
+            # No measured Dex1 jaw gap reaches this bridge yet.  ``None``
+            # selects the documented close-command delay fallback.
+            jaw_gap_m = {side: None for side in ("left", "right")}
+            grasp_engaged = {
+                side: grasp_engagement[side].update(
+                    commanded_closed=grasp_commanded[side],
+                    jaw_gap_m=jaw_gap_m[side],
+                    dt=dt,
+                )
+                for side in ("left", "right")
+            }
             controller_age_sec = (
                 (tick_us - latest_controller_state_us) / 1.0e6
                 if latest_controller_state_us > 0
@@ -2940,6 +2959,10 @@ def main() -> int:
                             (1.0 - final_orientation_weight) * shared_config.omega_n_orientation_released
                             + final_orientation_weight * shared_config.omega_n_orientation_armed
                         )
+                        if grasp_engaged[side]:
+                            # With the contact target suppressed, orientation
+                            # is the sole assisted degree of freedom.
+                            omega_n_ori = shared_config.omega_n_orientation_armed
                         r_ref = orientation_reference[side].step(
                             rotation_target, dt, measured=measured_tf[side][:3, :3],
                             omega_n=omega_n_ori, zeta=zeta_ori,
@@ -2948,7 +2971,11 @@ def main() -> int:
                         position_source = "operator"
                         zeta_pos = shared_config.zeta_released
                         omega_n_pos = shared_config.omega_n_position_released
-                        if belief_target is not None:
+                        if (
+                            belief_target is not None
+                            and belief_target.position_valid
+                            and not grasp_engaged[side]
+                        ):
                             goal = np.asarray(belief_target.position, dtype=np.float64).reshape(3)
                             is_canonical_grasp_center = (
                                 belief_target.position_point == "canonical_grasp_center"
@@ -2964,6 +2991,11 @@ def main() -> int:
                                 position_source = "belief_contact"
                                 zeta_pos = shared_config.zeta_armed
                                 omega_n_pos = shared_config.omega_n_position_armed
+                        elif grasp_engaged[side]:
+                            position_source = "operator_grasp_engaged"
+                        # Post-grasp position is operator-owned, while the
+                        # orientation belief above remains active.  Do not
+                        # reset the second-order position state here.
                         p_ref = position_reference[side].step(
                             position_target, dt, measured=measured_tf[side][:3, 3],
                             omega_n=omega_n_pos, zeta=zeta_pos,
@@ -2994,6 +3026,10 @@ def main() -> int:
                             "orientation_smoothed_confidence": float(orientation_authority[side].smoothed_confidence),
                             "zeta_position": float(zeta_pos),
                             "zeta_orientation": float(zeta_ori),
+                            "grasp_commanded": bool(grasp_commanded[side]),
+                            "grasp_engaged": bool(grasp_engaged[side]),
+                            "jaw_gap_m": jaw_gap_m[side],
+                            "grasp_state_source": "command_delay_fallback",
                         }
                     control_visual_hands = {
                         side: {
@@ -3022,6 +3058,10 @@ def main() -> int:
                             "position_source": reference_diagnostics[side][
                                 "position_source"
                             ],
+                            "grasp_commanded": bool(grasp_commanded[side]),
+                            "grasp_engaged": bool(grasp_engaged[side]),
+                            "jaw_gap_m": jaw_gap_m[side],
+                            "grasp_state_source": "command_delay_fallback",
                         }
                         for side, (
                             p_cmd,
@@ -3336,8 +3376,8 @@ def main() -> int:
             # mux fills waist/lower joints from measured state as damping
             # commands, so no SONIC action can enter this packet.
             direct_command_sent = False
-            direct_left_grip = pico_grip_active("left", tick_us)
-            direct_right_grip = pico_grip_active("right", tick_us)
+            direct_left_grip = grasp_commanded["left"]
+            direct_right_grip = grasp_commanded["right"]
             if (
                 qp_payload is not None
                 and qp_payload.get("schema") == "path.ipopt_arm_reference.v1"

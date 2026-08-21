@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import collections
 import threading
 import time
 from typing import Any
@@ -29,7 +28,6 @@ from .wrist_d405_protocol_v11 import (
     unpack_bundle,
     unpack_belief_telemetry,
     unpack_heartbeat,
-    unpack_mask,
     unpack_result,
 )
 
@@ -82,6 +80,8 @@ setInterval(update,1000);update();
 
 
 class WristV11WebViewer:
+    BELIEF_STALE_MS = 500.0
+
     def __init__(self, lcm_url: str) -> None:
         self.bus = lcm.LCM(lcm_url)
         self.lock = threading.Condition()
@@ -93,15 +93,11 @@ class WristV11WebViewer:
         # A viewer may restart while the worker remains running.  A wall-clock
         # revision stays newer than any previously acknowledged command.
         self.next_concept_revision = now_us()
-        self.image_history: collections.OrderedDict[
-            int, dict[str, np.ndarray]
-        ] = collections.OrderedDict()
-        self.result_history: collections.OrderedDict[int, dict[str, Any]] = (
-            collections.OrderedDict()
-        )
-        self.belief_history: collections.OrderedDict[int, dict[str, Any]] = (
-            collections.OrderedDict()
-        )
+        self.latest_images: dict[str, np.ndarray] | None = None
+        self.objects: list[dict[str, Any]] = []
+        self.latest_transforms: dict[str, dict[str, Any]] = {}
+        self.belief: dict[str, Any] | None = None
+        self.result_timestamp_us: int | None = None
         self.rendered_result_sequence: int | None = None
         self.rendered_belief: dict[str, Any] | None = None
         self.bus.subscribe(WRIST_BUNDLE_CHANNEL, self._on_bundle)
@@ -123,19 +119,40 @@ class WristV11WebViewer:
             with self.lock:
                 self.bundle_timestamp_us = int(bundle["bundle_timestamp_us"])
                 self.bundle_sequence = int(bundle["sequence"])
-                self._bounded_store(self.image_history, self.bundle_sequence, images)
-                self._render_matching_locked()
+                self.latest_images = images
+                self._render_locked()
         except Exception:
             return
 
     def _on_result(self, _channel: str, data: bytes) -> None:
         try:
+            result = unpack_result(data)
+            objects = [obj for obj in result.get("objects", []) if isinstance(obj, dict)]
+            transforms = result.get("t_goal_cam") or {}
             with self.lock:
-                result = unpack_result(data)
-                self._bounded_store(
-                    self.result_history, int(result.get("sequence", -1)), result
+                self.objects = objects
+                self.object_count = len(objects)
+                self.latest_transforms = {
+                    camera_id: {
+                        "t_goal_cam": transforms.get(camera_id)
+                        or self.latest_transforms.get(camera_id, {}).get("t_goal_cam"),
+                        "intrinsics": next(
+                            (
+                                obj.get("intrinsics")
+                                for obj in objects
+                                if obj.get("camera_id") == camera_id
+                                and obj.get("intrinsics")
+                            ),
+                            self.latest_transforms.get(camera_id, {}).get("intrinsics"),
+                        ),
+                    }
+                    for camera_id in CAMERA_IDS
+                }
+                self.result_timestamp_us = int(
+                    result.get("published_timestamp_us", 0) or 0
                 )
-                self._render_matching_locked()
+                self.rendered_result_sequence = int(result.get("sequence", -1))
+                self._render_locked()
         except Exception:
             return
 
@@ -155,39 +172,11 @@ class WristV11WebViewer:
         try:
             with self.lock:
                 belief = unpack_belief_telemetry(data)
-                sequence = int(belief.get("result_sequence", -1))
-                if sequence >= 0:
-                    self._bounded_store(self.belief_history, sequence, belief)
-                self._render_matching_locked()
+                self.belief = belief
+                self.rendered_belief = belief
+                self._render_locked()
         except Exception:
             return
-
-    @staticmethod
-    def _bounded_store(
-        history: collections.OrderedDict[int, Any], key: int, value: Any
-    ) -> None:
-        if key < 0:
-            return
-        history[key] = value
-        history.move_to_end(key)
-        while len(history) > 60:
-            history.popitem(last=False)
-
-    def _matched_triplet_locked(
-        self,
-    ) -> tuple[dict[str, np.ndarray], dict[str, Any], dict[str, Any]] | None:
-        """Return only an image/result/belief triple from the same result epoch."""
-        for result_sequence in reversed(self.result_history):
-            result = self.result_history[result_sequence]
-            belief = self.belief_history.get(result_sequence)
-            source_sequence = result.get("source_bundle_sequence")
-            try:
-                images = self.image_history.get(int(source_sequence))
-            except (TypeError, ValueError):
-                images = None
-            if belief is not None and images is not None:
-                return images, result, belief
-        return None
 
     def _encode_locked(self, images: dict[str, np.ndarray]) -> None:
         stacked = np.vstack([images[camera_id] for camera_id in CAMERA_IDS])
@@ -206,64 +195,43 @@ class WristV11WebViewer:
             self.jpeg = encoded.tobytes()
             self.lock.notify_all()
 
-    def _render_matching_locked(self) -> None:
-        matched = self._matched_triplet_locked()
-        if matched is None:
-            # It is useful to keep video live while SAM3/belief catches up, but
-            # never place stale masks or a belief marker onto that newer image.
-            if not self.image_history:
-                return
-            latest_key = next(reversed(self.image_history))
-            latest_images = self.image_history[latest_key]
-            self.rendered_result_sequence = None
-            self.rendered_belief = None
-            self.object_count = None
-            self._encode_locked(
-                {camera_id: image.copy() for camera_id, image in latest_images.items()}
-            )
+    def _belief_stale_locked(self) -> bool:
+        belief = self.belief
+        if not isinstance(belief, dict):
+            return True
+        published = int(belief.get("published_timestamp_us", 0) or 0)
+        return published <= 0 or (now_us() - published) / 1000.0 > self.BELIEF_STALE_MS
+
+    def _render_locked(self) -> None:
+        if self.latest_images is None:
             return
-        source_images, result, belief = matched
         images = {
-            camera_id: image.copy() for camera_id, image in source_images.items()
+            camera_id: image.copy()
+            for camera_id, image in self.latest_images.items()
         }
-        objects = list(result.get("objects", []))
-        for obj in objects:
-            camera_id = obj.get("camera_id")
-            if camera_id not in images or obj.get("mask_encoding") != "bitpack-zlib-row-major":
-                continue
-            try:
-                mask = unpack_mask(obj["mask_data"], width=int(obj["mask_width"]), height=int(obj["mask_height"]))
-                image = images[camera_id]
-                if mask.shape != image.shape[:2]:
-                    continue
-                color = np.array((40, 220, 40) if camera_id == "left_wrist" else (255, 140, 20), dtype=np.uint8)
-                image[mask] = (0.55 * image[mask] + 0.45 * color).astype(np.uint8)
-                x0, y0, _x1, _y1 = np.asarray(obj.get("box_xyxy"), dtype=int).reshape(4)
-                cv2.putText(image, f"{obj.get('label', 'object')} {float(obj.get('score', 0.0)):.2f}", (max(0, x0), max(32, y0)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color.tolist(), 1, cv2.LINE_AA)
-            except Exception:
-                continue
-        self._draw_belief_locked(images, objects, belief)
-        self.rendered_result_sequence = int(result.get("sequence", -1))
-        self.rendered_belief = belief
-        self.object_count = len(objects)
+        self._draw_latest_belief_locked(images)
         self._encode_locked(images)
 
-    def _draw_belief_locked(
-        self,
-        images: dict[str, np.ndarray],
-        objects: list[dict[str, Any]],
-        belief: dict[str, Any],
-    ) -> None:
+    def _draw_latest_belief_locked(self, images: dict[str, np.ndarray]) -> None:
+        """Project pelvis-frame belief into the camera image displayed now."""
+        belief = self.belief or {}
         hands = belief.get("hands") if isinstance(belief, dict) else None
         if not isinstance(hands, dict):
             return
+        latest = self.latest_transforms or {}
         for camera_id in CAMERA_IDS:
+            transform = latest.get(camera_id, {}).get("t_goal_cam")
+            intrinsics = dict(
+                latest.get(camera_id, {}).get("intrinsics") or {}
+            )
+            if intrinsics:
+                intrinsics.setdefault("cx", intrinsics.get("ppx"))
+                intrinsics.setdefault("cy", intrinsics.get("ppy"))
             camera_objects = [
-                obj for obj in objects if obj.get("camera_id") == camera_id
+                obj for obj in self.objects if obj.get("camera_id") == camera_id
             ]
             camera_hands: dict[str, Any] = {}
-            projection: dict[str, Any] | None = None
-            known_ids = {str(obj.get("track_id", "")) for obj in camera_objects}
+            known = {str(obj.get("track_id", "")): obj for obj in camera_objects}
             for side in ("left", "right"):
                 hand = dict(hands.get(side) or {})
                 target = hand.get("target")
@@ -271,34 +239,23 @@ class WristV11WebViewer:
                     hand["target"] = None
                     camera_hands[side] = hand
                     continue
-                projection = target
-                track_id = str(target.get("object_id", ""))
-                if track_id and track_id not in known_ids:
-                    camera_objects.append(
-                        {
-                            "track_id": track_id,
-                            "box_xyxy": target.get("box_xyxy"),
-                            "camera_id": camera_id,
-                        }
-                    )
+                target = dict(target)
+                current = known.get(str(target.get("object_id", "")))
+                # Boxes are image-frame measurements: bind them only to the
+                # newest observation of the same track. Pelvis targets remain
+                # valid without a box and are projected below with new pose.
+                target["box_xyxy"] = current.get("box_xyxy") if current else None
+                target.pop("t_goal_cam", None)
+                target.pop("intrinsics", None)
+                hand["target"] = target
                 camera_hands[side] = hand
-            if projection is None:
-                projection = next(
-                    (obj for obj in camera_objects if obj.get("t_goal_cam") and obj.get("intrinsics")),
-                    None,
-                )
-            transform = projection.get("t_goal_cam") if projection else None
-            intrinsics = dict(projection.get("intrinsics") or {}) if projection else None
-            if intrinsics:
-                intrinsics.setdefault("cx", intrinsics.get("ppx"))
-                intrinsics.setdefault("cy", intrinsics.get("ppy"))
             _draw_remote_belief_overlay(
                 images[camera_id],
                 camera_objects,
                 {**belief, "hands": camera_hands},
-                stale=False,
+                stale=self._belief_stale_locked(),
                 t_goal_cam=transform,
-                intrinsics=intrinsics,
+                intrinsics=intrinsics or None,
                 control=belief.get("control"),
             )
 
@@ -331,7 +288,8 @@ class WristV11WebViewer:
                 "bundle_age_ms": age,
                 "object_count": self.object_count,
                 "belief_result_sequence": self.rendered_result_sequence,
-                "overlay_sequence_matched": self.rendered_result_sequence is not None,
+                "overlay_uses_latest_camera_pose": bool(self.latest_transforms),
+                "belief_stale": self._belief_stale_locked(),
                 "belief_targets": {
                     side: (hands.get(side) or {}).get("target")
                     for side in ("left", "right")

@@ -90,6 +90,61 @@ def test_distance_advantage_positive_when_action_moves_toward_target():
     assert advantage > 0.0
 
 
+def test_proximity_advantage_is_bounded_monotone_and_enabled_by_default():
+    config = FeatureConfig()
+    feature = MultiFeatureCost(config)
+    near = feature.breakdown(
+        np.array([0.05, 0.0, 0.0]), eef_position=np.zeros(3)
+    )
+    far = feature.breakdown(
+        np.array([0.25, 0.0, 0.0]), eef_position=np.zeros(3)
+    )
+
+    assert config.w_proximity == 2.0
+    assert config.proximity_scale_m == 0.15
+    assert config.w_agreement == config.w_distance == 0.0
+    assert config.w_reach == 0.3
+    assert 0.0 < far["proximity_advantage"] < near["proximity_advantage"] <= 1.0
+    assert near["proximity_distance_m"] == 0.05
+    assert near["weighted_contributions"]["proximity"] == (
+        config.w_proximity * near["proximity_advantage"]
+    )
+
+
+def test_proximity_prefers_near_target_but_progress_can_select_a_far_target():
+    feature = MultiFeatureCost(
+        FeatureConfig(
+            w_proximity=2.0,
+            w_progress=1.0,
+            w_align=0.0,
+            w_reach=0.0,
+            w_agreement=0.0,
+            w_distance=0.0,
+            w_delta=0.0,
+        )
+    )
+    eef = np.zeros(3)
+
+    # Same progress evidence: the closer candidate wins by proximity.
+    near_same_direction = feature.advantage(
+        np.array([0.05, 0.0, 0.0]), eef, np.array([0.1, 0.0, 0.0])
+    )
+    far_same_direction = feature.advantage(
+        np.array([0.25, 0.0, 0.0]), eef, np.array([0.1, 0.0, 0.0])
+    )
+    assert near_same_direction > far_same_direction
+
+    # A deliberate move away from the near target must still overcome its
+    # proximity bonus, rather than trapping the operator at contact.
+    near_away = feature.advantage(
+        np.array([0.05, 0.0, 0.0]), eef, np.array([-0.1, 0.0, 0.0])
+    )
+    far_toward = feature.advantage(
+        np.array([0.25, 0.0, 0.0]), eef, np.array([0.1, 0.0, 0.0])
+    )
+    assert far_toward > near_away
+
+
 def test_ray_feature_is_compatibility_only_and_has_zero_weight():
     feature = MultiFeatureCost(FeatureConfig(w_distance=0.0, w_progress=0.0, w_agreement=0.0, w_reach=0.0))
     origin = np.zeros(3)

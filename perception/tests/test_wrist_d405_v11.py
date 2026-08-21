@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+
 import numpy as np
 
 from remote_offload.remote_sam3_wrist_d405_worker_v11 import (
@@ -13,9 +15,16 @@ from remote_offload.wrist_belief_gateway_v11 import (
     wrist_object_ids_for_hand,
 )
 from remote_offload.wrist_d405_protocol_v11 import (
+    CAMERA_IDS,
     make_result,
+    pack_result,
     pack_depth_z16,
     unpack_depth_z16,
+    unpack_result,
+)
+from remote_offload.remote_web_wrist_d405_v11 import WristV11WebViewer
+from remote_offload.wrist_d405_geometry_pipeline_v11 import (
+    camera_transform_diagnostics,
 )
 
 
@@ -92,6 +101,99 @@ def test_result_carries_sequence_match_and_geometry_diagnostics() -> None:
     )
     assert result["source_bundle_sequence"] == 7
     assert result["geometry_status"]["state_age_rejects"] == 2
+
+
+def test_frame_level_camera_transform_is_validated_and_not_object_payload() -> None:
+    transforms = {
+        camera_id: np.eye(4, dtype=float).reshape(-1).tolist()
+        for camera_id in CAMERA_IDS
+    }
+    diagnostics = {
+        camera_id: {"t_goal_camera": transforms[camera_id]}
+        for camera_id in CAMERA_IDS
+    }
+    result = make_result(
+        sequence=12,
+        source_bundle_timestamp_us=456,
+        source_bundle_sequence=8,
+        objects=[{"camera_id": "left_wrist", "track_id": "left_wrist:cup:0"}],
+        discarded_seam_masks=0,
+        t_goal_cam=transforms,
+        transform_diagnostics=diagnostics,
+    )
+    restored = unpack_result(pack_result(result))
+    assert restored["t_goal_cam"] == transforms
+    assert restored["transform_diagnostics"]["right_wrist"]["t_goal_camera"] == transforms["right_wrist"]
+    assert "t_goal_cam" not in restored["objects"][0]
+    assert "transform_diagnostics" not in restored["objects"][0]
+
+
+def test_frame_transform_diagnostics_use_supplied_fk_without_recomputation() -> None:
+    goal_wrist = np.eye(4, dtype=float)
+    goal_wrist[:3, 3] = [0.2, -0.1, 0.3]
+    wrist_camera = np.eye(4, dtype=float)
+    wrist_camera[:3, 3] = [0.05, 0.0, -0.02]
+    diagnostics = camera_transform_diagnostics(
+        "left_wrist", {"left_wrist": wrist_camera}, goal_wrist=goal_wrist
+    )
+    expected = goal_wrist @ wrist_camera
+    np.testing.assert_array_equal(
+        diagnostics["t_goal_camera"], expected.reshape(-1).tolist()
+    )
+    assert diagnostics["t_goal_wrist"] == goal_wrist.reshape(-1).tolist()
+
+
+def test_wrist_viewer_keeps_latest_frame_transform_without_object_pose_copy() -> None:
+    viewer = WristV11WebViewer.__new__(WristV11WebViewer)
+    viewer.lock = threading.Condition()
+    viewer.latest_images = None
+    viewer.objects = []
+    viewer.latest_transforms = {}
+    viewer.belief = None
+    viewer.result_timestamp_us = None
+    viewer.rendered_result_sequence = None
+    viewer.rendered_belief = None
+
+    first_transform = np.eye(4, dtype=float).reshape(-1).tolist()
+    intrinsics = {
+        "width": 640,
+        "height": 360,
+        "fx": 400.0,
+        "fy": 400.0,
+        "ppx": 320.0,
+        "ppy": 180.0,
+    }
+    first = make_result(
+        sequence=1,
+        source_bundle_timestamp_us=1,
+        objects=[{"camera_id": "left_wrist", "intrinsics": intrinsics}],
+        discarded_seam_masks=0,
+        t_goal_cam={"left_wrist": first_transform},
+        transform_diagnostics={"left_wrist": {"t_goal_camera": first_transform}},
+    )
+    viewer._on_result("result", pack_result(first))
+
+    second_transform = np.eye(4, dtype=float)
+    second_transform[0, 3] = 0.15
+    second_wire = second_transform.reshape(-1).tolist()
+    second = make_result(
+        sequence=2,
+        source_bundle_timestamp_us=2,
+        objects=[],
+        discarded_seam_masks=0,
+        t_goal_cam={"left_wrist": second_wire},
+        transform_diagnostics={"left_wrist": {"t_goal_camera": second_wire}},
+    )
+    viewer._on_result("result", pack_result(second))
+
+    assert viewer.latest_transforms["left_wrist"]["t_goal_cam"] == second_wire
+    assert viewer.latest_transforms["left_wrist"]["intrinsics"] == intrinsics
+
+
+def test_wrist_viewer_marks_stale_belief_after_half_second() -> None:
+    viewer = WristV11WebViewer.__new__(WristV11WebViewer)
+    viewer.belief = {"published_timestamp_us": 1}
+    assert viewer._belief_stale_locked() is True
 
 
 def test_wrist_gateway_executes_preserved_thor_belief_methods_directly() -> None:

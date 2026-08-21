@@ -34,6 +34,7 @@ from seg_web_node.sam3_backend import TensorRTSam3Backend, TorchSam3Backend
 
 from .wrist_d405_geometry_pipeline_v11 import (
     CAMERA_TO_WRIST_LINK,
+    camera_transform_diagnostics,
     load_wrist_extrinsics,
     attach_surface_geometry,
     object_geometry,
@@ -355,11 +356,18 @@ class WristD405Sam3Worker:
         # The paired state is mandatory above. One FK evaluation serves every
         # object in this atomic two-camera bundle.
         link_transforms = g1_link_transforms(np.asarray(paired_state.q, dtype=np.float64))
-        t_goal_cameras = {
-            camera_id: link_transforms[CAMERA_TO_WRIST_LINK[camera_id]]
-            @ self.extrinsics[camera_id]
-            for camera_id in CAMERA_IDS
-        }
+        t_goal_cameras: dict[str, np.ndarray] = {}
+        transform_diagnostics: dict[str, dict[str, Any]] = {}
+        for camera_id in CAMERA_IDS:
+            goal_wrist = link_transforms[CAMERA_TO_WRIST_LINK[camera_id]]
+            goal_camera = goal_wrist @ self.extrinsics[camera_id]
+            t_goal_cameras[camera_id] = goal_camera
+            transform_diagnostics[camera_id] = camera_transform_diagnostics(
+                camera_id,
+                self.extrinsics,
+                goal_wrist=goal_wrist,
+                goal_camera=goal_camera,
+            )
         up_goal = gravity_up_in_pelvis(paired_state.base_quat_wxyz)
         stacked, split_y = stack_wrist_images(frames)
         masks, boxes, scores, labels = self.backend.infer(stacked, concepts)
@@ -407,7 +415,7 @@ class WristD405Sam3Worker:
                     intrinsics=frame["intrinsics"], source_timestamp_us=int(frame["host_timestamp_us"]),
                     calibration_id=str(frame.get("calibration_id", "factory")), state=paired_state,
                     state_age_ms=state_age_by_camera[camera_id],
-                    wrist_extrinsics=self.extrinsics, min_depth_m=self.min_depth_m, max_depth_m=self.max_depth_m,
+                    min_depth_m=self.min_depth_m, max_depth_m=self.max_depth_m,
                     min_depth_points=self.min_depth_points, point_filter=self.point_filter,
                     depth_edge_mask=depth_edge_mask,
                     t_goal_cam=t_goal_cameras[camera_id],
@@ -421,6 +429,7 @@ class WristD405Sam3Worker:
                     surface_tracker=self.surface_trackers[camera_id], contact_config=self.contact_config,
                     pseudo_config=self.pseudo_config,
                     up_goal=up_goal,
+                    t_goal_cam=t_goal_cameras[camera_id],
                 ):
                     active_surface_tracks.add(obj["track_id"])
                 obj.update(
@@ -466,6 +475,11 @@ class WristD405Sam3Worker:
                 up_goal_available=up_goal is not None,
                 suppressed_duplicate_masks=suppressed_duplicates,
             ),
+            t_goal_cam={
+                camera_id: t_goal_cameras[camera_id].reshape(-1).astype(float).tolist()
+                for camera_id in CAMERA_IDS
+            },
+            transform_diagnostics=transform_diagnostics,
         )
         self.bus.publish(WRIST_RESULT_CHANNEL, pack_result(result))
         now_monotonic = time.monotonic()
@@ -509,6 +523,13 @@ class WristD405Sam3Worker:
             "inter_wrist_skew_us": int(bundle.get("inter_wrist_skew_us", 0) or 0),
             "robot_state_arrival_interval_us": bundle.get("robot_state_arrival_interval_us"),
             "robot_state_max_arrival_interval_us": bundle.get("robot_state_max_arrival_interval_us"),
+            # Host/G1 clocks are not synchronized, so this is not transport
+            # latency. It is the observable upper bound on how stale a held
+            # packet can be when the 15 ms frame/state gate is evaluated.
+            "robot_state_gap_ms": float(bundle.get("robot_state_gap_ms") or 0.0),
+            "robot_state_gap_max_ms": float(
+                bundle.get("robot_state_gap_max_ms") or 0.0
+            ),
             "track_count": {
                 camera_id: len(self.tracks[camera_id]) for camera_id in CAMERA_IDS
             },

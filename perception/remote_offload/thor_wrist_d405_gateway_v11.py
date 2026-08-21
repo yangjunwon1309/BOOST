@@ -114,7 +114,12 @@ class ThorWristD405Gateway:
         self.sequence = 0
         self.last_publish_log_monotonic = 0.0
         self.last_skip_log_monotonic = 0.0
-        self.stats: dict[str, Any] = {"skipped_frames": 0, "last_skip": None}
+        self.stats: dict[str, Any] = {
+            "skipped_frames": 0,
+            "last_skip_reason": None,
+            "robot_state_gap_ms": 0.0,
+            "robot_state_gap_max_ms": 0.0,
+        }
         self.capture: WristD405Capture | None = None
         self.belief: WristBeliefGateway | None = None
         self.latest_robot_state_packet: tuple[int, bytes] | None = None
@@ -163,6 +168,11 @@ class ThorWristD405Gateway:
             self.robot_state_max_arrival_interval_us = max(
                 self.robot_state_max_arrival_interval_us,
                 self.robot_state_arrival_interval_us,
+            )
+            gap_ms = self.robot_state_arrival_interval_us / 1000.0
+            self.stats["robot_state_gap_ms"] = gap_ms
+            self.stats["robot_state_gap_max_ms"] = max(
+                float(self.stats.get("robot_state_gap_max_ms", 0.0)), gap_ms
             )
         self.last_robot_state_received_us = received_us
         self.latest_robot_state_packet = (received_us, bytes(data))
@@ -295,6 +305,10 @@ class ThorWristD405Gateway:
             "robot_state_host_received_us": int(state_received_us),
             "robot_state_arrival_interval_us": self.robot_state_arrival_interval_us,
             "robot_state_max_arrival_interval_us": self.robot_state_max_arrival_interval_us,
+            "robot_state_gap_ms": float(self.stats.get("robot_state_gap_ms", 0.0)),
+            "robot_state_gap_max_ms": float(
+                self.stats.get("robot_state_gap_max_ms", 0.0)
+            ),
             "cameras": frames,
         }
         encoded = pack_bundle(payload)
@@ -318,13 +332,11 @@ class ThorWristD405Gateway:
                 WRIST_BUNDLE_CHANNEL, belief_status,
                 {
                     "skipped_frames": self.stats["skipped_frames"],
-                    "state_arrival_interval_ms": (
-                        None
-                        if self.robot_state_arrival_interval_us is None
-                        else round(self.robot_state_arrival_interval_us / 1000.0, 2)
+                    "robot_state_gap_ms": round(
+                        float(self.stats.get("robot_state_gap_ms", 0.0)), 2
                     ),
-                    "state_max_arrival_interval_ms": round(
-                        self.robot_state_max_arrival_interval_us / 1000.0, 2
+                    "robot_state_gap_max_ms": round(
+                        float(self.stats.get("robot_state_gap_max_ms", 0.0)), 2
                     ),
                 },
             )
@@ -365,9 +377,13 @@ class ThorWristD405Gateway:
                     self.stats["skipped_frames"] = int(
                         self.stats.get("skipped_frames", 0)
                     ) + 1
-                    self.stats["last_skip"] = str(error)
+                    self.stats["last_skip_reason"] = str(error)
                     if time.monotonic() - self.last_skip_log_monotonic >= 5.0:
-                        LOG.warning("frame skipped: %s", error)
+                        LOG.warning(
+                            "frame skipped (%d total): %s",
+                            self.stats["skipped_frames"],
+                            error,
+                        )
                         self.last_skip_log_monotonic = time.monotonic()
                 while self.wifi_bus.handle_timeout(0) > 0:
                     pass

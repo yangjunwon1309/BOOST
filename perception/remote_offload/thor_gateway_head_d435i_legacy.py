@@ -1500,6 +1500,27 @@ class ThorRemoteGateway:
             hand_input = hand_inputs.get(side)
             if hand_input is None or not isinstance(hand_telemetry, dict):
                 continue
+            control_hand = (
+                (self.latest_hand_selection.get("hands") or {}).get(side) or {}
+                if isinstance(self.latest_hand_selection, dict)
+                else {}
+            )
+            grasp_commanded = bool(control_hand.get("grasp_commanded", False))
+            grasp_engaged = bool(control_hand.get("grasp_engaged", False))
+            jaw_gap_m = control_hand.get("jaw_gap_m")
+            hand_telemetry["grasp_commanded"] = grasp_commanded
+            hand_telemetry["grasp_engaged"] = grasp_engaged
+            hand_telemetry["jaw_gap_m"] = jaw_gap_m
+            hand_telemetry["grasp_state_source"] = control_hand.get(
+                "grasp_state_source", "unavailable"
+            )
+            hand_target = hand_telemetry.get("target")
+            if isinstance(hand_target, dict):
+                hand_target["position_valid"] = not grasp_engaged
+                if grasp_engaged:
+                    # Do not change the posterior or orientation fields. The
+                    # held object no longer supplies a reach/contact target.
+                    hand_target["position_suppressed_reason"] = "grasp_engaged"
             # Tracker telemetry can return early when there are no valid
             # objects.  Preserve the actual gateway FK input on those ticks so
             # timing/FK gaps remain diagnosable instead of appearing blank.
@@ -1584,6 +1605,17 @@ class ThorRemoteGateway:
         position = _finite_vec3(target.get("position_goal_m"))
         if position is None:
             return None
+        control_hand = (
+            (self.latest_hand_selection.get("hands") or {}).get(
+                self.belief_selected_hand
+            )
+            or {}
+            if isinstance(self.latest_hand_selection, dict)
+            else {}
+        )
+        grasp_commanded = bool(control_hand.get("grasp_commanded", False))
+        grasp_engaged = bool(control_hand.get("grasp_engaged", False))
+        position_valid = bool(target.get("position_valid", True)) and not grasp_engaged
         object_id = str(target.get("object_id", ""))
         selected = next(
             (
@@ -1625,6 +1657,16 @@ class ThorRemoteGateway:
             "belief_selected": True,
             "belief_selected_hand": self.belief_selected_hand,
             "belief_ee_target_link": self._belief_target_link(),
+            "grasp_commanded": grasp_commanded,
+            "grasp_engaged": grasp_engaged,
+            "jaw_gap_m": control_hand.get("jaw_gap_m"),
+            "grasp_state_source": control_hand.get(
+                "grasp_state_source", "unavailable"
+            ),
+            "position_valid": position_valid,
+            "position_suppressed_reason": (
+                "grasp_engaged" if not position_valid else None
+            ),
             "belief_ray_origin_m": ray_origin.tolist() if ray_origin is not None else None,
             "belief_ray_direction": ray_direction.tolist() if ray_direction is not None else None,
             "orientation_object_id": target.get("orientation_object_id"),
@@ -1653,6 +1695,11 @@ class ThorRemoteGateway:
             "orientation_policy": target.get("orientation_policy", "minimal_rotation"),
             "orientation_frame_world": target.get("orientation_frame_world"),
             "position_point": f"{self.belief_hand_model}_grasp_center",
+            "position_valid": position_valid,
+            "position_suppressed_reason": (
+                "grasp_engaged" if not position_valid else None
+            ),
+            "grasp_engaged": grasp_engaged,
         }
         return position, output, "belief"
 
@@ -1752,6 +1799,11 @@ class ThorRemoteGateway:
                 "label": selected_output["label"],
                 "grip_index": selected_output["grip_index"],
                 "position_point": selected_output["position_point"],
+                "position_valid": bool(selected_output.get("position_valid", True)),
+                "position_suppressed_reason": selected_output.get(
+                    "position_suppressed_reason"
+                ),
+                "grasp_engaged": bool(selected_output.get("grasp_engaged", False)),
                 "orientation_axis_world": selected_output["orientation_axis_world"],
                 "orientation_relation": selected_output["orientation_relation"],
                 "orientation_confidence": selected_output["orientation_confidence"],

@@ -68,6 +68,10 @@ class SharedControlConfig:
 class EETarget:
     position: np.ndarray
     confidence: float
+    # Position and orientation are independently valid.  A held object no
+    # longer supplies a contact/reach target, but can still supply its
+    # transport-orientation constraint.
+    position_valid: bool = True
     orientation_wxyz: np.ndarray | None = None  # legacy diagnostic only
     object_id: str = ""
     grip_index: int = -1

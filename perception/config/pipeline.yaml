@@ -288,10 +288,12 @@ tasc_belief:
   grasp_center_local_m: [0.0, 0.100, 0.0]
   fallback_eef_position_m: [0.0, 0.0, 0.0]
   features:
-    w_distance: 1.4
+    w_proximity: 2.0
+    proximity_scale_m: 0.15
     w_progress: 1.0
-    w_agreement: 0.4
-    w_reach: 1.0
+    w_agreement: 0.0
+    w_distance: 0.0
+    w_reach: 0.3
     w_delta: 0.0
     w_align: 0.9
     align_min_quality: 0.25

@@ -364,8 +364,10 @@ class WristBeliefGateway(ThorRemoteGateway):
             payload.setdefault("image_width", first.get("mask_width"))
             payload.setdefault("image_height", first.get("mask_height"))
             try:
+                camera_id = str(first.get("camera_id", ""))
                 transform = np.asarray(
-                    first.get("t_goal_cam"), dtype=np.float64
+                    (payload.get("t_goal_cam") or {}).get(camera_id),
+                    dtype=np.float64,
                 ).reshape(4, 4)
                 payload.setdefault(
                     "camera_goal_origin_m", transform[:3, 3].tolist()
@@ -419,8 +421,6 @@ class WristBeliefGateway(ThorRemoteGateway):
                     target.update(
                         camera_id=source.get("camera_id"),
                         box_xyxy=source.get("box_xyxy"),
-                        t_goal_cam=source.get("t_goal_cam"),
-                        intrinsics=source.get("intrinsics"),
                     )
             hands[side] = hand
             target_presence[side] = isinstance(hand.get("target"), dict)

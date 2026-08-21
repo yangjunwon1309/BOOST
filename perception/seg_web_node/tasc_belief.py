@@ -2025,6 +2025,9 @@ class HierarchicalTascBelief:
                 "grip_index": int(best_target.grip_index),
                 "object_confidence": float(best_target.object_confidence),
                 "joint_confidence": float(best_target.joint_confidence),
+                # The gateway may suppress this independently during a
+                # completed grasp; the posterior itself remains observable.
+                "position_valid": True,
                 "position_goal_m": best_target.position.tolist(),
                 "orientation_xyzw": (
                     None if target_quaternion is None

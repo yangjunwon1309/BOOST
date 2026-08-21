@@ -1,22 +1,35 @@
-extrinsics_source: axis_convention_corrected_wrist_d405_v11
-calibration_status: PROVISIONAL_AXIS_ONLY_TRANSLATION_NOT_FITTED
+extrinsics_source: cad_derived_wrist_d405_v11
+calibration_status: CAD_DERIVED_ROTATION_EXACT_TRANSLATION_NOMINAL
 
-# Rotation is constructed, not fitted:
-# R_wrist_camera = Ry(+20 deg) @ P
+# Rotation is exact from the mount CAD:
+# R_wrist_camera = Ry(+25 deg) @ P
 # P maps RealSense optical axes to G1 wrist_yaw_link:
-# optical +z -> wrist +x, optical +x -> wrist -y, optical +y -> wrist -z.
-# The 20-degree tilt is about wrist +y because wrist +x is forward.
-# At q=0, optical +z in pelvis is [0.9397, 0, -0.3420].
-# Translation is nominal and must be re-fitted only after hardware validation.
-translation_uncertainty_m: 0.010
-orientation_uncertainty_deg: 5.0
+# optical +z (forward) -> wrist +x, optical +x (right) -> wrist -y,
+# optical +y (down) -> wrist -z.
+# The 25-degree tilt is about wrist +y, not wrist +x.
+# At q=0, optical +z in pelvis is [0.9063, 0, -0.4226].
+# Both wrist mounts have identical, non-mirrored geometry.
+
+# Translation combines the wrist-to-clamp measurement, exact CAD seat offset,
+# and a nominal 20 mm seat-to-left-imager optical-axis offset.
+translation_uncertainty_m: 0.008
+orientation_uncertainty_deg: 3.0
+
 T_left_wrist_camera:
-- [0.0, -0.3420201433, 0.9396926208, 0.05]
-- [-1.0, 0.0, 0.0, 0.0]
-- [0.0, -0.9396926208, -0.3420201433, 0.05]
-- [0.0, 0.0, 0.0, 1.0]
+  - [0.0, -0.4226182617, 0.9063077870, 0.0713200000]
+  - [-1.0, 0.0, 0.0, 0.0]
+  - [0.0, -0.9063077870, -0.4226182617, 0.0572880000]
+  - [0.0, 0.0, 0.0, 1.0]
+
 T_right_wrist_camera:
-- [0.0, -0.3420201433, 0.9396926208, 0.05]
-- [-1.0, 0.0, 0.0, 0.0]
-- [0.0, -0.9396926208, -0.3420201433, 0.05]
-- [0.0, 0.0, 0.0, 1.0]
+  - [0.0, -0.4226182617, 0.9063077870, 0.0713200000]
+  - [-1.0, 0.0, 0.0, 0.0]
+  - [0.0, -0.9063077870, -0.4226182617, 0.0572880000]
+  - [0.0, 0.0, 0.0, 1.0]
+
+cad_seat_centre_wrist_m: [0.053194, 0.0, 0.065740]
+cad_clamp_to_seat_mount_m: [0.0, -0.065740, -0.003194]
+cad_seat_normal_mount: [0.0, 0.4226182617, -0.9063077870]
+cad_clamp_bore_diameter_m: 0.050
+cad_seat_bolt_spacing_m: 0.030
+nominal_seat_to_imager_m: 0.020

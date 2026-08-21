@@ -1,44 +1,22 @@
-extrinsics_source: translation_fit_fixed_rotation_wrist_d405_v11
-calibration_status: translation_fit_fixed_rotation
-translation_uncertainty_m: 0.025
-orientation_uncertainty_deg: 10.0
+extrinsics_source: axis_convention_corrected_wrist_d405_v11
+calibration_status: PROVISIONAL_AXIS_ONLY_TRANSLATION_NOT_FITTED
+
+# Rotation is constructed, not fitted:
+# R_wrist_camera = Ry(+20 deg) @ P
+# P maps RealSense optical axes to G1 wrist_yaw_link:
+# optical +z -> wrist +x, optical +x -> wrist -y, optical +y -> wrist -z.
+# The 20-degree tilt is about wrist +y because wrist +x is forward.
+# At q=0, optical +z in pelvis is [0.9397, 0, -0.3420].
+# Translation is nominal and must be re-fitted only after hardware validation.
+translation_uncertainty_m: 0.010
+orientation_uncertainty_deg: 5.0
 T_left_wrist_camera:
-- - -1.0
-  - 0.0
-  - 0.0
-  - 0.1897523287589687
-- - 0.0
-  - -0.906307787
-  - -0.4226182617
-  - 0.017723039980443722
-- - 0.0
-  - -0.4226182617
-  - 0.906307787
-  - -0.09666684816800321
-- - 0.0
-  - 0.0
-  - 0.0
-  - 1.0
+- [0.0, -0.3420201433, 0.9396926208, 0.05]
+- [-1.0, 0.0, 0.0, 0.0]
+- [0.0, -0.9396926208, -0.3420201433, 0.05]
+- [0.0, 0.0, 0.0, 1.0]
 T_right_wrist_camera:
-- - -1.0
-  - 0.0
-  - 0.0
-  - 0.20158523696222452
-- - 0.0
-  - -0.906307787
-  - -0.4226182617
-  - 0.011854922004047353
-- - 0.0
-  - -0.4226182617
-  - 0.906307787
-  - -0.09041066670737019
-- - 0.0
-  - 0.0
-  - 0.0
-  - 1.0
-left_wrist_calibration_rms_m: 0.0001417647033229782
-left_wrist_calibration_max_error_m: 0.00021976841940786539
-left_wrist_calibration_observations: 3
-right_wrist_calibration_rms_m: 5.917091087238178e-05
-right_wrist_calibration_max_error_m: 5.9170910872388655e-05
-right_wrist_calibration_observations: 2
+- [0.0, -0.3420201433, 0.9396926208, 0.05]
+- [-1.0, 0.0, 0.0, 0.0]
+- [0.0, -0.9396926208, -0.3420201433, 0.05]
+- [0.0, 0.0, 0.0, 1.0]

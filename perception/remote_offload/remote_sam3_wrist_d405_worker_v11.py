@@ -558,7 +558,11 @@ def main() -> None:
     parser.add_argument("--backend", choices=("mock", "pytorch", "tensorrt"), default="pytorch")
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--trt-engine", type=Path)
-    parser.add_argument("--extrinsics", type=Path, default=Path("config/wrist_d405_extrinsics_v11.yaml"))
+    parser.add_argument(
+        "--extrinsics",
+        type=Path,
+        default=Path("config/wrist_d405_extrinsics_v11_translation_calibrated.yaml"),
+    )
     parser.add_argument("--belief-config", type=Path, default=Path("config/pipeline.yaml"),
                         help="existing TASC filter/cylinder/RANSAC configuration")
     parser.add_argument("--threshold", type=float, default=0.5)

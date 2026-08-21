@@ -163,6 +163,12 @@ def object_geometry(*, camera_id: str, serial: str, mask: np.ndarray, box_xyxy: 
         "center_pixel_uv": None,
         "gravity_up_goal": None, "contact_candidates": [], "surface_primitives": [],
         "surface_model": None, "point_filter": dict(diagnostics),
+        # The solver consumes pelvis-local targets.  Keep this explicit on the
+        # wire; calling it a generic "goal" frame made it too easy to feed a
+        # wrist-local point into the PATH/IPOPT path without noticing.
+        "target_position_frame": "pelvis_identity_fk",
+        "target_orientation_frame": "pelvis_identity_fk",
+        "wrist_link": CAMERA_TO_WRIST_LINK.get(camera_id),
     }
     if cloud is None or state is None:
         if state is None:

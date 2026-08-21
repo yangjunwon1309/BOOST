@@ -102,4 +102,4 @@ orientation_shared_control:
   gate_max_angle_rad: 1.047
   gate_taper_start_fraction: 0.667
 
-extrinsics: config/wrist_d405_extrinsics_v11.yaml
+extrinsics: config/wrist_d405_extrinsics_v11_translation_calibrated.yaml

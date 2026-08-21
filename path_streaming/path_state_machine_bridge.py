@@ -135,6 +135,33 @@ STREAM_MODE_TRACKING = 7
 Q_READY = np.zeros(29, dtype=np.float64)
 
 
+def rotation_matrix_to_quaternion_wxyz(rotation: np.ndarray) -> np.ndarray:
+    """Convert a proper rotation to the scalar-first quaternion wire form."""
+    r = np.asarray(rotation, dtype=np.float64).reshape(3, 3)
+    trace = float(np.trace(r))
+    if trace > 0.0:
+        s = 2.0 * np.sqrt(trace + 1.0)
+        q = np.array([
+            0.25 * s,
+            (r[2, 1] - r[1, 2]) / s,
+            (r[0, 2] - r[2, 0]) / s,
+            (r[1, 0] - r[0, 1]) / s,
+        ])
+    else:
+        diagonal = np.diag(r)
+        index = int(np.argmax(diagonal))
+        next_index = (index + 1) % 3
+        last_index = (index + 2) % 3
+        s = 2.0 * np.sqrt(max(1.0e-12, 1.0 + diagonal[index] - diagonal[next_index] - diagonal[last_index]))
+        q = np.zeros(4, dtype=np.float64)
+        q[index + 1] = 0.25 * s
+        q[0] = (r[last_index, next_index] - r[next_index, last_index]) / s
+        q[next_index + 1] = (r[next_index, index] + r[index, next_index]) / s
+        q[last_index + 1] = (r[last_index, index] + r[index, last_index]) / s
+    q /= max(1.0e-12, float(np.linalg.norm(q)))
+    return -q if q[0] < 0.0 else q
+
+
 def copy_locomotion_command(
     command: SonicLocomotionCommand,
     *,
@@ -3087,15 +3114,27 @@ def main() -> int:
                                 ),
                             )
                             if shared_target is not None:
+                                target_tf = left_target_tf if requested_hand == "left" else right_target_tf
                                 qp_payload.update(
                                     q_prior_source="ipopt_second_order_ee_pose",
-                                    terminal_target_link=str(selected_target_payload.get("target_link", "") if selected_target_payload else ""),
-                                    terminal_target_position=(left_target_tf if requested_hand == "left" else right_target_tf)[:3, 3].tolist(),
-                                    target_source=str(
+                                     terminal_target_link=str(selected_target_payload.get("target_link", "") if selected_target_payload else ""),
+                                     terminal_target_position=target_tf[:3, 3].tolist(),
+                                     # Preserve the exact pose that was sent to
+                                     # IPOPT.  Previously only position was
+                                     # emitted, so an orientation/frame mismatch
+                                     # could not be diagnosed from the solver
+                                     # stream and consumers fell back to a
+                                     # legacy quaternion.
+                                     terminal_target_orientation_wxyz=rotation_matrix_to_quaternion_wxyz(
+                                         target_tf[:3, :3]
+                                     ).tolist(),
+                                     terminal_target_transform=target_tf.reshape(-1).tolist(),
+                                     terminal_target_frame="pelvis_identity_fk",
+                                     target_source=str(
                                         latest_static_target.get("source", "sam3_tasc_belief")
                                         if latest_static_target else "none"
-                                    ),
-                                )
+                                     ),
+                                 )
                     else:
                         hold_q = last_ipopt_or_measured_hold()
                         qp_payload = ipopt_arm_sample_reference(

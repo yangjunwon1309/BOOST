@@ -26,14 +26,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 WRIST_IPOPT_VISUAL_CHANNEL = "PATH_V11_WRIST_IPOPT_VISUAL"
 
 
-def _age_ms(timestamp_us: Any, received_us: int) -> str:
+def _monotonic_delta_ms(later_us: Any, earlier_us: Any) -> str:
     try:
-        age = (received_us - int(timestamp_us)) / 1_000.0
+        delta = (int(later_us) - int(earlier_us)) / 1_000.0
     except (TypeError, ValueError):
         return "n/a"
-    # A negative value means the two hosts' wall clocks are not synchronized;
-    # it is not evidence of a transport failure.
-    return f"{age:.1f}"
+    return f"{delta:.1f}"
 
 
 def _format_target(hands: Any, side: str) -> str:
@@ -131,8 +129,10 @@ def main() -> int:
         print(
             "[ipopt-visual] "
             f"packet={received} state={payload.get('state', 'unknown')} "
-            f"publish_age={_age_ms(payload.get('published_timestamp_us'), received_us)} ms "
-            f"source_age={_age_ms(payload.get('source_timestamp_us'), received_us)} ms "
+            # PATH timestamps are monotonic-clock values from Thor. They cannot
+            # be compared to the laptop wall clock, but their same-host delta
+            # exposes any bridge-side delay before the LCM publish.
+            f"bridge_publish_delta={_monotonic_delta_ms(payload.get('published_timestamp_us'), payload.get('source_timestamp_us'))} ms "
             f"interval={interval} "
             f"left={_format_target(hands, 'left')} "
             f"right={_format_target(hands, 'right')}",

@@ -2017,6 +2017,31 @@ def main() -> int:
         hold[:15] = 0.0
         return hold
 
+    def ipopt_visual_hands_from_transforms(
+        left_wrist_tf: np.ndarray,
+        right_wrist_tf: np.ndarray,
+        *,
+        target_source: str,
+    ) -> dict[str, dict]:
+        """Encode the pelvis-frame wrist poses currently held by IPOPT.
+
+        The viewer must retain an explicit target even while PICO is waiting
+        for its first fresh body frame.  In those states the direct controller
+        holds Q_READY or the last IPOPT solution, both of which still have a
+        well-defined wrist FK pose.
+        """
+        return {
+            side: {
+                "ipopt_wrist_target_m": transform[:3, 3].astype(float).tolist(),
+                "ipopt_wrist_rotation": transform[:3, :3].reshape(9).astype(float).tolist(),
+                "target_source": target_source,
+            }
+            for side, transform in (
+                ("left", np.asarray(left_wrist_tf, dtype=np.float64).reshape(4, 4)),
+                ("right", np.asarray(right_wrist_tf, dtype=np.float64).reshape(4, 4)),
+            )
+        }
+
     def remember_pico_hand_fields(raw: bytes, topic: str, rx_us: int) -> None:
         nonlocal latest_left_hand_joints, latest_right_hand_joints
         nonlocal latest_hand_us, latest_hand_meta
@@ -2798,6 +2823,21 @@ def main() -> int:
                         else last_ipopt_or_measured_hold()
                     )
                     q_for_sonic[:15] = 0.0
+                    if ready_result.success:
+                        control_visual_hands = ipopt_visual_hands_from_transforms(
+                            q_ready_left_wrist_tf,
+                            q_ready_right_wrist_tf,
+                            target_source="teleop_wait_ready_q_ready",
+                        )
+                    else:
+                        hold_left_tf, hold_right_tf = (
+                            arm_nonlinear_ik.wrist_transforms_from_q29(q_for_sonic)
+                        )
+                        control_visual_hands = ipopt_visual_hands_from_transforms(
+                            hold_left_tf,
+                            hold_right_tf,
+                            target_source="teleop_wait_ready_ipopt_hold",
+                        )
                     if policy_started:
                         send_planner_command(
                             sonic,
@@ -3226,6 +3266,14 @@ def main() -> int:
                                  )
                     else:
                         hold_q = last_ipopt_or_measured_hold()
+                        hold_left_tf, hold_right_tf = (
+                            arm_nonlinear_ik.wrist_transforms_from_q29(hold_q)
+                        )
+                        control_visual_hands = ipopt_visual_hands_from_transforms(
+                            hold_left_tf,
+                            hold_right_tf,
+                            target_source="ipopt_failed_hold",
+                        )
                         qp_payload = ipopt_arm_sample_reference(
                             hold_q,
                             state=current_state,
@@ -3270,6 +3318,18 @@ def main() -> int:
                         last_ipopt_or_measured_hold()
                         if hold_tracking_target
                         else Q_READY.copy()
+                    )
+                    hold_left_tf, hold_right_tf = (
+                        arm_nonlinear_ik.wrist_transforms_from_q29(hold_q)
+                    )
+                    control_visual_hands = ipopt_visual_hands_from_transforms(
+                        hold_left_tf,
+                        hold_right_tf,
+                        target_source=(
+                            "stale_pico_ipopt_hold"
+                            if hold_tracking_target
+                            else "teleop_wait_ready_q_ready"
+                        ),
                     )
                     if policy_started:
                         send_planner_command(
@@ -3346,6 +3406,14 @@ def main() -> int:
                         blended_q,
                         freeze_lower_body=bool(args.freeze_planner_lower_body),
                         freeze_waist=bool(args.freeze_planner_waist),
+                    )
+                    blended_left_tf, blended_right_tf = (
+                        arm_nonlinear_ik.wrist_transforms_from_q29(blended_q)
+                    )
+                    control_visual_hands = ipopt_visual_hands_from_transforms(
+                        blended_left_tf,
+                        blended_right_tf,
+                        target_source="damped_return_ipopt_reference",
                     )
                     send_planner_command(
                         sonic,

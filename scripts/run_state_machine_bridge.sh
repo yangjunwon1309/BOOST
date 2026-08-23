@@ -33,12 +33,15 @@ python -u path_streaming/path_state_machine_bridge.py \
   --end-effector-model "${PATH_END_EFFECTOR_MODEL:-dex1}" \
   --hand-axis-local ${PATH_HAND_AXIS_LOCAL:-0.0 1.0 0.0} \
   --grasp-center-local ${PATH_GRASP_CENTER_LOCAL:-0.0 0.100 0.0} \
+  --grasp-center-wrist-x-offset-m "${PATH_GRASP_CENTER_WRIST_X_OFFSET_M:-0.070}" \
   --shared-ref-lpf-alpha "${PATH_SHARED_REF_LPF_ALPHA:-0.3}" \
   --shared-hand-h-margin-m "${PATH_SHARED_HAND_H_MARGIN_M:-0.05}" \
   --shared-hand-switch-confirm-n "${PATH_SHARED_HAND_SWITCH_CONFIRM_N:-10}" \
   --shared-orientation-mode "${PATH_SHARED_ORIENTATION_MODE:-gmr_prior}" \
   $(if [[ "${PATH_SHARED_LOCK_INACTIVE_ARM_Q_PRIOR:-1}" != "0" ]]; then printf '%s' "--shared-lock-inactive-arm-q-prior"; else printf '%s' "--no-shared-lock-inactive-arm-q-prior"; fi) \
   --direct-lcm-url "${PATH_LCM_URL:-udpm://239.255.76.67:7667?ttl=1}" \
+  --wrist-visual-lcm-url "${PATH_WRIST_VISUAL_LCM_URL:-${WIFI_LCM_URL:-udpm://239.255.77.67:7667?ttl=1}}" \
+  --wrist-visual-channel "${PATH_WRIST_VISUAL_CHANNEL:-PATH_V11_WRIST_IPOPT_VISUAL}" \
   --direct-upper-command-channel "${PATH_DIRECT_UPPER_CHANNEL:-G1_PATH_UPPER_COMMAND}" \
   --direct-state-channel "${PATH_LCM_STATE_CHANNEL:-G1_ROBOT_STATE}" \
   --direct-lcm-state \

@@ -24,6 +24,10 @@ WRIST_HEARTBEAT_CHANNEL = "PATH_V11_WRIST_PERCEPTION_HEARTBEAT"
 WRIST_ROBOT_STATE_CHANNEL = "PATH_V11_WRIST_ROBOT_STATE"
 WRIST_CONCEPT_CONTROL_CHANNEL = "PATH_V11_WRIST_CONCEPT_CONTROL"
 WRIST_BELIEF_TELEMETRY_CHANNEL = "PATH_V11_WRIST_BELIEF_TELEMETRY"
+# Direct state-machine -> laptop diagnostic stream.  This is intentionally
+# separate from belief telemetry so an unavailable Thor-local ZMQ relay cannot
+# hide the actual IPOPT reference from the wrist web viewer.
+WRIST_IPOPT_VISUAL_CHANNEL = "PATH_V11_WRIST_IPOPT_VISUAL"
 
 
 def now_us() -> int:
@@ -280,6 +284,23 @@ def validate_result(payload: dict[str, Any]) -> dict[str, Any]:
         )
         if list(transform) != list(diagnostic_transform):
             raise ValueError(f"frame transform mismatch for {camera_id}")
+    return payload
+
+
+def pack_ipopt_visual(payload: dict[str, Any]) -> bytes:
+    """Encode the state machine's current IPOPT wrist targets for the viewer."""
+    wire = {"version": VERSION, **payload}
+    return msgpack.packb(wire, use_bin_type=True, strict_types=False)
+
+
+def unpack_ipopt_visual(data: bytes) -> dict[str, Any]:
+    payload = msgpack.unpackb(data, raw=False, strict_map_key=False)
+    if (
+        not isinstance(payload, dict)
+        or payload.get("version") != VERSION
+        or payload.get("schema") != "path.wrist_ipopt_visual.v1"
+    ):
+        raise ValueError("unsupported wrist IPOPT visual payload")
     return payload
 
 

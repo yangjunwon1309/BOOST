@@ -384,8 +384,12 @@ def _draw_hand_markers(
     # VR/reference motion normally, or the selected shared target while its
     # switch is held.  It is independent of whether belief geometry exists.
     if control_fresh:
+        ipopt_target = control_hand.get(
+            "ipopt_wrist_target_m",
+            control_hand.get("reference_grasp_goal_m"),
+        )
         pixel = _goal_to_pixel(
-            control_hand.get("reference_grasp_goal_m"), t_goal_cam, intrinsics
+            ipopt_target, t_goal_cam, intrinsics
         )
         if pixel is not None:
             cv2.drawMarker(

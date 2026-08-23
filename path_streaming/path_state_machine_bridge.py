@@ -105,6 +105,10 @@ from perception.seg_web_node.robot_geometry import (
     angular_velocity_from_rotations,
     hand_frame_profile,
 )
+from perception.remote_offload.wrist_d405_protocol_v11 import (
+    WRIST_IPOPT_VISUAL_CHANNEL,
+    pack_ipopt_visual,
+)
 
 # ``auto_planning`` remains an accepted external compatibility value, but is
 # canonicalized to teleop.  A/B is now the sole shared-control gate.
@@ -311,6 +315,19 @@ def parse_args() -> argparse.Namespace:
         help="LCM transport carrying PATH direct upper commands and G1 state.",
     )
     parser.add_argument(
+        "--wrist-visual-lcm-url",
+        default=os.environ.get(
+            "PATH_WRIST_VISUAL_LCM_URL",
+            os.environ.get("WIFI_LCM_URL", "udpm://239.255.77.67:7667?ttl=1"),
+        ),
+        help="Wi-Fi LCM transport for direct Thor-to-laptop IPOPT visualization.",
+    )
+    parser.add_argument(
+        "--wrist-visual-channel",
+        default=WRIST_IPOPT_VISUAL_CHANNEL,
+        help="Wi-Fi LCM channel carrying current IPOPT wrist targets.",
+    )
+    parser.add_argument(
         "--direct-upper-command-channel",
         default=UPPER_COMMAND_CHANNEL,
         help="Thor-to-G1 IPOPT arm command channel; never a SONIC action channel.",
@@ -405,6 +422,15 @@ def parse_args() -> argparse.Namespace:
         nargs=3,
         default=None,
         help="Override the active hand model's canonical grasp-center offset.",
+    )
+    parser.add_argument(
+        "--grasp-center-wrist-x-offset-m",
+        type=float,
+        default=0.070,
+        help=(
+            "Wrist-yaw +X offset to the Dex1 grasp-centre base; 0.070 m is "
+            "the provisional palm-end correction used for shared targets."
+        ),
     )
     parser.add_argument("--shared-ref-lpf-alpha", type=float, default=0.3)
     parser.add_argument(
@@ -1625,6 +1651,7 @@ def main() -> int:
     # arm commands leave this process only as G1_PATH_UPPER_COMMAND over LCM.
     sonic: zmq.Socket | None = None
     direct_lcm = lcm.LCM(args.direct_lcm_url)
+    wrist_visual_lcm = lcm.LCM(args.wrist_visual_lcm_url)
     direct_lcm_sequence = 0
     direct_state = (
         DirectLcmRobotStateSubscriber(
@@ -1659,6 +1686,10 @@ def main() -> int:
     log(
         "SONIC output disabled; direct IPOPT arm PUB "
         f"{args.direct_lcm_url}/{args.direct_upper_command_channel}"
+    )
+    log(
+        "wrist IPOPT visual PUB "
+        f"{args.wrist_visual_lcm_url}/{args.wrist_visual_channel}"
     )
     if direct_state is not None:
         log(
@@ -1847,6 +1878,20 @@ def main() -> int:
     ) for side in ("left", "right")}
     hand_axis_local = np.asarray(args.hand_axis_local, dtype=np.float64).reshape(3)
     grasp_center_local = np.asarray(args.grasp_center_local, dtype=np.float64).reshape(3)
+    hand_profile = hand_frame_profile(args.end_effector_model)
+    grasp_center_wrist_offset = {
+        side: np.asarray(hand_profile["translation"][side], dtype=np.float64)
+        + np.asarray(hand_profile["rotation"][side], dtype=np.float64)
+        @ grasp_center_local
+        for side in ("left", "right")
+    }
+    # The original Dex1 profile carries a provisional +45 mm wrist-to-base
+    # value.  Use the requested +70 mm palm-end correction for both hands,
+    # while retaining the model's lateral/vertical terms and base rotation.
+    for side in ("left", "right"):
+        grasp_center_wrist_offset[side][0] = float(
+            args.grasp_center_wrist_x_offset_m
+        )
     latest_shared_result = None
     orientation_gate = {
         side: OrientationTargetGate(
@@ -2982,7 +3027,7 @@ def main() -> int:
                                 or belief_target.position_point.endswith("_grasp_center")
                             )
                             goal_wrist = (
-                                goal - r_ref @ grasp_center_local
+                                goal - r_ref @ grasp_center_wrist_offset[side]
                                 if is_canonical_grasp_center
                                 else goal
                             )
@@ -3033,6 +3078,10 @@ def main() -> int:
                         }
                     control_visual_hands = {
                         side: {
+                            # Exact wrist-yaw Cartesian reference handed to
+                            # solve_authoritative_ipopt_transforms below.
+                            "ipopt_wrist_target_m": human_tf[side][:3, 3].tolist(),
+                            "ipopt_wrist_rotation": human_tf[side][:3, :3].reshape(9).tolist(),
                             "command_wrist_position_m": p_cmd.tolist(),
                             "command_wrist_rotation": r_cmd.reshape(9).tolist(),
                             "command_velocity_mps": (
@@ -3540,6 +3589,22 @@ def main() -> int:
                 qp.send(pack_topic(args.qp_topic, qp_payload))
             if sonic is not None and pose_to_send is not None:
                 sonic.send(pose_to_send)
+
+            # This direct Wi-Fi diagnostic path deliberately bypasses the
+            # Thor-local belief ZMQ subscriber. Perception/belief may be late,
+            # but the laptop must always see the current IPOPT wrist target.
+            wrist_visual_lcm.publish(
+                args.wrist_visual_channel,
+                pack_ipopt_visual(
+                    {
+                        "schema": "path.wrist_ipopt_visual.v1",
+                        "published_timestamp_us": int(now_us()),
+                        "source_timestamp_us": int(tick_us),
+                        "state": current_state,
+                        "hands": control_visual_hands,
+                    }
+                ),
+            )
 
             # PUB/SUB has no retained state.  A short heartbeat makes the
             # A/B selection available to a gateway that starts later too.

@@ -17,10 +17,12 @@ from remote_offload.wrist_belief_gateway_v11 import (
 from remote_offload.wrist_d405_protocol_v11 import (
     CAMERA_IDS,
     make_result,
+    pack_ipopt_visual,
     pack_mask,
     pack_result,
     pack_depth_z16,
     unpack_depth_z16,
+    unpack_ipopt_visual,
     unpack_result,
 )
 from remote_offload.remote_web_wrist_d405_v11 import WristV11WebViewer
@@ -33,6 +35,21 @@ def test_d405_depth_round_trip_preserves_native_grid() -> None:
     depth = np.arange(640 * 360, dtype=np.uint16).reshape(360, 640)
     restored = unpack_depth_z16(pack_depth_z16(depth), width=640, height=360)
     np.testing.assert_array_equal(restored, depth)
+
+
+def test_wrist_ipopt_visual_round_trip() -> None:
+    payload = {
+        "schema": "path.wrist_ipopt_visual.v1",
+        "published_timestamp_us": 123,
+        "state": "teleop",
+        "hands": {
+            "left": {"ipopt_wrist_target_m": [0.1, 0.2, 0.3]},
+        },
+    }
+    assert unpack_ipopt_visual(pack_ipopt_visual(payload)) == {
+        "version": 1,
+        **payload,
+    }
 
 
 def test_vertical_masks_map_to_their_local_wrist_grid() -> None:

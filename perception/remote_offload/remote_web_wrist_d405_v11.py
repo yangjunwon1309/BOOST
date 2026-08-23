@@ -22,6 +22,7 @@ from .wrist_d405_protocol_v11 import (
     WRIST_BELIEF_TELEMETRY_CHANNEL,
     WRIST_CONCEPT_CONTROL_CHANNEL,
     WRIST_HEARTBEAT_CHANNEL,
+    WRIST_IPOPT_VISUAL_CHANNEL,
     WRIST_RESULT_CHANNEL,
     normalize_concepts,
     now_us,
@@ -29,6 +30,7 @@ from .wrist_d405_protocol_v11 import (
     unpack_bundle,
     unpack_belief_telemetry,
     unpack_heartbeat,
+    unpack_ipopt_visual,
     unpack_mask,
     unpack_result,
 )
@@ -103,10 +105,12 @@ class WristV11WebViewer:
         self.rendered_result_sequence: int | None = None
         self.result_source_bundle_sequence: int | None = None
         self.rendered_belief: dict[str, Any] | None = None
+        self.ipopt_visual: dict[str, Any] | None = None
         self.bus.subscribe(WRIST_BUNDLE_CHANNEL, self._on_bundle)
         self.bus.subscribe(WRIST_RESULT_CHANNEL, self._on_result)
         self.bus.subscribe(WRIST_HEARTBEAT_CHANNEL, self._on_heartbeat)
         self.bus.subscribe(WRIST_BELIEF_TELEMETRY_CHANNEL, self._on_belief)
+        self.bus.subscribe(WRIST_IPOPT_VISUAL_CHANNEL, self._on_ipopt_visual)
 
     def _on_bundle(self, _channel: str, data: bytes) -> None:
         try:
@@ -187,6 +191,15 @@ class WristV11WebViewer:
         except Exception:
             return
 
+    def _on_ipopt_visual(self, _channel: str, data: bytes) -> None:
+        try:
+            visual = unpack_ipopt_visual(data)
+            with self.lock:
+                self.ipopt_visual = visual
+                self._render_locked()
+        except Exception:
+            return
+
     def _encode_locked(self, images: dict[str, np.ndarray]) -> None:
         stacked = np.vstack([images[camera_id] for camera_id in CAMERA_IDS])
         split_y = images["left_wrist"].shape[0]
@@ -210,6 +223,21 @@ class WristV11WebViewer:
             return True
         published = int(belief.get("published_timestamp_us", 0) or 0)
         return published <= 0 or (now_us() - published) / 1000.0 > self.BELIEF_STALE_MS
+
+    def _ipopt_control_locked(self) -> dict[str, Any] | None:
+        visual = getattr(self, "ipopt_visual", None)
+        if not isinstance(visual, dict):
+            return None
+        published = int(visual.get("published_timestamp_us", 0) or 0)
+        if published <= 0:
+            return None
+        age_ms = max(0.0, (now_us() - published) / 1000.0)
+        return {
+            "schema": visual.get("schema"),
+            "state": visual.get("state"),
+            "hands": visual.get("hands", {}),
+            "age_ms": age_ms,
+        }
 
     def _render_locked(self) -> None:
         if self.latest_images is None:
@@ -259,7 +287,10 @@ class WristV11WebViewer:
         """Project pelvis-frame belief into the camera image displayed now."""
         belief = self.belief or {}
         hands = belief.get("hands") if isinstance(belief, dict) else None
-        if not isinstance(hands, dict):
+        hands = hands if isinstance(hands, dict) else {}
+        ipopt_control = self._ipopt_control_locked()
+        control = ipopt_control or belief.get("control")
+        if not hands and not isinstance(control, dict):
             return
         latest = self.latest_transforms or {}
         for camera_id in CAMERA_IDS:
@@ -299,7 +330,7 @@ class WristV11WebViewer:
                 stale=self._belief_stale_locked(),
                 t_goal_cam=transform,
                 intrinsics=intrinsics or None,
-                control=belief.get("control"),
+                control=control,
                 legend_side=(
                     "left" if camera_id == "left_wrist" else "right"
                 ),
@@ -328,6 +359,7 @@ class WristV11WebViewer:
                 if isinstance(self.rendered_belief, dict)
                 else {}
             )
+            ipopt_control = self._ipopt_control_locked()
             return {
                 "heartbeat": dict(self.heartbeat),
                 "bundle_sequence": self.bundle_sequence,
@@ -341,6 +373,14 @@ class WristV11WebViewer:
                 ),
                 "overlay_uses_latest_camera_pose": bool(self.latest_transforms),
                 "belief_stale": self._belief_stale_locked(),
+                "ipopt_visual_age_ms": (
+                    None
+                    if ipopt_control is None
+                    else round(float(ipopt_control["age_ms"]), 1)
+                ),
+                "ipopt_targets": (
+                    {} if ipopt_control is None else ipopt_control.get("hands", {})
+                ),
                 "belief_targets": {
                     side: (hands.get(side) or {}).get("target")
                     for side in ("left", "right")

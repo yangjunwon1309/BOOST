@@ -492,6 +492,7 @@ def _draw_remote_belief_overlay(
     control: dict[str, Any] | None = None,
     legend_side: str | None = None,
     ipopt_camera_z_offset_m: float = 0.0,
+    render_sides: tuple[str, ...] | None = None,
 ) -> None:
     control = control if isinstance(control, dict) else {}
     control_hands = control.get("hands") or {}
@@ -500,22 +501,17 @@ def _draw_remote_belief_overlay(
     except (TypeError, ValueError):
         control_age_ms = float("inf")
     control_fresh = control_age_ms <= CONTROL_STALE_AFTER_MS
-    if not isinstance(telemetry, dict):
-        _draw_belief_legend(
-            overlay,
-            {},
-            control,
-            "none",
-            stale,
-            legend_side=legend_side,
-            ipopt_camera_z_offset_m=ipopt_camera_z_offset_m,
-        )
-        return
+    telemetry = telemetry if isinstance(telemetry, dict) else {}
     hands = telemetry.get("hands") or {}
     selected_hand = str(telemetry.get("selected_hand", "none"))
+    sides = tuple(
+        side
+        for side in (render_sides or ("left", "right"))
+        if side in BELIEF_COLORS
+    )
     armed_sides: list[str] = []
     dim_sides: list[str] = []
-    for side in ("left", "right"):
+    for side in sides:
         hand = hands.get(side) or {}
         armed = side == selected_hand and bool(hand.get("armed", False)) and not stale
         (armed_sides if armed else dim_sides).append(side)

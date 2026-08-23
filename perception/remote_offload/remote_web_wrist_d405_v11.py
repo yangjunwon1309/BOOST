@@ -15,7 +15,10 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
-from .remote_web_server_head_d435i_legacy import _draw_remote_belief_overlay
+from .remote_web_server_head_d435i_legacy import (
+    _draw_remote_belief_overlay,
+    _goal_to_pixel,
+)
 from .wrist_d405_protocol_v11 import (
     CAMERA_IDS,
     WRIST_BUNDLE_CHANNEL,
@@ -112,6 +115,7 @@ class WristV11WebViewer:
         self.result_source_bundle_sequence: int | None = None
         self.rendered_belief: dict[str, Any] | None = None
         self.ipopt_visual: dict[str, Any] | None = None
+        self.ipopt_visual_received_monotonic: float | None = None
         self.bus.subscribe(WRIST_BUNDLE_CHANNEL, self._on_bundle)
         self.bus.subscribe(WRIST_RESULT_CHANNEL, self._on_result)
         self.bus.subscribe(WRIST_HEARTBEAT_CHANNEL, self._on_heartbeat)
@@ -133,6 +137,13 @@ class WristV11WebViewer:
                 self.bundle_timestamp_us = int(bundle["bundle_timestamp_us"])
                 self.bundle_sequence = int(bundle["sequence"])
                 self.latest_images = images
+                # Intrinsics belong to every RGB-D frame, not to a SAM object.
+                # Keeping them from the bundle allows IPOPT projection even
+                # when this camera currently has no segmentation result.
+                for camera_id in CAMERA_IDS:
+                    self.latest_transforms.setdefault(camera_id, {})[
+                        "intrinsics"
+                    ] = dict(bundle["cameras"][camera_id]["intrinsics"])
                 self._render_locked()
         except Exception:
             return
@@ -202,6 +213,10 @@ class WristV11WebViewer:
             visual = unpack_ipopt_visual(data)
             with self.lock:
                 self.ipopt_visual = visual
+                # Publisher timestamps use Thor's monotonic clock and cannot
+                # be compared with the laptop clock. Freshness is therefore
+                # measured from the local LCM callback receipt time.
+                self.ipopt_visual_received_monotonic = time.monotonic()
                 self._render_locked()
         except Exception:
             return
@@ -234,16 +249,67 @@ class WristV11WebViewer:
         visual = getattr(self, "ipopt_visual", None)
         if not isinstance(visual, dict):
             return None
-        published = int(visual.get("published_timestamp_us", 0) or 0)
-        if published <= 0:
+        received_monotonic = getattr(
+            self, "ipopt_visual_received_monotonic", None
+        )
+        if received_monotonic is None:
             return None
-        age_ms = max(0.0, (now_us() - published) / 1000.0)
+        age_ms = max(0.0, (time.monotonic() - received_monotonic) * 1000.0)
         return {
             "schema": visual.get("schema"),
             "state": visual.get("state"),
             "hands": visual.get("hands", {}),
             "age_ms": age_ms,
+            "publisher_timestamp_us": visual.get("published_timestamp_us"),
         }
+
+    def _ipopt_projection_status_locked(
+        self, control: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        if not isinstance(control, dict):
+            return {}
+        hands = control.get("hands") or {}
+        offset_m = float(getattr(self, "ipopt_visual_camera_z_offset_m", 0.25))
+        status: dict[str, Any] = {}
+        for camera_id, side in (
+            ("left_wrist", "left"),
+            ("right_wrist", "right"),
+        ):
+            metadata = self.latest_transforms.get(camera_id, {})
+            transform_raw = metadata.get("t_goal_cam")
+            intrinsics = dict(metadata.get("intrinsics") or {})
+            if intrinsics:
+                intrinsics.setdefault("cx", intrinsics.get("ppx"))
+                intrinsics.setdefault("cy", intrinsics.get("ppy"))
+            target = (hands.get(side) or {}).get("ipopt_wrist_target_m")
+            camera_point = None
+            try:
+                homogeneous = np.ones(4, dtype=np.float64)
+                homogeneous[:3] = np.asarray(target, dtype=np.float64).reshape(3)
+                transform = np.asarray(transform_raw, dtype=np.float64).reshape(4, 4)
+                camera_point = (np.linalg.inv(transform) @ homogeneous)[:3]
+            except (TypeError, ValueError, np.linalg.LinAlgError):
+                pass
+            pixel = _goal_to_pixel(
+                target,
+                transform_raw,
+                intrinsics or None,
+                camera_z_offset_m=offset_m,
+            )
+            status[camera_id] = {
+                "side": side,
+                "target_pelvis_m": target,
+                "transform_available": transform_raw is not None,
+                "intrinsics_available": bool(intrinsics),
+                "raw_camera_point_m": (
+                    None if camera_point is None else camera_point.astype(float).tolist()
+                ),
+                "display_camera_z_m": (
+                    None if camera_point is None else float(camera_point[2] + offset_m)
+                ),
+                "pixel_uv_local": None if pixel is None else list(pixel),
+            }
+        return status
 
     def _render_locked(self) -> None:
         if self.latest_images is None:
@@ -300,6 +366,7 @@ class WristV11WebViewer:
             return
         latest = self.latest_transforms or {}
         for camera_id in CAMERA_IDS:
+            camera_side = "left" if camera_id == "left_wrist" else "right"
             transform = latest.get(camera_id, {}).get("t_goal_cam")
             intrinsics = dict(
                 latest.get(camera_id, {}).get("intrinsics") or {}
@@ -337,12 +404,14 @@ class WristV11WebViewer:
                 t_goal_cam=transform,
                 intrinsics=intrinsics or None,
                 control=control,
-                legend_side=(
-                    "left" if camera_id == "left_wrist" else "right"
-                ),
+                legend_side=camera_side,
                 ipopt_camera_z_offset_m=getattr(
                     self, "ipopt_visual_camera_z_offset_m", 0.25
                 ),
+                # Each local overlay is drawn before np.vstack. The left local
+                # pixel therefore lands in the upper image and the right local
+                # pixel is shifted automatically into the lower image.
+                render_sides=(camera_side,),
             )
 
     def lcm_loop(self) -> None:
@@ -391,6 +460,11 @@ class WristV11WebViewer:
                     {} if ipopt_control is None else ipopt_control.get("hands", {})
                 ),
                 "ipopt_visual_camera_z_offset_m": self.ipopt_visual_camera_z_offset_m,
+                "ipopt_freshness_clock": "laptop_lcm_receipt_monotonic",
+                "ipopt_projection": self._ipopt_projection_status_locked(
+                    ipopt_control
+                ),
+                "camera_stack_order": ["left_wrist", "right_wrist"],
                 "belief_targets": {
                     side: (hands.get(side) or {}).get("target")
                     for side in ("left", "right")

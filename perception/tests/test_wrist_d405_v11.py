@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import time
 
 import numpy as np
 
@@ -50,6 +51,23 @@ def test_wrist_ipopt_visual_round_trip() -> None:
         "version": 1,
         **payload,
     }
+
+
+def test_wrist_ipopt_freshness_uses_local_receipt_clock() -> None:
+    viewer = WristV11WebViewer.__new__(WristV11WebViewer)
+    viewer.ipopt_visual = {
+        "schema": "path.wrist_ipopt_visual.v1",
+        # Deliberately belongs to a different monotonic clock domain.
+        "published_timestamp_us": 1,
+        "state": "teleop",
+        "hands": {"left": {"ipopt_wrist_target_m": [0.1, 0.2, 0.3]}},
+    }
+    viewer.ipopt_visual_received_monotonic = time.monotonic() - 0.020
+
+    control = viewer._ipopt_control_locked()
+
+    assert control is not None
+    assert 10.0 <= control["age_ms"] < 200.0
 
 
 def test_vertical_masks_map_to_their_local_wrist_grid() -> None:

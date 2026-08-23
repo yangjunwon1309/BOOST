@@ -244,8 +244,15 @@ def _goal_to_pixel(
     point_goal_m: Any,
     t_goal_cam: Any,
     intrinsics: Any,
+    *,
+    camera_z_offset_m: float = 0.0,
 ) -> tuple[int, int] | None:
-    """Project a goal-frame point into the frame that produced its geometry."""
+    """Project a goal-frame point into the frame that produced its geometry.
+
+    ``camera_z_offset_m`` is visualization-only and is expressed in the
+    camera's RealSense optical +Z direction.  It is used for an IPOPT wrist
+    origin that may physically lie behind its wrist-mounted camera.
+    """
     if point_goal_m is None or t_goal_cam is None or not intrinsics:
         return None
     try:
@@ -253,6 +260,7 @@ def _goal_to_pixel(
         homogeneous[:3] = np.asarray(point_goal_m, dtype=np.float64).reshape(3)
         transform = np.asarray(t_goal_cam, dtype=np.float64).reshape(4, 4)
         camera = (np.linalg.inv(transform) @ homogeneous)[:3]
+        camera[2] += float(camera_z_offset_m)
         if not np.isfinite(camera).all() or camera[2] <= 1.0e-6:
             return None
         width = int(intrinsics["width"])
@@ -323,6 +331,7 @@ def _draw_belief_legend(
     stale: bool,
     *,
     legend_side: str | None = None,
+    ipopt_camera_z_offset_m: float = 0.0,
 ) -> None:
     """Draw the hand-local visual key and the common IPOPT target key."""
     y = 22
@@ -346,9 +355,12 @@ def _draw_belief_legend(
     cv2.drawMarker(
         overlay, (18, y - 4), IPOPT_TARGET_COLOR, cv2.MARKER_DIAMOND, 14, 2
     )
-    _draw_text_with_halo(
-        overlay, "IPOPT target", (32, y), IPOPT_TARGET_COLOR, scale=0.48
+    ipopt_label = (
+        "IPOPT target"
+        if abs(float(ipopt_camera_z_offset_m)) <= 1.0e-9
+        else f"IPOPT view +Z {float(ipopt_camera_z_offset_m):.2f}m"
     )
+    _draw_text_with_halo(overlay, ipopt_label, (32, y), IPOPT_TARGET_COLOR, scale=0.48)
     del control, selected_hand, stale
 
 
@@ -363,6 +375,7 @@ def _draw_hand_markers(
     t_goal_cam: Any,
     intrinsics: Any,
     control_fresh: bool,
+    ipopt_camera_z_offset_m: float,
 ) -> None:
     """Draw operator command, reference, and belief at grasp-centre points."""
     color = BELIEF_COLORS[side]
@@ -389,7 +402,10 @@ def _draw_hand_markers(
             control_hand.get("reference_grasp_goal_m"),
         )
         pixel = _goal_to_pixel(
-            ipopt_target, t_goal_cam, intrinsics
+            ipopt_target,
+            t_goal_cam,
+            intrinsics,
+            camera_z_offset_m=ipopt_camera_z_offset_m,
         )
         if pixel is not None:
             cv2.drawMarker(
@@ -397,7 +413,11 @@ def _draw_hand_markers(
             )
             _draw_text_with_halo(
                 layer,
-                "IPOPT target",
+                (
+                    "IPOPT target"
+                    if abs(float(ipopt_camera_z_offset_m)) <= 1.0e-9
+                    else f"IPOPT +Z {float(ipopt_camera_z_offset_m):.2f}m"
+                ),
                 (pixel[0] + 12, pixel[1] + 16),
                 IPOPT_TARGET_COLOR,
                 scale=0.46,
@@ -471,6 +491,7 @@ def _draw_remote_belief_overlay(
     intrinsics: Any = None,
     control: dict[str, Any] | None = None,
     legend_side: str | None = None,
+    ipopt_camera_z_offset_m: float = 0.0,
 ) -> None:
     control = control if isinstance(control, dict) else {}
     control_hands = control.get("hands") or {}
@@ -481,7 +502,13 @@ def _draw_remote_belief_overlay(
     control_fresh = control_age_ms <= CONTROL_STALE_AFTER_MS
     if not isinstance(telemetry, dict):
         _draw_belief_legend(
-            overlay, {}, control, "none", stale, legend_side=legend_side
+            overlay,
+            {},
+            control,
+            "none",
+            stale,
+            legend_side=legend_side,
+            ipopt_camera_z_offset_m=ipopt_camera_z_offset_m,
         )
         return
     hands = telemetry.get("hands") or {}
@@ -506,6 +533,7 @@ def _draw_remote_belief_overlay(
                 t_goal_cam=t_goal_cam,
                 intrinsics=intrinsics,
                 control_fresh=control_fresh,
+                ipopt_camera_z_offset_m=ipopt_camera_z_offset_m,
             )
         cv2.addWeighted(
             scratch,
@@ -527,6 +555,7 @@ def _draw_remote_belief_overlay(
             t_goal_cam=t_goal_cam,
             intrinsics=intrinsics,
             control_fresh=control_fresh,
+            ipopt_camera_z_offset_m=ipopt_camera_z_offset_m,
         )
     _draw_belief_legend(
         overlay,
@@ -535,6 +564,7 @@ def _draw_remote_belief_overlay(
         selected_hand,
         stale,
         legend_side=legend_side,
+        ipopt_camera_z_offset_m=ipopt_camera_z_offset_m,
     )
 
 

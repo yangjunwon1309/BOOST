@@ -86,8 +86,14 @@ setInterval(update,1000);update();
 class WristV11WebViewer:
     BELIEF_STALE_MS = 500.0
 
-    def __init__(self, lcm_url: str) -> None:
+    def __init__(self, lcm_url: str, *, ipopt_visual_camera_z_offset_m: float = 0.25) -> None:
+        if not np.isfinite(ipopt_visual_camera_z_offset_m):
+            raise ValueError("ipopt_visual_camera_z_offset_m must be finite")
         self.bus = lcm.LCM(lcm_url)
+        # The wrist-yaw IPOPT target starts behind a forward-mounted D405 in
+        # Q_READY. This is a display proxy only; it never changes the solver
+        # target or the telemetry sent from the state machine.
+        self.ipopt_visual_camera_z_offset_m = float(ipopt_visual_camera_z_offset_m)
         self.lock = threading.Condition()
         self.jpeg: bytes | None = None
         self.bundle_timestamp_us: int | None = None
@@ -334,6 +340,9 @@ class WristV11WebViewer:
                 legend_side=(
                     "left" if camera_id == "left_wrist" else "right"
                 ),
+                ipopt_camera_z_offset_m=getattr(
+                    self, "ipopt_visual_camera_z_offset_m", 0.25
+                ),
             )
 
     def lcm_loop(self) -> None:
@@ -381,6 +390,7 @@ class WristV11WebViewer:
                 "ipopt_targets": (
                     {} if ipopt_control is None else ipopt_control.get("hands", {})
                 ),
+                "ipopt_visual_camera_z_offset_m": self.ipopt_visual_camera_z_offset_m,
                 "belief_targets": {
                     side: (hands.get(side) or {}).get("target")
                     for side in ("left", "right")
@@ -415,8 +425,17 @@ def main() -> None:
     parser.add_argument("--wifi-lcm-url", required=True)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8082)
+    parser.add_argument(
+        "--ipopt-visual-camera-z-offset-m",
+        type=float,
+        default=0.25,
+        help="Display-only D405 optical +Z offset for IPOPT wrist targets (default: 0.25).",
+    )
     args = parser.parse_args()
-    viewer = WristV11WebViewer(args.wifi_lcm_url)
+    viewer = WristV11WebViewer(
+        args.wifi_lcm_url,
+        ipopt_visual_camera_z_offset_m=args.ipopt_visual_camera_z_offset_m,
+    )
     threading.Thread(target=viewer.lcm_loop, daemon=True).start()
     app = FastAPI()
     app.get("/")(lambda: HTMLResponse(HTML))

@@ -821,6 +821,25 @@ def test_camera_metadata_supports_goal_reprojection_and_axis_foreshortening():
     assert toward_camera is not None and toward_camera[0] == toward_camera[1]
 
 
+def test_ipopt_display_camera_z_offset_can_project_wrist_target_behind_camera():
+    intrinsics = {
+        "width": 100,
+        "height": 80,
+        "fx": 100.0,
+        "fy": 100.0,
+        "cx": 50.0,
+        "cy": 40.0,
+    }
+    # The wrist-yaw origin is 4 cm behind a forward-mounted D405 at Q_READY.
+    assert _goal_to_pixel([0.0, 0.0, -0.04], np.eye(4), intrinsics) is None
+    assert _goal_to_pixel(
+        [0.0, 0.0, -0.04],
+        np.eye(4),
+        intrinsics,
+        camera_z_offset_m=0.25,
+    ) == (50, 40)
+
+
 def test_web_pairs_belief_telemetry_to_result_sequence_or_timestamp():
     runtime = RemoteWebRuntime.__new__(RemoteWebRuntime)
     runtime.lock = threading.Lock()

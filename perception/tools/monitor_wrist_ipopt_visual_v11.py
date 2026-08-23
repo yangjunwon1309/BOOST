@@ -22,10 +22,8 @@ except ModuleNotFoundError:  # Keep --help usable outside the deployment image.
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from remote_offload.wrist_d405_protocol_v11 import (  # noqa: E402
-    WRIST_IPOPT_VISUAL_CHANNEL,
-    unpack_ipopt_visual,
-)
+# Keep the monitor's help and dependency error readable outside Pixi/Docker.
+WRIST_IPOPT_VISUAL_CHANNEL = "PATH_V11_WRIST_IPOPT_VISUAL"
 
 
 def _age_ms(timestamp_us: Any, received_us: int) -> str:
@@ -93,6 +91,14 @@ def main() -> int:
             "python-lcm is required. Run this inside the laptop perception "
             "environment/container that runs the wrist webview."
         )
+    try:
+        from remote_offload.wrist_d405_protocol_v11 import unpack_ipopt_visual
+    except ModuleNotFoundError as error:
+        raise SystemExit(
+            f"{error.name} is required. From the PATH-G1 repository root run "
+            "`pixi run --locked python perception/tools/"
+            "monitor_wrist_ipopt_visual_v11.py ...`."
+        ) from error
 
     bus = lcm.LCM(args.wifi_lcm_url)
     received = 0

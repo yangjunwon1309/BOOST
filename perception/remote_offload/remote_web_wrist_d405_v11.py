@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import threading
 import time
+import zlib
 from typing import Any
 
 import cv2
@@ -28,6 +29,7 @@ from .wrist_d405_protocol_v11 import (
     unpack_bundle,
     unpack_belief_telemetry,
     unpack_heartbeat,
+    unpack_mask,
     unpack_result,
 )
 
@@ -99,6 +101,7 @@ class WristV11WebViewer:
         self.belief: dict[str, Any] | None = None
         self.result_timestamp_us: int | None = None
         self.rendered_result_sequence: int | None = None
+        self.result_source_bundle_sequence: int | None = None
         self.rendered_belief: dict[str, Any] | None = None
         self.bus.subscribe(WRIST_BUNDLE_CHANNEL, self._on_bundle)
         self.bus.subscribe(WRIST_RESULT_CHANNEL, self._on_result)
@@ -152,6 +155,12 @@ class WristV11WebViewer:
                     result.get("published_timestamp_us", 0) or 0
                 )
                 self.rendered_result_sequence = int(result.get("sequence", -1))
+                source_sequence = result.get("source_bundle_sequence")
+                self.result_source_bundle_sequence = (
+                    int(source_sequence)
+                    if isinstance(source_sequence, int) and source_sequence >= 0
+                    else None
+                )
                 self._render_locked()
         except Exception:
             return
@@ -209,8 +218,42 @@ class WristV11WebViewer:
             camera_id: image.copy()
             for camera_id, image in self.latest_images.items()
         }
+        self._draw_sam3_masks_locked(images)
         self._draw_latest_belief_locked(images)
         self._encode_locked(images)
+
+    def _draw_sam3_masks_locked(self, images: dict[str, np.ndarray]) -> None:
+        """Alpha-blend the SAM3 local masks carried by the newest result.
+
+        Masks are image-space data for ``result_source_bundle_sequence``.  The
+        live viewer deliberately keeps the newest RGB frame for low-latency
+        target projection, so ``status()`` exposes whether the mask and RGB
+        sequences match.  The mask itself is still shown, just like its
+        matching result bounding box, rather than silently dropping SAM3's
+        segmentation whenever worker latency is non-zero.
+        """
+        colors = {
+            "left_wrist": (255, 110, 25),
+            "right_wrist": (25, 145, 255),
+        }
+        for obj in self.objects:
+            camera_id = obj.get("camera_id")
+            image = images.get(camera_id)
+            if image is None or obj.get("mask_encoding") != "bitpack-zlib-row-major":
+                continue
+            payload = obj.get("mask_data")
+            if not isinstance(payload, (bytes, bytearray)):
+                continue
+            height, width = image.shape[:2]
+            try:
+                mask = unpack_mask(bytes(payload), width=width, height=height)
+            except (TypeError, ValueError, zlib.error):
+                continue
+            if not np.any(mask):
+                continue
+            mask_layer = image.copy()
+            mask_layer[mask] = colors[camera_id]
+            cv2.addWeighted(mask_layer, 0.38, image, 0.62, 0.0, image)
 
     def _draw_latest_belief_locked(self, images: dict[str, np.ndarray]) -> None:
         """Project pelvis-frame belief into the camera image displayed now."""
@@ -257,6 +300,9 @@ class WristV11WebViewer:
                 t_goal_cam=transform,
                 intrinsics=intrinsics or None,
                 control=belief.get("control"),
+                legend_side=(
+                    "left" if camera_id == "left_wrist" else "right"
+                ),
             )
 
     def lcm_loop(self) -> None:
@@ -288,6 +334,11 @@ class WristV11WebViewer:
                 "bundle_age_ms": age,
                 "object_count": self.object_count,
                 "belief_result_sequence": self.rendered_result_sequence,
+                "mask_source_bundle_sequence": self.result_source_bundle_sequence,
+                "mask_overlay_matches_live_rgb": (
+                    self.result_source_bundle_sequence is not None
+                    and self.result_source_bundle_sequence == self.bundle_sequence
+                ),
                 "overlay_uses_latest_camera_pose": bool(self.latest_transforms),
                 "belief_stale": self._belief_stale_locked(),
                 "belief_targets": {

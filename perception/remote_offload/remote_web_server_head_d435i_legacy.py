@@ -121,6 +121,7 @@ def detect_lan_host() -> str:
 
 
 BELIEF_COLORS = {"left": (255, 170, 20), "right": (40, 140, 255)}
+IPOPT_TARGET_COLOR = (70, 220, 70)
 BELIEF_DIM_ALPHA = 0.75
 CONTROL_STALE_AFTER_MS = 500.0
 
@@ -320,10 +321,13 @@ def _draw_belief_legend(
     control: dict[str, Any],
     selected_hand: str,
     stale: bool,
+    *,
+    legend_side: str | None = None,
 ) -> None:
-    """Draw the four-item visual key without diagnostic state strings."""
+    """Draw the hand-local visual key and the common IPOPT target key."""
     y = 22
-    for side in ("left", "right"):
+    sides = (legend_side,) if legend_side in BELIEF_COLORS else ("left", "right")
+    for side in sides:
         color = BELIEF_COLORS[side]
         initial = side[0].upper()
         cv2.drawMarker(
@@ -339,6 +343,12 @@ def _draw_belief_legend(
             overlay, f"{initial} belief", (142, y), color, scale=0.48
         )
         y += 20
+    cv2.drawMarker(
+        overlay, (18, y - 4), IPOPT_TARGET_COLOR, cv2.MARKER_DIAMOND, 14, 2
+    )
+    _draw_text_with_halo(
+        overlay, "IPOPT target", (32, y), IPOPT_TARGET_COLOR, scale=0.48
+    )
     del control, selected_hand, stale
 
 
@@ -370,15 +380,24 @@ def _draw_hand_markers(
                 color,
                 scale=0.46,
             )
-    # This reference is produced by the control loop, independently of
-    # whether depth geometry allowed belief inference on the same frame.
-    control_armed = bool(control_hand.get("armed", False))
-    if control_fresh and (armed or control_armed):
+    # This is the exact Cartesian target passed into the arm IPOPT solve:
+    # VR/reference motion normally, or the selected shared target while its
+    # switch is held.  It is independent of whether belief geometry exists.
+    if control_fresh:
         pixel = _goal_to_pixel(
             control_hand.get("reference_grasp_goal_m"), t_goal_cam, intrinsics
         )
         if pixel is not None:
-            cv2.drawMarker(layer, pixel, color, cv2.MARKER_CROSS, 20, 2)
+            cv2.drawMarker(
+                layer, pixel, IPOPT_TARGET_COLOR, cv2.MARKER_DIAMOND, 20, 2
+            )
+            _draw_text_with_halo(
+                layer,
+                "IPOPT target",
+                (pixel[0] + 12, pixel[1] + 16),
+                IPOPT_TARGET_COLOR,
+                scale=0.46,
+            )
 
     target = hand.get("target") or {}
     object_id = str(target.get("object_id", ""))
@@ -447,6 +466,7 @@ def _draw_remote_belief_overlay(
     t_goal_cam: Any = None,
     intrinsics: Any = None,
     control: dict[str, Any] | None = None,
+    legend_side: str | None = None,
 ) -> None:
     control = control if isinstance(control, dict) else {}
     control_hands = control.get("hands") or {}
@@ -456,7 +476,9 @@ def _draw_remote_belief_overlay(
         control_age_ms = float("inf")
     control_fresh = control_age_ms <= CONTROL_STALE_AFTER_MS
     if not isinstance(telemetry, dict):
-        _draw_belief_legend(overlay, {}, control, "none", stale)
+        _draw_belief_legend(
+            overlay, {}, control, "none", stale, legend_side=legend_side
+        )
         return
     hands = telemetry.get("hands") or {}
     selected_hand = str(telemetry.get("selected_hand", "none"))
@@ -508,6 +530,7 @@ def _draw_remote_belief_overlay(
         control,
         selected_hand,
         stale,
+        legend_side=legend_side,
     )
 
 

@@ -17,6 +17,7 @@ from remote_offload.wrist_belief_gateway_v11 import (
 from remote_offload.wrist_d405_protocol_v11 import (
     CAMERA_IDS,
     make_result,
+    pack_mask,
     pack_result,
     pack_depth_z16,
     unpack_depth_z16,
@@ -152,6 +153,7 @@ def test_wrist_viewer_keeps_latest_frame_transform_without_object_pose_copy() ->
     viewer.belief = None
     viewer.result_timestamp_us = None
     viewer.rendered_result_sequence = None
+    viewer.result_source_bundle_sequence = None
     viewer.rendered_belief = None
 
     first_transform = np.eye(4, dtype=float).reshape(-1).tolist()
@@ -188,6 +190,29 @@ def test_wrist_viewer_keeps_latest_frame_transform_without_object_pose_copy() ->
 
     assert viewer.latest_transforms["left_wrist"]["t_goal_cam"] == second_wire
     assert viewer.latest_transforms["left_wrist"]["intrinsics"] == intrinsics
+
+
+def test_wrist_viewer_alpha_blends_sam3_masks() -> None:
+    viewer = WristV11WebViewer.__new__(WristV11WebViewer)
+    mask = np.zeros((12, 16), dtype=bool)
+    mask[3:9, 4:12] = True
+    viewer.objects = [
+        {
+            "camera_id": "left_wrist",
+            "mask_encoding": "bitpack-zlib-row-major",
+            "mask_data": pack_mask(mask),
+        }
+    ]
+    images = {
+        "left_wrist": np.zeros((12, 16, 3), dtype=np.uint8),
+        "right_wrist": np.zeros((12, 16, 3), dtype=np.uint8),
+    }
+
+    viewer._draw_sam3_masks_locked(images)
+
+    assert np.any(images["left_wrist"][mask])
+    assert not np.any(images["left_wrist"][~mask])
+    assert not np.any(images["right_wrist"])
 
 
 def test_wrist_viewer_marks_stale_belief_after_half_second() -> None:

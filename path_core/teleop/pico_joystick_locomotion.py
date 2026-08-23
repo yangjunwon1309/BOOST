@@ -87,10 +87,10 @@ class PicoButtonGestureInterpreter:
             self.y_chorded = True
 
         events: list[str] = []
-        # A and B choose the arm that may receive a vision/shared-control
+        # Y and B choose the arm that may receive a vision/shared-control
         # Cartesian blend.  Only emit for an unchorded press so the existing
         # A+X, B+Y, and A+B+X+Y gestures keep their original meaning.
-        if a and not pa and not (b or x or y):
+        if y and not py and not (a or b or x):
             events.append("select_left")
         if b and not pb and not (a or x or y):
             events.append("select_right")

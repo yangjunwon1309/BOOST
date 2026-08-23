@@ -47,15 +47,15 @@ class PicoButtonGestureInterpreterTest(unittest.TestCase):
         self.assertNotIn("mode_q", events)
         self.assertNotIn("mode_e", events)
 
-    def test_a_and_b_select_shared_control_hands_only_when_unchorded(self) -> None:
+    def test_y_and_b_select_shared_control_hands_only_when_unchorded(self) -> None:
         gestures = PicoButtonGestureInterpreter()
-        self.assertIn("select_left", gestures.update((True, False, False, False)))
+        self.assertIn("select_left", gestures.update((False, False, False, True)))
         gestures.update((False, False, False, False))
         self.assertIn("select_right", gestures.update((False, True, False, False)))
 
         gestures = PicoButtonGestureInterpreter()
-        events = gestures.update((True, False, True, False))
-        self.assertIn("ax", events)
+        events = gestures.update((False, True, False, True))
+        self.assertIn("by", events)
         self.assertNotIn("select_left", events)
 
 

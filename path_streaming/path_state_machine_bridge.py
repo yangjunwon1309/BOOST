@@ -19,8 +19,8 @@ State behavior:
     PICO arm targets are ignored, and the last teleop root command is latched.
     The next A+X requires measured Q_READY convergence before it resets the
     joystick mapper and resumes live PICO targets.
-    Holding A selects the left arm and holding B selects the right arm for
-    belief/contact blending.  Without A/B, both arms follow PICO directly.
+    Holding Y selects the left arm and holding B selects the right arm for
+    belief/contact blending.  Without Y/B, both arms follow PICO directly.
   damped_return:
     Return the arm target toward the current PICO body target while
     The G1-local direct mux keeps lower-body and waist in damping mode.
@@ -111,7 +111,7 @@ from perception.remote_offload.wrist_d405_protocol_v11 import (
 )
 
 # ``auto_planning`` remains an accepted external compatibility value, but is
-# canonicalized to teleop.  A/B is now the sole shared-control gate.
+# canonicalized to teleop.  Y/B is now the sole shared-control gate.
 VALID_STATES = {"teleop", "intention", "auto_planning", "damped_return"}
 SHARED_HAND_PUBLISH_HZ = 50.0
 
@@ -374,12 +374,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--shared-hand-selection-bind",
         default="tcp://*:5567",
-        help="PUB endpoint that reports the A/B-selected shared-control hand.",
+        help="PUB endpoint that reports the Y/B-selected shared-control hand.",
     )
     parser.add_argument(
         "--shared-hand-selection-topic",
         default="path_shared_control_hand",
-        help="Topic carrying the A/B-selected shared-control hand heartbeat.",
+        help="Topic carrying the Y/B-selected shared-control hand heartbeat.",
     )
 
     parser.add_argument("--command-period-sec", type=float, default=0.25)
@@ -399,7 +399,7 @@ def parse_args() -> argparse.Namespace:
         "--shared-startup-hold-sec",
         type=float,
         default=0.0,
-        help="Delay shared-control alpha after an A/B hold (0 injects immediately).",
+        help="Delay shared-control alpha after a Y/B hold (0 injects immediately).",
     )
     parser.add_argument("--shared-stale-after-sec", type=float, default=0.3)
     parser.add_argument("--shared-d-max-m", type=float, default=0.9)
@@ -1760,7 +1760,7 @@ def main() -> int:
 
     current_state = "teleop" if args.state == "auto_planning" else args.state
     if args.state == "auto_planning":
-        log("initial auto_planning alias -> teleop (A/B gates belief)")
+        log("initial auto_planning alias -> teleop (Y/B gates belief)")
     # q/e share one SONIC planner-conditioning mode. State changes affect only
     # the Cartesian target blend sent to IPOPT.
     planner_lower_body_idle = True
@@ -1809,7 +1809,7 @@ def main() -> int:
     }
     latest_controller_left_axis = np.zeros(2, dtype=np.float64)
     latest_controller_right_axis = np.zeros(2, dtype=np.float64)
-    latest_controller_a = False
+    latest_controller_y = False
     latest_controller_b = False
     latest_controller_state_us = 0
     latest_controller_sequence = 0
@@ -1911,7 +1911,7 @@ def main() -> int:
         )
         for side in ("left", "right")
     }
-    # A/B is a dead-man switch for the left/right belief blend.
+    # Y/B is a dead-man switch for the left/right belief blend.
     shared_selected_hand = "none"
     shared_hand_selection_revision = 0
     next_shared_hand_publish = 0.0
@@ -1935,7 +1935,7 @@ def main() -> int:
     )
 
     def resync_references(reason: str) -> None:
-        """Re-seed only on session/state discontinuities, never A/B edges."""
+        """Re-seed only on session/state discontinuities, never Y/B edges."""
         q = latest_robot_q if latest_robot_q is not None else last_ipopt_or_measured_hold()
         left_tf, right_tf = arm_nonlinear_ik.wrist_transforms_from_q29(q)
         for side, transform in (("left", left_tf), ("right", right_tf)):
@@ -2106,7 +2106,7 @@ def main() -> int:
         if tick_us is None:
             tick_us = now_us()
         if requested == "auto_planning":
-            log(f"{source} auto_planning alias -> teleop (A/B gates belief)")
+            log(f"{source} auto_planning alias -> teleop (Y/B gates belief)")
             requested = "teleop"
         if requested not in VALID_STATES:
             log(f"ignored invalid {source} state command: {requested}")
@@ -2315,7 +2315,7 @@ def main() -> int:
                 ):
                     latest_controller_left_axis = left_axis[:2].copy()
                     latest_controller_right_axis = right_axis[:2].copy()
-                    latest_controller_a = bool(controller.get("a", False))
+                    latest_controller_y = bool(controller.get("y", False))
                     latest_controller_b = bool(controller.get("b", False))
                     latest_controller_state_us = tick_us
                     latest_controller_sequence = controller_sequence
@@ -2363,7 +2363,7 @@ def main() -> int:
                     elif event_name == "by":
                         planner = True
                     elif event_name == "select_left":
-                        log("Pico A: hold to enable left shared-control")
+                        log("Pico Y: hold to enable left shared-control")
                     elif event_name == "select_right":
                         log("Pico B: hold to enable right shared-control")
                     # Button edges now drive PATH state only. They must not
@@ -2699,18 +2699,18 @@ def main() -> int:
                 and controller_age_sec
                 <= float(args.joystick_stale_timeout_sec)
             )
-            # A/B are a dead-man arm selector in teleop.  Never retain the
+            # Y/B are a dead-man arm selector in teleop.  Never retain the
             # selected arm after a release or controller-state timeout.
             requested_shared_hand = "none"
             if current_state == "teleop" and controller_fresh:
-                if latest_controller_a and not latest_controller_b:
+                if latest_controller_y and not latest_controller_b:
                     requested_shared_hand = "left"
-                elif latest_controller_b and not latest_controller_a:
+                elif latest_controller_b and not latest_controller_y:
                     requested_shared_hand = "right"
             if requested_shared_hand != shared_selected_hand:
                 shared_selected_hand = requested_shared_hand
                 shared_hand_selection_revision += 1
-                # A/B only selects which target is tracked. Reference state
+                # Y/B only selects which target is tracked. Reference state
                 # remains continuous across the button edge.
                 log(
                     "shared-control hold "
@@ -3607,7 +3607,7 @@ def main() -> int:
             )
 
             # PUB/SUB has no retained state.  A short heartbeat makes the
-            # A/B selection available to a gateway that starts later too.
+            # Y/B selection available to a gateway that starts later too.
             if now >= next_shared_hand_publish:
                 shared_hand_pub.send(
                     pack_topic(

@@ -35,6 +35,7 @@ from remote_offload.thor_wrist_d405_gateway_v11 import (
     nearest_state_sample,
 )
 from seg_web_node.lcm_protocol import RobotState
+from seg_web_node.robot_geometry import hand_frame_profile
 from remote_offload.remote_web_wrist_d405_v11 import WristV11WebViewer
 from remote_offload.wrist_d405_geometry_pipeline_v11 import (
     camera_transform_diagnostics,
@@ -163,6 +164,13 @@ def test_wrist_ipopt_visual_round_trip() -> None:
         "version": 1,
         **payload,
     }
+
+
+def test_dex1_canonical_grasp_center_is_hand_base_origin() -> None:
+    profile = hand_frame_profile("dex1")
+    np.testing.assert_allclose(profile["grasp_center_local"], [0.0, 0.0, 0.0])
+    np.testing.assert_allclose(profile["translation"]["left"], [0.045, 0.0, 0.0])
+    np.testing.assert_allclose(profile["translation"]["right"], [0.045, 0.0, 0.0])
 
 
 def test_wrist_ipopt_freshness_uses_local_receipt_clock() -> None:

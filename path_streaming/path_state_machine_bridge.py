@@ -426,10 +426,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--grasp-center-wrist-x-offset-m",
         type=float,
-        default=0.070,
+        default=0.045,
         help=(
-            "Wrist-yaw +X offset to the Dex1 grasp-centre base; 0.070 m is "
-            "the provisional palm-end correction used for shared targets."
+            "Wrist-yaw +X offset to the Dex1 hand-base/palm centre; 0.045 m "
+            "matches the calibrated Dex1 attachment profile."
         ),
     )
     parser.add_argument("--shared-ref-lpf-alpha", type=float, default=0.3)
@@ -1885,9 +1885,8 @@ def main() -> int:
         @ grasp_center_local
         for side in ("left", "right")
     }
-    # The original Dex1 profile carries a provisional +45 mm wrist-to-base
-    # value.  Use the requested +70 mm palm-end correction for both hands,
-    # while retaining the model's lateral/vertical terms and base rotation.
+    # Use the calibrated wrist-yaw -> Dex1 hand-base +X translation for both
+    # hands.  Any explicit CLI value remains a deliberate hardware override.
     for side in ("left", "right"):
         grasp_center_wrist_offset[side][0] = float(
             args.grasp_center_wrist_x_offset_m

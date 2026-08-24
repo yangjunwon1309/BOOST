@@ -283,9 +283,10 @@ tasc_belief:
   max_objects: 10
   max_contacts_per_object: 6
   max_orientation_candidates: 96
-  # Dex1 canonical grasp center in the hand base frame. Validate the hardware
-  # offset against the installed Dex1 URDF before any real grasp experiment.
-  grasp_center_local_m: [0.0, 0.100, 0.0]
+  # The physical Dex1 palm centre is aligned with its hand-base origin.  Keep
+  # no extra base-local finger-extension offset; wrist-yaw -> base is modeled
+  # separately by the calibrated +X attachment translation.
+  grasp_center_local_m: [0.0, 0.0, 0.0]
   fallback_eef_position_m: [0.0, 0.0, 0.0]
   features:
     w_proximity: 2.0

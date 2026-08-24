@@ -203,11 +203,11 @@ _DEX1_HAND_BASE_TRANSLATION_FROM_WRIST = {
     "right": np.array([0.0450, 0.0, 0.0], dtype=np.float64),
 }
 
-# Keep the existing 6 cm canonical EE offset while transitioning hardware.
-# It remains a configurable base-local point; it is deliberately not replaced
-# with the estimated Dex1 fingertip centre until hardware validation is done.
+# The commanded Dex1 grasp point is the palm/hand-base centre.  Any physical
+# finger-extension or fingertip target must be an explicit, separately
+# calibrated task offset rather than a silent default in the hand profile.
 _BRAINCO_GRASP_CENTER_LOCAL = np.array([0.0, 0.0, 0.060], dtype=np.float64)
-_DEX1_GRASP_CENTER_LOCAL = np.array([0.0, 0.100, 0.0], dtype=np.float64)
+_DEX1_GRASP_CENTER_LOCAL = np.zeros(3, dtype=np.float64)
 
 # The orientation relation is defined against this physical hand axis.  It is
 # deliberately exported so perception and the PATH bridge cannot silently use

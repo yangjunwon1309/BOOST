@@ -12,6 +12,10 @@ from remote_offload.remote_sam3_wrist_d405_worker_v11 import (
     stack_wrist_images,
 )
 from remote_offload.thor_gateway_head_d435i_legacy import ThorRemoteGateway
+from remote_offload.remote_web_server_head_d435i_legacy import (
+    IPOPT_TARGET_COLOR,
+    _ipopt_marker_style,
+)
 from remote_offload.wrist_belief_gateway_v11 import (
     WristBeliefGateway,
     wrist_object_ids_for_hand,
@@ -171,6 +175,16 @@ def test_dex1_canonical_grasp_center_is_hand_base_origin() -> None:
     np.testing.assert_allclose(profile["grasp_center_local"], [0.0, 0.0, 0.0])
     np.testing.assert_allclose(profile["translation"]["left"], [0.045, 0.0, 0.0])
     np.testing.assert_allclose(profile["translation"]["right"], [0.045, 0.0, 0.0])
+
+
+def test_ipopt_marker_is_belief_tinted_only_when_belief_position_is_applied() -> None:
+    neutral, neutral_applied = _ipopt_marker_style("left", {"position_source": "operator"})
+    belief, belief_applied = _ipopt_marker_style("left", {"position_source": "belief_contact"})
+
+    assert neutral == IPOPT_TARGET_COLOR
+    assert neutral_applied is False
+    assert belief != IPOPT_TARGET_COLOR
+    assert belief_applied is True
 
 
 def test_wrist_ipopt_freshness_uses_local_receipt_clock() -> None:

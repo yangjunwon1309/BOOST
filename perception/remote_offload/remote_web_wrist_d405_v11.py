@@ -20,6 +20,7 @@ from .remote_web_server_head_d435i_legacy import (
     _draw_remote_belief_overlay,
     _draw_text_with_halo,
     _goal_to_pixel,
+    _ipopt_marker_style,
 )
 from .wrist_d405_protocol_v11 import (
     CAMERA_IDS,
@@ -185,11 +186,12 @@ def _draw_orientation_targets(
         )
         origin_pixel = projected if origin_pixel is None else origin_pixel
     if origin_pixel is not None:
+        ipopt_color, belief_applied = _ipopt_marker_style(side, control_hand)
         _draw_text_with_halo(
             image,
-            "IPOPT R",
+            f"IPOPT R <- {side[0].upper()} belief" if belief_applied else "IPOPT R",
             (origin_pixel[0] + 11, origin_pixel[1] - 17),
-            (230, 230, 230),
+            ipopt_color if belief_applied else (230, 230, 230),
             scale=0.42,
         )
 

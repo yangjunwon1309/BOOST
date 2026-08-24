@@ -6,6 +6,7 @@ import time
 import numpy as np
 
 from remote_offload.remote_sam3_wrist_d405_worker_v11 import (
+    WristD405Sam3Worker,
     attribute_stacked_masks,
     suppress_camera_duplicate_masks,
     stack_wrist_images,
@@ -22,10 +23,17 @@ from remote_offload.wrist_d405_protocol_v11 import (
     pack_mask,
     pack_result,
     pack_depth_z16,
+    pack_bundle,
+    unpack_bundle,
     unpack_depth_z16,
     unpack_ipopt_visual,
     unpack_result,
 )
+from remote_offload.thor_wrist_d405_gateway_v11 import (
+    RobotStateHistory,
+    nearest_state_sample,
+)
+from seg_web_node.lcm_protocol import RobotState
 from remote_offload.remote_web_wrist_d405_v11 import WristV11WebViewer
 from remote_offload.wrist_d405_geometry_pipeline_v11 import (
     camera_transform_diagnostics,
@@ -36,6 +44,109 @@ def test_d405_depth_round_trip_preserves_native_grid() -> None:
     depth = np.arange(640 * 360, dtype=np.uint16).reshape(360, 640)
     restored = unpack_depth_z16(pack_depth_z16(depth), width=640, height=360)
     np.testing.assert_array_equal(restored, depth)
+
+
+def test_v14_bundle_preserves_camera_specific_state_pairing() -> None:
+    depth = np.zeros((1, 1), dtype=np.uint16)
+    cameras = {}
+    for index, camera_id in enumerate(CAMERA_IDS):
+        cameras[camera_id] = {
+            "camera_id": camera_id,
+            "serial": f"d405-{index}",
+            "host_timestamp_us": 10_000 + index,
+            "color_timestamp_us": 20_000 + index,
+            "depth_timestamp_us": 20_000 + index,
+            "width": 1,
+            "height": 1,
+            "color_jpeg": b"jpeg",
+            "depth_z16_zlib": pack_depth_z16(depth),
+            "depth_scale_m": 0.001,
+            "intrinsics": {"width": 1, "height": 1, "fx": 1.0, "fy": 1.0, "ppx": 0.0, "ppy": 0.0},
+            "q_at_exposure": [float(index)] * 29,
+            "base_quat_at_exposure_wxyz": [1.0, 0.0, 0.0, 0.0],
+            "state_pairing": {
+                "lookup_us": 30_000 + index,
+                "state_arrival_us": 30_001 + index,
+                "residual_ms": 0.001,
+                "bias_us": -2_000,
+                "method": "nearest",
+                "wrist_speed_mps": 0.2,
+                "wrist_omega_rps": 1.0,
+                "estimated_error_m": 0.0005,
+            },
+        }
+    payload = {
+        "version": 1,
+        "sequence": 1,
+        "bundle_timestamp_us": 40_000,
+        "split_y": 1,
+        "inter_wrist_skew_us": 1,
+        "cameras": cameras,
+    }
+
+    restored = unpack_bundle(pack_bundle(payload))
+
+    assert restored["cameras"]["left_wrist"]["q_at_exposure"] != restored["cameras"]["right_wrist"]["q_at_exposure"]
+    assert restored["cameras"]["right_wrist"]["state_pairing"]["bias_us"] == -2_000
+
+
+def test_state_history_samples_nearest_arrival_without_hold() -> None:
+    history = RobotStateHistory(span_s=1.0, publish_hz=10.0)
+    for received_us in (1_000, 2_000, 3_000):
+        state = RobotState(
+            sequence=received_us,
+            lowstate_sequence=received_us,
+            timestamp_us=1,
+            mode_machine=0,
+            has_torso_imu=False,
+            base_quat_wxyz=np.array([1.0, 0.0, 0.0, 0.0]),
+            torso_quat_wxyz=np.array([1.0, 0.0, 0.0, 0.0]),
+            q=np.zeros(29),
+            dq=np.zeros(29),
+        )
+        history.add(received_us, bytes([received_us // 1_000]), state)
+
+    matched = nearest_state_sample(history.snapshot(), 2_600)
+
+    assert matched is not None
+    index, sample, residual_ms = matched
+    assert index == 2
+    assert sample.received_us == 3_000
+    assert residual_ms == 0.4
+
+
+def test_worker_uses_camera_paired_q_instead_of_legacy_snapshot() -> None:
+    fallback = RobotState(
+        sequence=1,
+        lowstate_sequence=1,
+        timestamp_us=1,
+        mode_machine=0,
+        has_torso_imu=False,
+        base_quat_wxyz=np.array([1.0, 0.0, 0.0, 0.0]),
+        torso_quat_wxyz=np.array([1.0, 0.0, 0.0, 0.0]),
+        q=np.zeros(29),
+        dq=np.zeros(29),
+    )
+    frame = {
+        "q_at_exposure": [0.25] * 29,
+        "base_quat_at_exposure_wxyz": [0.0, 1.0, 0.0, 0.0],
+        "state_pairing": {
+            "lookup_us": 100,
+            "state_arrival_us": 101,
+            "residual_ms": 0.001,
+            "bias_us": 0,
+            "method": "nearest",
+            "wrist_speed_mps": 0.0,
+            "wrist_omega_rps": 0.0,
+            "estimated_error_m": 0.0,
+        },
+    }
+
+    state, pairing = WristD405Sam3Worker._frame_paired_state(frame, fallback, 10.0)
+
+    assert state is not None and pairing is not None
+    np.testing.assert_allclose(state.q, 0.25)
+    np.testing.assert_allclose(state.base_quat_wxyz, [0.0, 1.0, 0.0, 0.0])
 
 
 def test_wrist_ipopt_visual_round_trip() -> None:

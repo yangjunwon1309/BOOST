@@ -38,6 +38,17 @@ def main() -> None:
                 "jpeg_bytes": len(cameras[camera_id]["color_jpeg"]),
                 "depth_bytes": len(cameras[camera_id]["depth_z16_zlib"]),
                 "rgb_depth_delta_ms": round(float(cameras[camera_id]["diagnostics"]["rgb_depth_delta_ms"]), 2),
+                "timestamp_domains": {
+                    "color": cameras[camera_id]["diagnostics"].get("color_timestamp_domain"),
+                    "depth": cameras[camera_id]["diagnostics"].get("depth_timestamp_domain"),
+                },
+                "state_pairing": {
+                    key: cameras[camera_id].get("state_pairing", {}).get(key)
+                    for key in (
+                        "residual_ms", "bias_us", "method", "wrist_speed_mps",
+                        "wrist_omega_rps", "estimated_error_m",
+                    )
+                },
             }
             for camera_id in CAMERA_IDS
         }

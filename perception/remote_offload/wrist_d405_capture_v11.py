@@ -41,6 +41,8 @@ class FrameBundle:
     host_timestamp_us: int
     color_timestamp_ms: float
     depth_timestamp_ms: float
+    color_timestamp_domain: str
+    depth_timestamp_domain: str
     color_bgr: Any
     depth_z16: Any
     intrinsics: dict[str, float | int]
@@ -217,6 +219,8 @@ class WristD405Capture:
             host_timestamp_us=time.monotonic_ns() // 1000,
             color_timestamp_ms=float(color.get_timestamp()),
             depth_timestamp_ms=float(depth.get_timestamp()),
+            color_timestamp_domain=str(color.get_frame_timestamp_domain()),
+            depth_timestamp_domain=str(depth.get_frame_timestamp_domain()),
             color_bgr=cv2.cvtColor(uyvy, cv2.COLOR_YUV2BGR_UYVY).copy(),
             depth_z16=np.asanyarray(depth.get_data()).copy(),
             intrinsics={

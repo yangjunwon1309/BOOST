@@ -163,6 +163,33 @@ def _validate_intrinsics(value: Any, *, width: int, height: int) -> dict[str, fl
     return result
 
 
+def _validate_vector(value: Any, *, length: int, name: str) -> None:
+    try:
+        vector = np.asarray(value, dtype=np.float64).reshape(-1)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} must contain {length} finite values") from error
+    if vector.size != length or not np.isfinite(vector).all():
+        raise ValueError(f"{name} must contain {length} finite values")
+
+
+def _validate_state_pairing(value: Any, *, camera_id: str) -> None:
+    if not isinstance(value, dict):
+        raise ValueError(f"{camera_id} state_pairing must be a mapping")
+    for key in ("lookup_us", "state_arrival_us", "bias_us"):
+        if not isinstance(value.get(key), int):
+            raise ValueError(f"{camera_id} state_pairing.{key} must be an integer")
+    if value["lookup_us"] <= 0 or value["state_arrival_us"] <= 0:
+        raise ValueError(f"{camera_id} state_pairing has invalid timestamps")
+    if value.get("method") not in {"nearest", "interpolated"}:
+        raise ValueError(f"{camera_id} state_pairing method is invalid")
+    for key in ("residual_ms", "wrist_speed_mps", "wrist_omega_rps", "estimated_error_m"):
+        numeric = value.get(key)
+        if numeric is not None and (not _finite(numeric) or float(numeric) < 0.0):
+            raise ValueError(f"{camera_id} state_pairing.{key} must be a non-negative finite number or null")
+    if not _finite(value.get("residual_ms")):
+        raise ValueError(f"{camera_id} state_pairing.residual_ms is required")
+
+
 def validate_bundle(payload: dict[str, Any], *, require_two: bool = True) -> dict[str, Any]:
     if not isinstance(payload, dict) or payload.get("version") != VERSION:
         raise ValueError("unsupported wrist D405 bundle version")
@@ -206,6 +233,24 @@ def validate_bundle(payload: dict[str, Any], *, require_two: bool = True) -> dic
         for key in ("host_timestamp_us", "color_timestamp_us", "depth_timestamp_us"):
             if int(frame.get(key, 0)) <= 0:
                 raise ValueError(f"{camera_id} has invalid {key}")
+        # v14 pairs each wrist independently on Thor.  Keep all three fields
+        # optional together for a rolling gateway/worker deployment, but never
+        # accept a partial pairing because that silently falls back to a shared q.
+        pairing_fields = (
+            "q_at_exposure",
+            "base_quat_at_exposure_wxyz",
+            "state_pairing",
+        )
+        present = [key in frame for key in pairing_fields]
+        if any(present) and not all(present):
+            raise ValueError(f"{camera_id} has an incomplete v14 state pairing")
+        if all(present):
+            _validate_vector(frame["q_at_exposure"], length=29, name=f"{camera_id}.q_at_exposure")
+            _validate_vector(
+                frame["base_quat_at_exposure_wxyz"], length=4,
+                name=f"{camera_id}.base_quat_at_exposure_wxyz",
+            )
+            _validate_state_pairing(frame["state_pairing"], camera_id=camera_id)
     return payload
 
 

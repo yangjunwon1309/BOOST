@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 import argparse
+import collections
+import dataclasses
 import logging
 import os
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any
 
 import lcm
 import numpy as np
+
+from seg_web_node.lcm_protocol import RobotState, decode_robot_state
+from seg_web_node.robot_geometry import g1_link_transforms
 
 from .wrist_d405_capture_v11 import WristD405Capture, discover_d405_serials, load_camera_specs
 from .wrist_belief_gateway_v11 import WristBeliefGateway
@@ -32,6 +38,87 @@ from .wrist_d405_protocol_v11 import (
 
 
 LOG = logging.getLogger(__name__)
+
+
+def monotonic_us() -> int:
+    """Thor-local clock shared by D405 arrivals and G1 LCM arrivals."""
+    return time.monotonic_ns() // 1_000
+
+
+@dataclasses.dataclass(frozen=True)
+class RobotStateSample:
+    received_us: int
+    wall_received_us: int
+    packet: bytes
+    state: RobotState
+
+
+class RobotStateHistory:
+    """Bounded Thor-arrival history used to sample state at camera exposure.
+
+    The robot packet timestamp belongs to the G1 clock and is deliberately not
+    used here.  Both arrival stamps are made on Thor's monotonic clock, so a
+    constant lookup bias is the only clock/transport calibration required.
+    """
+
+    def __init__(self, *, span_s: float = 2.0, publish_hz: float = 500.0) -> None:
+        capacity = max(2, int(np.ceil(float(span_s) * float(publish_hz))))
+        self.entries: collections.deque[RobotStateSample] = collections.deque(maxlen=capacity)
+
+    def add(
+        self, received_us: int, packet: bytes, state: RobotState, *, wall_received_us: int | None = None
+    ) -> None:
+        self.entries.append(
+            RobotStateSample(
+                int(received_us),
+                int(received_us if wall_received_us is None else wall_received_us),
+                bytes(packet),
+                state,
+            )
+        )
+
+    def snapshot(self) -> list[RobotStateSample]:
+        return list(self.entries)
+
+
+def nearest_state_sample(
+    samples: list[RobotStateSample], lookup_us: int
+) -> tuple[int, RobotStateSample, float] | None:
+    """Return nearest arrival-clock sample without extrapolating."""
+    if not samples:
+        return None
+    index = min(range(len(samples)), key=lambda i: abs(samples[i].received_us - int(lookup_us)))
+    sample = samples[index]
+    return index, sample, abs(sample.received_us - int(lookup_us)) / 1000.0
+
+
+def _rotation_angle_rad(rotation: np.ndarray) -> float:
+    cosine = float(np.clip((np.trace(rotation) - 1.0) * 0.5, -1.0, 1.0))
+    return float(np.arccos(cosine))
+
+
+def wrist_motion_from_history(
+    samples: list[RobotStateSample], sample_index: int, wrist_link: str
+) -> tuple[float, float] | None:
+    """Finite-difference wrist linear/angular speed around a matched state."""
+    if len(samples) < 2:
+        return None
+    candidate_indices = [index for index in (sample_index - 1, sample_index + 1) if 0 <= index < len(samples)]
+    if not candidate_indices:
+        return None
+    other_index = min(
+        candidate_indices,
+        key=lambda index: abs(samples[index].received_us - samples[sample_index].received_us),
+    )
+    first, second = sorted((samples[sample_index], samples[other_index]), key=lambda item: item.received_us)
+    dt_s = (second.received_us - first.received_us) / 1_000_000.0
+    if dt_s <= 0.0:
+        return None
+    first_wrist = g1_link_transforms(np.asarray(first.state.q, dtype=np.float64))[wrist_link]
+    second_wrist = g1_link_transforms(np.asarray(second.state.q, dtype=np.float64))[wrist_link]
+    linear_mps = float(np.linalg.norm(second_wrist[:3, 3] - first_wrist[:3, 3]) / dt_s)
+    angular_rps = _rotation_angle_rad(first_wrist[:3, :3].T @ second_wrist[:3, :3]) / dt_s
+    return linear_mps, float(angular_rps)
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -101,10 +188,15 @@ class ThorWristD405Gateway:
                  shared_hand_selection_endpoint: str, shared_hand_selection_topic: str,
                  ee_target_enabled: bool, ee_target_endpoint: str,
                  ee_target_topic: str, ee_target_link: str,
-                 ee_target_label: str, ee_target_min_score: float,
-                 ee_target_position_field: str, ee_target_duration_sec: float,
-                 ee_target_final_hold_sec: float,
-                 ee_target_quaternion_wxyz: tuple[float, float, float, float]) -> None:
+                  ee_target_label: str, ee_target_min_score: float,
+                  ee_target_position_field: str, ee_target_duration_sec: float,
+                  ee_target_final_hold_sec: float,
+                 ee_target_quaternion_wxyz: tuple[float, float, float, float],
+                 state_history_span_s: float = 2.0,
+                 state_history_publish_hz: float = 500.0,
+                 left_state_lookup_bias_ms: float = 0.0,
+                 right_state_lookup_bias_ms: float = 0.0,
+                 state_pairing_reference_range_m: float = 0.30) -> None:
         self.g1_bus = lcm.LCM(g1_lcm_url)
         self.wifi_bus = lcm.LCM(wifi_lcm_url)
         self.config = config
@@ -119,13 +211,26 @@ class ThorWristD405Gateway:
             "last_skip_reason": None,
             "robot_state_gap_ms": 0.0,
             "robot_state_gap_max_ms": 0.0,
+            "pairing_residual_ms": {},
+            "pairing_estimated_error_m": {},
         }
         self.capture: WristD405Capture | None = None
         self.belief: WristBeliefGateway | None = None
+        self.state_lock = threading.Lock()
+        self.state_history = RobotStateHistory(
+            span_s=state_history_span_s, publish_hz=state_history_publish_hz
+        )
         self.latest_robot_state_packet: tuple[int, bytes] | None = None
         self.last_robot_state_received_us: int | None = None
         self.robot_state_arrival_interval_us: int | None = None
         self.robot_state_max_arrival_interval_us = 0
+        self.state_lookup_bias_us = {
+            "left_wrist": int(round(float(left_state_lookup_bias_ms) * 1_000.0)),
+            "right_wrist": int(round(float(right_state_lookup_bias_ms) * 1_000.0)),
+        }
+        self.state_pairing_reference_range_m = max(0.0, float(state_pairing_reference_range_m))
+        self._state_pump_stop = threading.Event()
+        self._state_pump_thread: threading.Thread | None = None
         capture_config = _load_yaml(config).get("capture", {})
         self.max_inter_wrist_skew_us = int(float(capture_config.get("max_inter_wrist_skew_ms", 80.0)) * 1000.0)
         self.wifi_bus.subscribe(WRIST_RESULT_CHANNEL, self._on_result)
@@ -159,25 +264,60 @@ class ThorWristD405Gateway:
         # Robot state is the only legacy LCM input retained in v11. It is
         # forwarded unchanged for remote timestamp matching; no head image,
         # depth, or head calibration channel is subscribed.
+        try:
+            state = decode_robot_state(data)
+        except Exception as error:
+            LOG.warning("rejected G1 robot state for D405 pairing: %s", error)
+            return
+        received_us = monotonic_us()
+        wall_received_us = now_us()
+        with self.state_lock:
+            if self.last_robot_state_received_us is not None:
+                self.robot_state_arrival_interval_us = max(
+                    0, received_us - self.last_robot_state_received_us
+                )
+                self.robot_state_max_arrival_interval_us = max(
+                    self.robot_state_max_arrival_interval_us,
+                    self.robot_state_arrival_interval_us,
+                )
+                gap_ms = self.robot_state_arrival_interval_us / 1000.0
+                self.stats["robot_state_gap_ms"] = gap_ms
+                self.stats["robot_state_gap_max_ms"] = max(
+                    float(self.stats.get("robot_state_gap_max_ms", 0.0)), gap_ms
+                )
+            self.last_robot_state_received_us = received_us
+            self.latest_robot_state_packet = (received_us, bytes(data))
+            self.state_history.add(
+                received_us, bytes(data), state, wall_received_us=wall_received_us
+            )
         self.wifi_bus.publish(WRIST_ROBOT_STATE_CHANNEL, data)
-        received_us = now_us()
-        if self.last_robot_state_received_us is not None:
-            self.robot_state_arrival_interval_us = max(
-                0, received_us - self.last_robot_state_received_us
-            )
-            self.robot_state_max_arrival_interval_us = max(
-                self.robot_state_max_arrival_interval_us,
-                self.robot_state_arrival_interval_us,
-            )
-            gap_ms = self.robot_state_arrival_interval_us / 1000.0
-            self.stats["robot_state_gap_ms"] = gap_ms
-            self.stats["robot_state_gap_max_ms"] = max(
-                float(self.stats.get("robot_state_gap_max_ms", 0.0)), gap_ms
-            )
-        self.last_robot_state_received_us = received_us
-        self.latest_robot_state_packet = (received_us, bytes(data))
         if self.belief is not None:
             self.belief.update_robot_state(data)
+
+    def _state_pump(self) -> None:
+        """Keep receiving q while D405 waits for its next frame."""
+        while not self._state_pump_stop.is_set():
+            try:
+                self.g1_bus.handle_timeout(25)
+            except Exception as error:
+                if not self._state_pump_stop.is_set():
+                    LOG.warning("G1 robot-state receive loop stopped: %s", error)
+                return
+
+    def _start_state_pump(self) -> None:
+        if self._state_pump_thread is not None:
+            return
+        self._state_pump_stop.clear()
+        self._state_pump_thread = threading.Thread(
+            target=self._state_pump, name="wrist-d405-g1-state", daemon=True
+        )
+        self._state_pump_thread.start()
+
+    def _stop_state_pump(self) -> None:
+        self._state_pump_stop.set()
+        thread, self._state_pump_thread = self._state_pump_thread, None
+        if thread is not None:
+            thread.join(timeout=0.2)
 
     def preflight(self) -> None:
         rs = _import_realsense()
@@ -213,7 +353,7 @@ class ThorWristD405Gateway:
             LOG.info("%s serial=%s port=%s profile=UYVY/Z16 %dx%d@%d", side, spec.serial,
                      visible[spec.serial].get("physical_port", ""), spec.color.width, spec.color.height, spec.color.fps)
 
-    def start(self) -> None:
+    def start(self, *, state_pairing: bool = True) -> None:
         assert_video_nodes_unowned()
         rs = _import_realsense()
         specs = load_camera_specs(self.config)
@@ -222,12 +362,15 @@ class ThorWristD405Gateway:
             rs, specs,
             max_rgb_depth_delta_ms=float(capture_config.get("max_rgb_depth_delta_ms", 20.0)),
         )
+        if state_pairing:
+            self._start_state_pump()
         self.capture.start()
         if self.belief is not None:
             self.belief.start()
         LOG.info("direct D405 capture started for %s", sorted(self.capture.specs))
 
     def stop(self) -> None:
+        self._stop_state_pump()
         if self.belief is not None:
             self.belief.stop()
         if self.capture is not None:
@@ -255,15 +398,46 @@ class ThorWristD405Gateway:
     def publish_once(self) -> None:
         if self.capture is None:
             raise RuntimeError("D405 gateway is not started")
-        if self.latest_robot_state_packet is None:
+        with self.state_lock:
+            have_robot_state = bool(self.state_history.entries)
+        if not have_robot_state:
             raise RuntimeError(
                 f"no robot state received on {self.robot_state_channel}; "
                 "refusing RGB-D without the FK snapshot required for belief geometry"
             )
         captured = self.capture.wait_for_bundles()
+        # Take this snapshot *after* the blocking camera waits. The independent
+        # G1 receive thread has continued filling it during that interval.
+        with self.state_lock:
+            history = self.state_history.snapshot()
+        if not history:
+            raise RuntimeError("robot-state history became empty during D405 capture")
+        matches: dict[str, tuple[int, RobotStateSample, float]] = {}
+        motions: dict[str, tuple[float, float] | None] = {}
+        for camera_id in CAMERA_IDS:
+            frame_arrival_us = int(captured[camera_id].host_timestamp_us)
+            lookup_us = frame_arrival_us + self.state_lookup_bias_us[camera_id]
+            matched = nearest_state_sample(history, lookup_us)
+            if matched is None:
+                raise RuntimeError("robot-state history became empty during D405 capture")
+            matches[camera_id] = matched
+            motions[camera_id] = wrist_motion_from_history(
+                history, matched[0],
+                "left_wrist_yaw_link" if camera_id == "left_wrist" else "right_wrist_yaw_link",
+            )
         frames: dict[str, dict[str, Any]] = {}
         for camera_id in CAMERA_IDS:
             bundle = captured[camera_id]
+            _sample_index, sample, residual_ms = matches[camera_id]
+            wrist_motion = motions[camera_id]
+            wrist_speed_mps = None if wrist_motion is None else wrist_motion[0]
+            wrist_omega_rps = None if wrist_motion is None else wrist_motion[1]
+            estimated_error_m = (
+                None
+                if wrist_motion is None
+                else (wrist_speed_mps + self.state_pairing_reference_range_m * wrist_omega_rps)
+                * (residual_ms / 1000.0)
+            )
             import cv2
             ok, encoded = cv2.imencode(".jpg", bundle.color_bgr, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
             if not ok:
@@ -280,7 +454,27 @@ class ThorWristD405Gateway:
                 "color_jpeg": encoded.tobytes(), "depth_z16_zlib": pack_depth_z16(bundle.depth_z16),
                 "depth_scale_m": float(bundle.depth_scale_m), "intrinsics": bundle.intrinsics,
                 "calibration_id": "d405_factory_2026-08-20",
-                "diagnostics": {"rgb_depth_delta_ms": abs(bundle.color_timestamp_ms - bundle.depth_timestamp_ms)},
+                "diagnostics": {
+                    "rgb_depth_delta_ms": abs(bundle.color_timestamp_ms - bundle.depth_timestamp_ms),
+                    "color_timestamp_domain": bundle.color_timestamp_domain,
+                    "depth_timestamp_domain": bundle.depth_timestamp_domain,
+                },
+                # These values are selected on Thor, where camera and robot
+                # arrivals share a clock.  The worker must not re-pair them.
+                "q_at_exposure": np.asarray(sample.state.q, dtype=np.float64).tolist(),
+                "base_quat_at_exposure_wxyz": np.asarray(
+                    sample.state.base_quat_wxyz, dtype=np.float64
+                ).tolist(),
+                "state_pairing": {
+                    "lookup_us": int(bundle.host_timestamp_us) + self.state_lookup_bias_us[camera_id],
+                    "state_arrival_us": int(sample.received_us),
+                    "residual_ms": float(residual_ms),
+                    "bias_us": int(self.state_lookup_bias_us[camera_id]),
+                    "method": "nearest",
+                    "wrist_speed_mps": wrist_speed_mps,
+                    "wrist_omega_rps": wrist_omega_rps,
+                    "estimated_error_m": estimated_error_m,
+                },
             }
         # Use the capture timestamps, not sequential JPEG/packet construction,
         # to measure actual inter-camera timing after concurrent waits.
@@ -294,21 +488,35 @@ class ThorWristD405Gateway:
                 f"{self.max_inter_wrist_skew_us / 1000.0:.1f} ms"
             )
         self.sequence += 1
-        state_received_us, state_packet = self.latest_robot_state_packet
+        representative = min(matches.values(), key=lambda value: value[2])[1]
+        with self.state_lock:
+            interval_us = self.robot_state_arrival_interval_us
+            max_interval_us = self.robot_state_max_arrival_interval_us
+            gap_ms = float(self.stats.get("robot_state_gap_ms", 0.0))
+            gap_max_ms = float(self.stats.get("robot_state_gap_max_ms", 0.0))
+            self.stats["pairing_residual_ms"] = {
+                camera_id: float(matches[camera_id][2]) for camera_id in CAMERA_IDS
+            }
+            self.stats["pairing_estimated_error_m"] = {
+                camera_id: frames[camera_id]["state_pairing"]["estimated_error_m"]
+                for camera_id in CAMERA_IDS
+            }
         payload = {
             "version": 1,
             "sequence": self.sequence,
             "bundle_timestamp_us": now_us(),
             "split_y": frames["left_wrist"]["height"],
             "inter_wrist_skew_us": skew,
-            "robot_state_packet": state_packet,
-            "robot_state_host_received_us": int(state_received_us),
-            "robot_state_arrival_interval_us": self.robot_state_arrival_interval_us,
-            "robot_state_max_arrival_interval_us": self.robot_state_max_arrival_interval_us,
-            "robot_state_gap_ms": float(self.stats.get("robot_state_gap_ms", 0.0)),
-            "robot_state_gap_max_ms": float(
-                self.stats.get("robot_state_gap_max_ms", 0.0)
-            ),
+            # Compatibility snapshot for rolling worker upgrades. v14 workers
+            # use each camera's q/base quaternion above instead.
+            "robot_state_packet": representative.packet,
+            # Preserve the legacy wall-clock field for an old remote worker
+            # during a rolling deployment. v14 fields use monotonic arrival.
+            "robot_state_host_received_us": int(representative.wall_received_us),
+            "robot_state_arrival_interval_us": interval_us,
+            "robot_state_max_arrival_interval_us": max_interval_us,
+            "robot_state_gap_ms": gap_ms,
+            "robot_state_gap_max_ms": gap_max_ms,
             "cameras": frames,
         }
         encoded = pack_bundle(payload)
@@ -338,13 +546,17 @@ class ThorWristD405Gateway:
                     "robot_state_gap_max_ms": round(
                         float(self.stats.get("robot_state_gap_max_ms", 0.0)), 2
                     ),
+                    "pairing_residual_ms": {
+                        camera_id: round(float(matches[camera_id][2]), 2)
+                        for camera_id in CAMERA_IDS
+                    },
                 },
             )
             self.last_publish_log_monotonic = time.monotonic()
 
     def capture_smoke(self) -> None:
         """Verify both direct camera streams without sending any LCM traffic."""
-        self.start()
+        self.start(state_pairing=False)
         try:
             assert self.capture is not None
             for camera_id, bundle in self.capture.wait_for_bundles(
@@ -352,10 +564,11 @@ class ThorWristD405Gateway:
             ).items():
                 LOG.info(
                     "CAPTURE_OK camera=%s serial=%s grid=%dx%d rgb_ts_ms=%.3f "
-                    "depth_ts_ms=%.3f delta_ms=%.3f depth_scale_m=%g",
+                    "depth_ts_ms=%.3f delta_ms=%.3f rgb_domain=%s depth_domain=%s depth_scale_m=%g",
                     camera_id, bundle.serial, bundle.intrinsics["width"], bundle.intrinsics["height"],
                     bundle.color_timestamp_ms, bundle.depth_timestamp_ms,
-                    abs(bundle.color_timestamp_ms - bundle.depth_timestamp_ms), bundle.depth_scale_m,
+                    abs(bundle.color_timestamp_ms - bundle.depth_timestamp_ms),
+                    bundle.color_timestamp_domain, bundle.depth_timestamp_domain, bundle.depth_scale_m,
                 )
         finally:
             self.stop()
@@ -366,11 +579,6 @@ class ThorWristD405Gateway:
         try:
             while True:
                 started = time.monotonic()
-                # Keep the newest robot state: at 50 Hz a single callback per
-                # 15 Hz capture tick would otherwise violate the 15 ms v11 FK
-                # matching budget before the remote worker even receives it.
-                while self.g1_bus.handle_timeout(0) > 0:
-                    pass
                 try:
                     self.publish_once()
                 except RuntimeError as error:
@@ -411,6 +619,14 @@ def main() -> None:
     parser.add_argument("--max-hz", type=float, default=8.0)
     parser.add_argument("--jpeg-quality", type=int, default=85)
     parser.add_argument("--robot-state-channel", default="G1_ROBOT_STATE")
+    parser.add_argument("--state-history-span-sec", type=float, default=2.0)
+    parser.add_argument("--state-history-publish-hz", type=float, default=500.0)
+    parser.add_argument("--left-state-lookup-bias-ms", type=float, default=0.0,
+                        help="Thor-arrival lookup offset for left D405; tune from static-object sweep")
+    parser.add_argument("--right-state-lookup-bias-ms", type=float, default=0.0,
+                        help="Thor-arrival lookup offset for right D405; tune independently")
+    parser.add_argument("--state-pairing-reference-range-m", type=float, default=0.30,
+                        help="diagnostic range used before worker replaces it with object distance")
     parser.add_argument("--belief-config", type=Path, default=Path("config/pipeline.yaml"),
                         help="existing TASC belief settings reused for both wrists")
     parser.add_argument("--belief-inference", action=argparse.BooleanOptionalAction, default=True,
@@ -513,6 +729,11 @@ def main() -> None:
         ee_target_duration_sec=args.ee_target_duration_sec,
         ee_target_final_hold_sec=args.ee_target_final_hold_sec,
         ee_target_quaternion_wxyz=tuple(args.ee_target_quaternion_wxyz),
+        state_history_span_s=args.state_history_span_sec,
+        state_history_publish_hz=args.state_history_publish_hz,
+        left_state_lookup_bias_ms=args.left_state_lookup_bias_ms,
+        right_state_lookup_bias_ms=args.right_state_lookup_bias_ms,
+        state_pairing_reference_range_m=args.state_pairing_reference_range_m,
     )
     if args.diagnose:
         diagnose_runtime(_import_realsense())

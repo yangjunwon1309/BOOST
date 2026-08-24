@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import logging
 import threading
 import time
@@ -14,7 +15,7 @@ import lcm
 import numpy as np
 import yaml
 
-from seg_web_node.lcm_protocol import decode_robot_state
+from seg_web_node.lcm_protocol import RobotState, decode_robot_state
 from seg_web_node.grip_candidates import (
     GripCandidateConfig,
     PersistentCylinderSurfaceTracker,
@@ -193,12 +194,23 @@ class WristD405Sam3Worker:
                  seam_minority_ratio: float = 0.05,
                  track_association_radius_m: float = 0.06,
                  geometry_fallback_ttl_frames: int = 3,
-                 geometry_fallback_score_decay: float = 0.97) -> None:
+                 geometry_fallback_score_decay: float = 0.97,
+                 pairing_max_error_m: float = 0.008,
+                 pairing_max_residual_ms: float | None = None) -> None:
         self.bus = lcm.LCM(wifi_lcm_url)
         self.concepts, self.backend, self.extrinsics = concepts, backend, extrinsics
         self.seam_guard_px, self.min_depth_m, self.max_depth_m = int(seam_guard_px), float(min_depth_m), float(max_depth_m)
         self.seam_minority_ratio = float(np.clip(seam_minority_ratio, 0.0, 0.5))
-        self.min_depth_points, self.robot_state_max_delta_ms = int(min_depth_points), float(robot_state_max_delta_ms)
+        self.min_depth_points = int(min_depth_points)
+        # Keep the old CLI name as a compatibility alias, but v14's actual
+        # acceptance gate is estimated geometry error below.
+        self.robot_state_max_delta_ms = float(robot_state_max_delta_ms)
+        self.pairing_max_residual_ms = float(
+            robot_state_max_delta_ms
+            if pairing_max_residual_ms is None
+            else pairing_max_residual_ms
+        )
+        self.pairing_max_error_m = max(0.0, float(pairing_max_error_m))
         self.track_association_radius_m = max(0.0, float(track_association_radius_m))
         self.states = RobotStateBuffer()
         self.point_filter = point_filter or ObjectPointFilterConfig()
@@ -227,6 +239,7 @@ class WristD405Sam3Worker:
         self.tracks: dict[str, dict[str, tuple[np.ndarray, int]]] = {camera_id: {} for camera_id in CAMERA_IDS}
         self.stats: dict[str, Any] = {
             "state_age_rejects": 0,
+            "pairing_rejects": 0,
             "suppressed_duplicate_masks": 0,
             "geometry_fallback_objects": 0,
         }
@@ -280,6 +293,73 @@ class WristD405Sam3Worker:
         except Exception as error:
             LOG.warning("rejected wrist concept control: %s", error)
 
+    @staticmethod
+    def _frame_paired_state(
+        frame: dict[str, Any], fallback_state: RobotState | None, fallback_residual_ms: float | None
+    ) -> tuple[RobotState | None, dict[str, Any] | None]:
+        """Prefer the camera-specific Thor pairing; retain old bundle fallback."""
+        pairing = frame.get("state_pairing")
+        q = frame.get("q_at_exposure")
+        base_quat = frame.get("base_quat_at_exposure_wxyz")
+        if isinstance(pairing, dict) and q is not None and base_quat is not None:
+            try:
+                q_array = np.asarray(q, dtype=np.float64).reshape(29)
+                base_array = np.asarray(base_quat, dtype=np.float64).reshape(4)
+                if not np.isfinite(q_array).all() or not np.isfinite(base_array).all():
+                    raise ValueError("non-finite state")
+            except (TypeError, ValueError):
+                return None, None
+            if fallback_state is None:
+                fallback_state = RobotState(
+                    sequence=-1, lowstate_sequence=-1, timestamp_us=0,
+                    mode_machine=0, has_torso_imu=False,
+                    base_quat_wxyz=base_array.copy(), torso_quat_wxyz=np.array([1.0, 0.0, 0.0, 0.0]),
+                    q=q_array.copy(), dq=np.zeros(29, dtype=np.float64),
+                )
+            state = dataclasses.replace(
+                fallback_state, q=q_array.copy(), base_quat_wxyz=base_array.copy()
+            )
+            return state, dict(pairing)
+        if fallback_state is None or fallback_residual_ms is None:
+            return None, None
+        return fallback_state, {
+            "lookup_us": 0,
+            "state_arrival_us": 0,
+            "residual_ms": float(fallback_residual_ms),
+            "bias_us": 0,
+            "method": "legacy_shared_snapshot",
+            "wrist_speed_mps": None,
+            "wrist_omega_rps": None,
+            "estimated_error_m": None,
+        }
+
+    def _pairing_error_for_object(
+        self, camera_id: str, center_camera_m: Any, pairing: dict[str, Any]
+    ) -> tuple[dict[str, Any], bool]:
+        """Compute the v14 geometry error using actual object range, not a fixed time gate."""
+        resolved = dict(pairing)
+        try:
+            speed = float(resolved["wrist_speed_mps"])
+            omega = float(resolved["wrist_omega_rps"])
+            point = np.asarray(center_camera_m, dtype=np.float64).reshape(3)
+            # r is wrist->object, so include the known wrist->camera mount
+            # offset in addition to the source-frame optical range.
+            object_range_m = float(np.linalg.norm(point)) + float(
+                np.linalg.norm(self.extrinsics[camera_id][:3, 3])
+            )
+            residual_s = float(resolved["residual_ms"]) / 1000.0
+            estimate = (speed + object_range_m * omega) * residual_s
+            if not np.isfinite(estimate) or estimate < 0.0:
+                raise ValueError("invalid estimate")
+            resolved["estimated_error_m"] = float(estimate)
+            resolved["object_range_m"] = object_range_m
+            return resolved, estimate <= self.pairing_max_error_m
+        except (KeyError, TypeError, ValueError):
+            # The residual hard limit below remains the safety net if finite
+            # differencing is unavailable during history warm-up.
+            resolved["estimated_error_m"] = None
+            return resolved, True
+
     def process_latest(self) -> dict[str, Any] | None:
         with self.lock:
             bundle = self.latest_bundle
@@ -289,17 +369,21 @@ class WristD405Sam3Worker:
             return None
         frames = bundle["cameras"]
         paired_packet = bundle.get("robot_state_packet")
-        paired_state = (
-            decode_robot_state(paired_packet)
-            if isinstance(paired_packet, (bytes, bytearray))
-            else None
-        )
+        try:
+            paired_state = (
+                decode_robot_state(paired_packet)
+                if isinstance(paired_packet, (bytes, bytearray))
+                else None
+            )
+        except Exception as error:
+            LOG.warning("bundle has invalid legacy paired robot state: %s", error)
+            paired_state = None
         paired_state_received_us = int(
             bundle.get("robot_state_host_received_us", 0) or 0
         )
-        state_age_by_camera: dict[str, float | None] = {}
+        fallback_age_by_camera: dict[str, float | None] = {}
         if paired_state is not None and paired_state_received_us > 0:
-            state_age_by_camera = {
+            fallback_age_by_camera = {
                 camera_id: abs(
                     int(frames[camera_id]["host_timestamp_us"])
                     - paired_state_received_us
@@ -313,15 +397,25 @@ class WristD405Sam3Worker:
             )
             self.warned_unpaired_robot_state = True
 
-        state_age_ms = (
-            max(value for value in state_age_by_camera.values() if value is not None)
-            if state_age_by_camera
-            else None
+        paired_states: dict[str, RobotState | None] = {}
+        pairings: dict[str, dict[str, Any] | None] = {}
+        state_age_by_camera: dict[str, float | None] = {}
+        for camera_id in CAMERA_IDS:
+            state, pairing = self._frame_paired_state(
+                frames[camera_id], paired_state, fallback_age_by_camera.get(camera_id)
+            )
+            paired_states[camera_id], pairings[camera_id] = state, pairing
+            state_age_by_camera[camera_id] = (
+                None if pairing is None else float(pairing.get("residual_ms", 0.0))
+            )
+        state_age_ms = max(
+            (value for value in state_age_by_camera.values() if value is not None), default=None
         )
-        state_valid = (
-            paired_state is not None
-            and state_age_ms is not None
-            and state_age_ms <= self.robot_state_max_delta_ms
+        state_valid = all(
+            paired_states[camera_id] is not None
+            and state_age_by_camera[camera_id] is not None
+            and state_age_by_camera[camera_id] <= self.pairing_max_residual_ms
+            for camera_id in CAMERA_IDS
         )
         if not state_valid:
             self.stats["state_age_rejects"] = int(
@@ -329,8 +423,8 @@ class WristD405Sam3Worker:
             ) + 1
             reason = (
                 "robot_state_unavailable"
-                if paired_state is None or state_age_ms is None
-                else "robot_state_stale"
+                if any(paired_states[camera_id] is None for camera_id in CAMERA_IDS)
+                else "state_pairing_residual_exceeds_limit"
             )
             self.sequence += 1
             result = make_result(
@@ -353,22 +447,28 @@ class WristD405Sam3Worker:
             self.bus.publish(WRIST_RESULT_CHANNEL, pack_result(result))
             return result
 
-        # The paired state is mandatory above. One FK evaluation serves every
-        # object in this atomic two-camera bundle.
-        link_transforms = g1_link_transforms(np.asarray(paired_state.q, dtype=np.float64))
+        # Each wrist has its own exposure time and therefore its own Thor-paired
+        # q/base quaternion. A shared bundle-level FK would reintroduce skew.
         t_goal_cameras: dict[str, np.ndarray] = {}
         transform_diagnostics: dict[str, dict[str, Any]] = {}
+        up_goals: dict[str, np.ndarray | None] = {}
         for camera_id in CAMERA_IDS:
+            assert paired_states[camera_id] is not None
+            link_transforms = g1_link_transforms(np.asarray(paired_states[camera_id].q, dtype=np.float64))
             goal_wrist = link_transforms[CAMERA_TO_WRIST_LINK[camera_id]]
             goal_camera = goal_wrist @ self.extrinsics[camera_id]
             t_goal_cameras[camera_id] = goal_camera
-            transform_diagnostics[camera_id] = camera_transform_diagnostics(
+            diagnostic = camera_transform_diagnostics(
                 camera_id,
                 self.extrinsics,
                 goal_wrist=goal_wrist,
                 goal_camera=goal_camera,
             )
-        up_goal = gravity_up_in_pelvis(paired_state.base_quat_wxyz)
+            diagnostic["state_pairing"] = dict(pairings[camera_id] or {})
+            transform_diagnostics[camera_id] = diagnostic
+            up_goals[camera_id] = gravity_up_in_pelvis(
+                paired_states[camera_id].base_quat_wxyz
+            )
         stacked, split_y = stack_wrist_images(frames)
         masks, boxes, scores, labels = self.backend.infer(stacked, concepts)
         attributed, discarded = attribute_stacked_masks(
@@ -413,22 +513,45 @@ class WristD405Sam3Worker:
                     camera_id=camera_id, serial=str(frame["serial"]), mask=detected["mask"], box_xyxy=detected["box"].tolist(),
                     label=detected["label"], score=detected["score"], depth_z16=depth, depth_scale_m=float(frame["depth_scale_m"]),
                     intrinsics=frame["intrinsics"], source_timestamp_us=int(frame["host_timestamp_us"]),
-                    calibration_id=str(frame.get("calibration_id", "factory")), state=paired_state,
+                    calibration_id=str(frame.get("calibration_id", "factory")), state=paired_states[camera_id],
                     state_age_ms=state_age_by_camera[camera_id],
                     min_depth_m=self.min_depth_m, max_depth_m=self.max_depth_m,
                     min_depth_points=self.min_depth_points, point_filter=self.point_filter,
                     depth_edge_mask=depth_edge_mask,
                     t_goal_cam=t_goal_cameras[camera_id],
-                    gravity_up_goal=up_goal,
+                    gravity_up_goal=up_goals[camera_id],
                     max_points=self.contact_config.max_points,
                 )
                 obj["track_id"] = self._assign_track(camera_id, obj)
+                resolved_pairing, pairing_accepted = self._pairing_error_for_object(
+                    camera_id, obj.get("center_camera_m"), pairings[camera_id] or {}
+                )
+                obj["state_pairing"] = resolved_pairing
+                if not pairing_accepted:
+                    self.stats["pairing_rejects"] = int(self.stats.get("pairing_rejects", 0)) + 1
+                    # A bad current pairing must not be replaced by a cached
+                    # target for the same track; that would bypass this gate.
+                    self.geometry_fallbacks[camera_id].entries.pop(obj["track_id"], None)
+                    obj.pop("_points_goal_m", None)
+                    obj["center_goal_m"] = None
+                    obj["contact_candidates"] = []
+                    obj["surface_primitives"] = []
+                    obj["surface_model"] = None
+                    obj["geometry"] = {
+                        "valid": False,
+                        "reason": "state_pairing_error_exceeds_limit",
+                        "estimated_error_m": resolved_pairing.get("estimated_error_m"),
+                        "max_error_m": self.pairing_max_error_m,
+                    }
+                    obj["point_filter"] = dict(obj["geometry"])
+                    camera_objects.append(obj)
+                    continue
                 if attach_surface_geometry(
                     obj, track_id=obj["track_id"], label=str(obj["label"]),
                     source_timestamp_us=int(frame["host_timestamp_us"]),
                     surface_tracker=self.surface_trackers[camera_id], contact_config=self.contact_config,
                     pseudo_config=self.pseudo_config,
-                    up_goal=up_goal,
+                    up_goal=up_goals[camera_id],
                     t_goal_cam=t_goal_cameras[camera_id],
                 ):
                     active_surface_tracks.add(obj["track_id"])
@@ -472,7 +595,7 @@ class WristD405Sam3Worker:
                 primitive_count=primitive_count,
                 objects_with_valid_depth=valid_depth_count,
                 discarded_seam_masks=discarded,
-                up_goal_available=up_goal is not None,
+                up_goal_available=all(value is not None for value in up_goals.values()),
                 suppressed_duplicate_masks=suppressed_duplicates,
             ),
             t_goal_cam={
@@ -492,9 +615,9 @@ class WristD405Sam3Worker:
                 reasons[reason] = reasons.get(reason, 0) + 1
             LOG.info(
                 "WRIST_GEOMETRY sequence=%d masks=%d center_goal=%d primitives=%d "
-                "state_age_ms=%s state_rejects=%d reasons=%s",
+                "state_pairing_residual_ms=%s state_rejects=%d pairing_rejects=%d reasons=%s",
                 self.sequence, len(objects), centers, primitives, state_age_ms,
-                self.stats["state_age_rejects"], reasons,
+                self.stats["state_age_rejects"], self.stats["pairing_rejects"], reasons,
             )
             self.last_geometry_log_monotonic = now_monotonic
         return result
@@ -515,6 +638,13 @@ class WristD405Sam3Worker:
             "state_available": bool(state_available),
             "state_age_ms": state_age_ms,
             "state_age_rejects": int(self.stats.get("state_age_rejects", 0)),
+            "pairing_rejects": int(self.stats.get("pairing_rejects", 0)),
+            "pairing_max_error_m": self.pairing_max_error_m,
+            "pairing_max_residual_ms": self.pairing_max_residual_ms,
+            "state_pairing": {
+                camera_id: dict((bundle.get("cameras", {}).get(camera_id, {}).get("state_pairing") or {}))
+                for camera_id in CAMERA_IDS
+            },
             "up_goal_available": bool(up_goal_available),
             "primitive_count": int(primitive_count),
             "objects_with_valid_depth": int(objects_with_valid_depth),
@@ -604,6 +734,10 @@ def main() -> None:
     parser.add_argument("--max-depth-m", type=float, default=0.50)
     parser.add_argument("--min-depth-points", type=int, default=100)
     parser.add_argument("--robot-state-max-delta-ms", type=float, default=15.0)
+    parser.add_argument("--pairing-max-residual-ms", type=float, default=None,
+                        help="v14 hard safety limit; default uses --robot-state-max-delta-ms")
+    parser.add_argument("--pairing-max-error-m", type=float, default=0.008,
+                        help="reject target geometry when state-pairing error estimate exceeds this")
     parser.add_argument(
         "--track-association-radius-m",
         type=float,
@@ -628,7 +762,9 @@ def main() -> None:
                         contact_config=contact_config, pseudo_config=pseudo_config,
                         track_association_radius_m=args.track_association_radius_m,
                         geometry_fallback_ttl_frames=args.geometry_fallback_ttl_frames,
-                        geometry_fallback_score_decay=args.geometry_fallback_score_decay).run()
+                        geometry_fallback_score_decay=args.geometry_fallback_score_decay,
+                        pairing_max_residual_ms=args.pairing_max_residual_ms,
+                        pairing_max_error_m=args.pairing_max_error_m).run()
 
 
 if __name__ == "__main__":

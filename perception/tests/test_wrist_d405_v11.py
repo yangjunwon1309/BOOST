@@ -19,6 +19,7 @@ from remote_offload.wrist_belief_gateway_v11 import (
 from remote_offload.wrist_d405_protocol_v11 import (
     CAMERA_IDS,
     make_result,
+    now_us,
     pack_ipopt_visual,
     pack_mask,
     pack_result,
@@ -179,6 +180,52 @@ def test_wrist_ipopt_freshness_uses_local_receipt_clock() -> None:
 
     assert control is not None
     assert 10.0 <= control["age_ms"] < 200.0
+
+
+def test_wrist_viewer_projects_belief_normal_and_ipopt_orientation() -> None:
+    viewer = WristV11WebViewer.__new__(WristV11WebViewer)
+    viewer.ipopt_visual_camera_z_offset_m = 0.0
+    viewer.belief = {
+        "published_timestamp_us": now_us(),
+        "selected_hand": "left",
+        "hands": {
+            "left": {
+                "armed": True,
+                "target": {
+                    "camera_id": "left_wrist",
+                    "object_id": "cup:0",
+                    "position_goal_m": [0.0, 0.0, 1.0],
+                    "orientation_axis_world": [1.0, 0.0, 0.0],
+                    "orientation_valid": True,
+                },
+            }
+        },
+    }
+    viewer.ipopt_visual = {
+        "schema": "path.wrist_ipopt_visual.v1",
+        "hands": {
+            "left": {
+                "ipopt_wrist_target_m": [0.0, 0.0, 1.0],
+                "ipopt_wrist_rotation": np.eye(3).reshape(-1).tolist(),
+            }
+        },
+    }
+    viewer.ipopt_visual_received_monotonic = time.monotonic()
+    viewer.objects = [{"camera_id": "left_wrist", "track_id": "cup:0", "box_xyxy": [60, 60, 140, 140]}]
+    intrinsics = {"width": 200, "height": 160, "fx": 120.0, "fy": 120.0, "cx": 100.0, "cy": 80.0}
+    viewer.latest_transforms = {
+        "left_wrist": {"t_goal_cam": np.eye(4).reshape(-1).tolist(), "intrinsics": intrinsics},
+        "right_wrist": {"t_goal_cam": np.eye(4).reshape(-1).tolist(), "intrinsics": intrinsics},
+    }
+    images = {
+        "left_wrist": np.zeros((160, 200, 3), dtype=np.uint8),
+        "right_wrist": np.zeros((160, 200, 3), dtype=np.uint8),
+    }
+
+    viewer._draw_latest_belief_locked(images)
+
+    assert np.any(np.all(images["left_wrist"] == [255, 70, 255], axis=2))
+    assert np.any(np.all(images["left_wrist"] == [40, 40, 255], axis=2))
 
 
 def test_vertical_masks_map_to_their_local_wrist_grid() -> None:

@@ -16,7 +16,9 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from .remote_web_server_head_d435i_legacy import (
+    CONTROL_STALE_AFTER_MS,
     _draw_remote_belief_overlay,
+    _draw_text_with_halo,
     _goal_to_pixel,
 )
 from .wrist_d405_protocol_v11 import (
@@ -37,6 +39,159 @@ from .wrist_d405_protocol_v11 import (
     unpack_mask,
     unpack_result,
 )
+
+
+BELIEF_NORMAL_COLOR = (255, 70, 255)  # magenta, BGR
+IPOPT_ORIENTATION_AXES = (
+    ("x", (40, 40, 255)),  # red
+    ("y", (40, 255, 40)),  # green
+    ("z", (255, 180, 40)),  # blue
+)
+
+
+def _project_goal_axis(
+    origin_goal_m: Any,
+    axis_goal: Any,
+    t_goal_cam: Any,
+    intrinsics: Any,
+    *,
+    length_m: float,
+    camera_z_offset_m: float = 0.0,
+) -> tuple[tuple[int, int], tuple[int, int]] | None:
+    """Project a goal-frame direction segment using the displayed camera pose."""
+    try:
+        origin = np.asarray(origin_goal_m, dtype=np.float64).reshape(3)
+        axis = np.asarray(axis_goal, dtype=np.float64).reshape(3)
+        axis_norm = float(np.linalg.norm(axis))
+        if (
+            not np.isfinite(origin).all()
+            or not np.isfinite(axis).all()
+            or axis_norm <= 1.0e-9
+        ):
+            return None
+        endpoint = origin + axis * (float(length_m) / axis_norm)
+    except (TypeError, ValueError):
+        return None
+    start = _goal_to_pixel(
+        origin,
+        t_goal_cam,
+        intrinsics,
+        camera_z_offset_m=camera_z_offset_m,
+    )
+    end = _goal_to_pixel(
+        endpoint,
+        t_goal_cam,
+        intrinsics,
+        camera_z_offset_m=camera_z_offset_m,
+    )
+    return None if start is None or end is None else (start, end)
+
+
+def _draw_goal_axis(
+    image: np.ndarray,
+    origin_goal_m: Any,
+    axis_goal: Any,
+    t_goal_cam: Any,
+    intrinsics: Any,
+    *,
+    color: tuple[int, int, int],
+    length_m: float,
+    thickness: int = 2,
+    camera_z_offset_m: float = 0.0,
+) -> tuple[int, int] | None:
+    segment = _project_goal_axis(
+        origin_goal_m,
+        axis_goal,
+        t_goal_cam,
+        intrinsics,
+        length_m=length_m,
+        camera_z_offset_m=camera_z_offset_m,
+    )
+    if segment is None:
+        return None
+    start, end = segment
+    cv2.arrowedLine(image, start, end, color, thickness, cv2.LINE_AA, tipLength=0.22)
+    return start
+
+
+def _draw_orientation_legend(image: np.ndarray, side: str) -> None:
+    """Draw only the local camera's orientation key (left/top or right/bottom)."""
+    y = 82
+    cv2.arrowedLine(image, (18, y - 4), (34, y - 4), BELIEF_NORMAL_COLOR, 2, cv2.LINE_AA, tipLength=0.3)
+    _draw_text_with_halo(image, f"{side[0].upper()} contact normal", (42, y), BELIEF_NORMAL_COLOR, scale=0.42)
+    y += 19
+    x = 18
+    for _, color in IPOPT_ORIENTATION_AXES:
+        cv2.line(image, (x, y - 5), (x + 10, y - 5), color, 2, cv2.LINE_AA)
+        x += 13
+    _draw_text_with_halo(image, "IPOPT orientation xyz", (60, y), (230, 230, 230), scale=0.42)
+
+
+def _draw_orientation_targets(
+    image: np.ndarray,
+    *,
+    side: str,
+    hand: dict[str, Any],
+    control_hand: dict[str, Any],
+    control_fresh: bool,
+    belief_stale: bool,
+    t_goal_cam: Any,
+    intrinsics: Any,
+    ipopt_camera_z_offset_m: float,
+) -> None:
+    """Overlay the belief contact normal and the exact IPOPT wrist-frame axes."""
+    target = hand.get("target") if isinstance(hand, dict) else None
+    if isinstance(target, dict) and not belief_stale and bool(target.get("orientation_valid")):
+        origin = target.get("position_goal_m") or target.get("orientation_source_position_m")
+        normal_start = _draw_goal_axis(
+            image,
+            origin,
+            target.get("orientation_axis_world"),
+            t_goal_cam,
+            intrinsics,
+            color=BELIEF_NORMAL_COLOR,
+            length_m=0.10,
+        )
+        if normal_start is not None:
+            _draw_text_with_halo(
+                image,
+                f"{side[0].upper()} normal",
+                (normal_start[0] + 10, normal_start[1] - 18),
+                BELIEF_NORMAL_COLOR,
+                scale=0.42,
+            )
+
+    if not control_fresh or not isinstance(control_hand, dict):
+        return
+    origin = control_hand.get("ipopt_wrist_target_m")
+    try:
+        rotation = np.asarray(control_hand.get("ipopt_wrist_rotation"), dtype=np.float64).reshape(3, 3)
+        rotation_ok = bool(np.isfinite(rotation).all() and abs(float(np.linalg.det(rotation))) > 0.5)
+    except (TypeError, ValueError, np.linalg.LinAlgError):
+        rotation_ok = False
+    if origin is None or not rotation_ok:
+        return
+    origin_pixel: tuple[int, int] | None = None
+    for axis_index, (_, color) in enumerate(IPOPT_ORIENTATION_AXES):
+        projected = _draw_goal_axis(
+            image,
+            origin,
+            rotation[:, axis_index],
+            t_goal_cam,
+            intrinsics,
+            color=color,
+            length_m=0.07,
+            camera_z_offset_m=ipopt_camera_z_offset_m,
+        )
+        origin_pixel = projected if origin_pixel is None else origin_pixel
+    if origin_pixel is not None:
+        _draw_text_with_halo(
+            image,
+            "IPOPT R",
+            (origin_pixel[0] + 11, origin_pixel[1] - 17),
+            (230, 230, 230),
+            scale=0.42,
+        )
 
 
 # Kept deliberately byte-for-byte aligned with the legacy head-D435i viewer's
@@ -282,6 +437,15 @@ class WristV11WebViewer:
                 intrinsics.setdefault("cx", intrinsics.get("ppx"))
                 intrinsics.setdefault("cy", intrinsics.get("ppy"))
             target = (hands.get(side) or {}).get("ipopt_wrist_target_m")
+            rotation_raw = (hands.get(side) or {}).get("ipopt_wrist_rotation")
+            try:
+                rotation = np.asarray(rotation_raw, dtype=np.float64).reshape(3, 3)
+                rotation_available = bool(
+                    np.isfinite(rotation).all()
+                    and abs(float(np.linalg.det(rotation))) > 0.5
+                )
+            except (TypeError, ValueError, np.linalg.LinAlgError):
+                rotation_available = False
             camera_point = None
             try:
                 homogeneous = np.ones(4, dtype=np.float64)
@@ -308,6 +472,7 @@ class WristV11WebViewer:
                     None if camera_point is None else float(camera_point[2] + offset_m)
                 ),
                 "pixel_uv_local": None if pixel is None else list(pixel),
+                "orientation_rotation_available": rotation_available,
             }
         return status
 
@@ -413,6 +578,29 @@ class WristV11WebViewer:
                 # pixel is shifted automatically into the lower image.
                 render_sides=(camera_side,),
             )
+            control_hand = (
+                (control.get("hands") or {}).get(camera_side, {})
+                if isinstance(control, dict)
+                else {}
+            )
+            try:
+                control_fresh = float(control.get("age_ms")) <= CONTROL_STALE_AFTER_MS
+            except (AttributeError, TypeError, ValueError):
+                control_fresh = False
+            _draw_orientation_targets(
+                images[camera_id],
+                side=camera_side,
+                hand=camera_hands.get(camera_side, {}),
+                control_hand=control_hand,
+                control_fresh=control_fresh,
+                belief_stale=self._belief_stale_locked(),
+                t_goal_cam=transform,
+                intrinsics=intrinsics or None,
+                ipopt_camera_z_offset_m=getattr(
+                    self, "ipopt_visual_camera_z_offset_m", 0.25
+                ),
+            )
+            _draw_orientation_legend(images[camera_id], camera_side)
 
     def lcm_loop(self) -> None:
         while True:

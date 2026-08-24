@@ -150,7 +150,7 @@ def _draw_orientation_targets(
             t_goal_cam,
             intrinsics,
             color=BELIEF_NORMAL_COLOR,
-            length_m=0.10,
+            length_m=0.075,
         )
         if normal_start is not None:
             _draw_text_with_halo(
@@ -180,7 +180,7 @@ def _draw_orientation_targets(
             t_goal_cam,
             intrinsics,
             color=color,
-            length_m=0.07,
+            length_m=0.055,
             camera_z_offset_m=ipopt_camera_z_offset_m,
         )
         origin_pixel = projected if origin_pixel is None else origin_pixel

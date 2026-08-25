@@ -20,7 +20,10 @@ class GraspEngagementDetector:
     stall_rate_max_mps: float = 0.004
     engage_ticks: int = 5
     release_ticks: int = 3
-    command_delay_sec: float = 0.5
+    # No measured Dex1 jaw state reaches the live bridge.  Keep belief
+    # position authority through a deliberate, continuous 1.5 s close hold
+    # before handing position back to VR for transport.
+    command_delay_sec: float = 1.5
     engaged: bool = False
     stalled_ticks: int = 0
     free_ticks: int = 0

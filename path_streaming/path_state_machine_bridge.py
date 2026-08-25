@@ -404,6 +404,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--shared-stale-after-sec", type=float, default=0.3)
     parser.add_argument("--shared-d-max-m", type=float, default=0.9)
     parser.add_argument(
+        "--grasp-engagement-delay-sec",
+        type=float,
+        default=1.5,
+        help=(
+            "Continuous trigger/grip hold before the no-jaw-state fallback "
+            "marks a grasp engaged and returns position control to VR."
+        ),
+    )
+    parser.add_argument(
         "--end-effector-model",
         choices=("dex1", "brainco"),
         default="dex1",
@@ -1805,7 +1814,10 @@ def main() -> int:
     latest_hand_control_us = 0
     latest_hand_meta: dict[str, float] = {}
     grasp_engagement = {
-        side: GraspEngagementDetector() for side in ("left", "right")
+        side: GraspEngagementDetector(
+            command_delay_sec=max(0.0, float(args.grasp_engagement_delay_sec))
+        )
+        for side in ("left", "right")
     }
     latest_controller_left_axis = np.zeros(2, dtype=np.float64)
     latest_controller_right_axis = np.zeros(2, dtype=np.float64)

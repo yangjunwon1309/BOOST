@@ -4,9 +4,9 @@ from path_core.intention.grasp_engagement import GraspEngagementDetector
 
 
 def test_grasp_detector_waits_for_close_command_fallback_delay() -> None:
-    detector = GraspEngagementDetector(command_delay_sec=0.5)
+    detector = GraspEngagementDetector()
 
-    for _ in range(4):
+    for _ in range(14):
         assert detector.update(commanded_closed=True, jaw_gap_m=None, dt=0.1) is False
     assert detector.update(commanded_closed=True, jaw_gap_m=None, dt=0.1) is True
     assert detector.update(commanded_closed=False, jaw_gap_m=None, dt=0.1) is False

@@ -132,6 +132,7 @@ def _draw_goal_axis(
 def _draw_orientation_targets(
     image: np.ndarray,
     *,
+    side: str,
     hand: dict[str, Any],
     control_hand: dict[str, Any],
     control_fresh: bool,
@@ -575,6 +576,7 @@ class WristV11WebViewer:
                 control_fresh = False
             _draw_orientation_targets(
                 images[camera_id],
+                side=camera_side,
                 hand=camera_hands.get(camera_side, {}),
                 control_hand=control_hand,
                 control_fresh=control_fresh,

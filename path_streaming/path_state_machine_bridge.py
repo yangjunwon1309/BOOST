@@ -3154,6 +3154,9 @@ def main() -> int:
                             "measured_wrist_position_m": measured_tf[side][
                                 :3, 3
                             ].tolist(),
+                            "measured_wrist_rotation": measured_tf[side][
+                                :3, :3
+                            ].reshape(9).tolist(),
                             "armed": bool(shared_selected_hand == side),
                             "position_source": reference_diagnostics[side][
                                 "position_source"
@@ -3161,6 +3164,15 @@ def main() -> int:
                             "belief_position_applied": reference_diagnostics[side][
                                 "position_source"
                             ].startswith("belief"),
+                            "orientation_source": reference_diagnostics[side][
+                                "orientation_source"
+                            ],
+                            "orientation_authority_weight": reference_diagnostics[
+                                side
+                            ]["orientation_authority_weight"],
+                            "reference_speed_mps": reference_diagnostics[side][
+                                "reference_speed_mps"
+                            ],
                             "grasp_commanded": bool(grasp_commanded[side]),
                             "grasp_engaged": bool(grasp_engaged[side]),
                             "jaw_gap_m": jaw_gap_m[side],

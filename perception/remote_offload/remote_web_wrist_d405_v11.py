@@ -18,9 +18,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from .remote_web_server_head_d435i_legacy import (
     CONTROL_STALE_AFTER_MS,
     _draw_remote_belief_overlay,
-    _draw_text_with_halo,
     _goal_to_pixel,
-    _ipopt_marker_style,
 )
 from .wrist_d405_protocol_v11 import (
     CAMERA_IDS,
@@ -115,23 +113,9 @@ def _draw_goal_axis(
     return start
 
 
-def _draw_orientation_legend(image: np.ndarray, side: str) -> None:
-    """Draw only the local camera's orientation key (left/top or right/bottom)."""
-    y = 82
-    cv2.arrowedLine(image, (18, y - 4), (34, y - 4), BELIEF_NORMAL_COLOR, 2, cv2.LINE_AA, tipLength=0.3)
-    _draw_text_with_halo(image, f"{side[0].upper()} contact normal", (42, y), BELIEF_NORMAL_COLOR, scale=0.42)
-    y += 19
-    x = 18
-    for _, color in IPOPT_ORIENTATION_AXES:
-        cv2.line(image, (x, y - 5), (x + 10, y - 5), color, 2, cv2.LINE_AA)
-        x += 13
-    _draw_text_with_halo(image, "IPOPT orientation xyz", (60, y), (230, 230, 230), scale=0.42)
-
-
 def _draw_orientation_targets(
     image: np.ndarray,
     *,
-    side: str,
     hand: dict[str, Any],
     control_hand: dict[str, Any],
     control_fresh: bool,
@@ -144,7 +128,7 @@ def _draw_orientation_targets(
     target = hand.get("target") if isinstance(hand, dict) else None
     if isinstance(target, dict) and not belief_stale and bool(target.get("orientation_valid")):
         origin = target.get("position_goal_m") or target.get("orientation_source_position_m")
-        normal_start = _draw_goal_axis(
+        _draw_goal_axis(
             image,
             origin,
             target.get("orientation_axis_world"),
@@ -153,14 +137,6 @@ def _draw_orientation_targets(
             color=BELIEF_NORMAL_COLOR,
             length_m=0.075,
         )
-        if normal_start is not None:
-            _draw_text_with_halo(
-                image,
-                f"{side[0].upper()} normal",
-                (normal_start[0] + 10, normal_start[1] - 18),
-                BELIEF_NORMAL_COLOR,
-                scale=0.42,
-            )
 
     if not control_fresh or not isinstance(control_hand, dict):
         return
@@ -172,9 +148,8 @@ def _draw_orientation_targets(
         rotation_ok = False
     if origin is None or not rotation_ok:
         return
-    origin_pixel: tuple[int, int] | None = None
     for axis_index, (_, color) in enumerate(IPOPT_ORIENTATION_AXES):
-        projected = _draw_goal_axis(
+        _draw_goal_axis(
             image,
             origin,
             rotation[:, axis_index],
@@ -183,16 +158,6 @@ def _draw_orientation_targets(
             color=color,
             length_m=0.055,
             camera_z_offset_m=ipopt_camera_z_offset_m,
-        )
-        origin_pixel = projected if origin_pixel is None else origin_pixel
-    if origin_pixel is not None:
-        ipopt_color, belief_applied = _ipopt_marker_style(side, control_hand)
-        _draw_text_with_halo(
-            image,
-            f"IPOPT R <- {side[0].upper()} belief" if belief_applied else "IPOPT R",
-            (origin_pixel[0] + 11, origin_pixel[1] - 17),
-            ipopt_color if belief_applied else (230, 230, 230),
-            scale=0.42,
         )
 
 
@@ -591,7 +556,6 @@ class WristV11WebViewer:
                 control_fresh = False
             _draw_orientation_targets(
                 images[camera_id],
-                side=camera_side,
                 hand=camera_hands.get(camera_side, {}),
                 control_hand=control_hand,
                 control_fresh=control_fresh,
@@ -602,7 +566,6 @@ class WristV11WebViewer:
                     self, "ipopt_visual_camera_z_offset_m", 0.25
                 ),
             )
-            _draw_orientation_legend(images[camera_id], camera_side)
 
     def lcm_loop(self) -> None:
         while True:

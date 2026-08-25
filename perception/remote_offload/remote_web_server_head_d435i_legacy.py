@@ -130,15 +130,23 @@ def _ipopt_marker_style(
     side: str, control_hand: dict[str, Any] | None
 ) -> tuple[tuple[int, int, int], bool]:
     """Tint IPOPT only when its live Cartesian reference is belief-owned."""
-    position_source = str((control_hand or {}).get("position_source", ""))
-    belief_applied = position_source.startswith("belief_")
+    control_hand = control_hand or {}
+    position_source = str(control_hand.get("position_source", ""))
+    # New direct telemetry publishes an explicit bit.  Keep the source-string
+    # fallback so a viewer remains compatible with an already-running bridge.
+    explicit = control_hand.get("belief_position_applied")
+    belief_applied = (
+        bool(explicit)
+        if isinstance(explicit, bool)
+        else position_source.startswith("belief")
+    )
     if not belief_applied or side not in BELIEF_COLORS:
         return IPOPT_TARGET_COLOR, False
-    # Keep the established green IPOPT meaning while visibly moving it toward
-    # the active hand's blue/orange belief colour.
+    # Keep the established IPOPT identity while making the active hand's
+    # belief ownership unambiguous at a glance.
     belief_color = BELIEF_COLORS[side]
     color = tuple(
-        round(0.58 * base + 0.42 * belief)
+        round(0.35 * base + 0.65 * belief)
         for base, belief in zip(IPOPT_TARGET_COLOR, belief_color)
     )
     return color, True
@@ -150,17 +158,10 @@ def _ipopt_marker_label(
     *,
     camera_z_offset_m: float,
 ) -> str:
-    _, belief_applied = _ipopt_marker_style(side, control_hand)
-    label = (
-        f"IPOPT <- {side[0].upper()} belief"
-        if belief_applied
-        else "IPOPT target"
-    )
-    return (
-        label
-        if abs(float(camera_z_offset_m)) <= 1.0e-9
-        else f"{label} +Z {float(camera_z_offset_m):.2f}m"
-    )
+    # The camera +Z offset is visual-only; it should not clutter the operator
+    # legend or be mistaken for a target-frame offset.
+    del side, control_hand, camera_z_offset_m
+    return "IPOPT target"
 
 
 def _belief_for_object(
@@ -371,35 +372,35 @@ def _draw_belief_legend(
     ipopt_camera_z_offset_m: float = 0.0,
 ) -> None:
     """Draw the hand-local visual key and the common IPOPT target key."""
-    y = 22
+    y = 17
     sides = (legend_side,) if legend_side in BELIEF_COLORS else ("left", "right")
     for side in sides:
         color = BELIEF_COLORS[side]
         initial = side[0].upper()
         cv2.drawMarker(
-            overlay, (18, y - 4), color, cv2.MARKER_TILTED_CROSS, 14, 2
+            overlay, (13, y - 3), color, cv2.MARKER_TILTED_CROSS, 10, 1
         )
         _draw_text_with_halo(
-            overlay, f"{initial} human", (32, y), color, scale=0.48
+            overlay, f"{initial} human", (23, y), color, scale=0.36
         )
         cv2.drawMarker(
-            overlay, (128, y - 4), color, cv2.MARKER_CROSS, 14, 2
+            overlay, (92, y - 3), color, cv2.MARKER_CROSS, 10, 1
         )
         _draw_text_with_halo(
-            overlay, f"{initial} belief", (142, y), color, scale=0.48
+            overlay, f"{initial} belief", (102, y), color, scale=0.36
         )
-        y += 20
+        y += 15
     control_hand = (control.get("hands") or {}).get(legend_side, {})
     ipopt_color, _ = _ipopt_marker_style(str(legend_side), control_hand)
-    cv2.drawMarker(overlay, (18, y - 4), ipopt_color, cv2.MARKER_DIAMOND, 14, 2)
+    cv2.drawMarker(overlay, (13, y - 3), ipopt_color, cv2.MARKER_DIAMOND, 10, 1)
     _draw_text_with_halo(
         overlay,
         _ipopt_marker_label(
             str(legend_side), control_hand, camera_z_offset_m=ipopt_camera_z_offset_m
         ),
-        (32, y),
+        (23, y),
         ipopt_color,
-        scale=0.48,
+        scale=0.36,
     )
     del control, selected_hand, stale
 
@@ -426,13 +427,6 @@ def _draw_hand_markers(
         )
         if pixel is not None:
             cv2.drawMarker(layer, pixel, color, cv2.MARKER_TILTED_CROSS, 18, 2)
-            _draw_text_with_halo(
-                layer,
-                f"{initial} human",
-                (pixel[0] + 12, pixel[1] - 8),
-                color,
-                scale=0.46,
-            )
     # This is the exact Cartesian target passed into the arm IPOPT solve:
     # VR/reference motion normally, or the selected shared target while its
     # switch is held.  It is independent of whether belief geometry exists.
@@ -451,17 +445,6 @@ def _draw_hand_markers(
         if pixel is not None:
             cv2.drawMarker(
                 layer, pixel, ipopt_color, cv2.MARKER_DIAMOND, 20, 2
-            )
-            _draw_text_with_halo(
-                layer,
-                _ipopt_marker_label(
-                    side,
-                    control_hand,
-                    camera_z_offset_m=ipopt_camera_z_offset_m,
-                ),
-                (pixel[0] + 12, pixel[1] + 16),
-                ipopt_color,
-                scale=0.46,
             )
 
     target = hand.get("target") or {}

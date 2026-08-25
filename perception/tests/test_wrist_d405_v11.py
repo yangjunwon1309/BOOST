@@ -180,11 +180,16 @@ def test_dex1_canonical_grasp_center_is_hand_base_origin() -> None:
 def test_ipopt_marker_is_belief_tinted_only_when_belief_position_is_applied() -> None:
     neutral, neutral_applied = _ipopt_marker_style("left", {"position_source": "operator"})
     belief, belief_applied = _ipopt_marker_style("left", {"position_source": "belief_contact"})
+    explicit, explicit_applied = _ipopt_marker_style(
+        "right", {"position_source": "operator", "belief_position_applied": True}
+    )
 
     assert neutral == IPOPT_TARGET_COLOR
     assert neutral_applied is False
     assert belief != IPOPT_TARGET_COLOR
     assert belief_applied is True
+    assert explicit != IPOPT_TARGET_COLOR
+    assert explicit_applied is True
 
 
 def test_wrist_ipopt_freshness_uses_local_receipt_clock() -> None:

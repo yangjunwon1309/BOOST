@@ -3146,6 +3146,9 @@ def main() -> int:
                             "position_source": reference_diagnostics[side][
                                 "position_source"
                             ],
+                            "belief_position_applied": reference_diagnostics[side][
+                                "position_source"
+                            ].startswith("belief"),
                             "grasp_commanded": bool(grasp_commanded[side]),
                             "grasp_engaged": bool(grasp_engaged[side]),
                             "jaw_gap_m": jaw_gap_m[side],

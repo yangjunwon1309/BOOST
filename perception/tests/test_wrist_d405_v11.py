@@ -40,7 +40,10 @@ from remote_offload.thor_wrist_d405_gateway_v11 import (
 )
 from seg_web_node.lcm_protocol import RobotState
 from seg_web_node.robot_geometry import hand_frame_profile
-from remote_offload.remote_web_wrist_d405_v11 import WristV11WebViewer
+from remote_offload.remote_web_wrist_d405_v11 import (
+    WristV11WebViewer,
+    _ipopt_orientation_axis_color,
+)
 from remote_offload.wrist_d405_geometry_pipeline_v11 import (
     camera_transform_diagnostics,
 )
@@ -190,6 +193,18 @@ def test_ipopt_marker_is_belief_tinted_only_when_belief_position_is_applied() ->
     assert belief_applied is True
     assert explicit != IPOPT_TARGET_COLOR
     assert explicit_applied is True
+
+
+def test_ipopt_orientation_axes_follow_belief_marker_tint() -> None:
+    axis_color = (40, 40, 255)
+    marker_color = (190, 188, 38)
+
+    assert _ipopt_orientation_axis_color(
+        axis_color, marker_color, belief_applied=False
+    ) == axis_color
+    assert _ipopt_orientation_axis_color(
+        axis_color, marker_color, belief_applied=True
+    ) != axis_color
 
 
 def test_wrist_ipopt_freshness_uses_local_receipt_clock() -> None:

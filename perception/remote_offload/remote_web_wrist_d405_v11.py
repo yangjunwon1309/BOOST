@@ -19,6 +19,7 @@ from .remote_web_server_head_d435i_legacy import (
     CONTROL_STALE_AFTER_MS,
     _draw_remote_belief_overlay,
     _goal_to_pixel,
+    _ipopt_marker_style,
 )
 from .wrist_d405_protocol_v11 import (
     CAMERA_IDS,
@@ -46,6 +47,21 @@ IPOPT_ORIENTATION_AXES = (
     ("y", (40, 255, 40)),  # green
     ("z", (255, 180, 40)),  # blue
 )
+
+
+def _ipopt_orientation_axis_color(
+    axis_color: tuple[int, int, int],
+    marker_color: tuple[int, int, int],
+    *,
+    belief_applied: bool,
+) -> tuple[int, int, int]:
+    """Keep XYZ distinguishable while making active belief ownership visible."""
+    if not belief_applied:
+        return axis_color
+    return tuple(
+        round(0.35 * axis + 0.65 * marker)
+        for axis, marker in zip(axis_color, marker_color)
+    )
 
 
 def _project_goal_axis(
@@ -148,14 +164,17 @@ def _draw_orientation_targets(
         rotation_ok = False
     if origin is None or not rotation_ok:
         return
-    for axis_index, (_, color) in enumerate(IPOPT_ORIENTATION_AXES):
+    marker_color, belief_applied = _ipopt_marker_style(side, control_hand)
+    for axis_index, (_, axis_color) in enumerate(IPOPT_ORIENTATION_AXES):
         _draw_goal_axis(
             image,
             origin,
             rotation[:, axis_index],
             t_goal_cam,
             intrinsics,
-            color=color,
+            color=_ipopt_orientation_axis_color(
+                axis_color, marker_color, belief_applied=belief_applied
+            ),
             length_m=0.055,
             camera_z_offset_m=ipopt_camera_z_offset_m,
         )

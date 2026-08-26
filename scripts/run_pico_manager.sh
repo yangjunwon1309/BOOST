@@ -5,6 +5,11 @@ PATH_G1_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$PATH_G1_ROOT/configs/runtime/local.env"
 source "$PATH_GROOT_ROOT/.venv_sim/bin/activate"
 
+# The XRoboToolkit Python extension is built out-of-tree.  The shared-library
+# directory comes from local.env, but Python also needs this build directory
+# to import xrobotoolkit_sdk for the live Pico manager.
+export PYTHONPATH="$PATH_XROBO_ROOT/build:${PYTHONPATH:-}"
+
 cd "$PATH_G1_ROOT"
 exec python path_streaming/pico_manager_thread_server.py \
   --manager \

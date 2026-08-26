@@ -5,7 +5,7 @@ description = "PATH state-machine, cuRobo planning, and EE-QP integration for Un
 requires-python = ">=3.10"
 dependencies = [
   "msgpack",
-  "numpy",
+  "numpy<2",
   "pyyaml",
   "pyzmq",
   "scipy",
@@ -13,4 +13,3 @@ dependencies = [
 
 [tool.ruff]
 line-length = 100
-

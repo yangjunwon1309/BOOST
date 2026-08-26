@@ -22,6 +22,52 @@ import numpy as np
 from scipy.spatial.transform import Rotation as Rotation
 
 
+def _configure_vuer_server_tls() -> None:
+    """Disable accidental mutual TLS for the self-hosted WebXR server.
+
+    Vuer 0.0.60 requests a client certificate when no client CA is configured
+    (``CERT_OPTIONAL``). Android/WebXR browsers may then offer a device
+    certificate which the server cannot validate, closing the TLS handshake.
+    PATH authenticates only the server certificate, so no-CA sessions must use
+    ``CERT_NONE`` for client verification.
+    """
+    from vuer import base as vuer_base
+
+    server_type = vuer_base.Server
+    if getattr(server_type, "_path_tls_without_client_cert", False):
+        return
+
+    def run(self) -> None:
+        async def init_server() -> None:
+            runner = vuer_base.web.AppRunner(self.app)
+            await runner.setup()
+            if not self.cert:
+                site = vuer_base.web.TCPSite(runner, self.host, self.port)
+                await site.start()
+                return
+
+            ssl_context = vuer_base.ssl.create_default_context(
+                vuer_base.ssl.Purpose.CLIENT_AUTH
+            )
+            ssl_context.load_cert_chain(certfile=self.cert, keyfile=self.key)
+            if self.ca_cert:
+                ssl_context.load_verify_locations(self.ca_cert)
+                ssl_context.verify_mode = vuer_base.ssl.CERT_REQUIRED
+            else:
+                ssl_context.verify_mode = vuer_base.ssl.CERT_NONE
+            site = vuer_base.web.TCPSite(
+                runner, self.host, self.port, ssl_context=ssl_context
+            )
+            await site.start()
+
+        event_loop = vuer_base.asyncio.get_event_loop()
+        event_loop.run_until_complete(init_server())
+        event_loop.run_forever()
+
+    server_type.run = run
+    server_type._path_tls_without_client_cert = True
+
+
 T_ROBOT_OPENXR = np.array(
     [[0, 0, -1, 0], [-1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 1]],
     dtype=np.float64,
@@ -392,6 +438,7 @@ class TeleVuerSource(_LatestSampleSource):
             ) from error
         if not self.cert_file.is_file() or not self.key_file.is_file():
             raise RuntimeError("TeleVuer requires readable --televuer-cert and --televuer-key files")
+        _configure_vuer_server_tls()
         # TeleVuer v4.0 rejects img_shape=None even in pass-through mode.  A
         # 1x2 placeholder satisfies that constructor guard; pass-through with
         # ZMQ/WebRTC disabled creates no image transport or render path.

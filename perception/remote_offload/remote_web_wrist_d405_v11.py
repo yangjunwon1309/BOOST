@@ -629,7 +629,9 @@ class WristV11WebViewer:
         # small upper bound so they do not conceal wrist-image content.
         bar_width = max(8, min(14, round(image.shape[1] / 46.7)))
         orientation_x = image.shape[1] - 6 - bar_width
-        object_x = orientation_x - 4 - bar_width
+        # Keep b(o) on the right, but separate object/contact evidence from
+        # it by placing b(g,c) at the image's left edge.
+        object_x = 5
         object_segments = [
             (value, self._object_color(camera_id, object_id))
             for object_id, value in self._object_belief_segments(objects, hand)

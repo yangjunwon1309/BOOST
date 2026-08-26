@@ -17,7 +17,6 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from .remote_web_server_head_d435i_legacy import (
     CONTROL_STALE_AFTER_MS,
-    _draw_remote_belief_overlay,
     _goal_to_pixel,
     _ipopt_marker_style,
 )
@@ -41,12 +40,67 @@ from .wrist_d405_protocol_v11 import (
 )
 
 
-BELIEF_NORMAL_COLOR = (255, 70, 255)  # magenta, BGR
+# BGR palettes are deliberately disjoint across the two camera views.  A
+# colour is allocated once for each track ID and kept while that track exists.
+LEFT_OBJECT_PALETTE = (
+    (255, 95, 35), (255, 180, 20), (210, 80, 120), (190, 70, 250),
+    (145, 75, 255), (225, 50, 180), (255, 125, 110), (190, 155, 35),
+    (130, 220, 80), (215, 115, 0), (255, 210, 75), (175, 115, 220),
+    (245, 95, 165), (155, 185, 40), (235, 145, 90), (115, 155, 235),
+    (205, 70, 75), (245, 160, 155), (165, 205, 0), (220, 135, 135),
+)
+RIGHT_OBJECT_PALETTE = (
+    (20, 80, 255), (30, 145, 255), (20, 205, 245), (35, 245, 205),
+    (45, 225, 125), (0, 175, 255), (70, 105, 255), (55, 55, 235),
+    (85, 180, 255), (25, 235, 175), (45, 125, 225), (75, 200, 230),
+    (0, 115, 255), (90, 235, 245), (20, 165, 215), (110, 90, 255),
+    (50, 195, 255), (65, 225, 150), (105, 135, 245), (45, 235, 225),
+)
+OBJECT_PALETTES = {"left": LEFT_OBJECT_PALETTE, "right": RIGHT_OBJECT_PALETTE}
+BELIEF_GATE_COLORS = {"left": (255, 170, 20), "right": (40, 140, 255)}
+GRAVITY_ORIENTATION_COLOR = (0, 190, 255)  # fixed gold, BGR
 IPOPT_ORIENTATION_AXES = (
     ("x", (40, 40, 255)),  # red
     ("y", (40, 255, 40)),  # green
     ("z", (255, 180, 40)),  # blue
 )
+
+
+def _color_mix(
+    first: tuple[int, int, int], second: tuple[int, int, int], second_weight: float
+) -> tuple[int, int, int]:
+    weight = float(np.clip(second_weight, 0.0, 1.0))
+    return tuple(round((1.0 - weight) * a + weight * b) for a, b in zip(first, second))
+
+
+def _orientation_candidate_color(
+    object_color: tuple[int, int, int], relation: Any
+) -> tuple[int, int, int]:
+    """Use brightness, not text, to distinguish normal relations in the bar."""
+    if str(relation) == "parallel":
+        return _color_mix(object_color, (255, 255, 255), 0.26)
+    if str(relation) == "perpendicular":
+        return _color_mix(object_color, (0, 0, 0), 0.34)
+    return object_color
+
+
+def _probability(value: Any) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return float(np.clip(result, 0.0, 1.0)) if np.isfinite(result) else 0.0
+
+
+def _selected_contact_probability(object_belief: dict[str, Any]) -> float:
+    probabilities = object_belief.get("grip_probabilities")
+    try:
+        selected = int(object_belief.get("selected_grip_index", -1))
+    except (TypeError, ValueError):
+        selected = -1
+    if not isinstance(probabilities, list) or not 0 <= selected < len(probabilities):
+        return 0.0
+    return _probability(probabilities[selected])
 
 
 def _ipopt_orientation_axis_color(
@@ -133,28 +187,13 @@ def _draw_orientation_targets(
     image: np.ndarray,
     *,
     side: str,
-    hand: dict[str, Any],
     control_hand: dict[str, Any],
     control_fresh: bool,
-    belief_stale: bool,
     t_goal_cam: Any,
     intrinsics: Any,
     ipopt_camera_z_offset_m: float,
 ) -> None:
-    """Overlay the belief contact normal and the exact IPOPT wrist-frame axes."""
-    target = hand.get("target") if isinstance(hand, dict) else None
-    if isinstance(target, dict) and not belief_stale and bool(target.get("orientation_valid")):
-        origin = target.get("position_goal_m") or target.get("orientation_source_position_m")
-        _draw_goal_axis(
-            image,
-            origin,
-            target.get("orientation_axis_world"),
-            t_goal_cam,
-            intrinsics,
-            color=BELIEF_NORMAL_COLOR,
-            length_m=0.075,
-        )
-
+    """Overlay only the exact IPOPT wrist-frame axes, without a legend."""
     if not control_fresh or not isinstance(control_hand, dict):
         return
     origin = control_hand.get("ipopt_wrist_target_m")
@@ -250,6 +289,10 @@ class WristV11WebViewer:
         self.next_concept_revision = now_us()
         self.latest_images: dict[str, np.ndarray] | None = None
         self.objects: list[dict[str, Any]] = []
+        self.object_colors: dict[str, dict[str, tuple[int, int, int]]] = {
+            "left": {}, "right": {}
+        }
+        self.next_object_color_index = {"left": 0, "right": 0}
         self.latest_transforms: dict[str, dict[str, Any]] = {}
         self.belief: dict[str, Any] | None = None
         self.result_timestamp_us: int | None = None
@@ -273,7 +316,6 @@ class WristV11WebViewer:
                 image = cv2.imdecode(np.frombuffer(frame["color_jpeg"], dtype=np.uint8), cv2.IMREAD_COLOR)
                 if image is None:
                     raise ValueError(f"bad JPEG from {camera_id}")
-                cv2.putText(image, f"{camera_id} {frame['serial']} {frame['width']}x{frame['height']}", (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
                 images[camera_id] = image
             with self.lock:
                 self.bundle_timestamp_us = int(bundle["bundle_timestamp_us"])
@@ -484,10 +526,6 @@ class WristV11WebViewer:
         matching result bounding box, rather than silently dropping SAM3's
         segmentation whenever worker latency is non-zero.
         """
-        colors = {
-            "left_wrist": (255, 110, 25),
-            "right_wrist": (25, 145, 255),
-        }
         for obj in self.objects:
             camera_id = obj.get("camera_id")
             image = images.get(camera_id)
@@ -504,8 +542,186 @@ class WristV11WebViewer:
             if not np.any(mask):
                 continue
             mask_layer = image.copy()
-            mask_layer[mask] = colors[camera_id]
+            mask_layer[mask] = self._object_color(camera_id, obj)
             cv2.addWeighted(mask_layer, 0.38, image, 0.62, 0.0, image)
+
+    def _object_color(
+        self, camera_id: str, obj_or_id: dict[str, Any] | str
+    ) -> tuple[int, int, int]:
+        """Allocate a stable, camera-local palette colour for one SAM track."""
+        side = "left" if camera_id == "left_wrist" else "right"
+        if isinstance(obj_or_id, dict):
+            object_id = str(
+                obj_or_id.get("track_id")
+                or obj_or_id.get("object_id")
+                or obj_or_id.get("label")
+                or "untracked"
+            )
+        else:
+            object_id = str(obj_or_id or "untracked")
+        colors = self.object_colors[side]
+        if object_id not in colors:
+            palette = OBJECT_PALETTES[side]
+            index = self.next_object_color_index[side] % len(palette)
+            colors[object_id] = palette[index]
+            self.next_object_color_index[side] += 1
+        return colors[object_id]
+
+    @staticmethod
+    def _object_belief_segments(
+        objects: list[dict[str, Any]], hand: dict[str, Any]
+    ) -> list[tuple[str, float]]:
+        by_id = {
+            str(entry.get("object_id", "")): entry
+            for entry in hand.get("objects", [])
+            if isinstance(entry, dict)
+        }
+        posterior_map = hand.get("object_probabilities")
+        posterior_map = posterior_map if isinstance(posterior_map, dict) else {}
+        output: list[tuple[str, float]] = []
+        for obj in objects:
+            object_id = str(obj.get("track_id", ""))
+            belief = by_id.get(object_id, {})
+            object_probability = _probability(
+                belief.get("object_probability", posterior_map.get(object_id, 0.0))
+            )
+            output.append(
+                (object_id, object_probability * _selected_contact_probability(belief))
+            )
+        return output
+
+    def _draw_posterior_bar(
+        self,
+        image: np.ndarray,
+        *,
+        x0: int,
+        width: int,
+        segments: list[tuple[float, tuple[int, int, int]]],
+    ) -> None:
+        """Draw a label-free vertical probability mass bar; background is unassigned mass."""
+        height, image_width = image.shape[:2]
+        x0 = int(np.clip(x0, 0, max(0, image_width - 1)))
+        x1 = int(np.clip(x0 + max(2, width), x0 + 1, image_width - 1))
+        top, bottom = 8, max(9, height - 9)
+        cv2.rectangle(image, (x0, top), (x1, bottom), (30, 30, 30), -1)
+        values = [max(0.0, _probability(value)) for value, _ in segments]
+        scale = 1.0 / max(1.0, sum(values))
+        cursor = bottom
+        total_height = bottom - top
+        for value, (_, color) in zip(values, segments):
+            pixel_height = int(round(total_height * value * scale))
+            if pixel_height <= 0:
+                continue
+            next_cursor = max(top, cursor - pixel_height)
+            cv2.rectangle(image, (x0 + 1, next_cursor), (x1 - 1, cursor), color, -1)
+            cursor = next_cursor
+        cv2.rectangle(image, (x0, top), (x1, bottom), (180, 180, 180), 1, cv2.LINE_AA)
+
+    def _draw_belief_bars(
+        self,
+        image: np.ndarray,
+        *,
+        camera_id: str,
+        objects: list[dict[str, Any]],
+        hand: dict[str, Any],
+    ) -> None:
+        bar_width = max(5, min(9, image.shape[1] // 70))
+        orientation_x = image.shape[1] - 6 - bar_width
+        object_x = orientation_x - 4 - bar_width
+        object_segments = [
+            (value, self._object_color(camera_id, object_id))
+            for object_id, value in self._object_belief_segments(objects, hand)
+        ]
+        orientation = hand.get("orientation") if isinstance(hand.get("orientation"), dict) else {}
+        orientation_segments: list[tuple[float, tuple[int, int, int]]] = []
+        for candidate in orientation.get("candidates", []):
+            if not isinstance(candidate, dict):
+                continue
+            object_id = str(candidate.get("object_id", ""))
+            if object_id == "__gravity__":
+                color = GRAVITY_ORIENTATION_COLOR
+            else:
+                color = _orientation_candidate_color(
+                    self._object_color(camera_id, object_id), candidate.get("relation")
+                )
+            orientation_segments.append((_probability(candidate.get("probability")), color))
+        self._draw_posterior_bar(
+            image, x0=object_x, width=bar_width, segments=object_segments
+        )
+        self._draw_posterior_bar(
+            image, x0=orientation_x, width=bar_width, segments=orientation_segments
+        )
+
+    def _draw_object_and_target_overlay(
+        self,
+        image: np.ndarray,
+        *,
+        camera_id: str,
+        objects: list[dict[str, Any]],
+        hand: dict[str, Any],
+        selected_hand: str,
+        stale: bool,
+        control_hand: dict[str, Any],
+        control_fresh: bool,
+        t_goal_cam: Any,
+        intrinsics: Any,
+    ) -> None:
+        side = "left" if camera_id == "left_wrist" else "right"
+        for obj in objects:
+            box = obj.get("box_xyxy") or []
+            try:
+                x0, y0, x1, y1 = [round(float(value)) for value in box]
+            except (TypeError, ValueError):
+                continue
+            height, width = image.shape[:2]
+            x0, x1 = np.clip([x0, x1], 0, width - 1).astype(int)
+            y0, y1 = np.clip([y0, y1], 0, height - 1).astype(int)
+            cv2.rectangle(image, (x0, y0), (x1, y1), self._object_color(camera_id, obj), 1, cv2.LINE_AA)
+
+        if control_fresh:
+            human = _goal_to_pixel(
+                control_hand.get("human_grasp_goal_m"), t_goal_cam, intrinsics
+            )
+            if human is not None:
+                cv2.drawMarker(image, human, BELIEF_GATE_COLORS[side], cv2.MARKER_TILTED_CROSS, 18, 2)
+            ipopt = _goal_to_pixel(
+                control_hand.get("ipopt_wrist_target_m", control_hand.get("reference_grasp_goal_m")),
+                t_goal_cam,
+                intrinsics,
+                camera_z_offset_m=self.ipopt_visual_camera_z_offset_m,
+            )
+            if ipopt is not None:
+                color, _ = _ipopt_marker_style(side, control_hand)
+                cv2.drawMarker(image, ipopt, color, cv2.MARKER_DIAMOND, 20, 2)
+
+        target = hand.get("target") if isinstance(hand.get("target"), dict) else {}
+        if str(target.get("camera_id", "")) != camera_id:
+            return
+        object_id = str(target.get("object_id", ""))
+        color = self._object_color(camera_id, object_id)
+        contact = target.get("position_goal_m") or target.get("orientation_source_position_m")
+        pixel = _goal_to_pixel(contact, t_goal_cam, intrinsics)
+        armed = bool(not stale and selected_hand == side and hand.get("armed", False))
+        if pixel is not None:
+            cv2.drawMarker(image, pixel, color, cv2.MARKER_CROSS, 25, 2)
+            if armed:
+                cv2.drawMarker(image, pixel, BELIEF_GATE_COLORS[side], cv2.MARKER_CROSS, 33, 2)
+        if bool(target.get("orientation_valid")):
+            axis = target.get("orientation_axis_world")
+            _draw_goal_axis(
+                image, contact, axis, t_goal_cam, intrinsics, color=color, length_m=0.075
+            )
+            if armed:
+                _draw_goal_axis(
+                    image,
+                    contact,
+                    axis,
+                    t_goal_cam,
+                    intrinsics,
+                    color=BELIEF_GATE_COLORS[side],
+                    length_m=0.085,
+                    thickness=3,
+                )
 
     def _draw_latest_belief_locked(self, images: dict[str, np.ndarray]) -> None:
         """Project pelvis-frame belief into the camera image displayed now."""
@@ -548,23 +764,6 @@ class WristV11WebViewer:
                 target.pop("intrinsics", None)
                 hand["target"] = target
                 camera_hands[side] = hand
-            _draw_remote_belief_overlay(
-                images[camera_id],
-                camera_objects,
-                {**belief, "hands": camera_hands},
-                stale=self._belief_stale_locked(),
-                t_goal_cam=transform,
-                intrinsics=intrinsics or None,
-                control=control,
-                legend_side=camera_side,
-                ipopt_camera_z_offset_m=getattr(
-                    self, "ipopt_visual_camera_z_offset_m", 0.25
-                ),
-                # Each local overlay is drawn before np.vstack. The left local
-                # pixel therefore lands in the upper image and the right local
-                # pixel is shifted automatically into the lower image.
-                render_sides=(camera_side,),
-            )
             control_hand = (
                 (control.get("hands") or {}).get(camera_side, {})
                 if isinstance(control, dict)
@@ -574,18 +773,35 @@ class WristV11WebViewer:
                 control_fresh = float(control.get("age_ms")) <= CONTROL_STALE_AFTER_MS
             except (AttributeError, TypeError, ValueError):
                 control_fresh = False
+            hand = camera_hands.get(camera_side, {})
+            self._draw_object_and_target_overlay(
+                images[camera_id],
+                camera_id=camera_id,
+                objects=camera_objects,
+                hand=hand,
+                selected_hand=str(belief.get("selected_hand", "none")),
+                stale=self._belief_stale_locked(),
+                control_hand=control_hand,
+                control_fresh=control_fresh,
+                t_goal_cam=transform,
+                intrinsics=intrinsics or None,
+            )
             _draw_orientation_targets(
                 images[camera_id],
                 side=camera_side,
-                hand=camera_hands.get(camera_side, {}),
                 control_hand=control_hand,
                 control_fresh=control_fresh,
-                belief_stale=self._belief_stale_locked(),
                 t_goal_cam=transform,
                 intrinsics=intrinsics or None,
                 ipopt_camera_z_offset_m=getattr(
                     self, "ipopt_visual_camera_z_offset_m", 0.25
                 ),
+            )
+            self._draw_belief_bars(
+                images[camera_id],
+                camera_id=camera_id,
+                objects=camera_objects,
+                hand=hand,
             )
 
     def lcm_loop(self) -> None:

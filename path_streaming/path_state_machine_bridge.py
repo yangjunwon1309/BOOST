@@ -1807,6 +1807,7 @@ def main() -> int:
     latest_manager_mode = 0
     policy_started = False
     last_button_sequence = 0
+    last_button_publish_us = 0
     dedicated_button_events_seen = False
     latest_left_hand_joints: np.ndarray | None = None
     latest_right_hand_joints: np.ndarray | None = None
@@ -1825,6 +1826,7 @@ def main() -> int:
     latest_controller_b = False
     latest_controller_state_us = 0
     latest_controller_sequence = 0
+    latest_controller_publish_us = 0
     joystick_mapper = PicoJoystickLocomotionMapper(
         PicoJoystickLocomotionConfig(
             deadzone=float(args.joystick_deadzone),
@@ -2342,19 +2344,32 @@ def main() -> int:
                 if controller_hand_meta:
                     latest_hand_meta.update(controller_hand_meta)
                     latest_hand_control_us = tick_us
+                controller_publish_us = int(
+                    controller.get("publish_timestamp_us", 0)
+                )
+                controller_restarted = bool(
+                    controller_sequence <= latest_controller_sequence
+                    and controller_publish_us > latest_controller_publish_us
+                )
                 if (
-                    controller_sequence > latest_controller_sequence
+                    (controller_sequence > latest_controller_sequence or controller_restarted)
                     and left_axis.size >= 2
                     and right_axis.size >= 2
                     and np.isfinite(left_axis[:2]).all()
                     and np.isfinite(right_axis[:2]).all()
                 ):
+                    if controller_restarted:
+                        log(
+                            "Pico controller publisher sequence restarted: "
+                            f"{latest_controller_sequence} -> {controller_sequence}"
+                        )
                     latest_controller_left_axis = left_axis[:2].copy()
                     latest_controller_right_axis = right_axis[:2].copy()
                     latest_controller_y = bool(controller.get("y", False))
                     latest_controller_b = bool(controller.get("b", False))
                     latest_controller_state_us = tick_us
                     latest_controller_sequence = controller_sequence
+                    latest_controller_publish_us = controller_publish_us
             except zmq.Again:
                 pass
 
@@ -2367,9 +2382,20 @@ def main() -> int:
                         continue
                     event = unpack_prefixed_msgpack(event_raw, args.button_topic)
                     sequence = int(event.get("sequence", 0))
-                    if sequence <= last_button_sequence:
+                    event_publish_us = int(event.get("publish_timestamp_us", 0))
+                    event_restarted = bool(
+                        sequence <= last_button_sequence
+                        and event_publish_us > last_button_publish_us
+                    )
+                    if sequence <= last_button_sequence and not event_restarted:
                         continue
+                    if event_restarted:
+                        log(
+                            "Pico button publisher sequence restarted: "
+                            f"{last_button_sequence} -> {sequence}"
+                        )
                     last_button_sequence = sequence
+                    last_button_publish_us = event_publish_us
                     dedicated_button_events_seen = True
                     event_name = str(event.get("event", ""))
                     if event_name not in {

@@ -625,7 +625,9 @@ class WristV11WebViewer:
         objects: list[dict[str, Any]],
         hand: dict[str, Any],
     ) -> None:
-        bar_width = max(5, min(9, image.shape[1] // 70))
+        # 150% of the original 5--9 px diagnostic bars, while retaining a
+        # small upper bound so they do not conceal wrist-image content.
+        bar_width = max(8, min(14, round(image.shape[1] / 46.7)))
         orientation_x = image.shape[1] - 6 - bar_width
         object_x = orientation_x - 4 - bar_width
         object_segments = [

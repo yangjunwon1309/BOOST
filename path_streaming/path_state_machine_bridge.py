@@ -426,6 +426,19 @@ def parse_args() -> argparse.Namespace:
         help="Belief weight in --shared-position-mode alpha, constrained to [0, 1].",
     )
     parser.add_argument(
+        "--shared-position-alpha-source",
+        choices=("fixed", "posterior"),
+        default="fixed",
+        help=(
+            "fixed uses --shared-position-alpha; posterior maps the incoming "
+            "b(g)*b(c|g) joint posterior through EMA, hysteresis, and rate limiting."
+        ),
+    )
+    parser.add_argument("--shared-position-posterior-enter-confidence", type=float, default=0.45)
+    parser.add_argument("--shared-position-posterior-exit-confidence", type=float, default=0.25)
+    parser.add_argument("--shared-position-posterior-ema-alpha", type=float, default=0.15)
+    parser.add_argument("--shared-position-posterior-max-rate-per-s", type=float, default=1.2)
+    parser.add_argument(
         "--grasp-engagement-delay-sec",
         type=float,
         default=1.5,
@@ -1948,6 +1961,18 @@ def main() -> int:
         )
         for side in ("left", "right")
     }
+    # Position can use the same continuous authority construction as
+    # orientation, but its input is the hierarchical joint posterior
+    # b(object) * b(contact | object), carried in EETarget.confidence.
+    position_authority = {
+        side: OrientationAuthority(
+            enter_confidence=float(args.shared_position_posterior_enter_confidence),
+            exit_confidence=float(args.shared_position_posterior_exit_confidence),
+            ema_alpha=float(args.shared_position_posterior_ema_alpha),
+            max_authority_rate_per_s=float(args.shared_position_posterior_max_rate_per_s),
+        )
+        for side in ("left", "right")
+    }
     # Y/B is a dead-man switch for the left/right belief blend.
     shared_selected_hand = "none"
     shared_hand_selection_revision = 0
@@ -1980,6 +2005,7 @@ def main() -> int:
             orientation_reference[side].reset(transform[:3, :3])
             orientation_gate[side].reset()
             orientation_authority[side].reset()
+            position_authority[side].reset()
         log(f"reference resync ({reason})")
     wrist_fk: MujocoWristFk | None = None
     try:
@@ -3131,6 +3157,7 @@ def main() -> int:
                         )
                         position_target = human_tf[side][:3, 3]
                         position_source = "operator"
+                        position_belief_weight = 0.0
                         zeta_pos = shared_config.zeta_released
                         omega_n_pos = shared_config.omega_n_position_released
                         if (
@@ -3150,12 +3177,23 @@ def main() -> int:
                             )
                             if np.linalg.norm(goal_wrist - human_tf[side][:3, 3]) <= shared_config.d_max_m:
                                 if args.shared_position_mode == "alpha":
-                                    alpha = float(args.shared_position_alpha)
+                                    if args.shared_position_alpha_source == "posterior":
+                                        alpha = position_authority[side].update(
+                                            belief_target.confidence,
+                                            gate_ok=True,
+                                            dt=dt,
+                                        )
+                                    else:
+                                        position_authority[side].update(
+                                            0.0, gate_ok=False, dt=dt
+                                        )
+                                        alpha = float(args.shared_position_alpha)
                                     position_target = (
                                         (1.0 - alpha) * human_tf[side][:3, 3]
                                         + alpha * goal_wrist
                                     )
                                     position_source = "belief_contact_alpha"
+                                    position_belief_weight = float(alpha)
                                     # alpha=0 is a true position-control
                                     # ablation: keep both target and reference
                                     # dynamics operator-owned. alpha=1 recovers
@@ -3171,10 +3209,24 @@ def main() -> int:
                                 else:
                                     position_target = goal_wrist
                                     position_source = "belief_contact"
-                                    zeta_pos = shared_config.zeta_armed
-                                    omega_n_pos = shared_config.omega_n_position_armed
+                                    position_authority[side].update(
+                                        0.0, gate_ok=False, dt=dt
+                                    )
+                                position_belief_weight = 1.0
+                                zeta_pos = shared_config.zeta_armed
+                                omega_n_pos = shared_config.omega_n_position_armed
+                            else:
+                                # A stale/remote target must not retain a
+                                # prior posterior authority while VR remains
+                                # the active position source.
+                                position_authority[side].update(
+                                    0.0, gate_ok=False, dt=dt
+                                )
                         elif grasp_engaged[side]:
+                            position_authority[side].update(0.0, gate_ok=False, dt=dt)
                             position_source = "operator_grasp_engaged"
+                        else:
+                            position_authority[side].update(0.0, gate_ok=False, dt=dt)
                         # Post-grasp position is operator-owned, while the
                         # orientation belief above remains active.  Do not
                         # reset the second-order position state here.
@@ -3207,11 +3259,9 @@ def main() -> int:
                             "orientation_authority_weight": float(final_orientation_weight),
                             "orientation_smoothed_confidence": float(orientation_authority[side].smoothed_confidence),
                             "position_blend_mode": str(args.shared_position_mode),
-                            "position_belief_weight": (
-                                float(args.shared_position_alpha)
-                                if position_source == "belief_contact_alpha"
-                                else float(position_source == "belief_contact")
-                            ),
+                            "position_alpha_source": str(args.shared_position_alpha_source),
+                            "position_belief_weight": float(position_belief_weight),
+                            "position_smoothed_confidence": float(position_authority[side].smoothed_confidence),
                             "zeta_position": float(zeta_pos),
                             "zeta_orientation": float(zeta_ori),
                             "grasp_commanded": bool(grasp_commanded[side]),
@@ -3262,6 +3312,10 @@ def main() -> int:
                             "orientation_authority_weight": reference_diagnostics[
                                 side
                             ]["orientation_authority_weight"],
+                            "position_blend_mode": reference_diagnostics[side]["position_blend_mode"],
+                            "position_alpha_source": reference_diagnostics[side]["position_alpha_source"],
+                            "position_belief_weight": reference_diagnostics[side]["position_belief_weight"],
+                            "position_smoothed_confidence": reference_diagnostics[side]["position_smoothed_confidence"],
                             "reference_speed_mps": reference_diagnostics[side][
                                 "reference_speed_mps"
                             ],

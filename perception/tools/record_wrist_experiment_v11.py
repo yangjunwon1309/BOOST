@@ -269,6 +269,10 @@ class ExperimentRecorder:
             "orientation": _vector(hand.get("ipopt_wrist_rotation"), 9),
             "position_source": hand.get("position_source"),
             "belief_position_applied": bool(hand.get("belief_position_applied", False)),
+            "position_blend_mode": hand.get("position_blend_mode"),
+            "position_alpha_source": hand.get("position_alpha_source"),
+            "position_belief_weight": _number(hand.get("position_belief_weight")),
+            "position_smoothed_confidence": _number(hand.get("position_smoothed_confidence")),
             "orientation_source": hand.get("orientation_source"),
             "orientation_authority": _number(hand.get("orientation_authority_weight")),
             "reference_speed_mps": _number(hand.get("reference_speed_mps")),
@@ -497,6 +501,12 @@ def main() -> int:
             bus.handle_timeout(100)
     except KeyboardInterrupt:
         pass
+    except OSError as error:
+        # python-lcm returns -1 from handle_timeout when Ctrl-C interrupts
+        # its poll syscall.  Treat that specific shutdown path exactly like
+        # KeyboardInterrupt so an active trial is flushed and summarized.
+        if "lcm_handle_timeout() returned -1" not in str(error):
+            raise
     if recorder is not None:
         summary = recorder.close()
         completed_trials += 1

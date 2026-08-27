@@ -32,6 +32,11 @@ python -u path_streaming/path_state_machine_bridge.py \
   --shared-d-max-m "${PATH_SHARED_D_MAX_M:-0.9}" \
   --shared-position-mode "${PATH_SHARED_POSITION_MODE:-replace}" \
   --shared-position-alpha "${PATH_SHARED_POSITION_ALPHA:-0.5}" \
+  --shared-position-alpha-source "${PATH_SHARED_POSITION_ALPHA_SOURCE:-fixed}" \
+  --shared-position-posterior-enter-confidence "${PATH_SHARED_POSITION_POSTERIOR_ENTER_CONFIDENCE:-0.45}" \
+  --shared-position-posterior-exit-confidence "${PATH_SHARED_POSITION_POSTERIOR_EXIT_CONFIDENCE:-0.25}" \
+  --shared-position-posterior-ema-alpha "${PATH_SHARED_POSITION_POSTERIOR_EMA_ALPHA:-0.15}" \
+  --shared-position-posterior-max-rate-per-s "${PATH_SHARED_POSITION_POSTERIOR_MAX_RATE_PER_S:-1.2}" \
   --end-effector-model "${PATH_END_EFFECTOR_MODEL:-dex1}" \
   --hand-axis-local ${PATH_HAND_AXIS_LOCAL:-0.0 1.0 0.0} \
   --grasp-center-local ${PATH_GRASP_CENTER_LOCAL:-0.0 0.100 0.0} \

@@ -28,6 +28,9 @@ WRIST_BELIEF_TELEMETRY_CHANNEL = "PATH_V11_WRIST_BELIEF_TELEMETRY"
 # separate from belief telemetry so an unavailable Thor-local ZMQ relay cannot
 # hide the actual IPOPT reference from the wrist web viewer.
 WRIST_IPOPT_VISUAL_CHANNEL = "PATH_V11_WRIST_IPOPT_VISUAL"
+# Explicit edge event relayed by the state machine so the laptop-only
+# experiment recorder can be controlled by a physical XR controller button.
+WRIST_EXPERIMENT_RECORD_CONTROL_CHANNEL = "PATH_V11_WRIST_EXPERIMENT_RECORD_CONTROL"
 
 
 def now_us() -> int:
@@ -346,6 +349,46 @@ def unpack_ipopt_visual(data: bytes) -> dict[str, Any]:
         or payload.get("schema") != "path.wrist_ipopt_visual.v1"
     ):
         raise ValueError("unsupported wrist IPOPT visual payload")
+    return payload
+
+
+def pack_experiment_record_control(payload: dict[str, Any]) -> bytes:
+    """Encode one controller-originated start/stop edge for the recorder."""
+    sequence = payload.get("sequence")
+    if not isinstance(sequence, int) or sequence < 0:
+        raise ValueError("record-control sequence must be a non-negative integer")
+    timestamp_us = payload.get("published_timestamp_us", now_us())
+    if not isinstance(timestamp_us, int) or timestamp_us <= 0:
+        raise ValueError("record-control timestamp must be a positive integer")
+    event = str(payload.get("event", ""))
+    if event != "toggle":
+        raise ValueError("record-control event must be toggle")
+    return msgpack.packb(
+        {
+            "version": VERSION,
+            "schema": "path.wrist_experiment_record_control.v1",
+            "event": event,
+            "sequence": sequence,
+            "published_timestamp_us": timestamp_us,
+            "button_read_timestamp_us": int(payload.get("button_read_timestamp_us", 0)),
+        },
+        use_bin_type=True,
+    )
+
+
+def unpack_experiment_record_control(data: bytes) -> dict[str, Any]:
+    payload = msgpack.unpackb(data, raw=False, strict_map_key=False)
+    if (
+        not isinstance(payload, dict)
+        or payload.get("version") != VERSION
+        or payload.get("schema") != "path.wrist_experiment_record_control.v1"
+        or payload.get("event") != "toggle"
+        or not isinstance(payload.get("sequence"), int)
+        or int(payload["sequence"]) < 0
+        or not isinstance(payload.get("published_timestamp_us"), int)
+        or int(payload["published_timestamp_us"]) <= 0
+    ):
+        raise ValueError("unsupported wrist experiment record-control payload")
     return payload
 
 

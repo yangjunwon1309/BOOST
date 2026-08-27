@@ -8,9 +8,12 @@ in compact JSON columns so a trial stays one row per control sample rather than
 expanding into debug/candidate rows.
 
 Example:
-  pixi run --locked python perception/tools/record_wrist_experiment_v11.py \
+  python perception/tools/record_wrist_experiment_v11.py \
     --wifi-lcm-url 'udpm://239.255.77.67:7667?ttl=1' \
     --output records/trial_001.csv
+
+Use --x-toggle to start and stop successive numbered trials with an unchorded
+controller X press/release.  A+X remains reserved for PATH tracking.
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ import argparse
 import csv
 import json
 import math
+import re
 import sys
 import time
 from pathlib import Path
@@ -177,6 +181,24 @@ def _rotation_error_deg(target: list[float] | None, measured: list[float] | None
     return math.degrees(math.acos(float(np.clip(cosine, -1.0, 1.0))))
 
 
+def _next_indexed_output(template: Path) -> Path:
+    """Allocate the next ``prefix_NNN.csv`` without overwriting any trial."""
+    match = re.fullmatch(r"(?P<prefix>.*?)(?:_(?P<index>\d+))?", template.stem)
+    if match is None or not match.group("prefix"):
+        raise ValueError("--output must have a non-empty CSV filename stem")
+    prefix = match.group("prefix")
+    requested_index = match.group("index")
+    width = max(3, len(requested_index or ""))
+    highest_index = int(requested_index) - 1 if requested_index else 0
+    candidate_pattern = re.compile(rf"{re.escape(prefix)}_(\d+)$")
+    for candidate in template.parent.glob("*.csv"):
+        found = candidate_pattern.fullmatch(candidate.stem)
+        if found is not None:
+            highest_index = max(highest_index, int(found.group(1)))
+            width = max(width, len(found.group(1)))
+    return template.with_name(f"{prefix}_{highest_index + 1:0{width}d}.csv")
+
+
 class ExperimentRecorder:
     def __init__(
         self,
@@ -197,7 +219,9 @@ class ExperimentRecorder:
         self.latest_belief: dict[str, Any] | None = None
         self.latest_belief_received_monotonic: float | None = None
         self.last_record_monotonic: float | None = None
-        self.started_monotonic: float | None = None
+        # Trial time is defined by the controller record edge, not by the
+        # first surviving IPOPT sample.
+        self.started_monotonic: float | None = time.monotonic()
         self.last_ee: dict[str, tuple[list[float], float]] = {}
         self.distance_m = {side: 0.0 for side in SIDES}
         self.samples = 0
@@ -257,8 +281,6 @@ class ExperimentRecorder:
         if self.last_record_monotonic is not None and now - self.last_record_monotonic < self.sample_period_sec:
             return
         self.last_record_monotonic = now
-        if self.started_monotonic is None:
-            self.started_monotonic = now
         hands = payload.get("hands") if isinstance(payload.get("hands"), dict) else {}
         belief_hands = (
             self.latest_belief.get("hands", {})
@@ -345,6 +367,19 @@ def parse_args() -> argparse.Namespace:
         help="Stop automatically after this duration; <=0 records until Ctrl-C.",
     )
     parser.add_argument("--flush-every", type=int, default=25)
+    parser.add_argument(
+        "--x-toggle",
+        action="store_true",
+        help=(
+            "Wait for unchorded controller-X relay events: first press starts a "
+            "new numbered CSV, next press closes it, then repeats."
+        ),
+    )
+    parser.add_argument(
+        "--record-control-channel",
+        default="PATH_V11_WRIST_EXPERIMENT_RECORD_CONTROL",
+        help="Wi-Fi LCM channel carrying state-machine-relayed controller-X edges.",
+    )
     return parser.parse_args()
 
 
@@ -355,43 +390,105 @@ def main() -> int:
     try:
         from remote_offload.wrist_d405_protocol_v11 import (
             WRIST_BELIEF_TELEMETRY_CHANNEL,
+            WRIST_EXPERIMENT_RECORD_CONTROL_CHANNEL,
             WRIST_IPOPT_VISUAL_CHANNEL,
+            unpack_experiment_record_control,
             unpack_belief_telemetry,
             unpack_ipopt_visual,
         )
     except ModuleNotFoundError as error:
         raise SystemExit(
-            f"{error.name} is required. From the repository root run `pixi run --locked python perception/tools/record_wrist_experiment_v11.py ...`."
+            f"{error.name} is required in the recorder Python environment."
         ) from error
 
-    if args.output.exists() and not args.overwrite:
+    if args.x_toggle and args.overwrite:
+        raise SystemExit("--overwrite cannot be used with --x-toggle")
+    if args.x_toggle and float(args.duration_sec) > 0.0:
+        raise SystemExit("--duration-sec cannot be used with --x-toggle; press X again to stop")
+    if not args.x_toggle and args.output.exists() and not args.overwrite:
         raise SystemExit(
             f"refusing to overwrite existing trial CSV: {args.output} (pass --overwrite to replace it)"
         )
 
-    recorder = ExperimentRecorder(
-        args.output,
-        sample_hz=float(args.sample_hz),
-        flush_every=int(args.flush_every),
-        overwrite=bool(args.overwrite),
-    )
+    recorder: ExperimentRecorder | None = None
+    if not args.x_toggle:
+        recorder = ExperimentRecorder(
+            args.output,
+            sample_hz=float(args.sample_hz),
+            flush_every=int(args.flush_every),
+            overwrite=bool(args.overwrite),
+        )
     bus = lcm.LCM(args.wifi_lcm_url)
+    completed_trials = 0
+    last_control_key: tuple[int, int] | None = None
+
+    def print_summary(summary: dict[str, Any]) -> None:
+        print(
+            "[experiment-recorder] "
+            f"samples={summary['samples']} elapsed={summary['elapsed_s']:.2f}s "
+            f"ee_distance_total={summary['ee_distance_total_m']:.3f}m "
+            f"summary={summary['summary_path']}",
+            flush=True,
+        )
 
     def on_belief(_channel: str, data: bytes) -> None:
         try:
-            recorder.on_belief(unpack_belief_telemetry(data))
+            if recorder is not None:
+                recorder.on_belief(unpack_belief_telemetry(data))
         except Exception as error:
             print(f"[experiment-recorder] belief packet rejected: {error}", file=sys.stderr)
 
     def on_ipopt(_channel: str, data: bytes) -> None:
         try:
-            recorder.on_ipopt(unpack_ipopt_visual(data))
+            if recorder is not None:
+                recorder.on_ipopt(unpack_ipopt_visual(data))
         except Exception as error:
             print(f"[experiment-recorder] IPOPT packet rejected: {error}", file=sys.stderr)
 
+    def on_record_control(_channel: str, data: bytes) -> None:
+        nonlocal completed_trials, last_control_key, recorder
+        try:
+            control = unpack_experiment_record_control(data)
+            control_key = (
+                int(control["sequence"]), int(control["published_timestamp_us"])
+            )
+            if control_key == last_control_key:
+                return
+            last_control_key = control_key
+            if recorder is not None:
+                summary = recorder.close()
+                completed_trials += 1
+                print_summary({**summary, "summary_path": str(recorder.summary_path)})
+                recorder = None
+                print("[experiment-recorder] X toggle: stopped; waiting for next trial", flush=True)
+                return
+            output = _next_indexed_output(args.output)
+            recorder = ExperimentRecorder(
+                output,
+                sample_hz=float(args.sample_hz),
+                flush_every=int(args.flush_every),
+            )
+            print(f"[experiment-recorder] X toggle: started {output}", flush=True)
+        except Exception as error:
+            print(f"[experiment-recorder] record-control packet rejected: {error}", file=sys.stderr)
+
     bus.subscribe(WRIST_BELIEF_TELEMETRY_CHANNEL, on_belief)
     bus.subscribe(WRIST_IPOPT_VISUAL_CHANNEL, on_ipopt)
-    print(f"[experiment-recorder] recording to {args.output}", flush=True)
+    if args.x_toggle:
+        if args.record_control_channel != WRIST_EXPERIMENT_RECORD_CONTROL_CHANNEL:
+            print(
+                "[experiment-recorder] warning: non-default record-control channel; "
+                "the state machine must use the same channel",
+                flush=True,
+            )
+        bus.subscribe(args.record_control_channel, on_record_control)
+        print(
+            "[experiment-recorder] waiting for unchorded controller X; "
+            f"next output={_next_indexed_output(args.output)}",
+            flush=True,
+        )
+    else:
+        print(f"[experiment-recorder] recording to {args.output}", flush=True)
     deadline = (
         None if float(args.duration_sec) <= 0.0 else time.monotonic() + float(args.duration_sec)
     )
@@ -400,15 +497,11 @@ def main() -> int:
             bus.handle_timeout(100)
     except KeyboardInterrupt:
         pass
-    summary = recorder.close()
-    print(
-        "[experiment-recorder] "
-        f"samples={summary['samples']} elapsed={summary['elapsed_s']:.2f}s "
-        f"ee_distance_total={summary['ee_distance_total_m']:.3f}m "
-        f"summary={recorder.summary_path}",
-        flush=True,
-    )
-    return 0 if summary["samples"] else 1
+    if recorder is not None:
+        summary = recorder.close()
+        completed_trials += 1
+        print_summary({**summary, "summary_path": str(recorder.summary_path)})
+    return 0 if completed_trials else 1
 
 
 if __name__ == "__main__":

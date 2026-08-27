@@ -106,7 +106,9 @@ from perception.seg_web_node.robot_geometry import (
     hand_frame_profile,
 )
 from perception.remote_offload.wrist_d405_protocol_v11 import (
+    WRIST_EXPERIMENT_RECORD_CONTROL_CHANNEL,
     WRIST_IPOPT_VISUAL_CHANNEL,
+    pack_experiment_record_control,
     pack_ipopt_visual,
 )
 
@@ -328,6 +330,11 @@ def parse_args() -> argparse.Namespace:
         help="Wi-Fi LCM channel carrying current IPOPT wrist targets.",
     )
     parser.add_argument(
+        "--wrist-record-control-channel",
+        default=WRIST_EXPERIMENT_RECORD_CONTROL_CHANNEL,
+        help="Wi-Fi LCM channel relaying unchorded controller-X recorder toggles.",
+    )
+    parser.add_argument(
         "--direct-upper-command-channel",
         default=UPPER_COMMAND_CHANNEL,
         help="Thor-to-G1 IPOPT arm command channel; never a SONIC action channel.",
@@ -403,6 +410,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--shared-stale-after-sec", type=float, default=0.3)
     parser.add_argument("--shared-d-max-m", type=float, default=0.9)
+    parser.add_argument(
+        "--shared-position-mode",
+        choices=("replace", "alpha"),
+        default="replace",
+        help=(
+            "Belief-gated position policy: replace preserves the established "
+            "belief-contact target; alpha linearly blends raw VR and belief targets."
+        ),
+    )
+    parser.add_argument(
+        "--shared-position-alpha",
+        type=float,
+        default=0.5,
+        help="Belief weight in --shared-position-mode alpha, constrained to [0, 1].",
+    )
     parser.add_argument(
         "--grasp-engagement-delay-sec",
         type=float,
@@ -1563,6 +1585,8 @@ class OuterWaistPlanner:
 
 def main() -> int:
     args = parse_args()
+    if not 0.0 <= float(args.shared_position_alpha) <= 1.0:
+        raise ValueError("--shared-position-alpha must be within [0, 1]")
     hand_axis_local_override = args.hand_axis_local is not None
     if args.hand_axis_local is None:
         args.hand_axis_local = tuple(HAND_AXIS_LOCAL[args.end_effector_model].tolist())
@@ -2398,6 +2422,22 @@ def main() -> int:
                     last_button_publish_us = event_publish_us
                     dedicated_button_events_seen = True
                     event_name = str(event.get("event", ""))
+                    if event_name == "record_toggle":
+                        wrist_visual_lcm.publish(
+                            args.wrist_record_control_channel,
+                            pack_experiment_record_control(
+                                {
+                                    "event": "toggle",
+                                    "sequence": sequence,
+                                    "published_timestamp_us": int(now_us()),
+                                    "button_read_timestamp_us": int(
+                                        event.get("button_read_timestamp_us", 0)
+                                    ),
+                                }
+                            ),
+                        )
+                        log("Pico X: experiment recorder toggle relayed")
+                        continue
                     if event_name not in {
                         "start_combo", "ax", "by", "select_left", "select_right",
                     }:
@@ -3109,10 +3149,30 @@ def main() -> int:
                                 else goal
                             )
                             if np.linalg.norm(goal_wrist - human_tf[side][:3, 3]) <= shared_config.d_max_m:
-                                position_target = goal_wrist
-                                position_source = "belief_contact"
-                                zeta_pos = shared_config.zeta_armed
-                                omega_n_pos = shared_config.omega_n_position_armed
+                                if args.shared_position_mode == "alpha":
+                                    alpha = float(args.shared_position_alpha)
+                                    position_target = (
+                                        (1.0 - alpha) * human_tf[side][:3, 3]
+                                        + alpha * goal_wrist
+                                    )
+                                    position_source = "belief_contact_alpha"
+                                    # alpha=0 is a true position-control
+                                    # ablation: keep both target and reference
+                                    # dynamics operator-owned. alpha=1 recovers
+                                    # the armed belief dynamics.
+                                    zeta_pos = (
+                                        (1.0 - alpha) * shared_config.zeta_released
+                                        + alpha * shared_config.zeta_armed
+                                    )
+                                    omega_n_pos = (
+                                        (1.0 - alpha) * shared_config.omega_n_position_released
+                                        + alpha * shared_config.omega_n_position_armed
+                                    )
+                                else:
+                                    position_target = goal_wrist
+                                    position_source = "belief_contact"
+                                    zeta_pos = shared_config.zeta_armed
+                                    omega_n_pos = shared_config.omega_n_position_armed
                         elif grasp_engaged[side]:
                             position_source = "operator_grasp_engaged"
                         # Post-grasp position is operator-owned, while the
@@ -3146,6 +3206,12 @@ def main() -> int:
                             "orientation_belief_weight": float(belief_weight),
                             "orientation_authority_weight": float(final_orientation_weight),
                             "orientation_smoothed_confidence": float(orientation_authority[side].smoothed_confidence),
+                            "position_blend_mode": str(args.shared_position_mode),
+                            "position_belief_weight": (
+                                float(args.shared_position_alpha)
+                                if position_source == "belief_contact_alpha"
+                                else float(position_source == "belief_contact")
+                            ),
                             "zeta_position": float(zeta_pos),
                             "zeta_orientation": float(zeta_ori),
                             "grasp_commanded": bool(grasp_commanded[side]),

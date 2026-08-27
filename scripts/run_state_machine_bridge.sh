@@ -30,6 +30,8 @@ python -u path_streaming/path_state_machine_bridge.py \
   --gravity-bias-gyro-gate-rad-s "${PATH_GRAVITY_BIAS_GYRO_GATE_RAD_S:-0.05}" \
   --shared-stale-after-sec "${PATH_SHARED_STALE_AFTER_SEC:-0.3}" \
   --shared-d-max-m "${PATH_SHARED_D_MAX_M:-0.9}" \
+  --shared-position-mode "${PATH_SHARED_POSITION_MODE:-replace}" \
+  --shared-position-alpha "${PATH_SHARED_POSITION_ALPHA:-0.5}" \
   --end-effector-model "${PATH_END_EFFECTOR_MODEL:-dex1}" \
   --hand-axis-local ${PATH_HAND_AXIS_LOCAL:-0.0 1.0 0.0} \
   --grasp-center-local ${PATH_GRASP_CENTER_LOCAL:-0.0 0.100 0.0} \
@@ -42,6 +44,7 @@ python -u path_streaming/path_state_machine_bridge.py \
   --direct-lcm-url "${PATH_LCM_URL:-udpm://239.255.76.67:7667?ttl=1}" \
   --wrist-visual-lcm-url "${PATH_WRIST_VISUAL_LCM_URL:-${WIFI_LCM_URL:-udpm://239.255.77.67:7667?ttl=1}}" \
   --wrist-visual-channel "${PATH_WRIST_VISUAL_CHANNEL:-PATH_V11_WRIST_IPOPT_VISUAL}" \
+  --wrist-record-control-channel "${PATH_WRIST_RECORD_CONTROL_CHANNEL:-PATH_V11_WRIST_EXPERIMENT_RECORD_CONTROL}" \
   --direct-upper-command-channel "${PATH_DIRECT_UPPER_CHANNEL:-G1_PATH_UPPER_COMMAND}" \
   --direct-state-channel "${PATH_LCM_STATE_CHANNEL:-G1_ROBOT_STATE}" \
   --direct-lcm-state \

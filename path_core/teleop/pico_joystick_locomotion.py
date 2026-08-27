@@ -80,6 +80,11 @@ class PicoButtonGestureInterpreter:
 
         if x and a:
             self.x_chorded = True
+        # A recording toggle is deliberately assigned only to an unchorded
+        # X press.  Mark every multi-button use as chorded so an A+X tracking
+        # command (or any future X chord) cannot accidentally open a trial.
+        if x and (a or b or y):
+            self.x_chorded = True
         if y and b:
             self.y_chorded = True
         if a and b and x and y:
@@ -108,6 +113,10 @@ class PicoButtonGestureInterpreter:
             events.append("by")
 
         if px and not x:
+            if self.x_active and not self.x_chorded:
+                # Emit on release, after it is certain that X was not part of
+                # an A+X (or other) chord.  This is one event per press.
+                events.append("record_toggle")
             self.x_active = False
             self.x_chorded = False
         if py and not y:

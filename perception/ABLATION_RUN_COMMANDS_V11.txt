@@ -1,0 +1,147 @@
+PATH-G1 wrist D405 experiment launch commands (v11)
+======================================================
+
+Topology
+--------
+Terminal A (Thor): SAM3 worker
+Terminal B (Thor): D405 capture + belief gateway
+Terminal C (G1):   PATH state machine bridge
+
+Use the same BELIEF_CONFIG in Thor terminals A and B.  Do not run the
+RTX-4060-only run_remote_sam3_wrist_d405_v11.sh on Thor: its engine/image is
+not the Thor runtime.  The Thor worker uses run_thor.sh and the board-local
+/models/sam3_trt/sam3_fp16_4out.engine.
+
+Shared Thor environment (run in both Thor terminals)
+------------------------------------------------------
+cd ~/PATH-G1/perception
+export G1_LCM_URL='udpm://239.255.76.67:7667?ttl=1'
+export WIFI_LCM_URL='udpm://239.255.77.67:7667?ttl=1'
+
+
+0. Normal PATH baseline
+-----------------------
+
+Terminal A -- Thor SAM3 worker
+
+cd ~/PATH-G1/perception
+export WIFI_LCM_URL='udpm://239.255.77.67:7667?ttl=1'
+export BELIEF_CONFIG='config/pipeline.yaml'
+
+./tools/run_thor.sh python -m remote_offload.remote_sam3_wrist_d405_worker_v11 \
+  --wifi-lcm-url "$WIFI_LCM_URL" \
+  --backend tensorrt \
+  --trt-engine /models/sam3_trt/sam3_fp16_4out.engine \
+  --concepts object \
+  --extrinsics config/wrist_d405_extrinsics_v11_translation_calibrated.yaml \
+  --belief-config "$BELIEF_CONFIG" \
+  --pairing-max-residual-ms 15 \
+  --pairing-max-error-m 0.008
+
+Terminal B -- Thor D405 gateway
+
+cd ~/PATH-G1/perception
+export G1_LCM_URL='udpm://239.255.76.67:7667?ttl=1'
+export WIFI_LCM_URL='udpm://239.255.77.67:7667?ttl=1'
+
+./tools/run_thor_wrist_d405_gateway_v11.sh \
+  --auto-devices \
+  --g1-lcm-url "$G1_LCM_URL" \
+  --wifi-lcm-url "$WIFI_LCM_URL" \
+  --config config/wrist_d405_v11.yaml \
+  --belief-config config/pipeline.yaml \
+  --max-hz 8 \
+  --belief-inference \
+  --belief-input-source operator_command \
+  --belief-command-max-delta-ms 25 \
+  --belief-command-divergence-max-m 0.20 \
+  --ee-target-publishing \
+  --log-level INFO
+
+Terminal C -- G1 PATH bridge (normal belief target replacement)
+
+cd ~/PATH-G1
+export PATH_SHARED_POSITION_MODE='replace'
+unset PATH_SHARED_POSITION_ALPHA
+unset PATH_SHARED_POSITION_ALPHA_SOURCE
+
+./path_deploy/scripts/run_path_direct_lcm.sh
+
+
+1. No jump diffusion ablation
+------------------------------
+
+Only replace BELIEF_CONFIG in both Thor commands above with:
+
+export BELIEF_CONFIG='config/ablations/pipeline_v11_no_jump_diffusion.yaml'
+
+For the gateway, replace this one argument:
+
+  --belief-config config/ablations/pipeline_v11_no_jump_diffusion.yaml
+
+The G1 bridge command stays identical to normal PATH (replace mode).
+This profile sets jump.enabled=false and persist_leak=0.0.
+
+
+2. No orientation-belief ablation
+---------------------------------
+
+Only replace BELIEF_CONFIG in both Thor commands above with:
+
+export BELIEF_CONFIG='config/ablations/pipeline_v11_no_orientation_belief.yaml'
+
+For the gateway, replace this one argument:
+
+  --belief-config config/ablations/pipeline_v11_no_orientation_belief.yaml
+
+The G1 bridge command stays identical to normal PATH (replace mode).
+This profile sets tasc_belief.orientation.enabled=false; position/contact
+belief remains enabled.
+
+
+3. Fixed position alpha-blending ablation
+-----------------------------------------
+
+Thor remains on the normal baseline profile:
+
+export BELIEF_CONFIG='config/pipeline.yaml'
+
+Run the same normal PATH worker and gateway commands, then use this G1 bridge
+command instead of replace mode:
+
+cd ~/PATH-G1
+export PATH_SHARED_POSITION_MODE='alpha'
+export PATH_SHARED_POSITION_ALPHA_SOURCE='fixed'
+export PATH_SHARED_POSITION_ALPHA='0.50'
+
+./path_deploy/scripts/run_path_direct_lcm.sh
+
+Under a valid Y(left)/B(right) belief gate, this uses:
+  p_IPOPT = (1 - 0.50) * p_VR + 0.50 * p_belief
+
+For the position-only no-assist control, set alpha to 0.00.  Alpha 1.00
+recovers the normal PATH replace target and its armed reference dynamics.
+
+
+4. Posterior-driven position alpha (optional alpha variant)
+-----------------------------------------------------------
+
+Thor remains on the normal baseline profile:
+
+export BELIEF_CONFIG='config/pipeline.yaml'
+
+Use the normal PATH worker and gateway commands.  On G1 run:
+
+cd ~/PATH-G1
+export PATH_SHARED_POSITION_MODE='alpha'
+export PATH_SHARED_POSITION_ALPHA_SOURCE='posterior'
+
+# Default mapping: EMA=0.15; enter=0.45; exit=0.25; rate limit=1.2/s.
+./path_deploy/scripts/run_path_direct_lcm.sh
+
+The blend alpha is derived from the target's joint posterior
+b(object) * b(contact | object), not a fixed constant.  For a lower
+engagement threshold experiment, add before starting the bridge:
+
+export PATH_SHARED_POSITION_POSTERIOR_ENTER_CONFIDENCE='0.35'
+export PATH_SHARED_POSITION_POSTERIOR_EXIT_CONFIDENCE='0.20'

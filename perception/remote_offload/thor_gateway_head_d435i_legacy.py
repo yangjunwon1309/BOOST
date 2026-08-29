@@ -1508,9 +1508,13 @@ class ThorRemoteGateway:
             grasp_commanded = bool(control_hand.get("grasp_commanded", False))
             grasp_engaged = bool(control_hand.get("grasp_engaged", False))
             jaw_gap_m = control_hand.get("jaw_gap_m")
+            grasp_state = str(control_hand.get("grasp_state", "reaching"))
             hand_telemetry["grasp_commanded"] = grasp_commanded
             hand_telemetry["grasp_engaged"] = grasp_engaged
             hand_telemetry["jaw_gap_m"] = jaw_gap_m
+            hand_telemetry["grasp_state"] = grasp_state
+            hand_telemetry["grasp"] = control_hand.get("grasp")
+            hand_telemetry["frame_offset"] = control_hand.get("frame_offset")
             hand_telemetry["grasp_state_source"] = control_hand.get(
                 "grasp_state_source", "unavailable"
             )
@@ -1615,6 +1619,7 @@ class ThorRemoteGateway:
         )
         grasp_commanded = bool(control_hand.get("grasp_commanded", False))
         grasp_engaged = bool(control_hand.get("grasp_engaged", False))
+        grasp_state = str(control_hand.get("grasp_state", "reaching"))
         position_valid = bool(target.get("position_valid", True)) and not grasp_engaged
         object_id = str(target.get("object_id", ""))
         selected = next(
@@ -1659,6 +1664,9 @@ class ThorRemoteGateway:
             "belief_ee_target_link": self._belief_target_link(),
             "grasp_commanded": grasp_commanded,
             "grasp_engaged": grasp_engaged,
+            "grasp_state": grasp_state,
+            "grasp": control_hand.get("grasp"),
+            "frame_offset": control_hand.get("frame_offset"),
             "jaw_gap_m": control_hand.get("jaw_gap_m"),
             "grasp_state_source": control_hand.get(
                 "grasp_state_source", "unavailable"
@@ -1700,6 +1708,7 @@ class ThorRemoteGateway:
                 "grasp_engaged" if not position_valid else None
             ),
             "grasp_engaged": grasp_engaged,
+            "grasp_state": grasp_state,
         }
         return position, output, "belief"
 
@@ -1804,6 +1813,7 @@ class ThorRemoteGateway:
                     "position_suppressed_reason"
                 ),
                 "grasp_engaged": bool(selected_output.get("grasp_engaged", False)),
+                "grasp_state": selected_output.get("grasp_state", "reaching"),
                 "orientation_axis_world": selected_output["orientation_axis_world"],
                 "orientation_relation": selected_output["orientation_relation"],
                 "orientation_confidence": selected_output["orientation_confidence"],

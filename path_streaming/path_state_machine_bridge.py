@@ -65,8 +65,10 @@ from path_core.intention.action_blending import (
     SharedControlConfig,
     rotation_target_from_relation,
 )
-from path_core.intention.grasp_engagement import GraspEngagementDetector
 from path_core.intention.reference_dynamics import (
+    GraspTransitionDetector,
+    OperatorFrameOffset,
+    OperatorRotationOffset,
     OrientationAuthority,
     OrientationTargetGate,
     SecondOrderOrientationReference,
@@ -443,10 +445,14 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.5,
         help=(
-            "Continuous trigger/grip hold before the no-jaw-state fallback "
-            "marks a grasp engaged and returns position control to VR."
+            "Continuous close hold used only as the manual grasp override "
+            "when jaw-stall and co-motion evidence are unavailable."
         ),
     )
+    parser.add_argument("--grasp-closing-timeout-sec", type=float, default=0.60)
+    parser.add_argument("--operator-frame-washout-per-m", type=float, default=4.6)
+    parser.add_argument("--operator-frame-max-offset-m", type=float, default=0.30)
+    parser.add_argument("--operator-rotation-washout-per-rad", type=float, default=2.0)
     parser.add_argument(
         "--end-effector-model",
         choices=("dex1", "brainco"),
@@ -1311,6 +1317,22 @@ def _int_field(payload: dict | None, *keys: str, default: int = -1) -> int:
     return int(default)
 
 
+def _vec3_field(payload: dict | None, *keys: str) -> np.ndarray | None:
+    for key in keys:
+        value = payload.get(key) if isinstance(payload, dict) else None
+        if value is None:
+            value = _nested(payload, "perception", key)
+        if value is None:
+            continue
+        try:
+            vector = np.asarray(value, dtype=np.float64).reshape(3)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(vector).all():
+            return vector
+    return None
+
+
 def ee_target_from_static_payload(
     payload: dict | None,
     *,
@@ -1395,6 +1417,8 @@ def ee_target_from_static_payload(
         orientation_policy=str(payload.get("orientation_policy", "minimal_rotation") or "minimal_rotation"),
         orientation_frame_world=frame_world,
         position_point=str(payload.get("position_point", "wrist_origin")),
+        center_camera_m=_vec3_field(payload, "center_camera_m"),
+        center_goal_m=_vec3_field(payload, "center_goal_m"),
     )
 
 
@@ -1851,12 +1875,6 @@ def main() -> int:
     latest_hand_us = 0
     latest_hand_control_us = 0
     latest_hand_meta: dict[str, float] = {}
-    grasp_engagement = {
-        side: GraspEngagementDetector(
-            command_delay_sec=max(0.0, float(args.grasp_engagement_delay_sec))
-        )
-        for side in ("left", "right")
-    }
     latest_controller_left_axis = np.zeros(2, dtype=np.float64)
     latest_controller_right_axis = np.zeros(2, dtype=np.float64)
     latest_controller_y = False
@@ -1918,6 +1936,11 @@ def main() -> int:
         orientation_max_authority_rate_per_s=float(args.orientation_max_authority_rate_per_s),
         orientation_max_angle_rad=float(args.orientation_gate_max_angle_rad),
         orientation_gate_taper_start_fraction=float(args.orientation_gate_taper_start_fraction),
+        grasp_closing_timeout_s=float(args.grasp_closing_timeout_sec),
+        grasp_override_hold_s=float(args.grasp_engagement_delay_sec),
+        operator_frame_washout_per_m=float(args.operator_frame_washout_per_m),
+        operator_frame_max_offset_m=float(args.operator_frame_max_offset_m),
+        operator_rotation_washout_per_rad=float(args.operator_rotation_washout_per_rad),
     )
     position_reference = {side: SecondOrderPositionReference(
         zeta=shared_config.zeta_released, omega_n=shared_config.omega_n_position_released,
@@ -1973,6 +1996,32 @@ def main() -> int:
         )
         for side in ("left", "right")
     }
+    grasp_detector = {
+        side: GraspTransitionDetector(
+            jaw_stall_gap_min_m=shared_config.grasp_jaw_stall_gap_min_m,
+            jaw_stall_rate_max_mps=shared_config.grasp_jaw_stall_rate_max_mps,
+            jaw_stall_ticks=shared_config.grasp_jaw_stall_ticks,
+            comotion_window_s=shared_config.grasp_comotion_window_s,
+            comotion_enter_log_ratio=shared_config.grasp_comotion_enter_log_ratio,
+            comotion_exit_log_ratio=shared_config.grasp_comotion_exit_log_ratio,
+            comotion_min_excitation_m=shared_config.grasp_comotion_min_excitation_m,
+            closing_timeout_s=shared_config.grasp_closing_timeout_s,
+        )
+        for side in ("left", "right")
+    }
+    operator_frame_offset = {
+        side: OperatorFrameOffset(
+            washout_per_m=shared_config.operator_frame_washout_per_m,
+            max_offset_m=shared_config.operator_frame_max_offset_m,
+        )
+        for side in ("left", "right")
+    }
+    operator_rotation_offset = {
+        side: OperatorRotationOffset(
+            washout_per_rad=shared_config.operator_rotation_washout_per_rad,
+        )
+        for side in ("left", "right")
+    }
     # Y/B is a dead-man switch for the left/right belief blend.
     shared_selected_hand = "none"
     shared_hand_selection_revision = 0
@@ -2006,6 +2055,9 @@ def main() -> int:
             orientation_gate[side].reset()
             orientation_authority[side].reset()
             position_authority[side].reset()
+            grasp_detector[side].reset()
+            operator_frame_offset[side].reset()
+            operator_rotation_offset[side].reset()
         log(f"reference resync ({reason})")
     wrist_fk: MujocoWristFk | None = None
     try:
@@ -2807,15 +2859,12 @@ def main() -> int:
                 side: pico_grip_active(side, tick_us) for side in ("left", "right")
             }
             # No measured Dex1 jaw gap reaches this bridge yet.  ``None``
-            # selects the documented close-command delay fallback.
+            # leaves the jaw-stall channel inactive; co-motion and the
+            # explicit long-hold override remain available.
             jaw_gap_m = {side: None for side in ("left", "right")}
-            grasp_engaged = {
-                side: grasp_engagement[side].update(
-                    commanded_closed=grasp_commanded[side],
-                    jaw_gap_m=jaw_gap_m[side],
-                    dt=dt,
-                )
-                for side in ("left", "right")
+            grasp_engaged = {side: False for side in ("left", "right")}
+            grasp_state = {
+                side: grasp_detector[side].state for side in ("left", "right")
             }
             controller_age_sec = (
                 (tick_us - latest_controller_state_us) / 1.0e6
@@ -3085,7 +3134,41 @@ def main() -> int:
                     reference_diagnostics: dict[str, dict] = {}
                     for side in ("left", "right"):
                         belief_target = shared_target if shared_selection_armed and requested_hand == side else None
-                        rotation_command = human_tf[side][:3, :3]
+                        position_command = command_tf[side][:3, 3]
+                        rotation_command = command_tf[side][:3, :3]
+                        detector = grasp_detector[side]
+                        was_holding = detector.state == "holding"
+                        manual_grasp_override = bool(
+                            grasp_commanded[side]
+                            and detector.closing_elapsed_s
+                            >= shared_config.grasp_override_hold_s
+                        )
+                        grasp_state[side] = detector.update(
+                            commanded_closed=grasp_commanded[side],
+                            jaw_gap_m=jaw_gap_m[side],
+                            p_camera=(
+                                None
+                                if belief_target is None
+                                else belief_target.center_camera_m
+                            ),
+                            p_goal=(
+                                None
+                                if belief_target is None
+                                else belief_target.center_goal_m
+                            ),
+                            now_s=now,
+                            dt=dt,
+                            manual_override=manual_grasp_override,
+                        )
+                        holding = grasp_state[side] == "holding"
+                        transition_to_holding = holding and not was_holding
+                        grasp_engaged[side] = holding
+
+                        # A HOLDING transition is special: rebase the final
+                        # orientation reference onto the raw operator frame so
+                        # the held object never unwinds when belief releases.
+                        # Other authority changes already ramp continuously.
+                        use_operator_rotation_rebase = holding and not transition_to_holding
                         rotation_target = rotation_command
                         orientation_source = "operator"
                         zeta_ori = shared_config.zeta_released
@@ -3095,7 +3178,14 @@ def main() -> int:
                         belief_weight = 0.0
                         final_orientation_weight = 0.0
                         current_rotation = orientation_reference[side].rotation if orientation_reference[side].rotation is not None else measured_tf[side][:3, :3]
-                        if belief_target is not None and belief_target.has_orientation_constraint:
+                        if use_operator_rotation_rebase:
+                            orientation_gate[side].authority(None, current_rotation, dt)
+                            orientation_authority[side].update(0.0, gate_ok=False, dt=dt)
+                            rotation_target = operator_rotation_offset[side].apply(
+                                rotation_command
+                            )
+                            orientation_source = "operator_holding_rebased"
+                        elif belief_target is not None and belief_target.has_orientation_constraint:
                             target_model = str(args.end_effector_model).lower()
                             position_point = str(belief_target.position_point or "")
                             if position_point.endswith("_grasp_center"):
@@ -3147,23 +3237,30 @@ def main() -> int:
                             (1.0 - final_orientation_weight) * shared_config.omega_n_orientation_released
                             + final_orientation_weight * shared_config.omega_n_orientation_armed
                         )
-                        if grasp_engaged[side]:
-                            # With the contact target suppressed, orientation
-                            # is the sole assisted degree of freedom.
-                            omega_n_ori = shared_config.omega_n_orientation_armed
                         r_ref = orientation_reference[side].step(
                             rotation_target, dt, measured=measured_tf[side][:3, :3],
                             omega_n=omega_n_ori, zeta=zeta_ori,
                         )
-                        position_target = human_tf[side][:3, 3]
+                        if transition_to_holding:
+                            operator_rotation_offset[side].capture(
+                                r_ref, rotation_command
+                            )
+
+                        # Rebase the raw operator frame whenever position
+                        # authority ends, not only after a grasp.  ``track``
+                        # refreshes the exact p_ref - p_human offset on every
+                        # assisted tick; ``apply`` then preserves it while the
+                        # operator is still, and washes it out by path length.
+                        position_target = position_command
                         position_source = "operator"
                         position_belief_weight = 0.0
                         zeta_pos = shared_config.zeta_released
                         omega_n_pos = shared_config.omega_n_position_released
+                        position_assisted = False
                         if (
                             belief_target is not None
                             and belief_target.position_valid
-                            and not grasp_engaged[side]
+                            and not holding
                         ):
                             goal = np.asarray(belief_target.position, dtype=np.float64).reshape(3)
                             is_canonical_grasp_center = (
@@ -3175,7 +3272,7 @@ def main() -> int:
                                 if is_canonical_grasp_center
                                 else goal
                             )
-                            if np.linalg.norm(goal_wrist - human_tf[side][:3, 3]) <= shared_config.d_max_m:
+                            if np.linalg.norm(goal_wrist - position_command) <= shared_config.d_max_m:
                                 if args.shared_position_mode == "alpha":
                                     if args.shared_position_alpha_source == "posterior":
                                         alpha = position_authority[side].update(
@@ -3189,15 +3286,15 @@ def main() -> int:
                                         )
                                         alpha = float(args.shared_position_alpha)
                                     position_target = (
-                                        (1.0 - alpha) * human_tf[side][:3, 3]
+                                        (1.0 - alpha) * position_command
                                         + alpha * goal_wrist
                                     )
-                                    position_source = "belief_contact_alpha"
+                                    position_source = (
+                                        "belief_contact_alpha"
+                                        if alpha > 0.0
+                                        else "operator"
+                                    )
                                     position_belief_weight = float(alpha)
-                                    # alpha=0 is a true position-control
-                                    # ablation: keep both target and reference
-                                    # dynamics operator-owned. alpha=1 recovers
-                                    # the armed belief dynamics.
                                     zeta_pos = (
                                         (1.0 - alpha) * shared_config.zeta_released
                                         + alpha * shared_config.zeta_armed
@@ -3206,15 +3303,17 @@ def main() -> int:
                                         (1.0 - alpha) * shared_config.omega_n_position_released
                                         + alpha * shared_config.omega_n_position_armed
                                     )
+                                    position_assisted = alpha > 0.0
                                 else:
                                     position_target = goal_wrist
                                     position_source = "belief_contact"
                                     position_authority[side].update(
                                         0.0, gate_ok=False, dt=dt
                                     )
-                                position_belief_weight = 1.0
-                                zeta_pos = shared_config.zeta_armed
-                                omega_n_pos = shared_config.omega_n_position_armed
+                                    position_belief_weight = 1.0
+                                    zeta_pos = shared_config.zeta_armed
+                                    omega_n_pos = shared_config.omega_n_position_armed
+                                    position_assisted = True
                             else:
                                 # A stale/remote target must not retain a
                                 # prior posterior authority while VR remains
@@ -3222,18 +3321,28 @@ def main() -> int:
                                 position_authority[side].update(
                                     0.0, gate_ok=False, dt=dt
                                 )
-                        elif grasp_engaged[side]:
-                            position_authority[side].update(0.0, gate_ok=False, dt=dt)
-                            position_source = "operator_grasp_engaged"
                         else:
                             position_authority[side].update(0.0, gate_ok=False, dt=dt)
-                        # Post-grasp position is operator-owned, while the
-                        # orientation belief above remains active.  Do not
-                        # reset the second-order position state here.
+                        if not position_assisted:
+                            position_target = operator_frame_offset[side].apply(
+                                position_command
+                            )
+                            position_source = (
+                                "operator_holding_rebased"
+                                if holding
+                                else "operator_rebased"
+                            )
                         p_ref = position_reference[side].step(
                             position_target, dt, measured=measured_tf[side][:3, 3],
                             omega_n=omega_n_pos, zeta=zeta_pos,
                         )
+                        if position_assisted:
+                            # Track the *advanced* reference, rather than the
+                            # preceding tick, so a release is exactly
+                            # continuous even while the reference is moving.
+                            operator_frame_offset[side].track(
+                                p_ref, position_command
+                            )
                         # Measured lag is telemetry only. It must never freeze,
                         # resync, or down-weight a valid operator/belief target.
                         measured_lag_m = float(
@@ -3267,7 +3376,23 @@ def main() -> int:
                             "grasp_commanded": bool(grasp_commanded[side]),
                             "grasp_engaged": bool(grasp_engaged[side]),
                             "jaw_gap_m": jaw_gap_m[side],
-                            "grasp_state_source": "command_delay_fallback",
+                            "grasp_state": grasp_state[side],
+                            "grasp": {
+                                "state": grasp_state[side],
+                                "channels": dict(detector.channels),
+                                "comotion_log_ratio": detector.comotion_log_ratio,
+                                "jaw_gap_m": jaw_gap_m[side],
+                                "closing_elapsed_s": float(detector.closing_elapsed_s),
+                                "grasp_failed": bool(detector.grasp_failed),
+                                "override_active": bool(detector.override_active),
+                                "override_count": int(detector.override_count),
+                            },
+                            "frame_offset": {
+                                "offset_m": operator_frame_offset[side].offset.tolist(),
+                                "offset_norm_m": float(np.linalg.norm(operator_frame_offset[side].offset)),
+                                "peak_offset_m": float(operator_frame_offset[side].peak_offset_m),
+                            },
+                            "grasp_state_source": "v17_physical_state_machine",
                         }
                     control_visual_hands = {
                         side: {
@@ -3322,7 +3447,12 @@ def main() -> int:
                             "grasp_commanded": bool(grasp_commanded[side]),
                             "grasp_engaged": bool(grasp_engaged[side]),
                             "jaw_gap_m": jaw_gap_m[side],
-                            "grasp_state_source": "command_delay_fallback",
+                            "grasp_state": reference_diagnostics[side]["grasp_state"],
+                            "grasp": reference_diagnostics[side]["grasp"],
+                            "frame_offset": reference_diagnostics[side]["frame_offset"],
+                            "grasp_state_source": reference_diagnostics[side][
+                                "grasp_state_source"
+                            ],
                         }
                         for side, (
                             p_cmd,

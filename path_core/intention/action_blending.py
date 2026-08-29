@@ -33,6 +33,18 @@ class SharedControlConfig:
     orientation_ema_alpha: float = 0.15
     orientation_max_authority_rate_per_s: float = 1.2
     orientation_gate_taper_start_fraction: float = 0.667
+    grasp_jaw_stall_gap_min_m: float = 0.008
+    grasp_jaw_stall_rate_max_mps: float = 0.004
+    grasp_jaw_stall_ticks: int = 5
+    grasp_comotion_window_s: float = 0.5
+    grasp_comotion_enter_log_ratio: float = -0.7
+    grasp_comotion_exit_log_ratio: float = 0.0
+    grasp_comotion_min_excitation_m: float = 0.02
+    grasp_closing_timeout_s: float = 0.60
+    grasp_override_hold_s: float = 1.5
+    operator_frame_washout_per_m: float = 4.6
+    operator_frame_max_offset_m: float = 0.30
+    operator_rotation_washout_per_rad: float = 2.0
     waist_mode: str = "sonic_passthrough"
 
     @classmethod
@@ -83,6 +95,10 @@ class EETarget:
     orientation_policy: str = "minimal_rotation"
     orientation_frame_world: np.ndarray | None = None
     position_point: str = "canonical_grasp_center"
+    # Selected segmented-object centres are separate from the contact target.
+    # They supply the wrist-camera/pelvis co-motion grasp detector.
+    center_camera_m: np.ndarray | None = None
+    center_goal_m: np.ndarray | None = None
 
     @property
     def has_orientation_constraint(self) -> bool:

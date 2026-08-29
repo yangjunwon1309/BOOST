@@ -278,6 +278,9 @@ class ExperimentRecorder:
             "reference_speed_mps": _number(hand.get("reference_speed_mps")),
             "grasp_commanded": bool(hand.get("grasp_commanded", False)),
             "grasp_engaged": bool(hand.get("grasp_engaged", False)),
+            "grasp_state": hand.get("grasp_state"),
+            "grasp": hand.get("grasp"),
+            "frame_offset": hand.get("frame_offset"),
         }
 
     def on_ipopt(self, payload: dict[str, Any]) -> None:

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
+import math
 
 import numpy as np
 
@@ -56,6 +58,243 @@ def slerp_so3(source: np.ndarray, target: np.ndarray, weight: float) -> np.ndarr
         raise ValueError("SO(3) interpolation requires finite rotations")
     fraction = float(np.clip(weight if np.isfinite(weight) else 0.0, 0.0, 1.0))
     return rotation_from_vector(fraction * rotation_vector(target @ source.T)) @ source
+
+
+@dataclass
+class OperatorFrameOffset:
+    """Keep an operator-frame position target continuous after assistance ends.
+
+    The offset is refreshed while assistance owns the reference, then washed
+    out only by deliberate operator travel.  It never decays while the held
+    object and the controller are stationary.
+    """
+
+    washout_per_m: float = 4.6
+    max_offset_m: float = 0.30
+    offset: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float64))
+    previous_human: np.ndarray | None = None
+    peak_offset_m: float = 0.0
+
+    def reset(self) -> None:
+        self.offset = np.zeros(3, dtype=np.float64)
+        self.previous_human = None
+        self.peak_offset_m = 0.0
+
+    def track(self, reference: np.ndarray, human: np.ndarray) -> None:
+        reference = np.asarray(reference, dtype=np.float64).reshape(3)
+        human = np.asarray(human, dtype=np.float64).reshape(3)
+        delta = reference - human
+        norm = float(np.linalg.norm(delta))
+        self.peak_offset_m = max(self.peak_offset_m, norm)
+        limit = max(0.0, float(self.max_offset_m))
+        if limit > 0.0 and norm > limit:
+            delta *= limit / norm
+        self.offset = delta
+        self.previous_human = human.copy()
+
+    def apply(self, human: np.ndarray) -> np.ndarray:
+        human = np.asarray(human, dtype=np.float64).reshape(3)
+        if self.previous_human is not None:
+            travel = float(np.linalg.norm(human - self.previous_human))
+            self.offset *= float(
+                np.exp(-max(0.0, float(self.washout_per_m)) * travel)
+            )
+        self.previous_human = human.copy()
+        return human + self.offset
+
+
+@dataclass
+class OperatorRotationOffset:
+    """Rotation analogue of :class:`OperatorFrameOffset` for grasp handoff."""
+
+    washout_per_rad: float = 2.0
+    offset: np.ndarray = field(default_factory=lambda: np.eye(3, dtype=np.float64))
+    previous_human: np.ndarray | None = None
+
+    def reset(self) -> None:
+        self.offset = np.eye(3, dtype=np.float64)
+        self.previous_human = None
+
+    def capture(self, reference: np.ndarray, human: np.ndarray) -> None:
+        reference = np.asarray(reference, dtype=np.float64).reshape(3, 3)
+        human = np.asarray(human, dtype=np.float64).reshape(3, 3)
+        self.offset = reference @ human.T
+        self.previous_human = human.copy()
+
+    def apply(self, human: np.ndarray) -> np.ndarray:
+        human = np.asarray(human, dtype=np.float64).reshape(3, 3)
+        if self.previous_human is not None:
+            travel = float(
+                np.linalg.norm(rotation_vector(human @ self.previous_human.T))
+            )
+            self.offset = rotation_from_vector(
+                rotation_vector(self.offset)
+                * float(np.exp(-max(0.0, float(self.washout_per_rad)) * travel))
+            )
+        self.previous_human = human.copy()
+        return self.offset @ human
+
+
+@dataclass
+class GraspTransitionDetector:
+    """Physical REACHING -> CLOSING -> HOLDING grasp-state machine.
+
+    Jaw stall and object/hand co-motion are independent evidence channels.
+    The timeout only leaves CLOSING; it never declares a grasp by itself.
+    ``manual_override`` retains the established long close hold as an explicit
+    operator fallback when neither physical channel is available.
+    """
+
+    jaw_stall_gap_min_m: float = 0.008
+    jaw_stall_rate_max_mps: float = 0.004
+    jaw_stall_ticks: int = 5
+    comotion_window_s: float = 0.5
+    comotion_enter_log_ratio: float = -0.7
+    comotion_exit_log_ratio: float = 0.0
+    comotion_min_excitation_m: float = 0.02
+    closing_timeout_s: float = 0.60
+    state: str = "reaching"
+    channels: dict[str, bool] = field(
+        default_factory=lambda: {"jaw": False, "comotion": False}
+    )
+    closing_since: float | None = None
+    closing_elapsed_s: float = 0.0
+    grasp_failed: bool = False
+    override_active: bool = False
+    override_count: int = 0
+    comotion_log_ratio: float | None = None
+    _jaw_ticks: int = 0
+    _previous_gap: float | None = None
+    _history: deque[tuple[float, np.ndarray, np.ndarray]] = field(
+        default_factory=deque
+    )
+    _timeout_latched: bool = False
+
+    def reset(self) -> None:
+        self.state = "reaching"
+        self.channels = {"jaw": False, "comotion": False}
+        self.closing_since = None
+        self.closing_elapsed_s = 0.0
+        self.grasp_failed = False
+        self.override_active = False
+        self.comotion_log_ratio = None
+        self._jaw_ticks = 0
+        self._previous_gap = None
+        self._history.clear()
+        self._timeout_latched = False
+
+    def _update_jaw(
+        self, *, commanded_closed: bool, gap_m: float | None, dt: float
+    ) -> None:
+        if not commanded_closed or gap_m is None or not math.isfinite(float(gap_m)):
+            self.channels["jaw"] = False
+            self._jaw_ticks = 0
+            self._previous_gap = None
+            return
+        gap = float(gap_m)
+        rate = float("inf")
+        if self._previous_gap is not None and dt > 0.0:
+            rate = abs(gap - self._previous_gap) / dt
+        has_previous = self._previous_gap is not None
+        self._previous_gap = gap
+        if gap <= float(self.jaw_stall_gap_min_m):
+            self.grasp_failed = True
+            self.channels["jaw"] = False
+            self._jaw_ticks = 0
+            return
+        if has_previous and rate < float(self.jaw_stall_rate_max_mps):
+            self._jaw_ticks += 1
+        else:
+            self._jaw_ticks = 0
+        self.channels["jaw"] = self._jaw_ticks >= max(1, int(self.jaw_stall_ticks))
+
+    def _update_comotion(
+        self,
+        p_camera: np.ndarray | None,
+        p_goal: np.ndarray | None,
+        now_s: float,
+    ) -> None:
+        if p_camera is None or p_goal is None:
+            self.channels["comotion"] = False
+            return
+        try:
+            camera = np.asarray(p_camera, dtype=np.float64).reshape(3)
+            goal = np.asarray(p_goal, dtype=np.float64).reshape(3)
+        except (TypeError, ValueError):
+            self.channels["comotion"] = False
+            return
+        if not np.isfinite(camera).all() or not np.isfinite(goal).all():
+            self.channels["comotion"] = False
+            return
+        self._history.append((float(now_s), camera, goal))
+        while self._history and now_s - self._history[0][0] > max(
+            0.0, float(self.comotion_window_s)
+        ):
+            self._history.popleft()
+        if len(self._history) < 5:
+            return
+        camera_history = np.stack([sample[1] for sample in self._history])
+        goal_history = np.stack([sample[2] for sample in self._history])
+        var_camera = float(np.sum(np.var(camera_history, axis=0)))
+        var_goal = float(np.sum(np.var(goal_history, axis=0)))
+        if max(math.sqrt(var_camera), math.sqrt(var_goal)) < float(
+            self.comotion_min_excitation_m
+        ):
+            return
+        self.comotion_log_ratio = float(
+            np.log10(max(var_camera, 1.0e-12) / max(var_goal, 1.0e-12))
+        )
+        threshold = (
+            float(self.comotion_exit_log_ratio)
+            if self.channels["comotion"]
+            else float(self.comotion_enter_log_ratio)
+        )
+        self.channels["comotion"] = self.comotion_log_ratio < threshold
+
+    def update(
+        self,
+        *,
+        commanded_closed: bool,
+        jaw_gap_m: float | None,
+        p_camera: np.ndarray | None,
+        p_goal: np.ndarray | None,
+        now_s: float,
+        dt: float,
+        manual_override: bool = False,
+    ) -> str:
+        step = max(0.0, float(dt))
+        if not commanded_closed:
+            self.reset()
+            return self.state
+        self.closing_elapsed_s += step
+        self._update_jaw(
+            commanded_closed=commanded_closed, gap_m=jaw_gap_m, dt=step
+        )
+        self._update_comotion(p_camera, p_goal, now_s)
+        engaged = self.channels["jaw"] or self.channels["comotion"]
+        self.override_active = bool(manual_override)
+
+        if self.state == "reaching":
+            if not self._timeout_latched:
+                self.state = "closing"
+                self.closing_since = float(now_s)
+                self.grasp_failed = False
+        elif self.state == "closing":
+            elapsed = float(now_s) - float(
+                now_s if self.closing_since is None else self.closing_since
+            )
+            if engaged:
+                self.state = "holding"
+            elif self.grasp_failed:
+                self.state = "reaching"
+                self._timeout_latched = True
+            elif elapsed >= max(0.0, float(self.closing_timeout_s)):
+                self.state = "reaching"
+                self._timeout_latched = True
+        if manual_override and self.state != "holding":
+            self.state = "holding"
+            self.override_count += 1
+        return self.state
 
 
 @dataclass

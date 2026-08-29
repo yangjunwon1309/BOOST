@@ -37,6 +37,11 @@ python -u path_streaming/path_state_machine_bridge.py \
   --shared-position-posterior-exit-confidence "${PATH_SHARED_POSITION_POSTERIOR_EXIT_CONFIDENCE:-0.25}" \
   --shared-position-posterior-ema-alpha "${PATH_SHARED_POSITION_POSTERIOR_EMA_ALPHA:-0.15}" \
   --shared-position-posterior-max-rate-per-s "${PATH_SHARED_POSITION_POSTERIOR_MAX_RATE_PER_S:-1.2}" \
+  --grasp-engagement-delay-sec "${PATH_GRASP_OVERRIDE_HOLD_SEC:-1.5}" \
+  --grasp-closing-timeout-sec "${PATH_GRASP_CLOSING_TIMEOUT_SEC:-0.60}" \
+  --operator-frame-washout-per-m "${PATH_OPERATOR_FRAME_WASHOUT_PER_M:-4.6}" \
+  --operator-frame-max-offset-m "${PATH_OPERATOR_FRAME_MAX_OFFSET_M:-0.30}" \
+  --operator-rotation-washout-per-rad "${PATH_OPERATOR_ROTATION_WASHOUT_PER_RAD:-2.0}" \
   --end-effector-model "${PATH_END_EFFECTOR_MODEL:-dex1}" \
   --hand-axis-local ${PATH_HAND_AXIS_LOCAL:-0.0 1.0 0.0} \
   --grasp-center-local ${PATH_GRASP_CENTER_LOCAL:-0.0 0.100 0.0} \

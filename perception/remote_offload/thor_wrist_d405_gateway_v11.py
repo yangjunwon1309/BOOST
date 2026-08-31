@@ -40,6 +40,26 @@ from .wrist_d405_protocol_v11 import (
 LOG = logging.getLogger(__name__)
 
 
+_D405_TRANSPORT_ERROR_MARKERS = (
+    "device disconnected",
+    "no device connected",
+    "wait_for_frames cannot be called before start()",
+    "frame didn't arrive within",
+    "capture has not started",
+)
+
+
+def is_d405_transport_error(error: BaseException) -> bool:
+    """Whether retrying the RealSense pipeline can recover this failure.
+
+    Geometry and state-pairing errors deliberately do not match here: restarting
+    a camera cannot correct those and would hide useful diagnostics.
+    """
+
+    message = str(error).lower()
+    return any(marker in message for marker in _D405_TRANSPORT_ERROR_MARKERS)
+
+
 def monotonic_us() -> int:
     """Thor-local clock shared by D405 arrivals and G1 LCM arrivals."""
     return time.monotonic_ns() // 1_000
@@ -196,7 +216,9 @@ class ThorWristD405Gateway:
                  state_history_publish_hz: float = 500.0,
                  left_state_lookup_bias_ms: float = 0.0,
                  right_state_lookup_bias_ms: float = 0.0,
-                 state_pairing_reference_range_m: float = 0.30) -> None:
+                 state_pairing_reference_range_m: float = 0.30,
+                 camera_recovery_initial_delay_ms: float = 300.0,
+                 camera_recovery_max_delay_ms: float = 2000.0) -> None:
         self.g1_bus = lcm.LCM(g1_lcm_url)
         self.wifi_bus = lcm.LCM(wifi_lcm_url)
         self.config = config
@@ -213,6 +235,8 @@ class ThorWristD405Gateway:
             "robot_state_gap_max_ms": 0.0,
             "pairing_residual_ms": {},
             "pairing_estimated_error_m": {},
+            "camera_recoveries": 0,
+            "camera_recovery_attempts": 0,
         }
         self.capture: WristD405Capture | None = None
         self.belief: WristBeliefGateway | None = None
@@ -229,6 +253,13 @@ class ThorWristD405Gateway:
             "right_wrist": int(round(float(right_state_lookup_bias_ms) * 1_000.0)),
         }
         self.state_pairing_reference_range_m = max(0.0, float(state_pairing_reference_range_m))
+        self.camera_recovery_initial_delay_s = max(
+            0.05, float(camera_recovery_initial_delay_ms) / 1000.0
+        )
+        self.camera_recovery_max_delay_s = max(
+            self.camera_recovery_initial_delay_s,
+            float(camera_recovery_max_delay_ms) / 1000.0,
+        )
         self._state_pump_stop = threading.Event()
         self._state_pump_thread: threading.Thread | None = None
         capture_config = _load_yaml(config).get("capture", {})
@@ -353,18 +384,31 @@ class ThorWristD405Gateway:
             LOG.info("%s serial=%s port=%s profile=UYVY/Z16 %dx%d@%d", side, spec.serial,
                      visible[spec.serial].get("physical_port", ""), spec.color.width, spec.color.height, spec.color.fps)
 
-    def start(self, *, state_pairing: bool = True) -> None:
+    def _start_capture(self) -> None:
         assert_video_nodes_unowned()
         rs = _import_realsense()
         specs = load_camera_specs(self.config)
         capture_config = _load_yaml(self.config).get("capture", {})
-        self.capture = WristD405Capture(
+        capture = WristD405Capture(
             rs, specs,
             max_rgb_depth_delta_ms=float(capture_config.get("max_rgb_depth_delta_ms", 20.0)),
         )
+        try:
+            capture.start()
+        except Exception:
+            capture.stop()
+            raise
+        self.capture = capture
+
+    def _stop_capture(self) -> None:
+        if self.capture is not None:
+            self.capture.stop()
+            self.capture = None
+
+    def start(self, *, state_pairing: bool = True) -> None:
+        self._start_capture()
         if state_pairing:
             self._start_state_pump()
-        self.capture.start()
         if self.belief is not None:
             self.belief.start()
         LOG.info("direct D405 capture started for %s", sorted(self.capture.specs))
@@ -373,9 +417,51 @@ class ThorWristD405Gateway:
         self._stop_state_pump()
         if self.belief is not None:
             self.belief.stop()
-        if self.capture is not None:
-            self.capture.stop()
-            self.capture = None
+        self._stop_capture()
+
+    def _recover_capture(self, error: RuntimeError) -> None:
+        """Recreate both RealSense pipelines after a USB/UVC transport fault.
+
+        The first reset starts after 300 ms by default. If the USB device is
+        still re-enumerating, retries back off only to a short bounded delay;
+        robot-state reception and belief telemetry remain alive meanwhile.
+        """
+
+        reason = str(error)
+        started = time.monotonic()
+        delay_s = self.camera_recovery_initial_delay_s
+        attempt = 0
+        self._stop_capture()
+        while True:
+            attempt += 1
+            self.stats["camera_recovery_attempts"] = int(
+                self.stats.get("camera_recovery_attempts", 0)
+            ) + 1
+            LOG.warning(
+                "D405 transport fault; resetting both capture pipelines in %.0f ms "
+                "(attempt=%d): %s",
+                delay_s * 1000.0, attempt, reason,
+            )
+            time.sleep(delay_s)
+            try:
+                self._start_capture()
+            except Exception as recovery_error:
+                reason = str(recovery_error)
+                self._stop_capture()
+                delay_s = min(self.camera_recovery_max_delay_s, delay_s * 2.0)
+                continue
+            self.stats["camera_recoveries"] = int(
+                self.stats.get("camera_recoveries", 0)
+            ) + 1
+            self.stats["last_camera_recovery_ms"] = round(
+                (time.monotonic() - started) * 1000.0, 1
+            )
+            LOG.info(
+                "D405 capture recovered after %.1f ms (%d reset attempt%s)",
+                self.stats["last_camera_recovery_ms"], attempt,
+                "" if attempt == 1 else "s",
+            )
+            return
 
     def _on_result(self, _channel: str, data: bytes) -> None:
         try:
@@ -593,6 +679,8 @@ class ThorWristD405Gateway:
                             error,
                         )
                         self.last_skip_log_monotonic = time.monotonic()
+                    if is_d405_transport_error(error):
+                        self._recover_capture(error)
                 while self.wifi_bus.handle_timeout(0) > 0:
                     pass
                 time.sleep(max(0.0, period - (time.monotonic() - started)))
@@ -618,6 +706,18 @@ def main() -> None:
     parser.add_argument("--diagnose", action="store_true", help="log container-visible D405 devices, V4L2 sysfs, and USB node mounts")
     parser.add_argument("--max-hz", type=float, default=8.0)
     parser.add_argument("--jpeg-quality", type=int, default=85)
+    parser.add_argument(
+        "--camera-recovery-initial-delay-ms",
+        type=float,
+        default=300.0,
+        help="delay before the first D405 stop/start reset after USB/UVC loss",
+    )
+    parser.add_argument(
+        "--camera-recovery-max-delay-ms",
+        type=float,
+        default=2000.0,
+        help="maximum retry delay while a disconnected D405 is re-enumerating",
+    )
     parser.add_argument("--robot-state-channel", default="G1_ROBOT_STATE")
     parser.add_argument("--state-history-span-sec", type=float, default=2.0)
     parser.add_argument("--state-history-publish-hz", type=float, default=500.0)
@@ -734,6 +834,8 @@ def main() -> None:
         left_state_lookup_bias_ms=args.left_state_lookup_bias_ms,
         right_state_lookup_bias_ms=args.right_state_lookup_bias_ms,
         state_pairing_reference_range_m=args.state_pairing_reference_range_m,
+        camera_recovery_initial_delay_ms=args.camera_recovery_initial_delay_ms,
+        camera_recovery_max_delay_ms=args.camera_recovery_max_delay_ms,
     )
     if args.diagnose:
         diagnose_runtime(_import_realsense())

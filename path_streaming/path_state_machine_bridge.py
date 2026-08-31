@@ -52,7 +52,8 @@ import lcm
 import msgpack
 import numpy as np
 import zmq
-from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
+
+from path_core.messaging.zmq_wire import (
     HEADER_SIZE,
     build_command_message,
     build_planner_message,
@@ -94,6 +95,7 @@ from path_core.messaging.path_schema import (
     qp_sample_reference,
 )
 from path_core.messaging.zmq_bus import pack_topic, unpack_topic
+from path_core.g1_joint_layout import UPPER_BODY_PLANNER_INDICES
 from path_core.teleop.pico_joystick_locomotion import (
     PicoJoystickLocomotionConfig,
     PicoJoystickLocomotionMapper,
@@ -101,7 +103,6 @@ from path_core.teleop.pico_joystick_locomotion import (
     yaw_from_quaternion_wxyz,
 )
 from path_planning.unitree_arm_nonlinear_ik import UnitreeG1ArmNonlinearIK
-from path_streaming.path_smpl_thread_server import UPPER_BODY_PLANNER_INDICES
 from perception.seg_web_node.robot_geometry import (
     HAND_AXIS_LOCAL,
     angular_velocity_from_rotations,
@@ -369,8 +370,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-xml",
         type=Path,
-        default=Path("sonic_runtime/gear_sonic_deploy/g1/g1_29dof.xml"),
-        help="MuJoCo model used to detect when a planned EE target has been reached.",
+        default=(
+            Path(os.environ["PATH_MUJOCO_MODEL_XML"])
+            if os.environ.get("PATH_MUJOCO_MODEL_XML")
+            else None
+        ),
+        help=(
+            "Optional MuJoCo model used only for planned-target completion; "
+            "defaults to PATH_MUJOCO_MODEL_XML when set."
+        ),
     )
 
     parser.add_argument("--sonic-bind-host", default="*")
@@ -2060,11 +2068,14 @@ def main() -> int:
             operator_rotation_offset[side].reset()
         log(f"reference resync ({reason})")
     wrist_fk: MujocoWristFk | None = None
-    try:
-        wrist_fk = MujocoWristFk(args.model_xml)
-        log(f"loaded MuJoCo FK model for plan completion: {args.model_xml}")
-    except Exception as exc:
-        log(f"WARNING: plan completion FK disabled: {exc}")
+    if args.model_xml is not None:
+        try:
+            wrist_fk = MujocoWristFk(args.model_xml)
+            log(f"loaded MuJoCo FK model for plan completion: {args.model_xml}")
+        except Exception as exc:
+            log(f"WARNING: plan completion FK disabled: {exc}")
+    else:
+        log("plan completion FK disabled (PATH_MUJOCO_MODEL_XML is unset)")
 
     def solve_authoritative_ipopt_transforms(
         left_target_tf: np.ndarray,

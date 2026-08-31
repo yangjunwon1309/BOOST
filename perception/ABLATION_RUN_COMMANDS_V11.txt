@@ -1,26 +1,22 @@
-PATH-G1 wrist D405 experiment launch commands (v11)
-======================================================
+PATH-G1 wrist D405 ablation launch commands (v11)
+===================================================
 
-Topology
---------
-Terminal A (Thor): SAM3 worker
-Terminal B (Thor): D405 capture + belief gateway
-Terminal C (G1):   PATH state machine bridge
+Each experiment below is self-contained. Use exactly one experiment at a time,
+after stopping the previous SAM3 worker, D405 gateway, and PATH bridge.
 
-Use the same BELIEF_CONFIG in Thor terminals A and B.  Do not run the
-RTX-4060-only run_remote_sam3_wrist_d405_v11.sh on Thor: its engine/image is
-not the Thor runtime.  The Thor worker uses run_thor.sh and the board-local
-/models/sam3_trt/sam3_fp16_4out.engine.
+Terminal A and B run on Thor. Terminal C runs on G1. Paste each whole terminal
+block into its corresponding terminal. The two Thor terminals must use the same
+BELIEF_CONFIG for one experiment.
 
-Shared Thor environment (run in both Thor terminals)
-------------------------------------------------------
-cd ~/PATH-G1/perception
-export G1_LCM_URL='udpm://239.255.76.67:7667?ttl=1'
-export WIFI_LCM_URL='udpm://239.255.77.67:7667?ttl=1'
+The commands assume that Thor already has the required image and TensorRT engine:
+  /models/sam3_trt/sam3_fp16_4out.engine
+
+The gateway uses --auto-devices to detect the two attached D405 cameras. Do not
+use the RTX-4060-only run_remote_sam3_wrist_d405_v11.sh on Thor.
 
 
-0. Normal PATH baseline
------------------------
+0. PATH baseline (belief position replacement + orientation belief)
+--------------------------------------------------------------------
 
 Terminal A -- Thor SAM3 worker
 
@@ -38,19 +34,22 @@ export BELIEF_CONFIG='config/pipeline.yaml'
   --pairing-max-residual-ms 15 \
   --pairing-max-error-m 0.008
 
-Terminal B -- Thor D405 gateway
+Terminal B -- Thor D405 capture and belief gateway
 
 cd ~/PATH-G1/perception
 export G1_LCM_URL='udpm://239.255.76.67:7667?ttl=1'
 export WIFI_LCM_URL='udpm://239.255.77.67:7667?ttl=1'
+export BELIEF_CONFIG='config/pipeline.yaml'
 
 ./tools/run_thor_wrist_d405_gateway_v11.sh \
   --auto-devices \
   --g1-lcm-url "$G1_LCM_URL" \
   --wifi-lcm-url "$WIFI_LCM_URL" \
   --config config/wrist_d405_v11.yaml \
-  --belief-config config/pipeline.yaml \
+  --belief-config "$BELIEF_CONFIG" \
   --max-hz 8 \
+  --camera-recovery-initial-delay-ms 300 \
+  --camera-recovery-max-delay-ms 2000 \
   --belief-inference \
   --belief-input-source operator_command \
   --belief-command-max-delta-ms 25 \
@@ -58,90 +57,255 @@ export WIFI_LCM_URL='udpm://239.255.77.67:7667?ttl=1'
   --ee-target-publishing \
   --log-level INFO
 
-Terminal C -- G1 PATH bridge (normal belief target replacement)
+Terminal C -- G1 PATH state-machine bridge
 
 cd ~/PATH-G1
+export PATH_LCM_URL='udpm://239.255.76.67:7667?ttl=1'
+export PATH_WRIST_VISUAL_LCM_URL='udpm://239.255.77.67:7667?ttl=1'
 export PATH_SHARED_POSITION_MODE='replace'
 unset PATH_SHARED_POSITION_ALPHA
 unset PATH_SHARED_POSITION_ALPHA_SOURCE
+unset PATH_SHARED_POSITION_POSTERIOR_ENTER_CONFIDENCE
+unset PATH_SHARED_POSITION_POSTERIOR_EXIT_CONFIDENCE
+unset PATH_SHARED_POSITION_POSTERIOR_EMA_ALPHA
+unset PATH_SHARED_POSITION_POSTERIOR_MAX_RATE_PER_S
 
 ./path_deploy/scripts/run_path_direct_lcm.sh
 
 
 1. No jump diffusion ablation
-------------------------------
+-----------------------------
 
-Only replace BELIEF_CONFIG in both Thor commands above with:
+Terminal A -- Thor SAM3 worker
 
+cd ~/PATH-G1/perception
+export WIFI_LCM_URL='udpm://239.255.77.67:7667?ttl=1'
 export BELIEF_CONFIG='config/ablations/pipeline_v11_no_jump_diffusion.yaml'
 
-For the gateway, replace this one argument:
+./tools/run_thor.sh python -m remote_offload.remote_sam3_wrist_d405_worker_v11 \
+  --wifi-lcm-url "$WIFI_LCM_URL" \
+  --backend tensorrt \
+  --trt-engine /models/sam3_trt/sam3_fp16_4out.engine \
+  --concepts object \
+  --extrinsics config/wrist_d405_extrinsics_v11_translation_calibrated.yaml \
+  --belief-config "$BELIEF_CONFIG" \
+  --pairing-max-residual-ms 15 \
+  --pairing-max-error-m 0.008
 
-  --belief-config config/ablations/pipeline_v11_no_jump_diffusion.yaml
+Terminal B -- Thor D405 capture and belief gateway
 
-The G1 bridge command stays identical to normal PATH (replace mode).
-This profile sets jump.enabled=false and persist_leak=0.0.
+cd ~/PATH-G1/perception
+export G1_LCM_URL='udpm://239.255.76.67:7667?ttl=1'
+export WIFI_LCM_URL='udpm://239.255.77.67:7667?ttl=1'
+export BELIEF_CONFIG='config/ablations/pipeline_v11_no_jump_diffusion.yaml'
+
+./tools/run_thor_wrist_d405_gateway_v11.sh \
+  --auto-devices \
+  --g1-lcm-url "$G1_LCM_URL" \
+  --wifi-lcm-url "$WIFI_LCM_URL" \
+  --config config/wrist_d405_v11.yaml \
+  --belief-config "$BELIEF_CONFIG" \
+  --max-hz 8 \
+  --camera-recovery-initial-delay-ms 300 \
+  --camera-recovery-max-delay-ms 2000 \
+  --belief-inference \
+  --belief-input-source operator_command \
+  --belief-command-max-delta-ms 25 \
+  --belief-command-divergence-max-m 0.20 \
+  --ee-target-publishing \
+  --log-level INFO
+
+Terminal C -- G1 PATH state-machine bridge
+
+cd ~/PATH-G1
+export PATH_LCM_URL='udpm://239.255.76.67:7667?ttl=1'
+export PATH_WRIST_VISUAL_LCM_URL='udpm://239.255.77.67:7667?ttl=1'
+export PATH_SHARED_POSITION_MODE='replace'
+unset PATH_SHARED_POSITION_ALPHA
+unset PATH_SHARED_POSITION_ALPHA_SOURCE
+unset PATH_SHARED_POSITION_POSTERIOR_ENTER_CONFIDENCE
+unset PATH_SHARED_POSITION_POSTERIOR_EXIT_CONFIDENCE
+unset PATH_SHARED_POSITION_POSTERIOR_EMA_ALPHA
+unset PATH_SHARED_POSITION_POSTERIOR_MAX_RATE_PER_S
+
+./path_deploy/scripts/run_path_direct_lcm.sh
 
 
 2. No orientation-belief ablation
 ---------------------------------
 
-Only replace BELIEF_CONFIG in both Thor commands above with:
+Terminal A -- Thor SAM3 worker
 
+cd ~/PATH-G1/perception
+export WIFI_LCM_URL='udpm://239.255.77.67:7667?ttl=1'
 export BELIEF_CONFIG='config/ablations/pipeline_v11_no_orientation_belief.yaml'
 
-For the gateway, replace this one argument:
+./tools/run_thor.sh python -m remote_offload.remote_sam3_wrist_d405_worker_v11 \
+  --wifi-lcm-url "$WIFI_LCM_URL" \
+  --backend tensorrt \
+  --trt-engine /models/sam3_trt/sam3_fp16_4out.engine \
+  --concepts object \
+  --extrinsics config/wrist_d405_extrinsics_v11_translation_calibrated.yaml \
+  --belief-config "$BELIEF_CONFIG" \
+  --pairing-max-residual-ms 15 \
+  --pairing-max-error-m 0.008
 
-  --belief-config config/ablations/pipeline_v11_no_orientation_belief.yaml
+Terminal B -- Thor D405 capture and belief gateway
 
-The G1 bridge command stays identical to normal PATH (replace mode).
-This profile sets tasc_belief.orientation.enabled=false; position/contact
-belief remains enabled.
+cd ~/PATH-G1/perception
+export G1_LCM_URL='udpm://239.255.76.67:7667?ttl=1'
+export WIFI_LCM_URL='udpm://239.255.77.67:7667?ttl=1'
+export BELIEF_CONFIG='config/ablations/pipeline_v11_no_orientation_belief.yaml'
 
+./tools/run_thor_wrist_d405_gateway_v11.sh \
+  --auto-devices \
+  --g1-lcm-url "$G1_LCM_URL" \
+  --wifi-lcm-url "$WIFI_LCM_URL" \
+  --config config/wrist_d405_v11.yaml \
+  --belief-config "$BELIEF_CONFIG" \
+  --max-hz 8 \
+  --camera-recovery-initial-delay-ms 300 \
+  --camera-recovery-max-delay-ms 2000 \
+  --belief-inference \
+  --belief-input-source operator_command \
+  --belief-command-max-delta-ms 25 \
+  --belief-command-divergence-max-m 0.20 \
+  --ee-target-publishing \
+  --log-level INFO
 
-3. Fixed position alpha-blending ablation
------------------------------------------
-
-Thor remains on the normal baseline profile:
-
-export BELIEF_CONFIG='config/pipeline.yaml'
-
-Run the same normal PATH worker and gateway commands, then use this G1 bridge
-command instead of replace mode:
+Terminal C -- G1 PATH state-machine bridge
 
 cd ~/PATH-G1
+export PATH_LCM_URL='udpm://239.255.76.67:7667?ttl=1'
+export PATH_WRIST_VISUAL_LCM_URL='udpm://239.255.77.67:7667?ttl=1'
+export PATH_SHARED_POSITION_MODE='replace'
+unset PATH_SHARED_POSITION_ALPHA
+unset PATH_SHARED_POSITION_ALPHA_SOURCE
+unset PATH_SHARED_POSITION_POSTERIOR_ENTER_CONFIDENCE
+unset PATH_SHARED_POSITION_POSTERIOR_EXIT_CONFIDENCE
+unset PATH_SHARED_POSITION_POSTERIOR_EMA_ALPHA
+unset PATH_SHARED_POSITION_POSTERIOR_MAX_RATE_PER_S
+
+./path_deploy/scripts/run_path_direct_lcm.sh
+
+
+3. Fixed position alpha-blending ablation (alpha = 0.50)
+---------------------------------------------------------
+
+This keeps baseline perception and orientation belief. Only the G1 position
+target changes to: p_IPOPT = 0.50 * p_VR + 0.50 * p_belief.
+
+Terminal A -- Thor SAM3 worker
+
+cd ~/PATH-G1/perception
+export WIFI_LCM_URL='udpm://239.255.77.67:7667?ttl=1'
+export BELIEF_CONFIG='config/pipeline.yaml'
+
+./tools/run_thor.sh python -m remote_offload.remote_sam3_wrist_d405_worker_v11 \
+  --wifi-lcm-url "$WIFI_LCM_URL" \
+  --backend tensorrt \
+  --trt-engine /models/sam3_trt/sam3_fp16_4out.engine \
+  --concepts object \
+  --extrinsics config/wrist_d405_extrinsics_v11_translation_calibrated.yaml \
+  --belief-config "$BELIEF_CONFIG" \
+  --pairing-max-residual-ms 15 \
+  --pairing-max-error-m 0.008
+
+Terminal B -- Thor D405 capture and belief gateway
+
+cd ~/PATH-G1/perception
+export G1_LCM_URL='udpm://239.255.76.67:7667?ttl=1'
+export WIFI_LCM_URL='udpm://239.255.77.67:7667?ttl=1'
+export BELIEF_CONFIG='config/pipeline.yaml'
+
+./tools/run_thor_wrist_d405_gateway_v11.sh \
+  --auto-devices \
+  --g1-lcm-url "$G1_LCM_URL" \
+  --wifi-lcm-url "$WIFI_LCM_URL" \
+  --config config/wrist_d405_v11.yaml \
+  --belief-config "$BELIEF_CONFIG" \
+  --max-hz 8 \
+  --camera-recovery-initial-delay-ms 300 \
+  --camera-recovery-max-delay-ms 2000 \
+  --belief-inference \
+  --belief-input-source operator_command \
+  --belief-command-max-delta-ms 25 \
+  --belief-command-divergence-max-m 0.20 \
+  --ee-target-publishing \
+  --log-level INFO
+
+Terminal C -- G1 PATH state-machine bridge
+
+cd ~/PATH-G1
+export PATH_LCM_URL='udpm://239.255.76.67:7667?ttl=1'
+export PATH_WRIST_VISUAL_LCM_URL='udpm://239.255.77.67:7667?ttl=1'
 export PATH_SHARED_POSITION_MODE='alpha'
 export PATH_SHARED_POSITION_ALPHA_SOURCE='fixed'
 export PATH_SHARED_POSITION_ALPHA='0.50'
+unset PATH_SHARED_POSITION_POSTERIOR_ENTER_CONFIDENCE
+unset PATH_SHARED_POSITION_POSTERIOR_EXIT_CONFIDENCE
+unset PATH_SHARED_POSITION_POSTERIOR_EMA_ALPHA
+unset PATH_SHARED_POSITION_POSTERIOR_MAX_RATE_PER_S
 
 ./path_deploy/scripts/run_path_direct_lcm.sh
 
-Under a valid Y(left)/B(right) belief gate, this uses:
-  p_IPOPT = (1 - 0.50) * p_VR + 0.50 * p_belief
 
-For the position-only no-assist control, set alpha to 0.00.  Alpha 1.00
-recovers the normal PATH replace target and its armed reference dynamics.
+4. Posterior-driven position alpha-blending variant
+---------------------------------------------------
 
+This keeps baseline perception and orientation belief. Position alpha is
+derived continuously from b(object) * b(contact | object).
 
-4. Posterior-driven position alpha (optional alpha variant)
------------------------------------------------------------
+Terminal A -- Thor SAM3 worker
 
-Thor remains on the normal baseline profile:
-
+cd ~/PATH-G1/perception
+export WIFI_LCM_URL='udpm://239.255.77.67:7667?ttl=1'
 export BELIEF_CONFIG='config/pipeline.yaml'
 
-Use the normal PATH worker and gateway commands.  On G1 run:
+./tools/run_thor.sh python -m remote_offload.remote_sam3_wrist_d405_worker_v11 \
+  --wifi-lcm-url "$WIFI_LCM_URL" \
+  --backend tensorrt \
+  --trt-engine /models/sam3_trt/sam3_fp16_4out.engine \
+  --concepts object \
+  --extrinsics config/wrist_d405_extrinsics_v11_translation_calibrated.yaml \
+  --belief-config "$BELIEF_CONFIG" \
+  --pairing-max-residual-ms 15 \
+  --pairing-max-error-m 0.008
+
+Terminal B -- Thor D405 capture and belief gateway
+
+cd ~/PATH-G1/perception
+export G1_LCM_URL='udpm://239.255.76.67:7667?ttl=1'
+export WIFI_LCM_URL='udpm://239.255.77.67:7667?ttl=1'
+export BELIEF_CONFIG='config/pipeline.yaml'
+
+./tools/run_thor_wrist_d405_gateway_v11.sh \
+  --auto-devices \
+  --g1-lcm-url "$G1_LCM_URL" \
+  --wifi-lcm-url "$WIFI_LCM_URL" \
+  --config config/wrist_d405_v11.yaml \
+  --belief-config "$BELIEF_CONFIG" \
+  --max-hz 8 \
+  --camera-recovery-initial-delay-ms 300 \
+  --camera-recovery-max-delay-ms 2000 \
+  --belief-inference \
+  --belief-input-source operator_command \
+  --belief-command-max-delta-ms 25 \
+  --belief-command-divergence-max-m 0.20 \
+  --ee-target-publishing \
+  --log-level INFO
+
+Terminal C -- G1 PATH state-machine bridge
 
 cd ~/PATH-G1
+export PATH_LCM_URL='udpm://239.255.76.67:7667?ttl=1'
+export PATH_WRIST_VISUAL_LCM_URL='udpm://239.255.77.67:7667?ttl=1'
 export PATH_SHARED_POSITION_MODE='alpha'
 export PATH_SHARED_POSITION_ALPHA_SOURCE='posterior'
+unset PATH_SHARED_POSITION_ALPHA
+export PATH_SHARED_POSITION_POSTERIOR_ENTER_CONFIDENCE='0.45'
+export PATH_SHARED_POSITION_POSTERIOR_EXIT_CONFIDENCE='0.25'
+export PATH_SHARED_POSITION_POSTERIOR_EMA_ALPHA='0.15'
+export PATH_SHARED_POSITION_POSTERIOR_MAX_RATE_PER_S='1.20'
 
-# Default mapping: EMA=0.15; enter=0.45; exit=0.25; rate limit=1.2/s.
 ./path_deploy/scripts/run_path_direct_lcm.sh
-
-The blend alpha is derived from the target's joint posterior
-b(object) * b(contact | object), not a fixed constant.  For a lower
-engagement threshold experiment, add before starting the bridge:
-
-export PATH_SHARED_POSITION_POSTERIOR_ENTER_CONFIDENCE='0.35'
-export PATH_SHARED_POSITION_POSTERIOR_EXIT_CONFIDENCE='0.20'

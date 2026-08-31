@@ -18,7 +18,7 @@ import msgpack
 import numpy as np
 import zmq
 
-from gear_sonic.utils.teleop.zmq.zmq_planner_sender import pack_pose_message
+from path_core.messaging.zmq_wire import pack_pose_message
 from path_core.teleop.pico_joystick_locomotion import PicoButtonGestureInterpreter
 from path_streaming.xr_source_v15 import (
     TeleVuerSource,

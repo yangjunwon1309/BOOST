@@ -42,74 +42,27 @@ from scipy.spatial.transform import Rotation as R, Rotation as sRot
 import torch
 import zmq
 
-PATH_G1_ROOT = Path(__file__).resolve().parents[1]
-HUMAN_JOINTS_INFO_PATH = (
-    PATH_G1_ROOT / "sonic_runtime" / "gear_sonic" / "data" / "human" / "human_joints_info.pkl"
-)
-
-from gear_sonic.utils.teleop.zmq.zmq_poller import ZMQPoller
-from gear_sonic.trl.utils.rotation_conversion import decompose_rotation_aa
-from gear_sonic.trl.utils.torch_transform import (
-    angle_axis_to_quaternion,
-    compute_human_joints,
-    quat_apply,
-    quat_inv,
-    quaternion_to_angle_axis,
-    quaternion_to_rotation_matrix,
-)
+from path_core.messaging.zmq_poller import ZMQPoller
 from path_core.teleop.pico_joystick_locomotion import (
     PicoButtonGestureInterpreter,
 )
+from path_core.teleop.g1_gripper_ik import G1GripperInverseKinematicsSolver
+from path_core.teleop.rotation_decomposition import decompose_rotation_aa
 
-try:
-    from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
-        build_command_message,
-        build_planner_message,
-        pack_pose_message,
-    )
-except ImportError:
-
-    def build_command_message(*args, **kwargs) -> bytes:
-        raise RuntimeError("build_command_message unavailable")
-
-    def build_planner_message(*args, **kwargs) -> bytes:
-        raise RuntimeError("build_planner_message unavailable")
-
-    def pack_pose_message(*args, **kwargs) -> bytes:
-        raise RuntimeError("pack_pose_message unavailable")
-
-
-try:
-    from gear_sonic.isaac_utils.rotations import remove_smpl_base_rot, smpl_root_ytoz_up
-except ImportError:
-    print("Warning: gear_sonic.isaac_utils.rotations not available.")
-    remove_smpl_base_rot = None
-    smpl_root_ytoz_up = None
+from path_core.messaging.zmq_wire import (
+    build_command_message,
+    build_planner_message,
+    pack_pose_message,
+)
 
 try:
     import xrobotoolkit_sdk as xrt
 except ImportError:
     xrt = None
 
-try:
-    from gear_sonic.utils.teleop.solver.hand.g1_gripper_ik_solver import (
-        G1GripperInverseKinematicsSolver,
-    )
-except ImportError:
-    print("Warning: G1GripperInverseKinematicsSolver not available.")
-    G1GripperInverseKinematicsSolver = None
-
-try:
-    from gear_sonic.utils.teleop.vis.vr3pt_pose_visualizer import VR3PtPoseVisualizer
-except ImportError:
-    print("Warning: VR3PtPoseVisualizer not available (pyvista may not be installed).")
-    VR3PtPoseVisualizer = None
-
-try:
-    from gear_sonic.utils.teleop.vis.vr3pt_pose_visualizer import get_g1_key_frame_poses
-except ImportError:
-    print("Warning: get_g1_key_frame_poses not available (pyvista may not be installed).")
-    get_g1_key_frame_poses = None
+# The old PyVista/SONIC renderer is deliberately retired.  The maintained
+# visualization path is perception/remote_offload/remote_web_wrist_d405_v11.py.
+VR3PtPoseVisualizer = None
 
 
 class LocomotionMode(IntEnum):
@@ -582,49 +535,6 @@ def run_vr3pt_realtime_visualizer(update_hz: int = 10):
         visualizer.close()
 
 
-def process_smpl_joints(body_pose, global_orient, transl):
-    """Process SMPL parameters to compute local joints.
-
-    Args:
-        body_pose: Body pose tensor, shape (T, 69)
-        global_orient: Global orientation tensor, shape (T, 3)
-        transl: Translation tensor, shape (T, 3)
-
-    Returns:
-        Dictionary with processed joints and parameters
-    """
-    # Convert global_orient to quaternion and apply transformations (robust if utils missing)
-    global_orient_quat = angle_axis_to_quaternion(global_orient)
-    if smpl_root_ytoz_up is not None:
-        global_orient_quat = smpl_root_ytoz_up(global_orient_quat)
-    global_orient_new = quaternion_to_angle_axis(global_orient_quat)
-
-    # Compute joints and vertices using SMPL model (single forward pass)
-    joints = compute_human_joints(
-        body_pose=body_pose[..., :63],
-        global_orient=global_orient_new,
-        human_joints_info_path=str(HUMAN_JOINTS_INFO_PATH),
-    )  # (*, 24, 3)
-
-    # Apply base rotation removal and compute local joints
-    if remove_smpl_base_rot is not None:
-        global_orient_quat = remove_smpl_base_rot(global_orient_quat, w_last=False)
-
-    global_orient_quat_inv = quat_inv(global_orient_quat).unsqueeze(1).repeat(1, joints.shape[1], 1)
-    smpl_joints_local = quat_apply(global_orient_quat_inv, joints)
-    global_orient_mat = quaternion_to_rotation_matrix(global_orient_quat)
-    global_orient_6d = global_orient_mat[..., :2].reshape(1, 6)
-
-    return {
-        "smpl_pose": body_pose,
-        "joints": joints,
-        "smpl_joints_local": smpl_joints_local,
-        "global_orient_quat": global_orient_quat,
-        "global_orient_6d": global_orient_6d,
-        "adjusted_transl": transl,
-    }
-
-
 def generate_finger_data(hand: str, trigger: float, grip: float) -> np.ndarray:
     """
     Generate finger position data from Pico controller button states.
@@ -698,9 +608,7 @@ class YawAccumulator:
 
 
 def compute_from_body_poses(parent_indices: list, device, body_poses_np: np.ndarray):
-    """
-    Compute local joints and body orientation from provided body_poses_np.
-    """
+    """Build legacy pose diagnostics without SONIC's SMPL asset bundle."""
     positions = body_poses_np[:, :3]
     global_quats = body_poses_np[:, [6, 3, 4, 5]]
 
@@ -718,11 +626,17 @@ def compute_from_body_poses(parent_indices: list, device, body_poses_np: np.ndar
 
     pose_aa = np.array([rot.as_rotvec() for rot in local_rots])
 
+    root_inverse = global_rots[0].inv()
+    joints_local = root_inverse.apply(positions - positions[0])
+    root_quat_xyzw = global_rots[0].as_quat()
     body_pose = torch.from_numpy(pose_aa[1:].flatten()).float().to(device).unsqueeze(0)
-    global_orient = torch.from_numpy(pose_aa[0]).float().to(device).unsqueeze(0)
-    transl = torch.from_numpy(positions[0]).float().to(device).unsqueeze(0)
-
-    return process_smpl_joints(body_pose, global_orient, transl)
+    return {
+        "smpl_pose": body_pose,
+        "smpl_joints_local": torch.from_numpy(joints_local).float().to(device).unsqueeze(0),
+        "global_orient_quat": torch.from_numpy(
+            root_quat_xyzw[[3, 0, 1, 2]]
+        ).float().to(device).unsqueeze(0),
+    }
 
 
 # def compute_latest_frame(parent_indices: list, device) -> tuple[np.ndarray, np.ndarray]:
@@ -1162,13 +1076,11 @@ class ThreePointPose:
         self.enable_smpl_vis = enable_smpl_vis
 
         self._robot_model = robot_model
-        if enable_vis_vr3pt and self._robot_model is None:
-            from gear_sonic.data.robot_model.instantiation.g1 import (
-                instantiate_g1_robot_model,
+        if enable_vis_vr3pt:
+            raise RuntimeError(
+                "--vis_vr3pt is retired with the SONIC renderer; use the "
+                "maintained wrist remote web viewer instead."
             )
-
-            self._robot_model = instantiate_g1_robot_model()
-            print(f"[{log_prefix}] Robot model loaded for visualization")
 
         # Optional visualization (requires display + PyVista)
         self.vr3pt_visualizer = None

@@ -26,9 +26,7 @@ from gear_sonic.scripts.gmr_realtime_ee_reference import (
     ROOT_OFFSET_WXYZ,
     build_human_frame,
 )
-
-
-UPPER_BODY_PLANNER_INDICES = [12, 13, 14, 15, 22, 16, 23, 17, 24, 18, 25, 19, 26, 20, 27, 21, 28]
+from path_core.g1_joint_layout import UPPER_BODY_PLANNER_INDICES
 
 
 def parse_args() -> argparse.Namespace:

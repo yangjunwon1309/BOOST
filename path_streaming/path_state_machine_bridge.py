@@ -2030,6 +2030,13 @@ def main() -> int:
         )
         for side in ("left", "right")
     }
+    # Position and orientation authority intentionally have independent
+    # release edges.  A confirmed grasp releases position to the rebased
+    # operator frame, but it must not remove an actively held B/Y orientation
+    # constraint.  Orientation is rebased only when that constraint itself
+    # falls away.
+    orientation_belief_active = {side: False for side in ("left", "right")}
+    operator_rotation_rebase_active = {side: False for side in ("left", "right")}
     # Y/B is a dead-man switch for the left/right belief blend.
     shared_selected_hand = "none"
     shared_hand_selection_revision = 0
@@ -2066,6 +2073,8 @@ def main() -> int:
             grasp_detector[side].reset()
             operator_frame_offset[side].reset()
             operator_rotation_offset[side].reset()
+            orientation_belief_active[side] = False
+            operator_rotation_rebase_active[side] = False
         log(f"reference resync ({reason})")
     wrist_fk: MujocoWristFk | None = None
     if args.model_xml is not None:
@@ -3148,7 +3157,6 @@ def main() -> int:
                         position_command = command_tf[side][:3, 3]
                         rotation_command = command_tf[side][:3, :3]
                         detector = grasp_detector[side]
-                        was_holding = detector.state == "holding"
                         manual_grasp_override = bool(
                             grasp_commanded[side]
                             and detector.closing_elapsed_s
@@ -3172,14 +3180,13 @@ def main() -> int:
                             manual_override=manual_grasp_override,
                         )
                         holding = grasp_state[side] == "holding"
-                        transition_to_holding = holding and not was_holding
                         grasp_engaged[side] = holding
 
-                        # A HOLDING transition is special: rebase the final
-                        # orientation reference onto the raw operator frame so
-                        # the held object never unwinds when belief releases.
-                        # Other authority changes already ramp continuously.
-                        use_operator_rotation_rebase = holding and not transition_to_holding
+                        # HOLDING releases only position authority.  In
+                        # particular, do not let the post-grasp frame rebase
+                        # mask a valid B/Y-gated orientation constraint.
+                        was_orientation_belief_active = orientation_belief_active[side]
+                        orientation_belief_active[side] = False
                         rotation_target = rotation_command
                         orientation_source = "operator"
                         zeta_ori = shared_config.zeta_released
@@ -3189,14 +3196,7 @@ def main() -> int:
                         belief_weight = 0.0
                         final_orientation_weight = 0.0
                         current_rotation = orientation_reference[side].rotation if orientation_reference[side].rotation is not None else measured_tf[side][:3, :3]
-                        if use_operator_rotation_rebase:
-                            orientation_gate[side].authority(None, current_rotation, dt)
-                            orientation_authority[side].update(0.0, gate_ok=False, dt=dt)
-                            rotation_target = operator_rotation_offset[side].apply(
-                                rotation_command
-                            )
-                            orientation_source = "operator_holding_rebased"
-                        elif belief_target is not None and belief_target.has_orientation_constraint:
+                        if belief_target is not None and belief_target.has_orientation_constraint:
                             target_model = str(args.end_effector_model).lower()
                             position_point = str(belief_target.position_point or "")
                             if position_point.endswith("_grasp_center"):
@@ -3234,10 +3234,28 @@ def main() -> int:
                                     rotation_command, constrained, final_orientation_weight
                                 )
                                 orientation_source = f"belief_{belief_target.orientation_policy}"
+                                orientation_belief_active[side] = True
                             gate_reason = gate.last_reason
                         else:
                             orientation_gate[side].authority(None, current_rotation, dt)
                             orientation_authority[side].update(0.0, gate_ok=False, dt=dt)
+                        if not orientation_belief_active[side]:
+                            # Rebase only at the actual orientation-authority
+                            # falling edge: B/Y release, stale target, or an
+                            # invalid/rejected orientation constraint.  This
+                            # keeps the current reference continuous without
+                            # suppressing belief orientation merely because
+                            # position entered HOLDING.
+                            if was_orientation_belief_active:
+                                operator_rotation_offset[side].capture(
+                                    current_rotation, rotation_command
+                                )
+                                operator_rotation_rebase_active[side] = True
+                            rotation_target = operator_rotation_offset[side].apply(
+                                rotation_command
+                            )
+                            if operator_rotation_rebase_active[side]:
+                                orientation_source = "operator_rebased"
                         # Modulate reference dynamics continuously. The state
                         # itself is never blended or reset on authority edges.
                         zeta_ori = (
@@ -3252,10 +3270,6 @@ def main() -> int:
                             rotation_target, dt, measured=measured_tf[side][:3, :3],
                             omega_n=omega_n_ori, zeta=zeta_ori,
                         )
-                        if transition_to_holding:
-                            operator_rotation_offset[side].capture(
-                                r_ref, rotation_command
-                            )
 
                         # Rebase the raw operator frame whenever position
                         # authority ends, not only after a grasp.  ``track``
@@ -3378,6 +3392,8 @@ def main() -> int:
                             "orientation_belief_weight": float(belief_weight),
                             "orientation_authority_weight": float(final_orientation_weight),
                             "orientation_smoothed_confidence": float(orientation_authority[side].smoothed_confidence),
+                            "orientation_belief_active": bool(orientation_belief_active[side]),
+                            "orientation_rebase_active": bool(operator_rotation_rebase_active[side]),
                             "position_blend_mode": str(args.shared_position_mode),
                             "position_alpha_source": str(args.shared_position_alpha_source),
                             "position_belief_weight": float(position_belief_weight),

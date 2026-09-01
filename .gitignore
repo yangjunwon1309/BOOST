@@ -71,3 +71,7 @@ perception/data/belief_logs/*.csv
 # Bottle-open experiment recordings and generated analysis tables
 record/bottle_open/**/*.csv
 record/bottle_open/**/*.json
+
+# Local ablation launch notes and bottle-open analysis artifacts.
+perception/ABLATION_RUN_COMMANDS_V11.txt
+record/bottle_open/analysis/

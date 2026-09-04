@@ -22,9 +22,11 @@ import argparse
 import csv
 import json
 import math
+import os
 import re
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -38,9 +40,33 @@ except ModuleNotFoundError:  # Keep --help usable outside the deployment image.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SIDES = ("left", "right")
 SPEED_MAX_GAP_SEC = 0.25
+# G1 direct-state ordering: 12 lower-body joints, then waist, then both arms.
+# Keep this recorder intentionally limited to the upper body; lower-body joints
+# are neither teleoperation decision variables nor paper metrics for this study.
+UPPER_BODY_START = 12
+UPPER_BODY_COUNT = 17
+UPPER_BODY_JOINT_NAMES = (
+    "waist_yaw_joint",
+    "waist_roll_joint",
+    "waist_pitch_joint",
+    "left_shoulder_pitch_joint",
+    "left_shoulder_roll_joint",
+    "left_shoulder_yaw_joint",
+    "left_elbow_joint",
+    "left_wrist_roll_joint",
+    "left_wrist_pitch_joint",
+    "left_wrist_yaw_joint",
+    "right_shoulder_pitch_joint",
+    "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint",
+    "right_elbow_joint",
+    "right_wrist_roll_joint",
+    "right_wrist_pitch_joint",
+    "right_wrist_yaw_joint",
+)
 CSV_FIELDS = (
     "schema_version",
     "recorded_timestamp_us",
@@ -59,6 +85,7 @@ CSV_FIELDS = (
     "right_ipopt_target_json",
     "left_ee_json",
     "right_ee_json",
+    "upper_body_torque_json",
     "left_ee_distance_m",
     "right_ee_distance_m",
     "ee_distance_total_m",
@@ -199,6 +226,51 @@ def _next_indexed_output(template: Path) -> Path:
     return template.with_name(f"{prefix}_{highest_index + 1:0{width}d}.csv")
 
 
+@dataclass
+class UpperBodyTorqueCache:
+    """Latest measured/estimated G1 upper-body torque, shared across trials."""
+
+    max_age_sec: float
+    sequence: int | None = None
+    state_timestamp_us: int | None = None
+    tau_est_nm: list[float] | None = None
+    received_monotonic: float | None = None
+
+    def update(self, state: Any) -> None:
+        tau_est = np.asarray(state.tau_est, dtype=np.float64).reshape(-1)
+        upper_body = tau_est[UPPER_BODY_START:UPPER_BODY_START + UPPER_BODY_COUNT]
+        if upper_body.size != UPPER_BODY_COUNT or not np.isfinite(upper_body).all():
+            raise ValueError("G1 robot-state tau_est does not contain 17 finite upper-body values")
+        self.sequence = int(state.sequence)
+        self.state_timestamp_us = int(state.timestamp_us)
+        self.tau_est_nm = [float(value) for value in upper_body]
+        self.received_monotonic = time.monotonic()
+
+    def record(self, now: float) -> dict[str, Any]:
+        age_ms = (
+            None
+            if self.received_monotonic is None
+            else 1000.0 * (now - self.received_monotonic)
+        )
+        available = (
+            self.tau_est_nm is not None
+            and age_ms is not None
+            and age_ms <= 1000.0 * self.max_age_sec
+        )
+        return {
+            # This is the tau_est field received from G1, not a PD-gain
+            # reconstruction.  Its name intentionally preserves that fact.
+            "source": "g1_robot_state.tau_est",
+            "available": available,
+            "reason": None if available else ("unavailable" if age_ms is None else "stale"),
+            "age_ms": age_ms,
+            "sequence": self.sequence if available else None,
+            "state_timestamp_us": self.state_timestamp_us if available else None,
+            "joint_names": list(UPPER_BODY_JOINT_NAMES),
+            "tau_est_nm": self.tau_est_nm if available else None,
+        }
+
+
 class ExperimentRecorder:
     def __init__(
         self,
@@ -206,6 +278,7 @@ class ExperimentRecorder:
         *,
         sample_hz: float,
         flush_every: int,
+        upper_body_torque: UpperBodyTorqueCache,
         overwrite: bool = False,
     ) -> None:
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -216,6 +289,7 @@ class ExperimentRecorder:
         self.writer.writeheader()
         self.sample_period_sec = 1.0 / max(1.0, sample_hz)
         self.flush_every = max(1, flush_every)
+        self.upper_body_torque = upper_body_torque
         self.latest_belief: dict[str, Any] | None = None
         self.latest_belief_received_monotonic: float | None = None
         self.last_record_monotonic: float | None = None
@@ -330,6 +404,7 @@ class ExperimentRecorder:
             row[f"{side}_ipopt_target_json"] = _json(self._ipopt_record(ipopt_hand))
             row[f"{side}_ee_json"] = _json(ee)
             row[f"{side}_ee_distance_m"] = self.distance_m[side]
+        row["upper_body_torque_json"] = _json(self.upper_body_torque.record(now))
         row["ee_distance_total_m"] = sum(self.distance_m.values())
         self.writer.writerow(row)
         self.samples += 1
@@ -362,6 +437,25 @@ class ExperimentRecorder:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--wifi-lcm-url", required=True)
+    parser.add_argument(
+        "--g1-lcm-url",
+        default=os.environ.get("G1_LCM_URL", "udpm://239.255.76.67:7667?ttl=1"),
+        help=(
+            "G1 direct-LCM URL used for G1_ROBOT_STATE tau_est. Defaults to "
+            "$G1_LCM_URL or the standard G1 multicast URL."
+        ),
+    )
+    parser.add_argument(
+        "--robot-state-channel",
+        default="G1_ROBOT_STATE",
+        help="G1 direct-LCM robot-state channel carrying tau_est.",
+    )
+    parser.add_argument(
+        "--robot-state-max-age-ms",
+        type=float,
+        default=100.0,
+        help="Write torque as unavailable when its received age exceeds this value.",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--sample-hz", type=float, default=50.0)
     parser.add_argument(
@@ -395,6 +489,7 @@ def main() -> int:
     if lcm is None:
         raise SystemExit("python-lcm is required; run in the laptop perception environment.")
     try:
+        from path_core.messaging.g1_direct_protocol import unpack_robot_state
         from remote_offload.wrist_d405_protocol_v11 import (
             WRIST_BELIEF_TELEMETRY_CHANNEL,
             WRIST_EXPERIMENT_RECORD_CONTROL_CHANNEL,
@@ -417,15 +512,23 @@ def main() -> int:
             f"refusing to overwrite existing trial CSV: {args.output} (pass --overwrite to replace it)"
         )
 
+    if float(args.robot_state_max_age_ms) <= 0.0:
+        raise SystemExit("--robot-state-max-age-ms must be positive")
+
+    upper_body_torque = UpperBodyTorqueCache(
+        max_age_sec=float(args.robot_state_max_age_ms) / 1000.0,
+    )
     recorder: ExperimentRecorder | None = None
     if not args.x_toggle:
         recorder = ExperimentRecorder(
             args.output,
             sample_hz=float(args.sample_hz),
             flush_every=int(args.flush_every),
+            upper_body_torque=upper_body_torque,
             overwrite=bool(args.overwrite),
         )
     bus = lcm.LCM(args.wifi_lcm_url)
+    g1_bus = bus if args.g1_lcm_url == args.wifi_lcm_url else lcm.LCM(args.g1_lcm_url)
     completed_trials = 0
     last_control_key: tuple[int, int] | None = None
 
@@ -452,6 +555,12 @@ def main() -> int:
         except Exception as error:
             print(f"[experiment-recorder] IPOPT packet rejected: {error}", file=sys.stderr)
 
+    def on_robot_state(_channel: str, data: bytes) -> None:
+        try:
+            upper_body_torque.update(unpack_robot_state(data))
+        except Exception as error:
+            print(f"[experiment-recorder] robot-state packet rejected: {error}", file=sys.stderr)
+
     def on_record_control(_channel: str, data: bytes) -> None:
         nonlocal completed_trials, last_control_key, recorder
         try:
@@ -474,6 +583,7 @@ def main() -> int:
                 output,
                 sample_hz=float(args.sample_hz),
                 flush_every=int(args.flush_every),
+                upper_body_torque=upper_body_torque,
             )
             print(f"[experiment-recorder] X toggle: started {output}", flush=True)
         except Exception as error:
@@ -481,6 +591,7 @@ def main() -> int:
 
     bus.subscribe(WRIST_BELIEF_TELEMETRY_CHANNEL, on_belief)
     bus.subscribe(WRIST_IPOPT_VISUAL_CHANNEL, on_ipopt)
+    g1_bus.subscribe(args.robot_state_channel, on_robot_state)
     if args.x_toggle:
         if args.record_control_channel != WRIST_EXPERIMENT_RECORD_CONTROL_CHANNEL:
             print(
@@ -496,12 +607,24 @@ def main() -> int:
         )
     else:
         print(f"[experiment-recorder] recording to {args.output}", flush=True)
+    print(
+        "[experiment-recorder] upper-body tau_est listening "
+        f"channel={args.robot_state_channel} url={args.g1_lcm_url} "
+        f"max_age={float(args.robot_state_max_age_ms):.1f}ms",
+        flush=True,
+    )
     deadline = (
         None if float(args.duration_sec) <= 0.0 else time.monotonic() + float(args.duration_sec)
     )
     try:
         while deadline is None or time.monotonic() < deadline:
-            bus.handle_timeout(100)
+            # Keep Wi-Fi telemetry responsive while draining a bounded number
+            # of high-rate G1 state packets on the separate multicast group.
+            bus.handle_timeout(20)
+            if g1_bus is not bus:
+                for _ in range(32):
+                    if g1_bus.handle_timeout(0) <= 0:
+                        break
     except KeyboardInterrupt:
         pass
     except OSError as error:

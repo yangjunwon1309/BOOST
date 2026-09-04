@@ -68,6 +68,9 @@ perception/tools/verify_eovsam_environment.py
 # Generated belief logs
 perception/data/belief_logs/*.csv
 
+# All experiment recordings and their derived analysis artifacts are local data.
+/record/
+
 # Bottle-open experiment recordings and generated analysis tables
 record/bottle_open/**/*.csv
 record/bottle_open/**/*.json

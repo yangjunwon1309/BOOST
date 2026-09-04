@@ -104,6 +104,33 @@ class OperatorFrameOffset:
 
 
 @dataclass
+class FirstOrderPositionTargetFilter:
+    """Per-axis EWMA low-pass filter for an already selected Cartesian target.
+
+    ``alpha`` is the new-target weight.  The caller may supply ``seed`` on the
+    first assisted tick so enabling an alpha blend begins from the operator
+    command instead of jumping directly to the blended belief target.
+    """
+
+    alpha: float = 0.30
+    position: np.ndarray | None = None
+
+    def reset(self) -> None:
+        self.position = None
+
+    def step(self, target: np.ndarray, *, seed: np.ndarray | None = None) -> np.ndarray:
+        target = np.asarray(target, dtype=np.float64).reshape(3)
+        if self.position is None:
+            self.position = np.asarray(
+                target if seed is None else seed, dtype=np.float64
+            ).reshape(3).copy()
+            return self.position.copy()
+        alpha = float(np.clip(self.alpha, 0.0, 1.0))
+        self.position = (1.0 - alpha) * self.position + alpha * target
+        return self.position.copy()
+
+
+@dataclass
 class OperatorRotationOffset:
     """Rotation analogue of :class:`OperatorFrameOffset` for grasp handoff."""
 

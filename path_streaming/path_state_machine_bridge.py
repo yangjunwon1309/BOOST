@@ -67,6 +67,7 @@ from path_core.intention.action_blending import (
     rotation_target_from_relation,
 )
 from path_core.intention.reference_dynamics import (
+    FirstOrderPositionTargetFilter,
     GraspTransitionDetector,
     OperatorFrameOffset,
     OperatorRotationOffset,
@@ -444,6 +445,27 @@ def parse_args() -> argparse.Namespace:
             "b(g)*b(c|g) joint posterior through EMA, hysteresis, and rate limiting."
         ),
     )
+    parser.add_argument(
+        "--shared-position-alpha-lpf",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "apply a first-order LPF to the final position target only while "
+            "--shared-position-mode=alpha has nonzero belief authority"
+        ),
+    )
+    parser.add_argument(
+        "--shared-position-alpha-lpf-alpha",
+        "--shared-ref-lpf-alpha",
+        dest="shared_position_alpha_lpf_alpha",
+        type=float,
+        default=0.30,
+        help=(
+            "new-target weight for alpha-blend target LPF, in (0, 1]; "
+            "0.30 is the default (the old --shared-ref-lpf-alpha spelling "
+            "remains an alias)"
+        ),
+    )
     parser.add_argument("--shared-position-posterior-enter-confidence", type=float, default=0.45)
     parser.add_argument("--shared-position-posterior-exit-confidence", type=float, default=0.25)
     parser.add_argument("--shared-position-posterior-ema-alpha", type=float, default=0.15)
@@ -490,7 +512,6 @@ def parse_args() -> argparse.Namespace:
             "matches the calibrated Dex1 attachment profile."
         ),
     )
-    parser.add_argument("--shared-ref-lpf-alpha", type=float, default=0.3)
     parser.add_argument(
         "--shared-reset-alpha-on-target-switch",
         action=argparse.BooleanOptionalAction,
@@ -1632,6 +1653,8 @@ def main() -> int:
     args = parse_args()
     if not 0.0 <= float(args.shared_position_alpha) <= 1.0:
         raise ValueError("--shared-position-alpha must be within [0, 1]")
+    if not 0.0 < float(args.shared_position_alpha_lpf_alpha) <= 1.0:
+        raise ValueError("--shared-position-alpha-lpf-alpha must be within (0, 1]")
     hand_axis_local_override = args.hand_axis_local is not None
     if args.hand_axis_local is None:
         args.hand_axis_local = tuple(HAND_AXIS_LOCAL[args.end_effector_model].tolist())
@@ -2004,6 +2027,12 @@ def main() -> int:
         )
         for side in ("left", "right")
     }
+    position_alpha_lpf = {
+        side: FirstOrderPositionTargetFilter(
+            alpha=float(args.shared_position_alpha_lpf_alpha)
+        )
+        for side in ("left", "right")
+    }
     grasp_detector = {
         side: GraspTransitionDetector(
             jaw_stall_gap_min_m=shared_config.grasp_jaw_stall_gap_min_m,
@@ -2070,6 +2099,7 @@ def main() -> int:
             orientation_gate[side].reset()
             orientation_authority[side].reset()
             position_authority[side].reset()
+            position_alpha_lpf[side].reset()
             grasp_detector[side].reset()
             operator_frame_offset[side].reset()
             operator_rotation_offset[side].reset()
@@ -3279,6 +3309,8 @@ def main() -> int:
                         position_target = position_command
                         position_source = "operator"
                         position_belief_weight = 0.0
+                        position_alpha_lpf_applied = False
+                        position_unfiltered_target = position_command.copy()
                         zeta_pos = shared_config.zeta_released
                         omega_n_pos = shared_config.omega_n_position_released
                         position_assisted = False
@@ -3310,12 +3342,31 @@ def main() -> int:
                                             0.0, gate_ok=False, dt=dt
                                         )
                                         alpha = float(args.shared_position_alpha)
-                                    position_target = (
+                                    position_unfiltered_target = (
                                         (1.0 - alpha) * position_command
                                         + alpha * goal_wrist
                                     )
+                                    if (
+                                        bool(args.shared_position_alpha_lpf)
+                                        and alpha > 0.0
+                                    ):
+                                        # Seed at the raw operator command on
+                                        # the authority rising edge. This LPF
+                                        # smooths target updates without an
+                                        # additional Cartesian jump at B/Y.
+                                        position_target = position_alpha_lpf[side].step(
+                                            position_unfiltered_target,
+                                            seed=position_command,
+                                        )
+                                        position_alpha_lpf_applied = True
+                                    else:
+                                        position_target = position_unfiltered_target
                                     position_source = (
-                                        "belief_contact_alpha"
+                                        (
+                                            "belief_contact_alpha_lpf"
+                                            if position_alpha_lpf_applied
+                                            else "belief_contact_alpha"
+                                        )
                                         if alpha > 0.0
                                         else "operator"
                                     )
@@ -3331,6 +3382,7 @@ def main() -> int:
                                     position_assisted = alpha > 0.0
                                 else:
                                     position_target = goal_wrist
+                                    position_unfiltered_target = goal_wrist.copy()
                                     position_source = "belief_contact"
                                     position_authority[side].update(
                                         0.0, gate_ok=False, dt=dt
@@ -3349,9 +3401,11 @@ def main() -> int:
                         else:
                             position_authority[side].update(0.0, gate_ok=False, dt=dt)
                         if not position_assisted:
+                            position_alpha_lpf[side].reset()
                             position_target = operator_frame_offset[side].apply(
                                 position_command
                             )
+                            position_unfiltered_target = position_target.copy()
                             position_source = (
                                 "operator_holding_rebased"
                                 if holding
@@ -3397,6 +3451,10 @@ def main() -> int:
                             "position_blend_mode": str(args.shared_position_mode),
                             "position_alpha_source": str(args.shared_position_alpha_source),
                             "position_belief_weight": float(position_belief_weight),
+                            "position_alpha_lpf_enabled": bool(args.shared_position_alpha_lpf),
+                            "position_alpha_lpf_applied": bool(position_alpha_lpf_applied),
+                            "position_alpha_lpf_alpha": float(args.shared_position_alpha_lpf_alpha),
+                            "position_unfiltered_target_m": position_unfiltered_target.tolist(),
                             "position_smoothed_confidence": float(position_authority[side].smoothed_confidence),
                             "zeta_position": float(zeta_pos),
                             "zeta_orientation": float(zeta_ori),

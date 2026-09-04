@@ -1,10 +1,22 @@
 import numpy as np
 
 from path_core.intention.reference_dynamics import (
+    FirstOrderPositionTargetFilter,
     GraspTransitionDetector,
     OperatorFrameOffset,
     OperatorRotationOffset,
 )
+
+
+def test_alpha_position_lpf_seeds_at_operator_then_filters_blended_target():
+    lpf = FirstOrderPositionTargetFilter(alpha=0.30)
+    operator = np.array([0.10, 0.0, 0.0])
+    blended = np.array([0.30, 0.0, 0.0])
+
+    # Enabling alpha assistance begins continuously at the operator command.
+    assert np.allclose(lpf.step(blended, seed=operator), operator)
+    # Each later target update applies the ordinary first-order EWMA.
+    assert np.allclose(lpf.step(blended), [0.16, 0.0, 0.0])
 
 
 def test_operator_frame_offset_is_stationary_then_washes_out_by_path_length():

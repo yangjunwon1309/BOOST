@@ -33,6 +33,8 @@ python -u path_streaming/path_state_machine_bridge.py \
   --shared-position-mode "${PATH_SHARED_POSITION_MODE:-replace}" \
   --shared-position-alpha "${PATH_SHARED_POSITION_ALPHA:-0.5}" \
   --shared-position-alpha-source "${PATH_SHARED_POSITION_ALPHA_SOURCE:-fixed}" \
+  $(if [[ "${PATH_SHARED_POSITION_ALPHA_LPF:-0}" != "0" ]]; then printf '%s' "--shared-position-alpha-lpf"; else printf '%s' "--no-shared-position-alpha-lpf"; fi) \
+  --shared-position-alpha-lpf-alpha "${PATH_SHARED_POSITION_ALPHA_LPF_ALPHA:-${PATH_SHARED_REF_LPF_ALPHA:-0.30}}" \
   --shared-position-posterior-enter-confidence "${PATH_SHARED_POSITION_POSTERIOR_ENTER_CONFIDENCE:-0.45}" \
   --shared-position-posterior-exit-confidence "${PATH_SHARED_POSITION_POSTERIOR_EXIT_CONFIDENCE:-0.25}" \
   --shared-position-posterior-ema-alpha "${PATH_SHARED_POSITION_POSTERIOR_EMA_ALPHA:-0.15}" \
@@ -46,7 +48,6 @@ python -u path_streaming/path_state_machine_bridge.py \
   --hand-axis-local ${PATH_HAND_AXIS_LOCAL:-0.0 1.0 0.0} \
   --grasp-center-local ${PATH_GRASP_CENTER_LOCAL:-0.0 0.100 0.0} \
   --grasp-center-wrist-x-offset-m "${PATH_GRASP_CENTER_WRIST_X_OFFSET_M:-0.070}" \
-  --shared-ref-lpf-alpha "${PATH_SHARED_REF_LPF_ALPHA:-0.3}" \
   --shared-hand-h-margin-m "${PATH_SHARED_HAND_H_MARGIN_M:-0.05}" \
   --shared-hand-switch-confirm-n "${PATH_SHARED_HAND_SWITCH_CONFIRM_N:-10}" \
   --shared-orientation-mode "${PATH_SHARED_ORIENTATION_MODE:-gmr_prior}" \

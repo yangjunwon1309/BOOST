@@ -101,6 +101,8 @@ unset D405_VIDEO_DEVICES D405_USB_DEVICES
   --config config/wrist_d405_v11.yaml \
   --belief-config config/pipeline.yaml \
   --max-hz 8 \
+  --camera-recovery-initial-delay-ms 300 \
+  --camera-recovery-max-delay-ms 2000 \
   --belief-inference \
   --belief-input-source operator_command \
   --belief-command-max-delta-ms 25 \
@@ -166,10 +168,10 @@ writes the matching `.summary.json` next to the CSV.
 
 ```bash
 cd ~/PATH-G1
-mkdir -p record/bottle_open/manual
 python3 perception/tools/record_wrist_experiment_v11.py \
   --wifi-lcm-url 'udpm://239.255.77.67:7667?ttl=1' \
-  --output record/bottle_open/manual/trial_001.csv
+  --output record/bottle_open/nonexpert/no_orientation/trial_001.csv  \
+  --x-toggle
 ```
 
 For repeated controller-X start/stop recording, add `--x-toggle`.  Do not
@@ -205,6 +207,23 @@ export PATH_SHARED_POSITION_MODE='alpha'
 export PATH_SHARED_POSITION_ALPHA_SOURCE='fixed'
 export PATH_SHARED_POSITION_ALPHA='0.50'
 ```
+
+```bash
+# Alpha blend + LPF: filter only the final blended position target.
+# 0.30 is a basic first-order EWMA setting (new-target weight).
+export PATH_SHARED_POSITION_MODE='alpha'
+export PATH_SHARED_POSITION_ALPHA_SOURCE='fixed'
+export PATH_SHARED_POSITION_ALPHA='0.50'
+export PATH_SHARED_POSITION_ALPHA_LPF='1'
+export PATH_SHARED_POSITION_ALPHA_LPF_ALPHA='0.30'
+```
+
+`PATH_SHARED_POSITION_ALPHA_LPF` defaults to off, so the existing alpha
+ablation is unchanged. When enabled, the first B/Y-gated alpha tick is seeded
+at the VR position and subsequent blended targets use
+`p_lpf = 0.70 * p_lpf(previous) + 0.30 * p_alpha`. The LPF resets as soon as
+position authority is released; it does not filter normal VR or replace-mode
+targets.
 
 `No jump diffusion` and `No orientation` do not require a different G1 bridge
 command; only their paired Thor belief-config path changes.

@@ -37,7 +37,12 @@ try:
 except ModuleNotFoundError:  # Keep --help usable outside the deployment image.
     lcm = None
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+# The recorder may be invoked by absolute path or from a deployment shell
+# whose current directory is not on sys.path.  It needs both the perception
+# package and repository-local PATH modules (notably path_core).
+_SCRIPT_PATH = Path(__file__).resolve()
+sys.path.insert(0, str(_SCRIPT_PATH.parents[1]))
+sys.path.insert(0, str(_SCRIPT_PATH.parents[2]))
 
 
 SCHEMA_VERSION = 2

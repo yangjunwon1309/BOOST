@@ -24,6 +24,62 @@ struct MotorCommand {
   std::array<float, G1_NUM_MOTOR> tau_ff = {};
 };
 
+// Ported from g1_ws/include/policy_parameters.hpp. The bridge uses these
+// per-joint gains when it builds rt/arm_sdk commands.
+constexpr double ARMATURE_5020 = 0.003609725;
+constexpr double ARMATURE_7520_14 = 0.010177520;
+constexpr double ARMATURE_7520_22 = 0.025101925;
+constexpr double ARMATURE_4010 = 0.00425;
+constexpr double NATURAL_FREQ = 10.0 * 2.0 * 3.1415926535;
+constexpr double DAMPING_RATIO = 2.0;
+
+constexpr double STIFFNESS_5020 = ARMATURE_5020 * NATURAL_FREQ * NATURAL_FREQ;
+constexpr double STIFFNESS_7520_14 = ARMATURE_7520_14 * NATURAL_FREQ * NATURAL_FREQ;
+constexpr double STIFFNESS_7520_22 = ARMATURE_7520_22 * NATURAL_FREQ * NATURAL_FREQ;
+constexpr double STIFFNESS_4010 = ARMATURE_4010 * NATURAL_FREQ * NATURAL_FREQ;
+constexpr double DAMPING_5020 = 2.0 * DAMPING_RATIO * ARMATURE_5020 * NATURAL_FREQ;
+constexpr double DAMPING_7520_14 = 2.0 * DAMPING_RATIO * ARMATURE_7520_14 * NATURAL_FREQ;
+constexpr double DAMPING_7520_22 = 2.0 * DAMPING_RATIO * ARMATURE_7520_22 * NATURAL_FREQ;
+constexpr double DAMPING_4010 = 2.0 * DAMPING_RATIO * ARMATURE_4010 * NATURAL_FREQ;
+
+constexpr float ToMotorGain(double gain) { return static_cast<float>(gain); }
+
+constexpr std::array<float, G1_NUM_MOTOR> kps = {
+    ToMotorGain(STIFFNESS_7520_22), ToMotorGain(STIFFNESS_7520_22),
+    ToMotorGain(STIFFNESS_7520_14), ToMotorGain(STIFFNESS_7520_22),
+    ToMotorGain(2.0 * STIFFNESS_5020), ToMotorGain(2.0 * STIFFNESS_5020),
+    ToMotorGain(STIFFNESS_7520_22), ToMotorGain(STIFFNESS_7520_22),
+    ToMotorGain(STIFFNESS_7520_14), ToMotorGain(STIFFNESS_7520_22),
+    ToMotorGain(2.0 * STIFFNESS_5020), ToMotorGain(2.0 * STIFFNESS_5020),
+    ToMotorGain(STIFFNESS_7520_14), ToMotorGain(2.0 * STIFFNESS_5020),
+    ToMotorGain(2.0 * STIFFNESS_5020), ToMotorGain(STIFFNESS_5020),
+    ToMotorGain(STIFFNESS_5020), ToMotorGain(STIFFNESS_5020),
+    ToMotorGain(STIFFNESS_5020), ToMotorGain(STIFFNESS_5020),
+    ToMotorGain(STIFFNESS_4010), ToMotorGain(STIFFNESS_4010),
+    ToMotorGain(STIFFNESS_5020), ToMotorGain(STIFFNESS_5020),
+    ToMotorGain(STIFFNESS_5020), ToMotorGain(STIFFNESS_5020),
+    ToMotorGain(STIFFNESS_5020), ToMotorGain(STIFFNESS_4010),
+    ToMotorGain(STIFFNESS_4010),
+};
+
+constexpr std::array<float, G1_NUM_MOTOR> kds = {
+    ToMotorGain(DAMPING_7520_22), ToMotorGain(DAMPING_7520_22),
+    ToMotorGain(DAMPING_7520_14), ToMotorGain(DAMPING_7520_22),
+    ToMotorGain(2.0 * DAMPING_5020), ToMotorGain(2.0 * DAMPING_5020),
+    ToMotorGain(DAMPING_7520_22), ToMotorGain(DAMPING_7520_22),
+    ToMotorGain(DAMPING_7520_14), ToMotorGain(DAMPING_7520_22),
+    ToMotorGain(2.0 * DAMPING_5020), ToMotorGain(2.0 * DAMPING_5020),
+    ToMotorGain(DAMPING_7520_14), ToMotorGain(2.0 * DAMPING_5020),
+    ToMotorGain(2.0 * DAMPING_5020), ToMotorGain(DAMPING_5020),
+    ToMotorGain(DAMPING_5020), ToMotorGain(DAMPING_5020),
+    ToMotorGain(DAMPING_5020), ToMotorGain(DAMPING_5020),
+    ToMotorGain(DAMPING_4010), ToMotorGain(DAMPING_4010),
+    ToMotorGain(DAMPING_5020), ToMotorGain(DAMPING_5020),
+    ToMotorGain(DAMPING_5020), ToMotorGain(DAMPING_5020),
+    ToMotorGain(DAMPING_5020), ToMotorGain(DAMPING_4010),
+    ToMotorGain(DAMPING_4010),
+};
+
 enum class Mode : uint8_t {
   PR = 0,
   AB = 1,

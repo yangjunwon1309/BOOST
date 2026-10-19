@@ -5,6 +5,34 @@ on a separate x86/GPU host. Thor owns camera capture, timestamp-pairs results
 with `G1_ROBOT_STATE`, runs surface/belief processing, and publishes selected
 `path_static_ee_target` messages to PATH's nonlinear arm IK.
 
+## G1 teleimager UVC RGB path (image-only)
+
+The G1 teleimager setup in `dex1_cam_nature.yaml` publishes raw JPEG wrist
+frames on TCP ports 55556 (left) and 55557 (right). Thor can relay those
+frames to the SAM3 worker over LCM:
+
+```bash
+cd PATH-G1/perception
+G1_TELEIMAGER_HOST=192.168.123.164 ./tools/run_thor_g1_teleimager_wrist_relay_v11.sh
+```
+
+Start the existing TensorRT container in RGB-only mode:
+
+```bash
+SAM3_INPUT_MODE=teleimager_rgb \
+SAM3_DOCKER_IMAGE=g1-perception-sam3:thor-jp71 \
+SAM3_TRT_ENGINE_HOST=/home/url/PATH-G1/perception/models/sam3_trt/sam3_fp16_4out.engine \
+WIFI_LCM_URL='udpm://239.255.77.67:7667?ttl=1' \
+./tools/run_remote_sam3_wrist_d405_v11.sh
+```
+
+This UVC path logs SAM3 detection counts and labels. It does not publish masks
+to the viewer or create targets. The teleimager JPEG stream has no depth
+channel or camera exposure timestamp, so it cannot produce calibrated 3-D
+targets or arm IK commands. Keep it as a perception check until depth and
+capture-time/state synchronization are available. The D405 RGB-D mode remains
+the default for the production geometry path.
+
 ## Thor camera preflight
 
 Thor needs a PATH-G1 checkout and the D405 capture image

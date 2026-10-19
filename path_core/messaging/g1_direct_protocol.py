@@ -1,9 +1,7 @@
-"""Binary LCM packets for PATH's SONIC-free direct motor path.
+"""Binary LCM protocol between PATH on Thor and the G1 arm SDK bridge.
 
-The upper-command packet is intentionally smaller than the final 29-DoF
-LowCmd packet.  Thor owns only the two IPOPT arm solutions; the process on the
-G1 owns lower-body/waist damping today and will later mux a local lower-body
-controller before publishing the existing direct-motor V2 packet.
+PATH sends only the 14 arm joints. The G1 bridge owns SDK publication and
+robot-state telemetry; HOMIE/WBC remains an independent owner of legs/waist.
 """
 
 from __future__ import annotations
@@ -20,21 +18,16 @@ ARM_START = 15
 ARM_COUNT = 14
 
 UPPER_COMMAND_CHANNEL = "G1_PATH_UPPER_COMMAND"
-MOTOR_COMMAND_CHANNEL = "G1_PATH_MOTOR_COMMAND"
 ROBOT_STATE_CHANNEL = "G1_ROBOT_STATE"
 
-# ASCII "PDU1" in a little-endian uint32.  This is distinct from the legacy
-# GCA1 SONIC action packet and cannot be consumed by it accidentally.
+# ASCII "PDU1" in a little-endian uint32.
 PATH_UPPER_COMMAND_MAGIC = 0x31554450
 PATH_UPPER_COMMAND_VERSION = 1
-DIRECT_COMMAND_MAGIC = 0x31414347  # GCA1, shared with g1_lowlevel_bridge V2.
-DIRECT_COMMAND_VERSION = 2
 
 FLAG_LEFT_GRIP = 1 << 1
 FLAG_RIGHT_GRIP = 1 << 2
 
 _UPPER_PACKET = struct.Struct("<IHHQq42f")
-_DIRECT_PACKET = struct.Struct("<IHHQq87f")
 _STATE_PACKET = struct.Struct("<IHHQQqB107f")
 
 
@@ -72,33 +65,12 @@ def pack_upper_command(
     )
 
 
-def pack_direct_motor_command_v2(
-    *,
-    sequence: int,
-    timestamp_us: int,
-    q_target: Sequence[float] | np.ndarray,
-    dq_target: Sequence[float] | np.ndarray,
-    tau_ff: Sequence[float] | np.ndarray,
-    left_grip: bool = False,
-    right_grip: bool = False,
-) -> bytes:
-    q = _float_vector(q_target, NUM_MOTORS, "q_target")
-    dq = _float_vector(dq_target, NUM_MOTORS, "dq_target")
-    tau = _float_vector(tau_ff, NUM_MOTORS, "tau_ff")
-    return _DIRECT_PACKET.pack(
-        DIRECT_COMMAND_MAGIC,
-        DIRECT_COMMAND_VERSION,
-        grip_flags(left_grip=left_grip, right_grip=right_grip),
-        int(sequence),
-        int(timestamp_us),
-        *(q.tolist() + dq.tolist() + tau.tolist()),
-    )
-
-
 @dataclass(frozen=True)
 class RobotState:
     sequence: int
     timestamp_us: int
+    base_gyro: np.ndarray
+    base_accel: np.ndarray
     q: np.ndarray
     dq: np.ndarray
     tau_est: np.ndarray
@@ -119,6 +91,8 @@ def unpack_robot_state(packet: bytes) -> RobotState:
         sequence=sequence,
         timestamp_us=timestamp_us,
         base_quat_wxyz=floats[0:4].copy(),
+        base_gyro=floats[4:7].copy(),
+        base_accel=floats[7:10].copy(),
         q=floats[20:49].copy(),
         dq=floats[49:78].copy(),
         tau_est=floats[78:107].copy(),

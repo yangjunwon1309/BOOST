@@ -36,34 +36,9 @@ external/*
 !external/README.md
 
 
-# SONIC runtime generated/heavy artifacts
-sonic_runtime/**/.git/
-sonic_runtime/**/build/
-sonic_runtime/**/build.stale.*/
-sonic_runtime/**/target/
-sonic_runtime/**/.venv/
-sonic_runtime/**/__pycache__/
-sonic_runtime/**/*.onnx
-sonic_runtime/**/*.engine
-sonic_runtime/**/*.plan
-sonic_runtime/**/*.usd
-sonic_runtime/**/*.usda
-sonic_runtime/**/logs/
-sonic_runtime/**/exp_*/
-sonic_runtime/**/session_*/
-
-
 # TensorRT generated engines
 *.trt
 *.trt.*
-sonic_runtime/**/*.trt
-
-# Local EOVSAM evaluation environment (not part of PATH-G1 source)
-perception/third_party/EOVSAM/
-perception/weights/eovsam.pth
-perception/docker/Dockerfile.eovsam-thor
-perception/tools/benchmark_eovsam_mock.py
-perception/tools/verify_eovsam_environment.py
 
 # Generated belief logs
 perception/data/belief_logs/*.csv
@@ -75,6 +50,3 @@ perception/data/belief_logs/*.csv
 record/bottle_open/**/*.csv
 record/bottle_open/**/*.json
 
-# Local ablation launch notes and bottle-open analysis artifacts.
-perception/ABLATION_RUN_COMMANDS_V11.txt
-record/bottle_open/analysis/

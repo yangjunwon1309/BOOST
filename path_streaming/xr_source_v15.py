@@ -1,6 +1,6 @@
 """Source-neutral controller XR input for PATH v15.1.
 
-This module intentionally has no dependency on the legacy Pico manager.  Both
+This module is independent of the PICO manager implementation. Both
 the XRT comparison adapter and the Galaxy/WebXR server hand the same raw
 OpenXR-basis SE(3) sample to the one waist-target geometry path below.
 """

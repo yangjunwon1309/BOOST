@@ -45,8 +45,6 @@ class SharedControlConfig:
     operator_frame_washout_per_m: float = 4.6
     operator_frame_max_offset_m: float = 0.30
     operator_rotation_washout_per_rad: float = 2.0
-    waist_mode: str = "sonic_passthrough"
-
     @classmethod
     def from_dict(cls, payload: dict | None) -> "SharedControlConfig":
         data = dict(payload or {})

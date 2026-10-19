@@ -1,5 +1,0 @@
-1. 지금 FK 가 arm only로 되어 있는데, waist pose를 시작점으로 해서 반영할 수 있나? 이에 따라 delta theta 보정하는 것을 waist 까지 포함하는 거야. 그리고 EE position 자체도 initial을 waist 의 pose (SE(3))에서 시작해서 계산하는 거지. GMR 의 theta에 대한 목적 함수도 waist까지 포함. 
-
-2. 지금 predicted q target은 사용 안하는 것 같은데, jacobian의 원점을 predicted q target으로 옮기면 성능이 더 개선될까? 근데 지금은 noise가 하나도 없지만, 실제는 dot q 에서 노이즈가 굉장히 많고, joint state 자체의 노이즈까지 하면 q pred의 noise가 상당하긴 할거야. 
-
-3. 지금은 isaac lab에서 RL을 통해 proprioceptive를 input으로 해서 bound limit과 목적함수 가중치를 Network로 두어서 학습하기 전에, 안정적인 QP layer를 먼저 만드는 단계야. 일단 1cm 정도 오차를 줄이는 것은 확인했으니, 여기서 더 안정적으로 구조를 만들 수 있는 부분을 분석해봐야 해. 

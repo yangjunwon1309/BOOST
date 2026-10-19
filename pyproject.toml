@@ -1,7 +1,7 @@
 [project]
 name = "path-g1"
 version = "0.1.0"
-description = "PATH state-machine, cuRobo planning, and EE-QP integration for Unitree G1"
+description = "Perception-assisted arm control and Unitree G1 SDK bridge"
 requires-python = ">=3.10"
 dependencies = [
   "msgpack",

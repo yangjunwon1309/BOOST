@@ -18,7 +18,7 @@ class LastValidGeometryFallback:
         ttl_frames: int,
         score_decay: float,
         *,
-        fallback_reason: str = "yolo_detection_missing",
+        fallback_reason: str = "sam3_detection_missing",
     ) -> None:
         self.ttl_frames = max(0, int(ttl_frames))
         self.score_decay = float(np.clip(score_decay, 0.0, 1.0))

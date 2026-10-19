@@ -32,7 +32,7 @@ segmentation:
     track:
       geometry_fallback_ttl_frames: 6
       geometry_fallback_score_decay: 0.97
-  # Shared RGB-D self-filter for every vision backend. The server/remote worker
+  # Shared RGB-D self-filter for SAM3. The server/remote worker
   # reads synchronized LCM depth, color intrinsics, camera extrinsics and
   # G1_ROBOT_STATE, renders padded FK collision primitives to a robot depth
   # buffer, then vetoes mask pixels at or behind that depth.
@@ -50,67 +50,6 @@ segmentation:
     wrist_radius_m: 0.075
     torso_radius_m: 0.090
     sample_step_m: 0.020
-  # Official SAM2.1 Tiny generic-mask replacement.  Select explicitly with
-  # --backend sam2-tiny after building the updated perception image.
-  sam2:
-    checkpoint: /models/sam2/sam2.1_hiera_tiny.pt
-    reinitialization: central
-    reinitialize_interval_frames: 15
-    automatic_points_per_side: 8
-    max_masks: 12
-    central:
-      reference_width_px: 640
-      reference_height_px: 360
-      roi_center_px: [320, 200]
-      roi_radius_px: [220, 125]
-      prompt_spacing_px: 50
-      # Keep the last valid mask through short predictor/discovery dropouts.
-      track_missing_ttl_frames: 24
-      track_fallback_score_decay: 0.985
-      reinitialize_match_iou: 0.15
-  # EfficientTAM Tiny-512 uses SAM2-style prompted masks/video architecture
-  # with a 512px encoder. Select explicitly with --backend efficienttam-ti-512.
-  efficienttam:
-    checkpoint: /models/efficienttam/efficienttam_ti_512x512.pt
-    reinitialization: central
-    reinitialize_interval_frames: 15
-    automatic_points_per_side: 8
-    max_masks: 12
-    central:
-      reference_width_px: 640
-      reference_height_px: 360
-      roi_center_px: [320, 200]
-      roi_radius_px: [220, 125]
-      prompt_spacing_px: 50
-      # Preserve an object for ~7 s at the default 3.5 Hz if an automatic
-      # reinitialization or one box-prompt frame temporarily misses it.
-      track_missing_ttl_frames: 24
-      track_fallback_score_decay: 0.985
-      reinitialize_match_iou: 0.15
-  # COCO-80 semantic instance segmentation.  It is intentionally opt-in:
-  # --backend yolo11-seg.
-  yolo11:
-    checkpoint: /models/yolo11/yolo11n-seg.pt
-    imgsz: 640
-    # Only COCO instances with score >= 0.80 may become masks/tracks/belief
-    # candidates. Lower-score detections never enter persistence fallback.
-    confidence: 0.80
-    iou_threshold: 0.50
-    max_masks: 20
-    quantize: 16
-    # Empty means all COCO classes except excluded_classes.  Restrict this
-    # list later if the real workcell needs only a smaller class set.
-    allowed_classes: []
-    excluded_classes: [person]
-    track:
-      # Retained internally only for a later IoU re-association. Missing
-      # detector frames republish the last verified 3-D cylinder/contact for a
-      # short bounded interval; no new geometry is inferred during the hold.
-      missing_ttl_frames: 6
-      fallback_score_decay: 0.985
-      match_iou: 0.15
-      geometry_fallback_ttl_frames: 6
-      geometry_fallback_score_decay: 0.97
 cloud:
   workspace_lims: [-1.0, 1.0, -1.0, 1.0, 0.1, 1.5]
   voxel_size_m: 0.005
@@ -134,16 +73,6 @@ grip:
   gripper_axis_convention: "x_closing_z_approach"
   top_k: 4
   side_approach_angles_deg: [0, 30, -30]
-reid:
-  model: "dinov2_vits14"
-  local_repo: null
-  checkpoint: null
-  match_th: 0.72
-  hysteresis: 0.08
-  confirm_n: 3
-  gallery_k: 16
-  diversity_th: 0.90
-  use_size_gate: true
 publish:
   keepalive_hz: 1.0
   stale_after_s: 1.5
@@ -151,17 +80,16 @@ ee_target:
   # With --enable-ee-publishing, the server continuously emits both hand
   # belief targets. A/B selection is performed only by the PATH bridge.
   belief_publishing_enabled: true
-  # Test mode: accept any finite segmented center without range or timing gates.
-  bypass_checks: true
+  # Production default: require fresh robot/frame state and clamp targets to the
+  # configured workspace before publishing them to PATH.
+  bypass_checks: false
   camera_info: config/camera_info.yaml
   extrinsics: config/extrinsics.yaml
   # identity uses a fixed camera->goal transform and ignores pelvis->torso IMU/FK
   # rotation. This is the most stable mode while the RGB-D extrinsics are still
   # only approximate. Alternatives: joint_fk, dual_imu.
   torso_estimator: identity
-  # Wi-Fi RGB frames can arrive 70–100 ms after the latest Thor state packet.
-  # Keep geometry enabled for a state sample up to 200 ms old; the worker still
-  # requires finite state, calibration, depth, and a configured camera transform.
+  # Maximum robot-state age when pairing remote camera frames.
   robot_state_max_delta_ms: 200.0
   max_imu_fk_disagreement_deg: 12.0
   max_waist_speed_rad_s: 0.15
@@ -179,11 +107,6 @@ ee_target:
   min_depth_points: 80
   goal_endpoint: tcp://127.0.0.1:5564
   goal_topic: path_static_ee_target
-  # Direct PATH control consumes only path_static_ee_target.  Do not also
-  # publish legacy cuRobo path_goal commands on port 5561.
-  send_planner_goal: false
-  planner_endpoint: tcp://127.0.0.1:5561
-  planner_topic: path_goal
   workspace:
     x: [-0.15, 0.45]
     left_y: [0.03, 0.50]
@@ -192,9 +115,7 @@ ee_target:
     radius_m: 0.62
 tasc_belief:
   enabled: true
-  # Replace the old SAM3 mask center target with the selected depth contact
-  # point from the hierarchical grip belief. The existing QP-IK publisher and
-  # coordinate frame stay unchanged.
+  # Use the selected depth contact point from the hierarchical grip belief.
   use_contact_target: true
   object_max_points: 8000
   object_track_max_distance_m: 0.25

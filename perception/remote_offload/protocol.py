@@ -29,7 +29,7 @@ REMOTE_BELIEF_TELEMETRY_CHANNEL = "PATH_REMOTE_BELIEF_TELEMETRY"
 REMOTE_CONCEPT_CONTROL_CHANNEL = "PATH_REMOTE_CONCEPT_CONTROL"
 
 MASK_ENCODING = "bitpack-zlib-row-major"
-BACKENDS = {"sam3_pytorch", "sam3_tensorrt", "yolo11_pytorch", "mock"}
+BACKENDS = {"sam3_pytorch", "sam3_tensorrt", "mock"}
 WORKER_STAGE_KEYS = (
     "source_rgb",
     "worker_dequeue",

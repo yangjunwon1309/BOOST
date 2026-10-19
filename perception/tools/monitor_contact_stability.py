@@ -240,7 +240,7 @@ def main() -> int:
                 warned_old_worker = True
                 print(
                     "[contact-stability] WARNING: point_filter telemetry is missing; "
-                    "restart the updated remote YOLO11 worker.",
+                    "restart the current remote SAM3 worker.",
                     flush=True,
                 )
         if center is None or contact is None:

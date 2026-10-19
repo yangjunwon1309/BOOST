@@ -23,7 +23,6 @@ from seg_web_node.lcm_protocol import (
     decode_camera,
     decode_depth,
     decode_robot_state,
-    encode_robot_state,
 )
 from seg_web_node.robot_geometry import (
     angular_velocity_from_rotations,
@@ -98,55 +97,6 @@ def _topic_msgpack_unpack(raw: bytes, topic: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("topic payload is not a map")
     return payload
-
-
-def _vector_from_payload(
-    payload: dict[str, Any],
-    keys: tuple[str, ...],
-    length: int,
-    default: tuple[float, ...] | None = None,
-) -> np.ndarray | None:
-    for key in keys:
-        value = payload.get(key)
-        if value is None:
-            continue
-        try:
-            array = np.asarray(value, dtype=np.float64).reshape(-1)
-        except (TypeError, ValueError):
-            continue
-        if array.shape[0] >= length and np.isfinite(array[:length]).all():
-            return array[:length].copy()
-    if default is None:
-        return None
-    return np.asarray(default, dtype=np.float64).reshape(length)
-
-
-def _int_from_payload(payload: dict[str, Any], keys: tuple[str, ...], default: int) -> int:
-    for key in keys:
-        value = payload.get(key)
-        if value is None:
-            continue
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            continue
-    return int(default)
-
-
-def _retimestamp_robot_state_packet(data: bytes, timestamp_us: int) -> bytes:
-    state = decode_robot_state(data)
-    return encode_robot_state(
-        sequence=state.sequence,
-        lowstate_sequence=state.lowstate_sequence,
-        timestamp_us=int(timestamp_us),
-        mode_machine=state.mode_machine,
-        base_quat_wxyz=state.base_quat_wxyz,
-        torso_quat_wxyz=state.torso_quat_wxyz,
-        q=state.q,
-        dq=state.dq,
-        tau=None,
-        has_torso_imu=state.has_torso_imu,
-    )
 
 
 def _load_config(path: str) -> dict[str, Any]:
@@ -450,8 +400,6 @@ class ThorRemoteGateway:
         ee_target_duration_sec: float,
         ee_target_final_hold_sec: float,
         ee_target_quaternion_wxyz: tuple[float, float, float, float],
-        sim_state_zmq_endpoint: str,
-        sim_state_zmq_topic: str,
         belief_enabled: bool,
         belief_config: dict[str, Any],
         belief_ee_offset_m: float,
@@ -563,14 +511,6 @@ class ThorRemoteGateway:
             if self.ee_target_enabled
             else None
         )
-        self.sim_state_zmq_endpoint = str(sim_state_zmq_endpoint)
-        self.sim_state_zmq_topic = str(sim_state_zmq_topic)
-        self.sim_state_socket = None
-        if self.sim_state_zmq_endpoint:
-            self.sim_state_socket = zmq.Context.instance().socket(zmq.SUB)
-            self.sim_state_socket.setsockopt(zmq.LINGER, 0)
-            self.sim_state_socket.setsockopt_string(zmq.SUBSCRIBE, self.sim_state_zmq_topic)
-            self.sim_state_socket.connect(self.sim_state_zmq_endpoint)
         self.sync = RawRgbdSynchronizer(sync_tolerance_ms)
         self.lock = threading.Lock()
         self.pair_ready = threading.Condition(self.lock)
@@ -641,9 +581,6 @@ class ThorRemoteGateway:
             "belief_command_divergence_m": {},
             "command_lookup_age_ms": {},
             "command_lookup_failures": 0,
-            "sim_robot_state": 0,
-            "sim_robot_state_errors": 0,
-            "last_sim_robot_state": None,
             "last_stage_latency_ms": None,
         }
         self.threads: list[threading.Thread] = []
@@ -663,14 +600,6 @@ class ThorRemoteGateway:
             threading.Thread(target=self._forward_loop, name="wifi-forward", daemon=True),
             threading.Thread(target=self._log_loop, name="gateway-log", daemon=True),
         ]
-        if self.sim_state_socket is not None:
-            self.threads.append(
-                threading.Thread(
-                    target=self._sim_state_loop,
-                    name="sim-state-zmq",
-                    daemon=True,
-                )
-            )
         if self.belief_enabled and self.parallel_tasc_belief.config.enabled:
             self.threads.append(
                 threading.Thread(
@@ -690,8 +619,6 @@ class ThorRemoteGateway:
             thread.join(timeout=2.0)
         if self.ee_target_pub is not None:
             self.ee_target_pub.close()
-        if self.sim_state_socket is not None:
-            self.sim_state_socket.close(0)
         self.shared_hand_selection_socket.close(0)
         if self.belief_csv is not None:
             self.belief_csv.close()
@@ -750,108 +677,6 @@ class ThorRemoteGateway:
                 self.stats["local_robot_state"] += 1
         except Exception as error:
             self._record_error(error)
-
-    def _on_sim_state_payload(self, payload: dict[str, Any]) -> None:
-        q = _vector_from_payload(
-            payload,
-            ("body_q_measured", "body_q", "q_measured", "state_body_q_measured", "state_body_q"),
-            29,
-        )
-        if q is None:
-            raise ValueError("sim state payload has no 29-DoF measured q")
-        dq = _vector_from_payload(
-            payload,
-            ("body_dq_measured", "body_dq", "dq_measured", "state_body_dq_measured"),
-            29,
-            default=tuple([0.0] * 29),
-        )
-        tau = _vector_from_payload(
-            payload,
-            ("tau_est", "body_tau", "tau", "state_tau_est"),
-            29,
-            default=tuple([0.0] * 29),
-        )
-        base_quat = _vector_from_payload(
-            payload,
-            ("base_quat_measured", "base_quat", "state_base_quat_measured", "state_base_quat"),
-            4,
-            default=(1.0, 0.0, 0.0, 0.0),
-        )
-        torso_quat = _vector_from_payload(
-            payload,
-            (
-                "torso_quat_measured",
-                "torso_quat",
-                "state_torso_quat_measured",
-                "state_torso_quat",
-            ),
-            4,
-            default=(1.0, 0.0, 0.0, 0.0),
-        )
-        base_gyro = _vector_from_payload(
-            payload,
-            ("base_gyro_measured", "base_gyro", "state_base_gyro_measured"),
-            3,
-            default=(0.0, 0.0, 0.0),
-        )
-        base_accel = _vector_from_payload(
-            payload,
-            ("base_accel_measured", "base_accel", "state_base_accel_measured"),
-            3,
-            default=(0.0, 0.0, 0.0),
-        )
-        torso_gyro = _vector_from_payload(
-            payload,
-            ("torso_gyro_measured", "torso_gyro", "state_torso_gyro_measured"),
-            3,
-            default=(0.0, 0.0, 0.0),
-        )
-        torso_accel = _vector_from_payload(
-            payload,
-            ("torso_accel_measured", "torso_accel", "state_torso_accel_measured"),
-            3,
-            default=(0.0, 0.0, 0.0),
-        )
-        timestamp_us = _int_from_payload(
-            payload,
-            ("timestamp_us", "state_timestamp_us", "send_time_us", "time_us"),
-            int(time.time_ns() // 1000),
-        )
-        sequence = _int_from_payload(
-            payload,
-            ("sequence", "state_sequence", "frame_index", "source_frame_index"),
-            self.stats.get("sim_robot_state", 0),
-        )
-        lowstate_sequence = _int_from_payload(
-            payload,
-            ("lowstate_sequence", "lowstate_seq", "state_lowstate_sequence"),
-            sequence,
-        )
-        mode_machine = _int_from_payload(payload, ("mode_machine", "mode"), 0)
-        packet = encode_robot_state(
-            sequence=sequence,
-            lowstate_sequence=lowstate_sequence,
-            timestamp_us=timestamp_us,
-            mode_machine=mode_machine,
-            base_quat_wxyz=base_quat,
-            base_gyro=base_gyro,
-            base_accel=base_accel,
-            torso_quat_wxyz=torso_quat,
-            torso_gyro=torso_gyro,
-            torso_accel=torso_accel,
-            q=q,
-            dq=dq,
-            tau=tau,
-            has_torso_imu=True,
-        )
-        with self.lock:
-            self.latest_robot_state = (timestamp_us, packet)
-            self.stats["sim_robot_state"] += 1
-            self.stats["last_sim_robot_state"] = {
-                "timestamp_us": timestamp_us,
-                "sequence": sequence,
-                "q0": float(q[0]),
-            }
 
     def _on_remote_result(self, _channel: str, data: bytes) -> None:
         gateway_receive_us = time.time_ns() // 1000
@@ -2095,9 +1920,9 @@ class ThorRemoteGateway:
                 "force_replan": False,
                 "streaming_goal": True,
                 "source": (
-                    "remote_yolo11_contact"
+                    "remote_sam3_contact"
                     if selection.position_field == "target_contact_goal_m"
-                    else "remote_yolo11_center"
+                    else "remote_sam3_center"
                 ),
                 "confidence": score,
                 "object_confidence": score,
@@ -2150,24 +1975,6 @@ class ThorRemoteGateway:
                 self._record_error(error)
                 time.sleep(0.1)
 
-    def _sim_state_loop(self) -> None:
-        assert self.sim_state_socket is not None
-        poller = zmq.Poller()
-        poller.register(self.sim_state_socket, zmq.POLLIN)
-        while self.running:
-            try:
-                events = dict(poller.poll(100))
-                if self.sim_state_socket not in events:
-                    continue
-                raw = self.sim_state_socket.recv()
-                payload = _topic_msgpack_unpack(raw, self.sim_state_zmq_topic)
-                self._on_sim_state_payload(payload)
-            except Exception as error:
-                with self.lock:
-                    self.stats["sim_robot_state_errors"] += 1
-                    self.stats["last_sim_robot_state_error"] = str(error)
-                time.sleep(0.02)
-
     def _forward_loop(self) -> None:
         last_calibration = 0.0
         last_robot_state = 0.0
@@ -2194,31 +2001,7 @@ class ThorRemoteGateway:
                 ):
                     calibration = self.latest_calibration[1]
                     last_calibration = now
-                if (
-                    self.latest_robot_state is not None
-                    and self.sim_state_socket is None
-                    and now - last_robot_state >= self.robot_state_period
-                ):
-                    robot_state = self.latest_robot_state[1]
-                    last_robot_state = now
-                if (
-                    pair is not None
-                    and self.sim_state_socket is not None
-                    and self.latest_robot_state is not None
-                ):
-                    robot_state = _retimestamp_robot_state_packet(
-                        self.latest_robot_state[1],
-                        pair.rgb.timestamp_us,
-                    )
-                    last_robot_state = now
-                    self.stats["sim_robot_state_timestamp_aligned"] = (
-                        int(self.stats.get("sim_robot_state_timestamp_aligned", 0)) + 1
-                    )
-                    self.stats["last_sim_robot_state_aligned"] = {
-                        "state_timestamp_us": pair.rgb.timestamp_us,
-                        "rgb_timestamp_us": pair.rgb.timestamp_us,
-                    }
-            # This period is a Wi-Fi bandwidth cap.  It throttles bursts but
+                if (\r\n                    self.latest_robot_state is not None\r\n                    and now - last_robot_state >= self.robot_state_period\r\n                ):\r\n                    robot_state = self.latest_robot_state[1]\r\n                    last_robot_state = now\r\n            # This period is a Wi-Fi bandwidth cap.  It throttles bursts but
             # no longer makes each frame wait for an unrelated polling tick.
             if pair is not None:
                 elapsed = time.monotonic() - self.last_forward_monotonic
@@ -2366,18 +2149,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--sim-state-zmq-endpoint",
-        default=os.environ.get("PATH_SIM_STATE_ZMQ_ENDPOINT", ""),
-        help=(
-            "Optional MuJoCo/SONIC g1_debug ZMQ endpoint to repack as "
-            "REMOTE_ROBOT_STATE for remote perception sim tests."
-        ),
-    )
-    parser.add_argument(
-        "--sim-state-zmq-topic",
-        default=os.environ.get("PATH_SIM_STATE_ZMQ_TOPIC", "g1_debug"),
-    )
-    parser.add_argument(
         "--belief-inference",
         action=argparse.BooleanOptionalAction,
         default=os.environ.get("PATH_REMOTE_BELIEF_ENABLED", "1").lower()
@@ -2476,8 +2247,6 @@ def main(argv: list[str] | None = None) -> int:
         ee_target_duration_sec=args.ee_target_duration_sec,
         ee_target_final_hold_sec=args.ee_target_final_hold_sec,
         ee_target_quaternion_wxyz=tuple(args.ee_target_quaternion_wxyz),
-        sim_state_zmq_endpoint=args.sim_state_zmq_endpoint,
-        sim_state_zmq_topic=args.sim_state_zmq_topic,
         belief_enabled=args.belief_inference,
         belief_config=belief_config,
         belief_ee_offset_m=float(belief_config.get("ee_offset_m", target_config.get("ee_offset_m", 0.05))),
@@ -2514,13 +2283,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     if args.belief_csv:
         LOG.info("Thor belief CSV logging enabled: %s at %.1f Hz", args.belief_csv, args.belief_log_hz)
-    if args.sim_state_zmq_endpoint:
-        LOG.info(
-            "MuJoCo sim robot-state forwarding enabled from %s/%s to %s",
-            args.sim_state_zmq_endpoint,
-            args.sim_state_zmq_topic,
-            REMOTE_ROBOT_STATE_CHANNEL,
-        )
     try:
         while True:
             time.sleep(1.0)

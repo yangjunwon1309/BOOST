@@ -7,7 +7,7 @@ This module mirrors the G1_29 IK objective used in Unitree's xr_teleop:
   + 0.02 * q_regularization^2 + 0.1 * q_smooth^2
 
 The reduced model locks legs, waist, and hands.  The decision variable is the
-14 arm joints themselves, not a delta around SONIC's PD target.  For single-arm
+14 arm joints themselves, not a delta around another controller's target. For single-arm
 static targets, the opposite arm is hard-locked by setting its dynamic joint
 bounds to the latched hold q.
 """
@@ -497,22 +497,6 @@ class UnitreeG1ArmNonlinearIK:
         right[:3, 3] = self.data.oMf[self.right_frame_id].translation
         return left, right
 
-    def gmr_wrist_transforms_from_q29(
-        self, q29: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Pelvis-identity FK of the complete GMR waist+arm configuration."""
-
-        q_full = np.zeros(self.robot.model.nq, dtype=np.float64)
-        q_full[self.full_q_indices] = np.asarray(q29, dtype=np.float64).reshape(29)
-        pin.framesForwardKinematics(self.robot.model, self.full_data, q_full)
-        left = np.eye(4, dtype=np.float64)
-        right = np.eye(4, dtype=np.float64)
-        left[:3, :3] = self.full_data.oMf[self.full_left_frame_id].rotation
-        left[:3, 3] = self.full_data.oMf[self.full_left_frame_id].translation
-        right[:3, :3] = self.full_data.oMf[self.full_right_frame_id].rotation
-        right[:3, 3] = self.full_data.oMf[self.full_right_frame_id].translation
-        return left, right
-
     def gravity_torque_from_q29(
         self,
         q29: np.ndarray,
@@ -765,8 +749,8 @@ class UnitreeG1ArmNonlinearIK:
             tau_ff = self.gravity_torque_from_q29(
                 q_ref, base_quaternion_wxyz=base_quaternion_wxyz
             )
-            # Legs and waist remain under SONIC/PD ownership. PATH supplies
-            # RNEA feedforward only for the two IPOPT-controlled arms.
+            # PATH supplies arm feedforward only; WBC/HOMIE owns the base,
+            # legs, and waist through its separate controller.
             tau_ff[:15] = 0.0
 
             (
@@ -845,29 +829,6 @@ class UnitreeG1ArmNonlinearIK:
             left_position_weight_scale=left_position_weight_scale,
             right_position_weight_scale=right_position_weight_scale,
             smooth_weight_scale=smooth_weight_scale,
-        )
-
-    def solve_gmr_reference(
-        self,
-        *,
-        q_gmr29: np.ndarray,
-        q_seed29: np.ndarray,
-        left_position_override: np.ndarray | None = None,
-        right_position_override: np.ndarray | None = None,
-        base_quaternion_wxyz: np.ndarray | None = None,
-    ) -> ArmIkResult:
-        """Solve GMR EE poses, optionally replacing only an e-mode position."""
-
-        left_tf, right_tf = self.gmr_wrist_transforms_from_q29(q_gmr29)
-        if left_position_override is not None:
-            left_tf[:3, 3] = np.asarray(left_position_override, dtype=np.float64).reshape(3)
-        if right_position_override is not None:
-            right_tf[:3, 3] = np.asarray(right_position_override, dtype=np.float64).reshape(3)
-        return self.solve_bimanual_targets(
-            left_target_tf=left_tf,
-            right_target_tf=right_tf,
-            q_seed29=q_seed29,
-            base_quaternion_wxyz=base_quaternion_wxyz,
         )
 
     def solve_single_target(

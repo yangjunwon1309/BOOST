@@ -35,7 +35,7 @@ def qp_sample_reference(
     q_ref: Sequence[float] | np.ndarray,
     *,
     state: str = "teleop",
-    source: str = "gmr",
+    source: str = "path_arm_ik",
     control_mode: str = "teleop",
     feasible: bool = True,
     plan_id: int = 0,

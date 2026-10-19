@@ -1,18 +1,15 @@
-# External Dependencies
+# External runtime components
 
-PATH-G1 vendors the modified SONIC runtime because it is part of the PATH
-system, but it does not vendor GMR or cuRoboV2.
+PATH-G1 contains its own arm control, perception integration, robot model, and
+G1 arm bridge. These components remain separate deployments:
 
-Expected Thor host paths:
+- **Unitree SDK2** builds and runs the G1-local `g1_bridge/` process.
+- **HOMIE/WBC** owns legs and waist from its own repository and configuration.
+- **Dex1 service** owns hand hardware and consumes hand intent separately.
+- **XRoboToolkit / PICO SDK** supplies the live PICO manager's controller input.
+- **Remote SAM3 worker** runs on the selected inference host; it sends camera
+  segmentation and geometry data to the Thor gateway.
 
-- `PATH_GROOT_ROOT=/home/url/GR00T-WholeBodyControl`
-- `PATH_CUROBO_ROOT=/home/url/GR00T-WholeBodyControl/external_dependencies/curobo_v2`
-- `PATH_GMR_ROOT=/home/url/GMR`
-- `PATH_SONIC_DEPLOY_ROOT=/home/url/PATH-G1/sonic_runtime/gear_sonic_deploy`
-
-Inside the deploy Docker, `~/PATH-G1` is mounted as `/workspace/PATH-G1`, so
-`configs/runtime/local.env` resolves:
-
-- `PATH_G1_ROOT=/workspace/PATH-G1`
-- `PATH_SONIC_DEPLOY_ROOT=/workspace/PATH-G1/sonic_runtime/gear_sonic_deploy`
-
+This directory does not vendor these projects. Keep host-specific checkout
+paths and credentials in deployment environment files, not in PATH-G1 source.
+HOMIE fork, commit, and G1 topic configuration are recorded with its deployment.

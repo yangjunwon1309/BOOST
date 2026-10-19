@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Galaxy XR/WebXR controller server for PATH v15.1.
 
-This is deliberately separate from ``pico_manager_thread_server.py``.  It
-publishes the same controller, button, and absolute waist-wrist wire topics
-that PATH's state-machine bridge already consumes, but never imports or starts
+This is deliberately separate from ``pico_manager_thread_server.py``. It
+publishes controller, button, and absolute waist-wrist topics consumed by
+PATH's state-machine bridge, but never imports or starts
 the Pico/XRoboToolkit runtime.
 """
 
@@ -19,7 +19,7 @@ import numpy as np
 import zmq
 
 from path_core.messaging.zmq_wire import pack_pose_message
-from path_core.teleop.pico_joystick_locomotion import PicoButtonGestureInterpreter
+from path_core.teleop.pico_button_gestures import PicoButtonGestureInterpreter
 from path_streaming.xr_source_v15 import (
     TeleVuerSource,
     XrStreamReader,
@@ -40,7 +40,6 @@ def parse_args() -> argparse.Namespace:
         default="controller",
         help="Only controller is supported by WebXR; body modes fail before startup.",
     )
-    parser.add_argument("--manager-port", type=int, default=5559)
     parser.add_argument("--button-event-port", type=int, default=5565)
     parser.add_argument("--vr-pose-debug-port", type=int, default=5566)
     parser.add_argument("--pose-hz", type=float, default=50.0)
@@ -138,21 +137,6 @@ def _send_events(
     return sequence
 
 
-def _send_manager_state(socket: zmq.Socket, *, tracking: bool) -> None:
-    socket.send(
-        pack_pose_message(
-            {
-                "stream_mode": np.array(
-                    [STREAM_MODE_TRACKING if tracking else STREAM_MODE_OFF], dtype=np.int32
-                ),
-                "toggle_data_collection": np.array([False], dtype=bool),
-                "toggle_data_abort": np.array([False], dtype=bool),
-            },
-            topic="manager_state",
-        )
-    )
-
-
 def _send_wrist_targets(
     socket: zmq.Socket,
     sample,
@@ -227,13 +211,11 @@ def main() -> int:
     )
     reader = XrStreamReader(source, poll_hz=args.source_poll_hz)
     context = zmq.Context()
-    manager_socket = context.socket(zmq.PUB)
     button_socket = context.socket(zmq.PUB)
     wrist_socket = context.socket(zmq.PUB)
-    for socket in (manager_socket, button_socket, wrist_socket):
+    for socket in (button_socket, wrist_socket):
         socket.setsockopt(zmq.SNDHWM, 4)
         socket.setsockopt(zmq.LINGER, 0)
-    manager_socket.bind(f"tcp://*:{args.manager_port}")
     button_socket.bind(f"tcp://*:{args.button_event_port}")
     wrist_socket.bind(f"tcp://*:{args.vr_pose_debug_port}")
 
@@ -243,7 +225,7 @@ def main() -> int:
         flush=True,
     )
     print(
-        f"[GalaxyXR] PUB manager={args.manager_port} buttons={args.button_event_port} "
+        f"[GalaxyXR] PUB buttons={args.button_event_port} "
         f"wrist={args.vr_pose_debug_port}; pose={args.pose_hz:.0f}Hz controller={args.controller_hz:.0f}Hz",
         flush=True,
     )
@@ -270,7 +252,7 @@ def main() -> int:
                 event_sequence = _send_events(
                     button_socket, gestures, sample, sequence=event_sequence, timestamp_us=timestamp_us
                 )
-                # Match the legacy manager: the all-four-button chord gates
+                # Match the PICO manager: the all-four-button chord gates
                 # whether valid controller poses are supplied to PATH.
                 if event_sequence != old_event_sequence:
                     buttons = sample.buttons if sample is not None else {}
@@ -292,7 +274,6 @@ def main() -> int:
                     frame_index=frame_index,
                     monitor=reader.monitor.report(),
                 )
-                _send_manager_state(manager_socket, tracking=tracking)
                 next_pose += pose_period
                 if next_pose < now - pose_period:
                     next_pose = now + pose_period
@@ -306,7 +287,7 @@ def main() -> int:
         return 0
     finally:
         reader.stop()
-        for socket in (wrist_socket, button_socket, manager_socket):
+        for socket in (wrist_socket, button_socket):
             socket.close()
         context.term()
 

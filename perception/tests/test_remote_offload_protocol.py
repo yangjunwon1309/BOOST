@@ -18,7 +18,7 @@ def _payload():
         "calibration_id": 7,
         "image_width": 640,
         "image_height": 360,
-        "backend": "yolo11_pytorch",
+        "backend": "sam3_tensorrt",
         "inference_ms": 130.0,
         "valid": True,
         "error": None,

@@ -128,15 +128,11 @@ class GoalPublisher:
         *,
         goal_endpoint: str,
         goal_topic: str,
-        planner_endpoint: str | None,
-        planner_topic: str,
         dry_run: bool = False,
     ) -> None:
         self.goal_topic = goal_topic
-        self.planner_topic = planner_topic
         self.dry_run = dry_run
         self.goal_socket = None
-        self.planner_socket = None
         if not dry_run:
             context = zmq.Context.instance()
             self.goal_socket = context.socket(zmq.PUB)
@@ -146,11 +142,6 @@ class GoalPublisher:
             # target message.
             self.goal_socket.setsockopt(zmq.SNDHWM, 1)
             self.goal_socket.connect(goal_endpoint)
-            if planner_endpoint:
-                self.planner_socket = context.socket(zmq.PUB)
-                self.planner_socket.setsockopt(zmq.LINGER, 0)
-                self.planner_socket.setsockopt(zmq.SNDHWM, 1)
-                self.planner_socket.connect(planner_endpoint)
 
     @staticmethod
     def _send(socket: zmq.Socket, topic: str, payload: dict) -> None:
@@ -179,8 +170,6 @@ class GoalPublisher:
         count = max(int(repeat), int(math.ceil(max(0.0, sustain_sec) / period)) + 1)
         for index in range(max(1, count)):
             self._send(self.goal_socket, self.goal_topic, payload)
-            if self.planner_socket is not None:
-                self._send(self.planner_socket, self.planner_topic, payload)
             if index + 1 < count:
                 time.sleep(period)
 
@@ -188,6 +177,3 @@ class GoalPublisher:
         if self.goal_socket is not None:
             self.goal_socket.close()
             self.goal_socket = None
-        if self.planner_socket is not None:
-            self.planner_socket.close()
-            self.planner_socket = None

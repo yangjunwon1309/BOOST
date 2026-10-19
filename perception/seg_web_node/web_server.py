@@ -60,9 +60,6 @@ from .object_point_filter import (
     extract_filtered_object_cloud,
     project_camera_point_to_pixel,
 )
-from .sam2_backend import Sam2HieraTinyBackend
-from .efficienttam_backend import EfficientTamTi512Backend
-from .yolo11_backend import Yolo11SegBackend
 from .sam3_backend import TensorRTSam3Backend, TorchSam3Backend
 from .tasc_belief import (
     BeliefInputObject,
@@ -572,9 +569,6 @@ class SegmentationRuntime:
         checkpoint: Path | None,
         inference_backend: str,
         tensorrt_config: dict[str, Any],
-        sam2_config: dict[str, Any],
-        efficienttam_config: dict[str, Any],
-        yolo11_config: dict[str, Any],
         depth_self_filter_config: dict[str, Any],
         object_point_filter_config: dict[str, Any],
         intrinsics: CameraIntrinsics | None,
@@ -602,9 +596,6 @@ class SegmentationRuntime:
         self.checkpoint = checkpoint
         self.inference_backend = inference_backend
         self.tensorrt_config = tensorrt_config
-        self.sam2_config = sam2_config
-        self.efficienttam_config = efficienttam_config
-        self.yolo11_config = yolo11_config
         self.depth_self_filter_config = dict(depth_self_filter_config)
         self.object_point_filter = ObjectPointFilterConfig.from_dict(
             object_point_filter_config
@@ -1635,54 +1626,6 @@ class SegmentationRuntime:
                 time.sleep(0.1)
 
     def _load_model(self):
-        if self.inference_backend == "yolo11-seg":
-            options = self.yolo11_config
-            return Yolo11SegBackend(
-                checkpoint=Path(options.get("checkpoint", "/models/yolo11/yolo11n-seg.pt")),
-                threshold=self.threshold,
-                min_area_px=self.min_area_px,
-                imgsz=int(options.get("imgsz", 640)),
-                confidence=float(options.get("confidence", 0.80)),
-                iou_threshold=float(options.get("iou_threshold", 0.50)),
-                max_masks=int(options.get("max_masks", 20)),
-                quantize=options.get("quantize", 16),
-                track=dict(options.get("track", {})),
-                allowed_classes=list(options.get("allowed_classes", [])),
-                excluded_classes=list(options.get("excluded_classes", ["person"])),
-                depth_self_filter=dict(
-                    options.get("depth_self_filter", self.depth_self_filter_config)
-                ),
-            )
-        if self.inference_backend == "sam2-tiny":
-            options = self.sam2_config
-            return Sam2HieraTinyBackend(
-                checkpoint=Path(options.get("checkpoint", "/models/sam2/sam2.1_hiera_tiny.pt")),
-                threshold=self.threshold,
-                min_area_px=self.min_area_px,
-                reinitialization=str(options.get("reinitialization", "central")),
-                reinitialize_interval_frames=int(options.get("reinitialize_interval_frames", 15)),
-                automatic_points_per_side=int(options.get("automatic_points_per_side", 8)),
-                max_masks=int(options.get("max_masks", 12)),
-                central=dict(options.get("central", {})),
-                depth_self_filter=dict(
-                    options.get("depth_self_filter", self.depth_self_filter_config)
-                ),
-            )
-        if self.inference_backend == "efficienttam-ti-512":
-            options = self.efficienttam_config
-            return EfficientTamTi512Backend(
-                checkpoint=Path(options.get("checkpoint", "/models/efficienttam/efficienttam_ti_512x512.pt")),
-                threshold=self.threshold,
-                min_area_px=self.min_area_px,
-                reinitialization=str(options.get("reinitialization", "central")),
-                reinitialize_interval_frames=int(options.get("reinitialize_interval_frames", 15)),
-                automatic_points_per_side=int(options.get("automatic_points_per_side", 8)),
-                max_masks=int(options.get("max_masks", 12)),
-                central=dict(options.get("central", {})),
-                depth_self_filter=dict(
-                    options.get("depth_self_filter", self.depth_self_filter_config)
-                ),
-            )
         if self.inference_backend == "tensorrt":
             return TensorRTSam3Backend(
                 engine_path=Path(self.tensorrt_config["engine"]),
@@ -2011,7 +1954,7 @@ class SegmentationRuntime:
                     "jpeg_decode_depth_align": round(
                         (preprocess_finished - frame_started) * 1000.0, 2
                     ),
-                    "yolo_model": round((model_finished - model_started) * 1000.0, 2),
+                    "segmentation_model": round((model_finished - model_started) * 1000.0, 2),
                     "rgbd_belief_overlay": round(
                         (postprocess_finished - model_finished) * 1000.0, 2
                     ),
@@ -2190,7 +2133,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-area-px", type=int, default=None)
     parser.add_argument("--allow-unaligned", action="store_true")
     parser.add_argument("--checkpoint", type=Path, default=None)
-    parser.add_argument("--backend", choices=("pytorch", "tensorrt", "sam2-tiny", "efficienttam-ti-512", "yolo11-seg"), default=None)
+    parser.add_argument("--backend", choices=("pytorch", "tensorrt"), default=None)
     parser.add_argument("--engine", type=Path, default=None)
     parser.add_argument(
         "--enable-ee-publishing",
@@ -2258,9 +2201,6 @@ def main() -> int:
     depth_config = config.get("depth", {})
     segmentation_config = config.get("segmentation", {})
     tensorrt_config = dict(segmentation_config.get("tensorrt", {}))
-    sam2_config = dict(segmentation_config.get("sam2", {}))
-    efficienttam_config = dict(segmentation_config.get("efficienttam", {}))
-    yolo11_config = dict(segmentation_config.get("yolo11", {}))
     depth_self_filter_config = dict(segmentation_config.get("depth_self_filter", {}))
     object_point_filter_config = dict(config.get("cloud", {}).get("object_filter", {}))
     target_config = config.get("ee_target", {})
@@ -2296,12 +2236,6 @@ def main() -> int:
                 target_config.get("goal_endpoint", "tcp://127.0.0.1:5564")
             ),
             goal_topic=str(target_config.get("goal_topic", "path_static_ee_target")),
-            planner_endpoint=(
-                str(target_config.get("planner_endpoint", "tcp://127.0.0.1:5561"))
-                if target_config.get("send_planner_goal", False)
-                else None
-            ),
-            planner_topic=str(target_config.get("planner_topic", "path_goal")),
             dry_run=args.ee_dry_run,
         )
     runtime = SegmentationRuntime(
@@ -2321,9 +2255,6 @@ def main() -> int:
         checkpoint=checkpoint,
         inference_backend=inference_backend,
         tensorrt_config=tensorrt_config,
-        sam2_config=sam2_config,
-        efficienttam_config=efficienttam_config,
-        yolo11_config=yolo11_config,
         depth_self_filter_config=depth_self_filter_config,
         object_point_filter_config=object_point_filter_config,
         intrinsics=intrinsics,

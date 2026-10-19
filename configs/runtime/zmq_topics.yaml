@@ -1,30 +1,36 @@
-pico_internal:
-  bind: "tcp://*:5559"
-  connect: "tcp://127.0.0.1:5559"
-  topics: ["pose", "command", "planner", "manager_state"]
-pico_vr_debug:
+pico_controls:
+  bind: "tcp://*:5565"
+  connect: "tcp://127.0.0.1:5565"
+  topics: ["pico_button_event", "pico_controller_state"]
+pico_wrist_targets:
   bind: "tcp://*:5566"
   connect: "tcp://127.0.0.1:5566"
   topic: "vr_pose_debug"
-gmr_ref:
-  bind: "tcp://*:5558"
-  connect: "tcp://127.0.0.1:5558"
-  topic: "gmr_ref"
-pose:
-  endpoint: "tcp://127.0.0.1:5556"
-  topic: "pose"
-sonic_debug:
-  endpoint: "tcp://127.0.0.1:5557"
-  topic: "g1_debug"
 path_qp_reference:
   bind: "tcp://*:5560"
   connect: "tcp://127.0.0.1:5560"
   topic: "path_qp_reference"
+path_static_ee_target:
+  bind: "tcp://*:5564"
+  connect: "tcp://127.0.0.1:5564"
+  topic: "path_static_ee_target"
+path_shared_hand_selection:
+  bind: "tcp://*:5567"
+  connect: "tcp://127.0.0.1:5567"
+  topic: "path_shared_control_hand"
 path_direct_control:
   transport: "lcm"
+  thor_to_g1_url: "udpm://239.255.76.67:7667?ttl=1"
+  wifi_url: "udpm://239.255.77.67:7667?ttl=1"
   upper_command_channel: "G1_PATH_UPPER_COMMAND"
-  motor_command_channel: "G1_PATH_MOTOR_COMMAND"
   robot_state_channel: "G1_ROBOT_STATE"
+unitree_g1:
+  state_topic: "rt/lowstate"
+  arm_command_topic: "rt/arm_sdk"
+  path_forbidden_command_topic: "rt/lowcmd"
+  whole_body_command_owner: "homie_g1_29dof"
+perception_web:
+  port: 8080
 path_state_command:
   bind: "tcp://*:5563"
   connect: "tcp://127.0.0.1:5563"

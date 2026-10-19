@@ -10,9 +10,8 @@ platforms = ["linux-64"]
 [dependencies]
 python = "==3.12.3"
 
-# Exact replacement for the temporary /tmp/path-g1-v6-deps environment used
-# during the v6 remote-offload validation. Transitive packages are pinned too
-# so a fresh `pixi install --locked` reproduces the same Python package set.
+# Pinned host-side runtime and maintenance tools. GPU inference remains inside
+# the SAM3 containers defined under perception/docker/.
 [pypi-dependencies]
 annotated-doc = "==0.0.5"
 annotated-types = "==0.8.0"
@@ -47,8 +46,5 @@ PYTHONPATH = "$PIXI_PROJECT_ROOT:$PIXI_PROJECT_ROOT/perception"
 
 [tasks]
 verify-host = "python perception/tools/verify_pixi_host_environment.py"
-test-v6 = "python -m pytest -q perception/tests/test_remote_offload.py perception/tests/test_remote_offload_protocol.py perception/tests/test_remote_sam3_belief_input.py perception/tests/test_remote_yolo_fallback.py perception/tests/test_path_spec_v4.py perception/tests/test_tasc_belief.py perception/tests/test_object_point_filter.py"
 test-perception = "python -m pytest -q perception/tests"
-lint-v6 = "ruff check perception/remote_offload/protocol.py perception/remote_offload/remote_geometry_pipeline.py perception/remote_offload/remote_sam3_belief_input_worker.py perception/remote_offload/remote_web_server.py perception/remote_offload/remote_yolo11_worker.py perception/remote_offload/thor_gateway.py perception/seg_web_node/geometry_fallback.py perception/seg_web_node/grip_candidates.py perception/tests/test_remote_sam3_belief_input.py"
-sam3-worker = { cmd = "bash tools/run_remote_sam3_trt_worker.sh", cwd = "perception" }
-web-viewer = { cmd = "bash tools/run_remote_web_viewer.sh", cwd = "perception" }
+sam3-worker = { cmd = "bash tools/run_remote_sam3_wrist_d405_v11.sh", cwd = "perception" }

@@ -1,4 +1,4 @@
-"""Small non-blocking ZMQ subscriber used by legacy-compatible XR inputs."""
+"""Small non-blocking ZMQ subscriber used by PICO and Galaxy XR inputs."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import zmq
 
 
 class ZMQPoller:
-    """Keep only the latest subscribed packet without depending on SONIC."""
+    """Keep only the latest subscribed packet for low-latency inputs."""
 
     def __init__(self, host: str = "localhost", port: int = 5555, topic: str = ""):
         self._context = zmq.Context()

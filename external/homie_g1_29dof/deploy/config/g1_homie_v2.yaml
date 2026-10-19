@@ -1,0 +1,47 @@
+# HOMIE G1 29DoF policy spec — vendored verbatim from robofinals
+# url_IKEA_challenge/robofinals/.../wbc_policy/config/g1_homie_v2.yaml
+# This is authoritative for stand.onnx / walk.onnx. Do NOT retune here; these
+# values define the observation/action contract the ONNX files were trained with.
+#
+# Only the 15 leg+waist joints are policy-controlled. Arms (idx 15..28) are driven
+# externally (see arm_target_source.py) and are NOT in default_angles below.
+
+# Timing: 50 Hz control = simulation_dt 0.005 * control_decimation 4
+simulation_dt: 0.005
+control_decimation: 4
+
+# PD gains for the 15 policy joints (legs 0..11, waist 12..14).
+# Used to build the hardware 29-dim gain table in configs/g1_homie.yaml.
+kps: [150, 150, 150, 200, 40, 40,
+      150, 150, 150, 200, 40, 40,
+      250.0, 250.0, 250.0]
+kds: [2.0, 2.0, 2.0, 4.0, 2.0, 2.0,
+      2.0, 2.0, 2.0, 4.0, 2.0, 2.0,
+      5.0, 5.0, 5.0]
+
+# Default joint angles for the 15 policy joints (legs + waist).
+default_angles: [-0.1, 0.0, 0.0, 0.3, -0.2, 0.0,
+                 -0.1, 0.0, 0.0, 0.3, -0.2, 0.0,
+                  0.0, 0.0, 0.0]
+
+# Observation scaling factors
+ang_vel_scale: 0.5
+dof_pos_scale: 1.0
+dof_vel_scale: 0.05
+action_scale: 0.25
+cmd_scale: [2.0, 2.0, 0.5]
+
+# Model I/O
+num_actions: 15
+num_obs: 516        # 86 (single frame) * 6 (history length)
+obs_history_len: 6
+
+# Fixed command channels (the policy still expects these dims in the obs)
+cmd_init: [0.0, 0.0, 0.0]
+height_cmd: 0.80
+rpy_cmd: [0.0, 0.0, 0.0]
+freq_cmd: 0.75
+
+# stand.onnx vs walk.onnx selection threshold on ||cmd[vx,vy,wz]||.
+# Trained/reference value is 0.05; deployment requested 0.2.
+stand_cmd_threshold: 0.05

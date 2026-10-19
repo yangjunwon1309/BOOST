@@ -41,10 +41,10 @@ robot actuator topics. See [`../perception/remote_offload/README.md`](../percept
    the Dex1-1 service.
 
 For the first camera/SAM3 integration run, keep the wrist gateway's end-effector
-target publishing disabled. The checked-in wrist-to-camera transforms are
-CAD-derived estimates, and the configured left/right camera serial assignment
-is provisional. Calibrate both transforms and verify the physical camera sides
-before enabling target-driven robot motion; see
+target publishing disabled while checking capture and camera-side assignment.
+The current CAD-derived wrist transforms are accepted for this installation;
+verify that the configured serials correspond to the physical left and right
+wrist cameras before enabling target publication. See
 [`../perception/remote_offload/README.md`](../perception/remote_offload/README.md).
 
 Build details and bridge command line are in [`../g1_bridge/README.md`](../g1_bridge/README.md).

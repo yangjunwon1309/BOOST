@@ -1,5 +1,7 @@
 extrinsics_source: cad_derived_wrist_d405_v11
 calibration_status: CAD_DERIVED_ROTATION_EXACT_TRANSLATION_NOMINAL
+# The filename is retained for compatibility; these are the accepted CAD
+# transforms for the current installation, not a measured hand-eye calibration.
 
 # Rotation is exact from the mount CAD:
 # R_wrist_camera = Ry(+25 deg) @ P

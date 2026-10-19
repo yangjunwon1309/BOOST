@@ -10,10 +10,9 @@
 #   face normal. The 3x3 block is wrist<-camera in the RealSense optical frame
 #   (x right, y down, z forward), and is right handed (determinant +1).
 #
-# This applies the same upright printed-holder orientation on each side. It is
-# not a hand-eye calibration: verify the actual left/right installation and
-# replace both transforms with correspondence-fit values before autonomous
-# contact geometry/control is enabled.
+# This applies the same upright printed-holder orientation on each side. These
+# CAD-derived transforms are accepted for the current installation. Verify the
+# camera serial-to-side assignment and recheck the transforms if a mount changes.
 extrinsics_source: CAD_APPROXIMATE_G1_DEX1_D405_HOLDER_2026_08_20
 calibration_status: provisional_cad_only
 translation_uncertainty_m: 0.025

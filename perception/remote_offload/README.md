@@ -60,11 +60,13 @@ cd PATH-G1/perception
   --no-ee-target-publishing
 ```
 
-The current wrist transforms are CAD-derived estimates, not measured
-hand-eye calibrations. Calibrate both transforms and verify the camera-to-hand
-assignment before enabling target-driven robot motion. After that verification,
-restart the gateway with `--ee-target-publishing` and the PATH state machine
-listening on TCP 5564. Its selected-hand heartbeat uses TCP 5567.
+The current CAD-derived wrist transforms are the accepted values for this
+installation; a separate hand-eye calibration is not a prerequisite. Verify
+that the configured camera serials correspond to the physical left and right
+wrists and inspect the resulting targets. Then restart the gateway with
+`--ee-target-publishing` and the PATH state machine listening on TCP 5564. Its
+selected-hand heartbeat uses TCP 5567. Recheck the transforms if a camera mount
+or holder changes.
 
 Thor and the inference host must exchange LCM multicast on
 `239.255.77.67:7667`; G1 and Thor must exchange `G1_ROBOT_STATE` on

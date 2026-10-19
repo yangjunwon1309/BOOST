@@ -129,12 +129,14 @@ Dex1 hand output. Live Dex1 startup reads both hand state topics and opens the
 grippers; PATH grip flags then set close/open targets. Stop each dry-run with
 Ctrl+C before starting that process in live mode.
 
-The checked-in HOMIE config selects `cmd_source: "udp"` and listens on
-`192.168.123.164:15001`, allowing only Thor at `192.168.123.2`. PATH-G1 has no
-sender for this locomotion packet, so absent another sender HOMIE receives a
-zero command and selects stand; the G1 wireless sticks still override UDP and
-can command walking. Verify these IPs on the robot, and provide a separate
-sender if Thor must command HOMIE locomotion.
+The checked-in HOMIE config selects `cmd_source: "udp"`. The HOMIE process on
+G1 receives Thor's locomotion `cmd_vel` at `192.168.123.164:15001` and accepts
+packets only from Thor at `192.168.123.2`; the payload carries `vx`, `vy`,
+`wz`, `session`, and `seq`. This is the intended high-level command path into
+HOMIE, not a packet to the Unitree handheld remote. The handheld sticks are
+read separately by HOMIE and override UDP input. The PATH-G1 checkout contains
+the receiver; the existing Thor-side sender must target this address and port.
+Verify the two IPs against the actual network configuration.
 
 ```bash
 cd /home/unitree/00_workspace/homie_g1_29dof/deploy

@@ -31,9 +31,11 @@ data/*
 logs/
 *.log
 
-# External dependency checkouts should be referenced, not vendored.
+# Ignore external checkouts, while tracking the reviewed HOMIE deployment snapshot.
 external/*
 !external/README.md
+!external/homie_g1_29dof/
+!external/homie_g1_29dof/**
 
 
 # TensorRT generated engines

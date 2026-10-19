@@ -2001,7 +2001,13 @@ class ThorRemoteGateway:
                 ):
                     calibration = self.latest_calibration[1]
                     last_calibration = now
-                if (\r\n                    self.latest_robot_state is not None\r\n                    and now - last_robot_state >= self.robot_state_period\r\n                ):\r\n                    robot_state = self.latest_robot_state[1]\r\n                    last_robot_state = now\r\n            # This period is a Wi-Fi bandwidth cap.  It throttles bursts but
+                if (
+                    self.latest_robot_state is not None
+                    and now - last_robot_state >= self.robot_state_period
+                ):
+                    robot_state = self.latest_robot_state[1]
+                    last_robot_state = now
+            # This period is a Wi-Fi bandwidth cap.  It throttles bursts but
             # no longer makes each frame wait for an unrelated polling tick.
             if pair is not None:
                 elapsed = time.monotonic() - self.last_forward_monotonic

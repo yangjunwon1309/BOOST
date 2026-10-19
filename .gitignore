@@ -36,6 +36,7 @@ external/*
 !external/README.md
 !external/homie_g1_29dof/
 !external/homie_g1_29dof/**
+external/homie_g1_29dof/**/__pycache__/
 
 
 # TensorRT generated engines

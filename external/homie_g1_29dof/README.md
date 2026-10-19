@@ -16,10 +16,11 @@ measured to throttle teleop arm tracking well below xr_teleoperate's own publish
 Moving inference to its own process (own GIL) removes that stall entirely. The layout
 mirrors the modular structure of `~/06_IKEA/TWIST2/deploy_real`.
 
-Policy switch: **`‖cmd[vx,vy,wz]‖ < 0.2` → `stand.onnx`, otherwise `walk.onnx`**
-(the threshold lives in `deploy/config/g1_homie_v2.yaml` as `stand_cmd_threshold`). The
-authoritative robofinals policy uses 0.05; this deploy defaults to 0.2 as requested — see
-`DEPLOY_GUIDE.md` §2.
+Policy switch: **`‖cmd[vx,vy,wz]‖ < 0.05` → `stand.onnx`, otherwise `walk.onnx`**
+(the runtime threshold is `stand_cmd_threshold` in
+`deploy/config/g1_homie_v2.yaml`). This snapshot currently matches the
+authoritative robofinals threshold of 0.05; verify the loaded config before
+hardware operation.
 
 **Deploying on hardware? Follow [`DEPLOY_GUIDE.md`](DEPLOY_GUIDE.md)** — always start with
 the `--dry-run` (reads state + runs the policy at 50 Hz but keeps the robot limp).
@@ -106,7 +107,7 @@ changes to xr_teleoperate, no second process, no Redis. Details in `DEPLOY_GUIDE
 
 ## Verification
 
-`deploy/tests/test_offline.py` checks obs assembly (516), the 0.2 stand/walk switch,
+`deploy/tests/test_offline.py` checks obs assembly (516), the configured stand/walk switch,
 and the warm-start, using only numpy + onnxruntime:
 
 ```bash
@@ -114,8 +115,7 @@ python deploy/tests/test_offline.py
 ```
 
 The observation/action pipeline was cross-checked against the authoritative
-`robofinals` `G1HomiePolicyV2` and matches to floating-point precision (~1e-7); the only
-intended difference is the `stand_cmd_threshold` (0.05 → 0.2).
+`robofinals` `G1HomiePolicyV2` and matches to floating-point precision (~1e-7).
 
 ## Notes / gains
 

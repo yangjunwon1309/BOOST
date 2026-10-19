@@ -40,6 +40,13 @@ robot actuator topics. See [`../perception/remote_offload/README.md`](../percept
    through `rt/arm_sdk` into the HOMIE command merger and route grip bits to
    the Dex1-1 service.
 
+For the first camera/SAM3 integration run, keep the wrist gateway's end-effector
+target publishing disabled. The checked-in wrist-to-camera transforms are
+CAD-derived estimates, and the configured left/right camera serial assignment
+is provisional. Calibrate both transforms and verify the physical camera sides
+before enabling target-driven robot motion; see
+[`../perception/remote_offload/README.md`](../perception/remote_offload/README.md).
+
 Build details and bridge command line are in [`../g1_bridge/README.md`](../g1_bridge/README.md).
 For the local-versus-upstream HOMIE comparison, see
 [`homie_integration.md`](homie_integration.md).

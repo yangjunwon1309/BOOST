@@ -45,25 +45,23 @@ cd thirdparty/homie_g1_29dof/deploy
 python tests/test_offline.py
 ```
 
-Expect: `OK: threshold=0.2, ... all checks passed`.
+Expect: `OK: threshold=0.05, ... all checks passed`.
 
 ---
 
 ## 2. What the controller does
 
 - 50 Hz loop. Reads the wireless controller → `cmd_vel = [vx, vy, wz]`.
-- `‖cmd_vel‖ < stand_cmd_threshold` (default **0.2**, in `config/g1_homie_v2.yaml`) →
+- `‖cmd_vel‖ < stand_cmd_threshold` (currently **0.05**, in `config/g1_homie_v2.yaml`) →
   `stand.onnx`; otherwise `walk.onnx`.
 - Policy outputs 15 targets (12 legs + 3 waist, indices 0..14).
 - Arms (15..28) come from the arm source: **hold default** (default) or **xr_teleoperate**
   via `rt/arm_sdk`.
 - Sends absolute 29-DoF `q_target` with HOMIE PD gains on `rt/lowcmd`.
 
-> Note on the threshold: the authoritative robofinals `G1HomiePolicyV2` switches at
-> **0.05**. This deploy defaults to **0.2** as requested. Table-assembly teleoperation in
-> `url_IKEA_challenge` uses a *different* policy (decoupled whole-body WBC) that has no
-> stand/walk ONNX switch at all. To match the original HOMIE exactly, set
-> `stand_cmd_threshold: 0.05`.
+> The current snapshot and authoritative robofinals `G1HomiePolicyV2` both use
+> `stand_cmd_threshold: 0.05`. Table-assembly teleoperation in
+> `url_IKEA_challenge` uses a different policy and has no stand/walk ONNX switch.
 
 ---
 
@@ -125,7 +123,7 @@ Bring-up sequence (prompted on the console):
 2. **A** → starts the policy. It eases from the default pose into policy output over
    `--ramp-time` (default 1 s).
 3. Sticks: left = vx/vy, right = wz. Released sticks → `‖cmd‖ = 0` → `stand.onnx`.
-4. Give a small forward `vx` past 0.2 → switches to `walk.onnx` and steps.
+4. Give a small forward `vx` past 0.05 → switches to `walk.onnx` and steps.
 5. **Select** / Ctrl+C → exits to zero-stiffness damping.
 
 Only remove the support once standing + small stepping look stable.

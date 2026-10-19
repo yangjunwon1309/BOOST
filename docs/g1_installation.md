@@ -2,18 +2,27 @@
 
 ## Selected HOMIE source
 
-Install the local controller at
-`C:\studioprojects\homie_g1_29dof\homie_g1_29dof`. Its `deploy/arm_target_source.py`
-reads PATH's `rt/arm_sdk` arm targets, and `deploy/run_homie.py` merges them with
-the 15 leg/waist targets before publishing the final 29-joint command on
-`rt/lowcmd`. Its `g1_homie.yaml` already sets `arm_source: "arm_sdk"`.
+Use the G1-local HOMIE checkout that contains `deploy/run_homie.py`,
+`deploy/robot_control/configs/g1_homie.yaml`, and both `ckpts/stand.onnx` and
+`ckpts/walk.onnx`. The PATH-G1 `homie-g1-snapshot` branch also carries the
+deployment snapshot under `external/homie_g1_29dof/`; its two checkpoint hashes
+match the current Windows source tree. If HOMIE is already cloned on G1 with
+these files, use that checkout and skip transfer and installation steps below.
 
-This local folder has no Git remote, so it cannot be installed with a `git
-clone` URL. Transfer it from the Windows development machine as a bundle. Do
-not substitute upstream `InternRobotics/Homie/HomieDeploy/unitree_sdk2`: its
-`g1_control` subscribes to different LCM arm channels and writes `rt/lowcmd`
-itself. The upstream controller does not consume this PATH bridge's
-`rt/arm_sdk` output; see [`homie_integration.md`](homie_integration.md).
+The run commands later in this guide assume
+`/home/unitree/00_workspace/homie_g1_29dof/deploy`. If your clone is elsewhere,
+run them from that clone's `deploy/` directory. If you use the bundled snapshot,
+run them from `$HOME/PATH-G1/external/homie_g1_29dof/deploy`; its checkpoints
+are already under the matching `../ckpts/` path. Use the
+`homie-g1-snapshot` branch for the PATH-G1 runtime checkout on G1, Thor, and the
+remote SAM3 worker so all three use the same deployment code. Keep the separate
+HOMIE clone as the `rt/lowcmd` controller source.
+
+The local configuration selects `arm_source: "arm_sdk"`. HOMIE combines PATH's
+14 arm targets with its 15 leg/waist targets and must remain the only
+`rt/lowcmd` publisher. Do not run upstream
+`HomieDeploy/unitree_sdk2/g1_control` alongside it; that binary consumes a
+different arm-input protocol. See [`homie_integration.md`](homie_integration.md).
 
 ## Transfer local HOMIE from Windows
 
@@ -84,7 +93,7 @@ branch. The branch URL is `https://github.com/yangjunwon1309/PATH-G1`.
 sudo apt update
 sudo apt install -y git cmake g++ build-essential pkg-config liblcm-dev \
   libyaml-cpp-dev libeigen3-dev libboost-all-dev libfmt-dev
-git clone --branch deploy --single-branch \
+git clone --branch homie-g1-snapshot --single-branch \
   https://github.com/yangjunwon1309/PATH-G1.git "$HOME/PATH-G1"
 ```
 
@@ -119,6 +128,13 @@ live. Use separate terminals on G1. Start the local HOMIE WBC as the only
 Dex1 hand output. Live Dex1 startup reads both hand state topics and opens the
 grippers; PATH grip flags then set close/open targets. Stop each dry-run with
 Ctrl+C before starting that process in live mode.
+
+The checked-in HOMIE config selects `cmd_source: "udp"` and listens on
+`192.168.123.164:15001`, allowing only Thor at `192.168.123.2`. PATH-G1 has no
+sender for this locomotion packet, so absent another sender HOMIE receives a
+zero command and selects stand; the G1 wireless sticks still override UDP and
+can command walking. Verify these IPs on the robot, and provide a separate
+sender if Thor must command HOMIE locomotion.
 
 ```bash
 cd /home/unitree/00_workspace/homie_g1_29dof/deploy

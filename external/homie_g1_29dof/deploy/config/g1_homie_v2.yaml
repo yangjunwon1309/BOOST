@@ -43,5 +43,5 @@ rpy_cmd: [0.0, 0.0, 0.0]
 freq_cmd: 0.75
 
 # stand.onnx vs walk.onnx selection threshold on ||cmd[vx,vy,wz]||.
-# Trained/reference value is 0.05; deployment requested 0.2.
+# Trained/reference value and current deployment setting are both 0.05.
 stand_cmd_threshold: 0.05

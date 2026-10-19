@@ -10,14 +10,14 @@ leg/waist policy output, and is the sole publisher to `rt/lowcmd`.
 | Legs, motors 0-11 | HOMIE policy | HOMIE merged `rt/lowcmd` |
 | Waist, motors 12-14 | HOMIE policy | HOMIE merged `rt/lowcmd` |
 | Left/right arms, motors 15-28 | PATH nonlinear IK | `rt/arm_sdk` into HOMIE, then merged `rt/lowcmd` |
-| Dex1 hands | Separate hand service | Separate hand DDS topics when enabled |
+| Dex1 hands | PATH grip bits over LCM | G1 bridge publishes `rt/dex1/{left,right}/cmd` |
 | Robot state | G1 bridge | Reads `rt/lowstate`, publishes `G1_ROBOT_STATE` |
 | Camera masks, surface geometry, belief | Thor/remote SAM3 pipeline | Target and belief messages only |
 
-The G1 bridge owns `rt/arm_sdk` only. It does not publish `rt/lowcmd`. The
-HOMIE process owns the final full-body `rt/lowcmd` writer and must be configured
-with `arm_source: "arm_sdk"`. The bridge ignores PATH grip flags; the Dex1
-service owns hand commands.
+The G1 bridge publishes arm targets on `rt/arm_sdk` and hand targets on the
+separate Dex1 DDS topics. It does not publish `rt/lowcmd`. The HOMIE process
+owns the final full-body `rt/lowcmd` writer and must be configured with
+`arm_source: "arm_sdk"`.
 
 ```text
 PICO / SAM3 belief target
@@ -36,6 +36,8 @@ HOMIE reads rt/arm_sdk and combines 14 arm + 15 leg/waist targets
           |
           v
 HOMIE sole rt/lowcmd writer
+
+PATH grip bits -----------------------> G1 bridge -> rt/dex1/*/cmd
 ```
 
 Use the local `homie_g1_29dof` deployment for this interface. Do not run the

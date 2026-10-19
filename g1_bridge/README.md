@@ -9,10 +9,11 @@ The source is ported from `C:\studioprojects\g1_ws\g1_ws`: the original
 `src/g1_lowlevel_bridge.cpp` and its supporting headers are copied into this
 folder. The original `g1_ws` checkout is not modified. The port adds direct
 support for PATH's existing 192-byte `G1_PATH_UPPER_COMMAND` packet and
-keeps the packaged process focused on arm SDK output, G1 state, and LCM. The
-camera and hand DDS subsystems are not part of this bridge package. The bridge
-only writes arm targets, so `path_direct_lcm_bridge` from `g1_ws` is not needed
-on the robot.
+keeps the packaged process focused on arm SDK output, Dex1 hand control, G1
+state, and LCM. Camera capture and SAM3 perception run in PATH's perception
+pipeline on Thor or the remote worker, not in this G1 bridge. The bridge only
+writes arm targets on `rt/arm_sdk`; `path_direct_lcm_bridge` from `g1_ws` is not
+needed on the robot.
 
 ## PATH and HOMIE command flow
 
@@ -27,6 +28,17 @@ arm targets with HOMIE's 15 leg/waist targets, and is the sole `rt/lowcmd`
 writer. Run that WBC deployment separately. Do not run the upstream HOMIE
 `g1_control` lowcmd writer at the same time; it has a different LCM arm input
 interface. See [`../docs/control_ownership.md`](../docs/control_ownership.md).
+
+PDU1 grip flags are routed to Dex1-1 on `rt/dex1/left/cmd` and
+`rt/dex1/right/cmd`. The bridge reads both hand state topics and owns a separate
+200 Hz hand writer. This follows the Unitree
+[`dex1_1_service`](https://github.com/unitreerobotics/dex1_1_service) DDS
+interface: the bridge publishes `MotorCmds_` and subscribes to `MotorStates_`.
+Start that serial-to-DDS service on the computer connected to the hands before
+starting the bridge live. Dex1 is the default in live mode and requires both
+hand state streams at startup; initialization opens the grippers. Dry-run mode
+does not initialize hand writers. Use `--hand-backend none` for a G1 without
+Dex1 hands.
 
 ## Build on G1
 
@@ -59,5 +71,7 @@ The defaults are LCM URL `udpm://239.255.76.67:7667?ttl=1`, command channel
 publication. Override them with `PATH_LCM_URL`, `G1_PATH_UPPER_CHANNEL`,
 `G1_ROBOT_STATE_CHANNEL`, and `G1_LCM_STATE_RATE_HZ`.
 
-The bridge validates but ignores the packet's grip flags. The separate Dex1
-service remains responsible for hand control.
+The bridge defaults to `--hand-backend dex1`. The `run.sh` wrapper forwards
+extra CLI arguments, so `./g1_bridge/run.sh --hand-backend none` disables hand
+DDS access when the robot has no Dex1 hands. Dry-run mode never publishes arm
+or hand targets.

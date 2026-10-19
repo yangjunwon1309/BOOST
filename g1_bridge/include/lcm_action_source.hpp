@@ -123,6 +123,8 @@ class LcmActionSource final : public ActionSource {
       command.dq_target[motor] = packet.dq_arm[i];
       command.tau_ff[motor] = packet.tau_arm[i];
     }
+    command.left_grip = (packet.flags & g1_path::kFlagLeftGrip) != 0;
+    command.right_grip = (packet.flags & g1_path::kFlagRightGrip) != 0;
     command.sequence = packet.sequence;
     command.received_at = std::chrono::steady_clock::now();
 

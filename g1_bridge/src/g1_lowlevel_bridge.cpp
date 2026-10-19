@@ -22,6 +22,7 @@
 #include "lcm_protocol.hpp"
 #include "lcm_robot_state_publisher.hpp"
 #include "null_action_source.hpp"
+#include "dex1_hands.hpp"
 #include "path_direct_protocol.hpp"
 #include "robot_parameters.hpp"
 
@@ -50,6 +51,7 @@ struct BridgeOptions {
   std::string lcm_url;
   std::string lcm_action_channel = g1_path::kDefaultUpperCommandChannel;
   std::string lcm_state_channel = g1_lcm::kDefaultStateChannel;
+  std::string hand_backend = "dex1";
   bool publish_lcm_state = false;
   bool dry_run_actions = false;
   int lcm_state_rate_hz = 100;
@@ -119,6 +121,14 @@ class G1LowLevelBridge {
       return false;
     }
 
+    if (!InitializeHands()) {
+      std::cerr << "[bridge] Failed to initialize hand backend: "
+                << options_.hand_backend << '\n';
+      action_source_->Stop();
+      if (lcm_state_publisher_) lcm_state_publisher_->Stop();
+      return false;
+    }
+
     SetSafeCommand();
     running_.store(true);
     command_writer_thread_ = std::thread(&G1LowLevelBridge::CommandWriterLoop, this);
@@ -130,6 +140,13 @@ class G1LowLevelBridge {
     std::cout << "[bridge] Started. Action source: " << action_source_->Name() << '\n';
     std::cout << "[bridge] DDS output: arm-only topic=" << HG_ARM_SDK_TOPIC
               << " joints=15..28\n";
+    std::cout << "[bridge] Hand backend: " << options_.hand_backend;
+    if (options_.hand_backend == "dex1") {
+      std::cout << (options_.dry_run_actions
+                        ? " (DDS output disabled in dry-run)"
+                        : " (rt/dex1/*, dedicated 200 Hz writer)");
+    }
+    std::cout << '\n';
     if (options_.dry_run_actions) {
       std::cout << "[bridge] Dry-run actions enabled; received actions will not move motors.\n";
     } else if (options_.action_source == "null") {
@@ -171,12 +188,18 @@ class G1LowLevelBridge {
 
     SetSafeCommand();
 
+    std::thread hand_shutdown_thread;
+    if (options_.hand_backend == "dex1") {
+      hand_shutdown_thread = std::thread(&G1LowLevelBridge::ShutdownHands, this);
+    }
+
     // In arm-SDK mode these writes contain only the ownership-release marker;
     // waist and lower body remain owned by the resident G1 controller.
     for (int i = 0; i < 100; ++i) {
       WriteLowCommand();
       std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
+    if (hand_shutdown_thread.joinable()) hand_shutdown_thread.join();
   }
 
   ~G1LowLevelBridge() {
@@ -266,6 +289,36 @@ class G1LowLevelBridge {
                                   lowstate_count_.load());
   }
 
+  bool InitializeHands() {
+    if (options_.hand_backend == "none") return true;
+    if (options_.dry_run_actions) {
+      std::cout << "[bridge] Dry-run: Dex1 DDS writers are disabled.\n";
+      return true;
+    }
+    return dex1_hands_.Initialize();
+  }
+
+  void ShutdownHands() {
+    if (options_.hand_backend == "dex1") dex1_hands_.Shutdown();
+  }
+
+  void UpdateGripCommands(const ActionCommand& command) {
+    if (options_.hand_backend != "dex1") return;
+
+    if (command.left_grip != last_left_grip_) {
+      dex1_hands_.SetGripCommand(true, command.left_grip);
+      last_left_grip_ = command.left_grip;
+      std::cout << "[bridge] Dex1 left hand: "
+                << (command.left_grip ? "CLOSE" : "OPEN") << '\n';
+    }
+    if (command.right_grip != last_right_grip_) {
+      dex1_hands_.SetGripCommand(false, command.right_grip);
+      last_right_grip_ = command.right_grip;
+      std::cout << "[bridge] Dex1 right hand: "
+                << (command.right_grip ? "CLOSE" : "OPEN") << '\n';
+    }
+  }
+
   void UpdateCommandFromActionSource() {
     auto maybe_action = action_source_->Poll();
     if (!maybe_action) {
@@ -297,6 +350,7 @@ class G1LowLevelBridge {
     }
 
     SetDirectMotorCommand(command);
+    UpdateGripCommands(command);
     const uint64_t applied_count = ++action_applied_count_;
     if (applied_count == 1 || applied_count % 500 == 0) {
       const auto action_age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -379,6 +433,7 @@ class G1LowLevelBridge {
   std::string network_interface_;
   std::unique_ptr<ActionSource> action_source_;
   std::unique_ptr<LcmRobotStatePublisher> lcm_state_publisher_;
+  dex1::Dex1Hands dex1_hands_;
 
   TimestampedBuffer<LowState_> low_state_buffer_;
   TimestampedBuffer<IMUState_> imu_torso_buffer_;
@@ -397,6 +452,8 @@ class G1LowLevelBridge {
   std::atomic<uint64_t> action_applied_count_{0};
   std::atomic<uint64_t> crc_error_count_{0};
   std::atomic_bool arm_sdk_armed_{false};
+  bool last_left_grip_ = false;
+  bool last_right_grip_ = false;
 };
 
 void PrintUsage(const char* argv0) {
@@ -406,6 +463,7 @@ void PrintUsage(const char* argv0) {
             << "  --lcm-url <url>                  LCM URL (default: LCM default/env)\n"
             << "  --lcm-action-channel <name>      PATH arm channel (default: "
             << g1_path::kDefaultUpperCommandChannel << ")\n"
+            << "  --hand-backend <dex1|none>       Dex1 hand DDS output (default: dex1)\n"
             << "  --publish-lcm-state              Publish robot state over LCM\n"
             << "  --lcm-state-channel <name>       State channel (default: "
             << g1_lcm::kDefaultStateChannel << ")\n"
@@ -445,6 +503,14 @@ bool ParseOptions(int argc, char** argv, BridgeOptions& options) {
       const char* value = require_value("--lcm-action-channel");
       if (!value) return false;
       options.lcm_action_channel = value;
+    } else if (arg == "--hand-backend") {
+      const char* value = require_value("--hand-backend");
+      if (!value) return false;
+      options.hand_backend = value;
+      if (options.hand_backend != "dex1" && options.hand_backend != "none") {
+        std::cerr << "--hand-backend must be 'dex1' or 'none'\n";
+        return false;
+      }
     } else if (arg == "--publish-lcm-state") {
       options.publish_lcm_state = true;
     } else if (arg == "--lcm-state-channel") {

@@ -14,6 +14,8 @@ struct ActionCommand {
   std::array<float, G1_NUM_MOTOR> q_target = {};
   std::array<float, G1_NUM_MOTOR> dq_target = {};
   std::array<float, G1_NUM_MOTOR> tau_ff = {};
+  bool left_grip = false;
+  bool right_grip = false;
   uint64_t sequence = 0;
   std::chrono::steady_clock::time_point received_at = std::chrono::steady_clock::now();
 };

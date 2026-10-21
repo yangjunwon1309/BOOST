@@ -1,7 +1,8 @@
 # Control ownership
 
-PATH-G1 owns arm task control and produces arm-only targets. On G1, the PATH
-bridge publishes those targets to `rt/arm_sdk`. The selected local
+The current BOOST teleop still uses the imported PATH arm-control path and
+produces arm-only targets. On G1, its bridge publishes those targets to
+`rt/arm_sdk`. The selected local
 `homie_g1_29dof` deployment reads that topic, combines the arms with its
 leg/waist policy output, and is the sole publisher to `rt/lowcmd`.
 
@@ -9,7 +10,7 @@ leg/waist policy output, and is the sole publisher to `rt/lowcmd`.
 | --- | --- | --- |
 | Legs, motors 0-11 | HOMIE policy | HOMIE merged `rt/lowcmd` |
 | Waist, motors 12-14 | HOMIE policy | HOMIE merged `rt/lowcmd` |
-| Left/right arms, motors 15-28 | PATH nonlinear IK | `rt/arm_sdk` into HOMIE, then merged `rt/lowcmd` |
+| Left/right arms, motors 15-28 | PATH-derived nonlinear IK | `rt/arm_sdk` into HOMIE, then merged `rt/lowcmd` |
 | Dex1 hands | PATH grip bits over LCM | G1 bridge publishes `rt/dex1/{left,right}/cmd` |
 | Robot state | G1 bridge | Reads `rt/lowstate`, publishes `G1_ROBOT_STATE` |
 | Camera masks, surface geometry, belief | Thor/remote SAM3 pipeline | Target and belief messages only |
@@ -20,10 +21,10 @@ owns the final full-body `rt/lowcmd` writer and must be configured with
 `arm_source: "arm_sdk"`.
 
 ```text
-PICO / SAM3 belief target
+PICO / SAM3 surface target
           |
           v
-PATH state machine + nonlinear arm IK (Thor)
+BOOST teleop state machine + nonlinear arm IK (Thor)
           |
           v
 G1_PATH_UPPER_COMMAND over LCM
@@ -37,7 +38,7 @@ HOMIE reads rt/arm_sdk and combines 14 arm + 15 leg/waist targets
           v
 HOMIE sole rt/lowcmd writer
 
-PATH grip bits -----------------------> G1 bridge -> rt/dex1/*/cmd
+PATH-era grip bits ------------------> G1 bridge -> rt/dex1/*/cmd
 ```
 
 Use the local `homie_g1_29dof` deployment for this interface. Do not run the

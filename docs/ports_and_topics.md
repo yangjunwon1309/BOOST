@@ -1,6 +1,7 @@
 # Ports and topics
 
-These are the PATH-G1 deployment defaults. LCM uses UDP multicast; Unitree DDS
+These are the PATH-derived deployment defaults currently carried by BOOST.
+LCM uses UDP multicast; Unitree DDS
 topics are local SDK channels and do not use the ZMQ TCP ports below.
 
 | Port / transport | Publisher -> consumer | Topic / channel | Purpose |

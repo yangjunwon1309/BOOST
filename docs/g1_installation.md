@@ -1,4 +1,10 @@
-# G1 deployment installation
+# Legacy PATH/Dex1 G1 deployment reference
+
+This document records the PATH-G1 arm and Dex1 deployment. It is retained for
+reproducing the imported PATH setup and does not configure BOOST's planned
+BrainCo Revo2 interface. In the reorganized BOOST tree, the carried bridge is
+under `boost/io/g1_bridge/`; the commands below refer to an original PATH-G1
+checkout unless explicitly adapted.
 
 ## Selected HOMIE source
 

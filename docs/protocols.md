@@ -51,7 +51,7 @@ PATH uses the base IMU and joint state for gravity estimation and arm IK seeds.
 The bridge subscribes to `rt/lowstate` and publishes PATH arm targets through
 `rt/arm_sdk`. It writes arm motor slots 15-28 and the reserved SDK enable
 marker in slot 29; it does not publish `rt/lowcmd`. The arm gains come from the
-ported `g1_ws` `kps`/`kds` arrays in `g1_bridge/include/robot_parameters.hpp`;
+ported `g1_ws` `kps`/`kds` arrays in `boost/io/g1_bridge/include/robot_parameters.hpp`;
 PATH supplies `q`, `dq`, and feed-forward `tau`. The local HOMIE
 deployment subscribes to `rt/arm_sdk`, merges the arms with WBC output, and
 publishes the final command on `rt/lowcmd`. Topic and marker usage
@@ -72,7 +72,7 @@ The PATH bridge subscribes to both state topics and publishes both command
 topics. Each command sets `mode=1`, position `q` in radians, zero `dq` and
 `tau`, `kp=5.0`, `kd=0.05`, and a zeroed reserve field, matching Unitree's
 official Dex1-1 test publisher. The bridge sends at 200 Hz with bounded
-position steps. Both `dex1_1_service` and `g1_bridge` initialize Unitree DDS on
+position steps. Both `dex1_1_service` and `boost/io/g1_bridge` initialize Unitree DDS on
 domain 0; their selected network interfaces must share DDS traffic. Run the
 service on the computer connected to the grippers' serial cables. The bridge
 does not open the serial ports itself.
@@ -84,3 +84,13 @@ commands. Grip flags from PATH select the targets sent to that service.
 The current local HOMIE merge forwards arm position, gains, and feed-forward
 torque but sends zero target velocity on `rt/lowcmd`; PATH's intermediate
 `dq` field is not consumed by that merge.
+
+## Revo2 hand service (planned BOOST adapter)
+
+The PATH bridge's Dex1 topics do not control BrainCo Revo2. Revo2 uses
+Unitree's external `brainco_hand_service` over
+`rt/brainco/{left,right}/cmd` and `rt/brainco/{left,right}/state`; each hand
+has six normalized values in `[0, 1]`, ordered Thumb, Thumb_aux, Index,
+Middle, Ring, Pinky. The BOOST adapter is reserved under
+`boost/io/revo2_hand_service/`. The service itself is not vendored, and HOMIE
+continues to own `rt/lowcmd`.

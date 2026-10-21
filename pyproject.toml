@@ -1,7 +1,7 @@
 [project]
-name = "path-g1"
+name = "boost"
 version = "0.1.0"
-description = "Perception-assisted arm control and Unitree G1 SDK bridge"
+description = "Object-centric teleoperation and manipulation research for Unitree G1"
 requires-python = ">=3.10"
 dependencies = [
   "msgpack",
@@ -9,6 +9,24 @@ dependencies = [
   "pyyaml",
   "pyzmq",
   "scipy",
+]
+
+[project.optional-dependencies]
+# These match the PATH runtime split: PATH's sonic_runtime pins NumPy/SciPy;
+# MuJoCo 3.5.0 is the version installed in the local PATH simulation Python.
+# PATH does not pin Pinocchio or CasADi, so keep those constraints aligned with
+# its source extra instead of inventing different solver versions.
+sim = [
+  "mujoco==3.5.0",
+  "numpy==1.26.4",
+  "scipy==1.15.3",
+  "pyyaml==6.0.1",
+  "pyzmq==27.1.0",
+  "msgpack==1.2.1",
+  "lcm==1.5.2",
+  "pin",
+  "casadi",
+  "onnxruntime",
 ]
 
 [tool.ruff]

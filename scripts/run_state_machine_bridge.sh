@@ -2,11 +2,11 @@
 set -euo pipefail
 
 PATH_G1_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-source "$PATH_G1_ROOT/configs/runtime/local.env"
+source "$PATH_G1_ROOT/configs/teleop/local.env"
 
 cd "$PATH_G1_ROOT"
-exec taskset -c "${PATH_CONTROL_CPUSET:-6-7}" \
-"$PATH_PYTHON" -u path_streaming/path_state_machine_bridge.py \
+state_machine_command=(
+"$PATH_PYTHON" -u boost/teleop/path_streaming/path_state_machine_bridge.py \
   --state "${PATH_STATE:-teleop}" \
   --fps "${PATH_FPS:-50}" \
   --pico-hand-timeout-sec "${PATH_PICO_HAND_TIMEOUT_SEC:-0.35}" \
@@ -73,3 +73,9 @@ exec taskset -c "${PATH_CONTROL_CPUSET:-6-7}" \
   --arm-ik-output-velocity-limit-rad-s "${PATH_ARM_IK_OUTPUT_VELOCITY_LIMIT_RAD_S:-10.0}" \
   --arm-ik-output-control-hz "${PATH_ARM_IK_OUTPUT_CONTROL_HZ:-50.0}" \
   "$@"
+)
+
+if [[ -n "${PATH_CONTROL_CPUSET-6-7}" ]] && command -v taskset >/dev/null 2>&1; then
+  exec taskset -c "$PATH_CONTROL_CPUSET" "${state_machine_command[@]}"
+fi
+exec "${state_machine_command[@]}"

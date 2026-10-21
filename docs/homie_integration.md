@@ -19,7 +19,7 @@ gains, and feed-forward torque are carried through; velocity feed-forward is
 not.
 
 Deploy this snapshot on G1 with `arm_source: "arm_sdk"`. Run its HOMIE
-controller separately from PATH-G1's `g1_bridge/run.sh`. Keep the HOMIE
+controller separately from BOOST's `boost/io/g1_bridge/run.sh`. Keep the HOMIE
 controller as the only `rt/lowcmd` publisher. G1 transfer and dependency
 commands are in [`g1_installation.md`](g1_installation.md).
 

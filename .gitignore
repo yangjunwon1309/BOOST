@@ -18,8 +18,6 @@ compile_commands.json
 .venv/
 .venv_*/
 .pixi/
-data/*
-!data/.gitkeep
 *.npz
 *.npy
 *.pkl
@@ -44,7 +42,7 @@ external/homie_g1_29dof/**/__pycache__/
 *.trt.*
 
 # Generated belief logs
-perception/data/belief_logs/*.csv
+services/pose_service/data/belief_logs/*.csv
 
 # All experiment recordings and their derived analysis artifacts are local data.
 /record/

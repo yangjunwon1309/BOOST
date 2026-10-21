@@ -1,0 +1,25 @@
+# MuJoCo/DDS setup based on PATH-G1 sonic_runtime's Revo2 backend.
+# Interface lo gives the simulator, HOMIE, and the PATH arm bridge one isolated
+# local DDS domain so no physical G1 receives the simulated commands.
+scene: boost/sim/mujoco/scene_29dof_with_revo2.xml
+homie_config: configs/sim/homie_g1_mujoco.yaml
+interface: lo
+domain_id: 0
+sim_dt: 0.005
+initial_height: 0.793
+
+num_body_motors: 29
+num_hand_motors: 6
+num_hand_joints: 11
+hand_backend: brainco_revo2
+hand_pd:
+  kp: 30.0
+  kd: 10.0
+binary_open: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+binary_close: [0.70, 1.0, 1.0, 1.0, 1.0, 1.0]
+
+# The original PATH binary command carries only left/right grip flags. The
+# sim adapter maps those to the six-channel BrainCo order [Thumb, Thumb_aux,
+# Index, Middle, Ring, Pinky] until continuous hand tracking is added.
+grip_lcm_channel: G1_PATH_UPPER_COMMAND
+grip_stale_open_after_sec: 0.35

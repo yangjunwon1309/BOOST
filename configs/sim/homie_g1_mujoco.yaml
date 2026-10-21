@@ -1,0 +1,88 @@
+# HOMIE G1 29DoF hardware/deploy config (mirrors TWIST2 deploy_real/robot_control/configs/g1.yaml)
+# Owns everything about the *robot*: control rate, joint mapping, 29-dim PD gains,
+# and the full 29-dim default pose (policy joints + arm rest pose).
+#
+# The 15 policy joints (0..14) use the HOMIE gains from config/g1_homie_v2.yaml.
+# The 14 arm joints (15..28) are NOT policy-controlled; conservative arm gains are
+# taken from the TWIST2 G1 config and hold the default arm pose unless an external
+# arm-target source overrides them.
+
+control_dt: 0.02          # 50 Hz, matches simulation_dt(0.005) * control_decimation(4)
+
+num_actions: 29           # full hardware DoF
+
+msg_type: "hg"
+imu_type: "pelvis"        # HOMIE V2 uses the pelvis/base IMU only
+
+lowcmd_topic: "rt/lowcmd"
+lowstate_topic: "rt/lowstate"
+
+# Body order == hardware order == Unitree G1JointIndex (identity mapping).
+joint2motor_idx: [0, 1, 2, 3, 4, 5,        # left leg
+                  6, 7, 8, 9, 10, 11,      # right leg
+                  12, 13, 14,              # waist yaw/roll/pitch
+                  15, 16, 17, 18, 19, 20, 21,   # left arm
+                  22, 23, 24, 25, 26, 27, 28]   # right arm
+
+# Gains: idx 0..14 = HOMIE (g1_homie_v2.yaml), idx 15..28 = conservative arm PD.
+kps: [150, 150, 150, 200, 40, 40,          # left leg
+      150, 150, 150, 200, 40, 40,          # right leg
+      250, 250, 250,                       # waist
+      40, 40, 40, 40, 20, 20, 20,          # left arm
+      40, 40, 40, 40, 20, 20, 20]          # right arm
+kds: [2, 2, 2, 4, 2, 2,
+      2, 2, 2, 4, 2, 2,
+      5, 5, 5,
+      5, 5, 5, 5, 1, 1, 1,
+      5, 5, 5, 5, 1, 1, 1]
+
+# Full 29-dim default pose: policy joints match g1_homie_v2.yaml default_angles,
+# arms hold a neutral rest pose (from TWIST2 G1 config).
+default_angles: [-0.1, 0.0, 0.0, 0.3, -0.2, 0.0,      # left leg
+                 -0.1, 0.0, 0.0, 0.3, -0.2, 0.0,      # right leg
+                  0.0, 0.0, 0.0,                      # waist
+                  0.0, 0.4, 0.0, 1.2, 0.0, 0.0, 0.0,  # left arm
+                  0.0, -0.4, 0.0, 1.2, 0.0, 0.0, 0.0] # right arm
+
+# Wireless-controller cmd_vel limits [vx, vy, wz] (m/s, m/s, rad/s).
+max_cmd: [0.6, 0.4, 0.6]
+cmd_deadzone: 0.04         # stick deadzone (fraction of full scale)
+
+# cmd_vel source. UDP is the verified Thor (192.168.123.2) -> G1 PC2 path.
+# Physical wireless sticks always override it; stale or invalid input is zero.
+cmd_source: "wireless"
+cmd_udp_bind_host: "192.168.123.164"
+cmd_udp_port: 15001
+cmd_udp_allowed_host: "192.168.123.2"
+cmd_udp_timeout: 0.3
+# Legacy optional source: set cmd_source to "dds" to consume rt/nav_cmd.
+cmd_dds_timeout: 0.3
+
+# Arm-target source for joints 15..28:
+#   "hold"    -> hold the default arm pose (safest for bring-up)
+#   "arm_sdk" -> read xr_teleoperate's rt/arm_sdk publications (recommended for teleop)
+#   "redis"   -> read a 14-float JSON channel from Redis
+arm_source: "arm_sdk"
+arm_redis_key: "action_arm_unitree_g1_homie"
+arm_redis_timeout: 0.2   # seconds; hold default if channel is stale
+
+# Low-pass time constant (seconds) smoothing arm_sdk mode's raw target before it's sent.
+# xr_teleoperate's own rt/arm_sdk publish rate is irregular in practice (Thor-side IK/
+# vision/recording load); the G1 firmware's native rt/arm_sdk overlay apparently smooths
+# over that on its own, but that overlay is bypassed once HOMIE owns rt/lowcmd, so we do
+# it ourselves here. Larger = smoother but more lag; smaller = snappier but more
+# "stepping" whenever teleop's own updates arrive unevenly. 0 disables smoothing.
+arm_smoothing_tau: 0.0
+
+# Feedforward torque (tau) safety, forwarded from teleop's motor_cmd[15:29].tau
+# (gravity comp) alongside q/kp/kd. Conservative on purpose -- this is added on TOP of
+# the PD position tracking, not relied on for it. Forced to exactly 0 regardless of
+# these settings whenever teleop is disengaged, the rt/arm_sdk sample is stale, or any
+# element is NaN/Inf (see arm_target_source.py).
+arm_tau_scale: 1.0     # multiplier applied to teleop's raw tau after the weight scale
+# N*m, hard per-joint clamp applied after scaling. Per-joint (G1 URDF effort limits),
+# order = ARM_MOTOR_IDS = G1_29_JointArmIndex (see arm_target_source.py):
+#   [L shoulder pitch/roll/yaw, L elbow, L wrist roll/pitch/yaw,
+#    R shoulder pitch/roll/yaw, R elbow, R wrist roll/pitch/yaw]
+# A scalar is also accepted (broadcasts to all 14 joints).
+arm_tau_clamp: [25, 25, 25, 25, 25, 5, 5, 25, 25, 25, 25, 25, 5, 5]

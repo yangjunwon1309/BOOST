@@ -1,7 +1,7 @@
 [workspace]
-name = "path-g1-host"
+name = "boost"
 version = "0.1.0"
-description = "Reproducible host-side PATH-G1 validation and Docker launch tools"
+description = "BOOST host-side teleoperation and service launch tools"
 channels = ["conda-forge"]
 platforms = ["linux-64"]
 
@@ -11,7 +11,7 @@ platforms = ["linux-64"]
 python = "==3.12.3"
 
 # Pinned host-side runtime and maintenance tools. GPU inference remains inside
-# the SAM3 containers defined under perception/docker/.
+# the SAM3 containers defined under services/pose_service/docker/.
 [pypi-dependencies]
 annotated-doc = "==0.0.5"
 annotated-types = "==0.8.0"
@@ -42,9 +42,9 @@ typing-inspection = "==0.4.4"
 uvicorn = "==0.52.3"
 
 [activation.env]
-PYTHONPATH = "$PIXI_PROJECT_ROOT:$PIXI_PROJECT_ROOT/perception"
+PYTHONPATH = "$PIXI_PROJECT_ROOT:$PIXI_PROJECT_ROOT/services/pose_service"
 
 [tasks]
-verify-host = "python perception/tools/verify_pixi_host_environment.py"
-test-perception = "python -m pytest -q perception/tests"
-sam3-worker = { cmd = "bash tools/run_remote_sam3_wrist_d405_v11.sh", cwd = "perception" }
+verify-host = "python services/pose_service/tools/verify_pixi_host_environment.py"
+test-perception = "python -m pytest -q services/pose_service/tests"
+sam3-worker = { cmd = "bash tools/run_remote_sam3_wrist_d405_v11.sh", cwd = "services/pose_service" }

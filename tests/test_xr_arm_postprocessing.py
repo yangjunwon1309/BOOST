@@ -2,7 +2,7 @@ import unittest
 
 import numpy as np
 
-from path_core.teleop.xr_arm_postprocessing import XrArmCommandPostprocessor
+from boost.teleop.xr.xr_arm_postprocessing import XrArmCommandPostprocessor
 
 
 class XrArmCommandPostprocessorTest(unittest.TestCase):

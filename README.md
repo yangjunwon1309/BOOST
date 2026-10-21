@@ -1,47 +1,55 @@
-# PATH-G1 deploy
+# BOOST
 
-PATH-G1 runs arm-only, perception-assisted teleoperation for Unitree G1.
-Thor computes arm references with nonlinear IK and can blend SAM3 surface and
-belief inputs. The G1 bridge publishes PATH commands only through Unitree's
-arm SDK topic and routes binary grip flags to the G1's Dex1 hand DDS topics.
-The separately deployed HOMIE/WBC remains the sole `rt/lowcmd` writer.
+BOOST is the research codebase for object-centric teleoperation and
+manipulation with a Unitree G1 and BrainCo Revo2 hands. The development scope
+and staged implementation plan are in [`BOOST_dev_plan.md`](BOOST_dev_plan.md).
 
-## Repository map
+The current source is a reorganized PATH-G1 starting point. The teleop state
+machine, XR streams, arm IK, G1 bridge, and wrist perception service have been
+moved into the subsystem layout below. This layout does not mean the planned
+Revo2 command path, FoundationPose integration, object-aware MPPI, episode
+schema, or MuJoCo task are already implemented.
 
-- `path_streaming/`: PICO inputs, PATH state machine, arm references, and telemetry.
-- `path_planning/`: nonlinear G1 arm IK.
-- `perception/`: RGB-D capture, SAM3 masks, surface geometry, belief assistance,
-  and end-effector target publication.
-- `assets/robot/`: packaged G1 URDF, meshes, and upstream license.
-- `g1_bridge/`: G1-local LCM/Unitree SDK arm and Dex1 hand bridge.
-- `docs/`: control ownership, protocol layout, ports, and deployment order.
+Git workflow: `main` is the README-only landing branch; ongoing development is
+on `deploy`. See [`docs/git_workflow.md`](docs/git_workflow.md) and
+`python scripts/boost_git.py --help`.
 
-## Deployment sequence
+## Repository layout
 
-1. Build and start `g1_bridge` on G1 in default dry-run mode; confirm
-   `G1_ROBOT_STATE` reaches Thor.
-2. Start the PATH state machine and the desired PICO input process on Thor.
-3. Start the selected perception route. For wrist D405, run the Thor gateway
-   and the remote SAM3 worker; the local web server is an optional camera view.
-4. Start the local `homie_g1_29dof` deployment on G1 with
-   `arm_source: "arm_sdk"` and its sole `rt/lowcmd` writer.
-5. Start Unitree `dex1_1_service` on the computer connected to the hand serial
-   cables, then restart the G1 bridge with `G1_BRIDGE_LIVE=1` to forward PATH
-   arm commands on `rt/arm_sdk` and hand commands over Dex1 DDS. HOMIE merges
-   arm targets with its leg/waist output.
+- `boost/teleop/`: PATH-derived state machine, XR input, and isolated legacy
+  intention code. Its source pin and move map are in
+  [`boost/teleop/UPSTREAM.md`](boost/teleop/UPSTREAM.md).
+- `boost/io/path_transport/`: the PATH LCM protocol and ZMQ transport layer.
+- `boost/io/revo2_hand_service/`: the planned adapter contract for the external
+  BrainCo hand service; its driver source is not vendored.
+- `boost/control/arm/`: PATH-derived nonlinear G1 arm IK.
+- `boost/io/g1_bridge/`: PATH-derived Unitree arm and Dex1 bridge. It still
+  speaks the old Dex1 interface; Revo2 uses the separate
+  `unitreerobotics/brainco_hand_service` DDS interface and needs a new adapter.
+- `services/pose_service/`: the moved PATH wrist RGB-D/SAM3 service. It
+  currently publishes surface and target data; FoundationPose pose estimation
+  is planned work.
+- `configs/`: BOOST configuration roots, with the existing teleop runtime
+  settings under `configs/teleop/`.
+- `boost/sim/`: MuJoCo assets and model work.
+- `assets/robot/`: pinned G1 model and the BrainCo Revo2 description snapshot.
+- `external/homie_g1_29dof/`: local HOMIE/WBC snapshot. HOMIE remains the sole
+  `rt/lowcmd` writer; BOOST sends arm targets through `rt/arm_sdk`.
+- `scripts/`, `docs/`, `tests/`, `datasets/`, and `third_party/`: launch tools,
+  deployment references, verification, dataset guidance, and pinned external
+  dependencies.
 
-The state machine and IK default to `assets/robot/g1_body29_hand14.urdf`.
-The G1 bridge build and launch instructions are in [`g1_bridge/README.md`](g1_bridge/README.md).
+## Existing PATH teleop entry points
 
-## Deployment contracts
+The current PATH-derived servers can be started from the repository root:
 
-- [Joint and process ownership](docs/control_ownership.md)
-- [LCM and SDK packet formats](docs/protocols.md)
-- [Ports and topics](docs/ports_and_topics.md)
-- [Deployment order](docs/deployment.md)
-- [HOMIE interface comparison](docs/homie_integration.md)
-- [Perception and remote SAM3](perception/README.md)
-- [G1, Unitree SDK2, and local HOMIE installation commands](docs/g1_installation.md)
+```bash
+bash scripts/run_pico_manager.sh
+bash scripts/run_state_machine_bridge.sh
+```
 
-The deployment instructions identify the local `homie_g1_29dof` source to copy
-to G1. It is not the upstream `InternRobotics/Homie` controller.
+Use `bash scripts/run_galaxy_xr_manager.sh` for the Galaxy XR input route.
+These entry points retain the current PATH packet and controller behavior;
+they do not send Revo2 hand commands. The service deployment notes are in
+[`docs/deployment.md`](docs/deployment.md). The separate G1/Dex1 installation
+document is retained as a PATH reference, not a BOOST Revo2 runbook.

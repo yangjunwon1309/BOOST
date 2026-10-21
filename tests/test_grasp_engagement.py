@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from path_core.intention.grasp_engagement import GraspEngagementDetector
+from boost.teleop.legacy.intention.grasp_engagement import GraspEngagementDetector
 
 
 def test_grasp_detector_waits_for_close_command_fallback_delay() -> None:

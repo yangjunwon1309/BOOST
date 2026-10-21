@@ -6,7 +6,7 @@ import time
 
 import numpy as np
 
-from path_streaming.xr_source_v15 import (
+from boost.teleop.path_streaming.xr_source_v15 import (
     ArrivalMonitor,
     T_ROBOT_OPENXR,
     TeleVuerSource,

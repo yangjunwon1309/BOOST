@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from path_core.intention.reference_dynamics import (
+from boost.teleop.legacy.intention.reference_dynamics import (
     SecondOrderOrientationReference,
     SecondOrderPositionReference,
     rotation_from_vector,

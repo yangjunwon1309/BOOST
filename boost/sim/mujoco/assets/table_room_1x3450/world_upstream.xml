@@ -1,0 +1,87 @@
+<mujoco model="table_room_1x3450 world">
+  <!--
+    Table + YCB chips can (Pringles) in a 3.6 m wide x 7.2 m deep room with a grey stone-tile floor: a white front wall and the lab's 3450 x 1800 mm partitions,
+    one on the back and two on each of the left and right (the side walls stop 15 cm short of the front and back walls).
+    World frame: x forward, y left, origin on the floor under the robot's spawn point; the robot faces +x.
+    Meshes come from tools/build_room_meshes.py (z-up, real size, origin on the floor).
+      room        inside x -3.5..3.7, y -1.8..1.8; the robot spawns 3.5 m in front of the back wall, facing the table
+      floor       visual-only grey stone tiles (0.5 m, meshes/floor.png repeating every 2.0 m) 0.5 mm over the robot's floor, infinite (hides it everywhere)
+      sky         white, white haze (replace the robot's skybox and haze; need unitree-g1-mujoco with world sky/visual support)
+      front wall  white box, 3.6 m wide, 1.8 m high, 0.05 thick, inner face at x = 3.7
+      partitions  3.45 m wide, 1.8 m high; back x = -3.5 (centre y = 0), sides y = +-1.8 (x centres -1.625, 1.825)
+      table       white adjustable table scaled to a 0.80 m top (0.58 deep x 0.82 wide), centre (3.25, 0), 3.25 m ahead of the robot and 0.45 m from the
+                  front wall (its far edge 0.165 m from it, as in table_room_1x3450_short), turned 180 deg (column towards the front wall); its near edge is 2.96 m ahead
+      pringles_can  YCB 001_chips_can at (3.14, -0.08), logo towards the robot: collision is a 75 x 250 mm cylinder, 0.205 kg (the YCB
+                  size and mass); the visual is the tsdf scan, brightened (75.8 mm wide, its lid 4 mm low, the bottom 6 mm missing);
+                  not named chips_can: robot code that finds joints by name parts ("hip") would take its free joint
+    Visual meshes do not collide (room_visual); collisions are boxes (room_collision, group 3, hidden) and the can's
+    cylinder. <option> is elliptic cones with impratio 10 and implicitfast; the timestep comes from the robot.
+  -->
+  <option cone="elliptic" impratio="10" integrator="implicitfast" />
+  <visual>
+    <rgba haze="1 1 1 1" />
+  </visual>
+  <default>
+    <default class="room_visual">
+      <geom type="mesh" contype="0" conaffinity="0" group="2" density="0" />
+    </default>
+    <default class="room_collision">
+      <geom type="box" group="3" rgba="0.5 0.5 0.5 0.3" />
+    </default>
+  </default>
+  <asset>
+    <texture name="table" type="2d" file="meshes/table.png" />
+    <texture name="partition" type="2d" file="meshes/partition.png" />
+    <texture name="chips_can" type="2d" file="meshes/chips_can.png" />
+    <material name="table" texture="table" specular="0.2" shininess="0.2" />
+    <material name="partition" texture="partition" specular="0" shininess="0" />
+    <material name="chips_can" texture="chips_can" specular="0.3" shininess="0.3" />
+    <texture name="room_sky" type="skybox" builtin="flat" rgb1="1 1 1" rgb2="1 1 1" width="16" height="96" />
+    <texture name="room_floor" type="2d" file="meshes/floor.png" />
+    <material name="room_floor" texture="room_floor" texrepeat="1 1" texuniform="true" specular="0" shininess="0" reflectance="0" />
+    <material name="front_wall" rgba="0.92 0.92 0.92 1" specular="0" shininess="0" reflectance="0" />
+    <mesh name="table" file="meshes/table.obj" />
+    <mesh name="partition" file="meshes/partition.obj" />
+    <mesh name="chips_can" file="meshes/chips_can.obj" />
+  </asset>
+  <worldbody>
+    <geom name="room_floor" class="room_visual" type="plane" pos="0.1 0 0.0005" size="0 0 0.1" material="room_floor" />
+    <geom name="front_wall" type="box" pos="3.725 0 0.9" size="0.025 1.8 0.9" material="front_wall" />
+
+    <body name="back_partition" pos="-3.5 0 0" quat="0.7071068 0 0 0.7071068">
+      <geom class="room_visual" mesh="partition" material="partition" />
+      <geom name="back_partition" class="room_collision" pos="0 0 0.9" size="1.725 0.03 0.9" />
+    </body>
+    <body name="left_partition_1" pos="-1.625 1.8 0">
+      <geom class="room_visual" mesh="partition" material="partition" />
+      <geom name="left_partition_1" class="room_collision" pos="0 0 0.9" size="1.725 0.03 0.9" />
+    </body>
+    <body name="left_partition_2" pos="1.825 1.8 0">
+      <geom class="room_visual" mesh="partition" material="partition" />
+      <geom name="left_partition_2" class="room_collision" pos="0 0 0.9" size="1.725 0.03 0.9" />
+    </body>
+    <body name="right_partition_1" pos="-1.625 -1.8 0">
+      <geom class="room_visual" mesh="partition" material="partition" />
+      <geom name="right_partition_1" class="room_collision" pos="0 0 0.9" size="1.725 0.03 0.9" />
+    </body>
+    <body name="right_partition_2" pos="1.825 -1.8 0">
+      <geom class="room_visual" mesh="partition" material="partition" />
+      <geom name="right_partition_2" class="room_collision" pos="0 0 0.9" size="1.725 0.03 0.9" />
+    </body>
+
+    <body name="table" pos="3.25 0 0" quat="0 0 0 1">
+      <geom class="room_visual" mesh="table" material="table" />
+      <geom name="table_top" class="room_collision" pos="0 0 0.785" size="0.285 0.395 0.015" friction="1.0 0.005 0.0001" />
+      <geom name="table_column" class="room_collision" pos="-0.075 0 0.48" size="0.045 0.04 0.28" />
+      <geom name="table_base" class="room_collision" pos="-0.015 0 0.06" size="0.245 0.40 0.06" />
+    </body>
+    <body name="pringles_can" pos="3.14 -0.08 0.801" quat="0.5 0 0 -0.8660254">
+      <freejoint name="pringles_can" />
+      <geom class="room_visual" mesh="chips_can" material="chips_can" />
+      <geom name="pringles_can" class="room_collision" type="cylinder" pos="0 0 0.125" size="0.0375 0.125" mass="0.205" condim="4" priority="2" friction="1.0 0.03 0.002" solref="0.008 1" solimp="0.97 0.995 0.001" />
+    </body>
+
+    <camera name="table_view" pos="3.6 0.75 1.35" xyaxes="-0.875 0.485 0 -0.226 -0.408 0.885" fovy="60" />
+    <camera name="room_view" pos="3.55 -1.65 2.2" xyaxes="0.733 0.680 0 -0.376 0.405 0.833" fovy="70" />
+  </worldbody>
+</mujoco>

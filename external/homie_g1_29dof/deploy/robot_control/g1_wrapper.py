@@ -307,10 +307,19 @@ class G1RealWorldEnv:
         self._writer_thread = None
 
     # --- bring-up ----------------------------------------------------------
-    def move_to_default_pos(self):
-        print("[green]Press START on the remote to ramp to the default pose...[/green]")
-        while self.read_controller_input().keys != self.controller_mapping["start"]:
-            time.sleep(self.config.control_dt)
+    def move_to_default_pos(self, *, exit_on_select=False, auto_start=False):
+        if auto_start:
+            print("[green]Simulation auto-start: ramping to the default pose...[/green]")
+        else:
+            print("[green]Press START on the remote to ramp to the default pose...[/green]")
+            while True:
+                keys = self.read_controller_input().keys
+                if exit_on_select and keys == self.controller_mapping["select"]:
+                    print("[yellow]Select pressed before START; aborting stand-up.[/yellow]")
+                    return False
+                if keys == self.controller_mapping["start"]:
+                    break
+                time.sleep(self.config.control_dt)
         print("[green]Ramping to default pose.[/green]")
 
         total_time = 2.0
@@ -318,9 +327,17 @@ class G1RealWorldEnv:
         q0 = self.get_robot_state()[0]
         q_tgt = self.config.default_angles.copy()
         for i in range(num_step):
+            if (
+                exit_on_select
+                and not auto_start
+                and self.read_controller_input().keys == self.controller_mapping["select"]
+            ):
+                print("[yellow]Select pressed during ramp; aborting stand-up.[/yellow]")
+                return False
             alpha = i / num_step
             self.send_robot_action(q0 * (1 - alpha) + q_tgt * alpha)
             time.sleep(self.config.control_dt)
+        return True
 
     def default_pos_state(self):
         print("Holding default pose. Press A to start the policy...")

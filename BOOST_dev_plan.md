@@ -1,6 +1,6 @@
 # BOOST 개발 계획서
 
-- 버전: v0.1 (2026-10-20)
+- 버전: v0.2 (2026-10-22) — 손 MPPI 비용을 표면 투영 목표 방식으로 변경 (상세: `BOOST_hand_mppi_contact_plan.md`)
 - 목적: Codex 및 협업자 공유용 개발 기준 문서
 - 목표 학회: IROS 2027 (논문 마감 2027-03-01)
 - 읽는 순서: 0–1 (무엇을 만드는가) → 2–5 (구조, 환경, git 규칙) → 6 (단계별 작업) → **7 (teleop 데이터 명세, 가장 중요)**
@@ -32,7 +32,7 @@ $$
 | $\delta\xi^{\theta}$ | 접촉 미세 보정 | 손 expert 출력 | 그래프 가치 가중 SFT |
 | $q_{1:H}$ | 손 관절 목표 (6 DoF × 2) | 0차: GMM retrieval / 이후: 손 expert | 위와 동일 |
 
-저수준에서는 손 MPPI(100 Hz)가 $q$ 목표와 물체 좌표계 keypoint 목표를 받아 실제 손 명령을 만든다 (6.1.3절).
+저수준에서는 손 MPPI가 손끝 목표(teleop: 사람 손끝을 물체 표면으로 투영한 점 / runtime: 그래프 subgoal에서 온 점)를 받아 실제 손 명령을 만든다 (6.1.3절).
 
 ### 1.2 상태 그래프
 
@@ -63,8 +63,8 @@ $$
 └───────────────▲──────────────────────────────▲─────────────────────────────┘
                 │ arm q_cmd / q_meas            │ hand q_cmd / q_meas
 ┌───────────────┴──────────────┐  ┌────────────┴──────────────────────────────┐
-│ control 프로세스 (core env)   │  │ hand MPPI 프로세스 (core env), 100 Hz      │
-│  arm IK (PATH 이식), chunk 실행│  │  물체 좌표계 keypoint loss + SDF 항        │
+│ control 프로세스 (core env)   │  │ hand MPPI 프로세스 (core env)              │
+│  arm IK (PATH 이식), chunk 실행│  │  SBR 비용 + 표면 투영 손끝 목표            │
 └───────────────▲──────────────┘  └────────────▲──────────────────────────────┘
                 │                               │
 ┌───────────────┴───────────────────────────────┴──────────────────────────────┐
@@ -122,7 +122,7 @@ boost/
 │   ├── perception/    # pose 서비스 클라이언트, 물체 레지스트리(메쉬, canonical frame, 대칭)
 │   ├── control/
 │   │   ├── arm/       # 팔 IK (PATH 이식), chunk 실행기
-│   │   └── hand_mppi/ # object-aware MPPI (Smooth Operator 구조), 100 Hz
+│   │   └── hand_mppi/ # SBR(Smooth Operator) 구조 + surface/(SurfaceQuery backends) + targets/(목표 생성기)
 │   ├── teleop/        # XR teleop, 목표 생성, UPSTREAM.md, legacy/(의도 추론 격리)
 │   ├── sim/           # MuJoCo 환경 (G1 + BrainCo + 박스·마우스), 렌더 카메라
 │   ├── data/
@@ -212,13 +212,13 @@ pose = ["pose"]
 
 | 브랜치 / tag | 용도 | 규칙 |
 |---|---|---|
-| `main` | `README.md`만 둠 | 코드 push 금지 |
-| `deploy` | **기본 개발 브랜치** (GitHub default branch로 설정) | 실제 개발과 통합 검증 진행 |
-| `feat/<name>` | 선택적 단기 작업 브랜치 | deploy로 merge 후 삭제 |
+| `main` | README와 문서만 | 코드 push 금지 |
+| `develop` | **기본 작업 브랜치** (GitHub default branch로 설정) | 항상 sim에서 동작하는 상태 유지 |
+| `feat/<name>` | 선택적 단기 작업 브랜치 | develop으로 merge 후 삭제 |
 | tag `<feature>-v<maj>.<min>` | 기능 완성 시점 표시 (annotated tag) | 예: `teleop-v0.1` |
 | `snap/<feature>-v<maj>.<min>` | 기능 완성 시점 스냅샷 브랜치 | **수정 금지**. 긴급 수정은 `snap/<...>-p1` 새 브랜치 |
 
-- 기능이 완성되면 같은 commit에 **tag와 스냅샷 브랜치를 함께** 만들고, 작업은 deploy에서 계속한다.
+- 기능이 완성되면 같은 commit에 **tag와 스냅샷 브랜치를 함께** 만들고, 작업은 develop에서 계속한다.
 - 브랜치와 tag를 **똑같은 이름으로 만들면 git ref가 모호해지므로**(ambiguous refname) 스냅샷 브랜치는 반드시 `snap/` 접두사를 붙인다.
 - 커밋 금지: 데이터, 체크포인트, 메쉬 원본 대용량 파일. `.gitignore`에 `data/`, `checkpoints/`, `outputs/`.
 - 모든 학습·rollout 실행은 `(BOOST commit, 데이터셋 ID, 설정 해시)`를 기록한다.
@@ -254,7 +254,7 @@ pose = ["pose"]
 #### 6.1.1 PATH 이식과 정리
 
 - PATH 정리본을 `boost/teleop/`, `boost/control/arm/`, `boost/io/`, `services/pose_service/`로 나눠 가져온다.
-- **의도 추론(belief inference)**: 삭제하지 않고 `boost/teleop/legacy/`로 격리하고 설정 플래그 `teleop.use_intent_inference=false`를 기본으로 둔다. 손 MPPI의 물체 좌표계 keypoint loss가 안정화되면 삭제 여부를 결정한다.
+- **의도 추론(belief inference)**: 삭제하지 않고 `boost/teleop/legacy/`로 격리하고 설정 플래그 `teleop.use_intent_inference=false`를 기본으로 둔다. 손 MPPI의 표면 투영 목표가 실물에서 안정화되면 삭제 여부를 결정한다.
 - WBC는 별도 레포를 전제로 하고, g1 sdk로 보내는 토픽은 arm only로 유지한다 (PATH 정리 기준 유지).
 
 #### 6.1.2 Perception: SAM3 표면 + FoundationPose
@@ -263,8 +263,8 @@ pose = ["pose"]
 
 | 출력 | 생성 | 좌표계 | 사용처 |
 |---|---|---|---|
-| 물체 표면 (point cloud / SDF) | SAM3 마스크 + depth 표면 피팅 (**PATH 기존 그대로**) | world(pelvis) | 손 MPPI의 접촉·침투 항 (c), (d) |
-| 물체 6D pose $\hat T_o$ | FoundationPose (**신규**), SAM3 마스크로 초기화 | canonical 물체 좌표계 → pelvis | 물체 좌표계 keypoint loss (a), 그래프 상태, 해석적 손목 보정 |
+| 물체 표면 (point cloud / SDF) | SAM3 마스크 + depth 표면 피팅 (**PATH 기존 그대로**) | world(pelvis) | 손 MPPI 목표 생성(손끝을 표면으로 투영) |
+| 물체 6D pose $\hat T_o$ | FoundationPose (**신규**), SAM3 마스크로 초기화 | canonical 물체 좌표계 → pelvis | 그래프 상태, 해석적 손목 보정. **teleop 제어 루프에는 쓰지 않고 녹화만** |
 
 - FoundationPose 메쉬: 박스는 실측 치수로 CAD, 마우스는 스캔 또는 SAM 3D로 1회 생성. canonical frame 정의와 대칭군을 `configs/tasks/packaging.yaml`에 기록.
 - 실행 방식: **pose 추정(estimation)은 에피소드 시작과 tracking 실패 시에만**, 이후 프레임은 **tracking**. 물체당 tracker 하나 (박스, 마우스).
@@ -272,28 +272,17 @@ pose = ["pose"]
 - 메쉬가 생기므로, MPPI SDF를 "메쉬를 $\hat T_o$로 배치한 SDF"로도 만들 수 있다. SAM3 표면과 교차 검증용으로 둘 다 계산하되, 기본값은 PATH 방식(SAM3 표면) 유지.
 - 속도는 8절 참고.
 
-#### 6.1.3 손 MPPI 비용: 물체 좌표계 keypoint loss
+#### 6.1.3 손 MPPI 비용: 표면 투영 손끝 목표
 
-PATH의 Smooth Operator 기반 MPPI 비용을 다음과 같이 바꾼다.
+**상세 명세는 `BOOST_hand_mppi_contact_plan.md`가 기준이다.** 요약:
 
-$$
-J(u) = \sum_{k=1}^{H_m}\Big[\underbrace{\sum_i w_i\,\rho_\beta\big(\hat T_{o,k}^{-1}\,x^{c}_{t+k}\,{}^{w}p_i(q_k) - {}^{o}p^{*}_i(\tau_k)\big)}_{\text{(a) 물체 좌표계 keypoint}}
-+ \underbrace{w_{th}\sum_{i\ne1}\rho_\beta\big(v_{1i}(q_k)-v^{*}_{1i}\big)}_{\text{(b) 손 형태}}
-+ \underbrace{\lambda_c\sum_{i\in\mathcal C}(\phi_o(p_i)+\varepsilon_i)^2}_{\text{(c) squeeze}}
-+ \underbrace{\lambda_{pen}\sum_{l\notin\mathcal C}\max(0,-\phi_o(p_l))^2}_{\text{(d) 침투}}
-+ \underbrace{w_v\lVert q_k-q_{k-1}\rVert^2}_{\text{(e) 매끄러움}}\Big]
-$$
-
-물체 좌표계 목표 $^{o}p^{*}_i$를 만드는 방식은 설정 `teleop.target_mode`로 선택한다.
-
-| 모드 | 목표 생성 | 장점 | 단점 |
-|---|---|---|---|
-| **A: `human_tip`** (기본) | XR 사람 손끝을 retarget 후 $\hat T_o^{-1}$로 물체 좌표계 변환 | 단순, 결정적 | 사람 손끝이 물체 표면에 정확히 닿지 않음 |
-| **B: `contact_point`** | PATH의 contact point 추론을 **5개 손가락 각각에 대해 매 주기** 실행해 표면 위 접촉점을 추정하고 물체 좌표계로 변환 | 목표가 표면 위에 있어 squeeze 항과 일관됨 | 추론 품질에 의존 |
-
-- 두 모드 모두 구현 가능하도록 목표 생성부를 인터페이스로 분리한다. 기본은 A, 비교는 sim에서.
-- 접촉 집합 $\mathcal C$: 모드 B에서는 접촉점이 추정된 손가락, 모드 A에서는 손끝과 표면 거리 임계값으로 결정.
-- 어떤 모드든 **사람 원본 keypoint, 물체 좌표계 목표, MPPI 출력 $q$, 실행된 $q$를 모두 녹화**한다 (7.3절). 손 expert의 라벨을 무엇으로 할지는 나중에 결정할 수 있어야 한다.
+- SBR(Smooth Operator) 비용의 **형태는 그대로** 두고, 손끝·엄지벡터 **목표값만** 바꾼다. 샘플당 연산은 원본과 같은 차수.
+- 목표 생성(제어 주기당 1회): 사람 손끝 $\tilde x_i$의 표면 부호 거리 $d_i$, 최근접점 $s_i$, 법선 $n_i$를 구하고, hysteresis 활성화 $\alpha_i$로 $p^*_i = \tilde x_i - \alpha_i(d_i+\varepsilon)n_i$ (표면 안쪽 $\varepsilon$, 파지력 설정값).
+- 샘플당 비용: $J(q) = \sum_i w_i\rho_\beta({}^{w}p_i(q) - {}^{w}p^*_i) + w_{th}\sum_{i\ge2}\rho_\beta(v_{1i}(q) - v^*_{1i}) + w_v\lVert q-q_{\text{prev}}\rVert^2$, 한 시점 문제($H_m=1$).
+- 이전 초안의 물체 좌표계 keypoint 항, squeeze 항, 샘플별 SDF 침투 항은 **삭제**. teleop에서 물체 좌표계 정합은 강체 변환 불변성 때문에 의미가 없다 (상세 문서 2.5절). 침투가 관찰되면 접평면 hinge만 선택적으로 켠다.
+- 표면 질의는 `SurfaceQuery` 인터페이스 뒤에 둔다. **sim: `mj_geomDistance` + probe (MuJoCo 충돌 기하와 정확히 일치, 실측 검증 완료)**, 실물: SAM3 점군 또는 메쉬 SDF + FoundationPose.
+- 이전의 목표 모드 A/B 구분과 PATH 접촉점 추론 경로는 **이 투영 방식 하나로 통합**한다.
+- **사람 원본 keypoint, 투영 목표, MPPI 출력 $q$, 실행된 $q$를 모두 녹화**한다 (7.3절).
 
 #### 6.1.4 Recorder
 
@@ -305,11 +294,13 @@ $$
 | 항목 | 방법 | 통과 기준 (초안, 조정 가능) |
 |---|---|---|
 | 모델 로드 | G1 + BrainCo 6 DoF MJCF, 박스·마우스 메쉬 | `HandSpec.fingertips`가 MuJoCo 사이트와 일치 (< 1 mm) |
-| MPPI 실시간성 | RTX 3080에서 1 iteration 시간 측정 | 100 Hz 유지 (p95 < 10 ms) |
-| keypoint 추종 | GT 물체 pose로 사람 손끝 궤적(녹화 재생 또는 합성) 추종 | 물체 좌표계 손끝 오차 측정·기록 |
-| 파지 유지 | 물체를 쥐고 들어 올리기 | 미끄러짐·침투 없이 유지 |
-| pose 노이즈 강건성 | $\hat T_o$에 위치·회전 노이즈 주입 | 노이즈 크기별 성공률 곡선 확보 |
-| 모드 A vs B | 같은 시나리오 비교 | 기본 모드 결정 |
+| 회귀 | 물체가 멀 때(모든 $\alpha_i=0$) 수정 전 SBR과 출력 $q$ 일치 | 같은 seed에서 수치 오차 이내 |
+| MPPI 실시간성 | 수정 전 대비 제어 주기 계산 시간 | 증가분 < 10% (기존 주기 유지) |
+| 표면 질의 | `mj_geomDistance` backend 단위 테스트 (상세 문서 3.4절) | 해석해와 일치, 질의 < 0.1 ms/주기 |
+| 표면 추종 | 녹화 재생·합성 궤적으로 박스 옆면 파지 | 활성 손가락 $\lvert d_i(q)+\varepsilon\rvert$ 기록 |
+| 파지 유지 | 물체를 쥐고 들어 올리기 | 미끄러짐·과침투 없이 유지 |
+| $\varepsilon$ sweep | 1, 3, 5 mm | 파지 성공률·침투·접촉력으로 기본값 결정 |
+| 표면 노이즈 강건성 | 표면점·법선에 노이즈 주입 (실물 점군 backend 대비) | 노이즈 크기별 성공률 곡선 확보 |
 | (선택) FoundationPose | MuJoCo 렌더 RGB-D로 pose 추정, GT와 비교 | 오차 통계 확보 |
 | **recorder 추적성** | sim 에피소드 녹화 → `data/reader.py`로 7.5절 모든 상태 재구성 | **단위 테스트 통과** (가장 중요) |
 
@@ -426,7 +417,7 @@ $$
 | `T_pel_wR`, `T_pel_wL` | (N, 7) | 실측 손목 pose (FK) | $^{\text{pel}}x_w$, $^{o}x_w$ |
 | `ik_residual` | (N, 2) | IK 잔차 | QA |
 
-#### (4) 손 `hand/` — 손 MPPI 주기 100 Hz
+#### (4) 손 `hand/` — 손 MPPI 제어 주기
 
 | 필드 | shape | 설명 | 용도 |
 |---|---|---|---|
@@ -439,17 +430,20 @@ $$
 | `contact_cont` | (N, 2, 5) | 연속 접촉 강도 (추종 오차 크기 등) | expert 입력 $s_t$ |
 | `tip_world` | (N, 2, 5, 3) | FK 손끝 위치 (pelvis) | 검증용 (재계산 가능하지만 QA 편의상 저장) |
 
-#### (5) 손 MPPI 내부 `mppi/` — 100 Hz
+#### (5) 손 MPPI 내부 `mppi/` — 손 MPPI 제어 주기
 
 | 필드 | shape | 설명 | 용도 |
 |---|---|---|---|
 | `t` | (N,) | | |
-| `target_mode` | scalar | A 또는 B | |
-| `tip_target_obj` | (N, 2, 5, 3) | 물체 좌표계 손끝 목표 $^{o}p^{*}_i$ | 라벨·분석 |
-| `ref_obj` | (N, 2) int | 각 손의 목표가 정의된 물체 ID | 기준 물체 추적 |
-| `contact_set` | (N, 2, 5) bool | MPPI의 접촉 집합 $\mathcal C$ | |
-| `cost_terms` | (N, 2, 5) | 비용 항 (a)–(e) 값 | 진단 |
-| `solve_ms` | (N,) | 1회 계산 시간 | 실시간성 QA |
+| `tip_human_world` | (N, 2, 5, 3) | 사람 손끝 $\tilde x_i$ (pelvis) | 투영 전 목표, 재처리 |
+| `tip_target_world` | (N, 2, 5, 3) | 투영 목표 $p^*_i$ (pelvis) | 라벨·분석 |
+| `surf_dist` | (N, 2, 5) | $d_i$ | 접촉 판정 보조, 세그먼트 검증 |
+| `surf_point`, `surf_normal` | (N, 2, 5, 3) | $s_i$, $n_i$ | 재처리 |
+| `surf_obj` | (N, 2, 5) int | 가장 가까운 물체 ID | **기준 물체 추적** (그래프 anchor 후보) |
+| `alpha`, `active` | (N, 2, 5) | $\alpha_i$, hysteresis 상태 $a_i$ | 투영 강도 |
+| `surface_backend` | scalar | `mj_geom` / `mesh_grid` / `point_cloud` | |
+| `cost_terms` | (N, 2, 3) | 손끝·벡터·속도 항 값 | 진단 |
+| `solve_ms` | (N,) | 제어 주기 계산 시간 | 실시간성 QA |
 
 #### (6) 사람 입력 `xr/` — XR 기본 주기
 
@@ -458,19 +452,10 @@ $$
 | `t` | (N,) | | |
 | `T_head` | (N, 7) | 사람 머리 pose | 재처리 |
 | `T_wrist_R`, `T_wrist_L` | (N, 7) | 사람 손목 pose (로봇 좌표로 변환 전 원본 + 변환 후 둘 다) | 재retarget |
-| `hand_kp_R`, `hand_kp_L` | (N, K_xr, 7) | 사람 손 관절 keypoint 원본 (OpenXR 손 관절 전체) | **재retarget, 모드 A 목표 재계산** |
+| `hand_kp_R`, `hand_kp_L` | (N, K_xr, 7) | 사람 손 관절 keypoint 원본 (OpenXR 손 관절 전체) | **재retarget, 투영 목표 재계산** |
 | `buttons` | (N, ·) | 버튼, 트리거 상태 | 시작·종료·라벨 이벤트 |
 
-#### (7) PATH 접촉점 추론 `contact_infer/` — 모드 B 사용 시 (또는 항상 기록)
-
-| 필드 | shape | 설명 |
-|---|---|---|
-| `t` | (N,) | |
-| `point_obj` | (N, 2, 5, 3) | 손가락별 추정 접촉점 (물체 좌표계) |
-| `conf` | (N, 2, 5) | 신뢰도 |
-| `valid` | (N, 2, 5) bool | |
-
-#### (8) 이벤트 `events/`
+#### (7) 이벤트 `events/`
 
 | 필드 | 설명 |
 |---|---|
@@ -531,7 +516,7 @@ $$
 ### 7.6 수집 시점 QA (녹화 직후 자동 검사)
 
 - 모든 그룹의 타임스탬프 단조 증가, 그룹별 평균 주기가 설정값의 ±10% 이내
-- 손 MPPI `solve_ms` p95 < 10 ms
+- 손 MPPI `solve_ms` p95가 설정 제어 주기 이내
 - 물체 pose `score`가 임계값 미만인 프레임 비율, `reinit` 횟수
 - 접촉 직전 구간(손끝–표면 거리 < 3 cm)에서 pose 결측 비율
 - `meta.success`가 기입되었는지
@@ -568,7 +553,8 @@ $$
 | 항목 | 결정 시점 |
 |---|---|
 | PATH 전송 계층 방식 (ZMQ 등) 확인 및 메시지 스키마 확정 | Stage 1 첫 주 |
-| 손 MPPI 목표 모드 A vs B 기본값 | `teleop-sim-v0.1` |
+| 손 MPPI 투영 파라미터 $\varepsilon$, $d_{\text{on}}/d_{\text{off}}$ 기본값 | `teleop-sim-v0.1` |
+| 실물 표면 backend: SAM3 점군 vs 메쉬 SDF + FoundationPose | 실물 이전 시 (sim에서 `mj_geom` 대비 오차 측정 후) |
 | 손 행동 라벨: `q_cmd` vs `q_goal` | Stage 5 시작 전 (둘 다 녹화하므로 지연 가능) |
 | keyframe 간격 $n$, chunk 길이 $H$ | Stage 2 |
 | BrainCo 전류·힘 센서 제공 범위 | Stage 1 |

@@ -89,6 +89,8 @@ CYCLONEDDS_HOME = "$CONDA_PREFIX"
 [feature.sim.tasks]
 setup-sim = { cmd = "bash scripts/setup_mujoco_desktop.sh", description = "Prepare and inspect the Pixi desktop MuJoCo runtime" }
 mujoco = { cmd = "bash scripts/run_galaxy_homie_mujoco.sh", description = "Run MuJoCo with HOMIE, PATH, and Galaxy XR" }
+mujoco-hand-test = { cmd = "bash scripts/run_mujoco_hand_test.sh", description = "Run HOMIE stand.onnx and Revo2 MPPI in local MuJoCo with an editable JSON hand pose; no XR/PATH" }
+mujoco-hand-xr = { cmd = "bash scripts/run_galaxy_homie_mujoco.sh --hand-mppi-xr", description = "Run live Galaxy XR to Televuer/PATH to Revo2 MPPI in MuJoCo" }
 mujoco-no-xr = { cmd = "bash scripts/run_galaxy_homie_mujoco.sh --no-xr", description = "Run MuJoCo with HOMIE and PATH without Galaxy XR" }
 mujoco-headless = { cmd = "bash scripts/run_galaxy_homie_mujoco.sh --no-xr --headless", description = "Run the HOMIE/PATH MuJoCo stack without XR or a viewer" }
 
@@ -115,6 +117,9 @@ platforms = ["desktop-hand"]
 [feature.hand.activation.env]
 PYTHONPATH = "$PIXI_PROJECT_ROOT:$PIXI_PROJECT_ROOT/services/pose_service"
 CYCLONEDDS_HOME = "$CONDA_PREFIX"
+
+[feature.hand.tasks]
+hand-mppi = { cmd = "python -m boost.control.hand_mppi.runner", description = "Inspect Televuer-to-Revo2 targets without publishing DDS commands" }
 
 [environments.hand]
 features = ["hand"]

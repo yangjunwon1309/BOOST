@@ -3,6 +3,8 @@ set -euo pipefail
 
 PATH_G1_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$PATH_G1_ROOT/configs/teleop/local.env"
+source "$PATH_G1_ROOT/scripts/ensure_televuer_tls.sh"
+ensure_televuer_tls
 
 cd "$PATH_G1_ROOT"
 args=(

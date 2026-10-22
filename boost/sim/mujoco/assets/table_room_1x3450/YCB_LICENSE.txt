@@ -1,0 +1,7 @@
+CC BY 4.0 License (https://creativecommons.org/licenses/by/4.0/)
+
+Assets originate from: https://www.ycbbenchmarks.com/
+chips_can.obj / chips_can.png: YCB 001_chips_can, Berkeley tsdf scan, as mirrored by
+https://huggingface.co/datasets/ll4ma-lab/ycb-fixed-meshes (CC BY 4.0).
+
+Changes: vertices merged, recentred on the can's axis, texture brightened (tools/build_room_meshes.py).

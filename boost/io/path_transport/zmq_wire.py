@@ -45,3 +45,57 @@ def pack_pose_message(pose_data: dict, topic: str = "pose", version: int = 3) ->
             value = value.astype(value.dtype.newbyteorder("<"))
         binary_data.append(value.tobytes())
     return topic.encode("utf-8") + _build_header(fields, version=version) + b"".join(binary_data)
+
+
+def unpack_pose_message(raw: bytes, topic: str = "pose") -> dict[str, np.ndarray]:
+    """Decode the packed PATH pose message produced by :func:`pack_pose_message`.
+
+    The wire format is ``topic + fixed-size JSON header + contiguous field data``.
+    Returned arrays own their buffers so callers can safely retain them after the
+    ZeroMQ receive buffer is released.
+    """
+    topic_bytes = topic.encode("utf-8")
+    if not raw.startswith(topic_bytes):
+        raise ValueError(f"unexpected topic for {topic!r}")
+
+    offset = len(topic_bytes)
+    if len(raw) < offset + HEADER_SIZE:
+        raise ValueError("truncated PATH pose header")
+    header_bytes = raw[offset : offset + HEADER_SIZE].split(b"\0", 1)[0]
+    try:
+        header = json.loads(header_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid PATH pose header") from exc
+    if header.get("endian") != "le":
+        raise ValueError(f"unsupported PATH pose byte order: {header.get('endian')!r}")
+
+    dtype_map = {
+        "u8": np.dtype("u1"),
+        "i32": np.dtype("<i4"),
+        "i64": np.dtype("<i8"),
+        "f32": np.dtype("<f4"),
+        "f64": np.dtype("<f8"),
+        "bool": np.dtype("?") ,
+    }
+    cursor = offset + HEADER_SIZE
+    result: dict[str, np.ndarray] = {}
+    for field in header.get("fields", []):
+        try:
+            name = str(field["name"])
+            dtype = dtype_map[field["dtype"]]
+            shape = tuple(int(dimension) for dimension in field["shape"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("invalid PATH pose field declaration") from exc
+        if any(dimension < 0 for dimension in shape):
+            raise ValueError(f"negative dimension for PATH pose field {name!r}")
+        byte_count = int(np.prod(shape, dtype=np.int64)) * dtype.itemsize
+        end = cursor + byte_count
+        if end > len(raw):
+            raise ValueError(f"truncated PATH pose field {name!r}")
+        if name in result:
+            raise ValueError(f"duplicate PATH pose field {name!r}")
+        result[name] = np.frombuffer(raw[cursor:end], dtype=dtype).reshape(shape).copy()
+        cursor = end
+    if cursor != len(raw):
+        raise ValueError(f"unexpected trailing data in PATH pose message ({len(raw) - cursor} bytes)")
+    return result

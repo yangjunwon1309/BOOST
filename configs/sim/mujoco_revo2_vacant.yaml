@@ -1,0 +1,34 @@
+# Backup profile for the original vacant G1 + Revo2 scene.
+# Select with MUJOCO_SIM_CONFIG=configs/sim/mujoco_revo2_vacant.yaml.
+# MuJoCo/DDS setup based on PATH-G1 sonic_runtime's Revo2 backend.
+# Interface lo gives the simulator, HOMIE, and the PATH arm bridge one isolated
+# local DDS domain so no physical G1 receives the simulated commands.
+scene: boost/sim/mujoco/scene_29dof_with_revo2.xml
+homie_config: configs/sim/homie_g1_mujoco.yaml
+hand_config: configs/hands/brainco_revo2.yaml
+interface: lo
+domain_id: 0
+sim_dt: 0.005
+initial_height: 0.793
+
+num_body_motors: 29
+num_hand_motors: 6
+num_hand_joints: 11
+hand_backend: brainco_revo2
+hand_pd:
+  kp: 30.0
+  kd: 10.0
+
+# Names of collision geoms belonging to the manipulated object(s). Keep this
+# explicit so the floor, G1, and Revo2 cannot become grasp targets. Geoms must
+# have contact enabled and margin=0. Contact guidance is served only when the
+# simulator is started with --surface-query-endpoint.
+surface_query:
+  object_geom_names: []
+  probe_radius_m: 0.0005
+  distmax_m: 0.03
+
+# PATH's current binary command carries left/right grip flags. `hand_mppi`
+# will publish continuous retargeted values through the same six BrainCo DDS
+# channels [Thumb, Thumb_aux, Index, Middle, Ring, Pinky].
+grip_lcm_channel: G1_PATH_UPPER_COMMAND

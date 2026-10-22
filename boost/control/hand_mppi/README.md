@@ -1,68 +1,92 @@
-# Revo2 hand control integration
+# Revo2 hand retargeting
 
-BOOST's BrainCo Revo2 integration is defined here; the upstream
+BOOST connects Televuer landmarks to BrainCo Revo2 with the pinned
 [`mimic_retargeter_lab`](https://github.com/mimicrobotics/mimic_retargeter_lab)
-repository is pinned as the `upstream/` submodule. Its current hand registry
-does not include Revo2. The desktop simulator now uses BrainCo's official
-Revo2 MJCF and mesh assets through the pinned `external/brainco-description`
-submodule. The remaining work is a local `RobotHandModel` wrapper and
-retargeter config here so the policy can produce the six Revo2 targets.
+checkout in `upstream/`. The current Revo2 model wrapper lives in
+`brainco_revo2_model.py`; it uses the official single-hand MJCF and maps its
+eleven MJCF joints onto the six BrainCo command channels.
 
-## Command and state contract
+## Existing PATH and DDS contracts
 
-`revo2.py` is the single mapping between the upstream retargeter, BOOST, and the
-existing MuJoCo simulator:
+| Direction | Contract |
+|---|---|
+| Televuer → PATH → runner | ZMQ `vr_pose_debug` on `tcp://127.0.0.1:5566` |
+| PATH hand payload | Schema 1, two `(25, 3)` float32 arrays in metres, validity `[left, right]`, sequence, monotonic timestamp, coordinate-frame id 1 |
+| Runner → Revo2 | Unitree DDS `MotorCmds_` on `rt/brainco/{left,right}/cmd` |
+| Revo2 → runner | Unitree DDS `MotorStates_` on `rt/brainco/{left,right}/state` |
+| PATH arm route | Existing arm packet and HOMIE `rt/lowcmd` ownership stay unchanged |
 
-| Channel | DDS order | Commanded MJCF joint | Range |
-|---|---|---|---|
-| 0 | Thumb | `{side}_thumb_metacarpal_joint` | 0 to 1.57 rad |
-| 1 | Thumb_aux | `{side}_thumb_proximal_joint` | 0 to 1.03 rad |
-| 2 | Index | `{side}_index_proximal_joint` | 0 to 1.41 rad |
-| 3 | Middle | `{side}_middle_proximal_joint` | 0 to 1.41 rad |
-| 4 | Ring | `{side}_ring_proximal_joint` | 0 to 1.41 rad |
-| 5 | Pinky | `{side}_pinky_proximal_joint` | 0 to 1.41 rad |
+The runner treats Televuer positions as the same 25-point topology consumed by
+Mimic's `ManusHandModel`; the WebXR orientation quaternions are not used by this
+position-based retargeter. It checks the schema, coordinate frame, sample age,
+validity, shape, and finiteness before optimizing either hand.
 
-The command positions published on DDS are normalized to `[0, 1]`. Each side
-uses Unitree `MotorCmds_` on `rt/brainco/{left,right}/cmd`; measured positions,
-velocities, and estimated torque use `MotorStates_` on
-`rt/brainco/{left,right}/state`. `BrainCoDDS` implements that transport. The
-simulator uses the same constants and adapter. HOMIE remains the only writer to
-`rt/lowcmd`; hand targets do not pass through PATH's 192-byte arm packet.
+## Runtime behavior
 
-## Televuer input boundary
+`runner.py` uses Mimic's sampling-based iCEM retargeter with the local Revo2
+model. Its six radian targets are clamped to official BrainCo limits, converted
+through `BrainCoRevo2Adapter` to `[0, 1]`, then rate-limited per channel. Live
+publishing waits for fresh Revo2 state on each side and seeds the optimizer from
+the measured pose. After tracking has started, a stale hand stream moves toward
+the configured open pose at the same rate limit. HOMIE remains the sole writer
+to `rt/lowcmd`.
 
-Televuer hand tracking provides 25 WebXR joint positions and orientations per
-hand. The Galaxy XR launcher enables that input mode when
-`PATH_TELEVUER_HAND_TRACKING=1` is set. PATH forwards the joint positions in
-the existing `vr_pose_debug` ZMQ message. Schema version 1 uses the standard
-25-joint WebXR order, float32 metres, and coordinate-frame id 1 for OpenXR world
-after the configured basis correction. The hand sequence, monotonic timestamp,
-and per-hand validity travel in the same message as the wrist target. PATH's
-existing LCM packet still carries only the 14 arm joints and grip flags.
+The runner is read-only unless `--publish` is supplied:
 
-The low-level hand runner should subscribe to the same ZMQ endpoint, transform
-valid landmarks into the configured retargeter frame, reject stale samples,
-map retargeted Revo2 angles through `BrainCoRevo2Adapter`, then publish
-normalized six-channel targets via `BrainCoDDS`. Televuer supplies hand pose
-landmarks; the Mimic Revo2 retargeter remains responsible for converting them
-into Revo2 joint targets.
+```bash
+pixi install -e hand
+pixi run -e hand python -m boost.control.hand_mppi.runner
+```
 
-## Next implementation sequence
+Start the full desktop Galaxy XR → Televuer → PATH → HOMIE → MuJoCo loop with:
 
-1. Add a local `RobotHandModel` wrapper and Revo2 config that point to the
-   official BrainCo MJCF, six commanded joints, and selected Televuer joint set.
-2. Implement a runner here that subscribes to the versioned `vr_pose_debug`
-   landmarks, loads the local Revo2 retargeter config, rejects
-   stale or invalid frames, maps radians through `BrainCoRevo2Adapter`, and
-   publishes at the configured hand update rate with `BrainCoDDS`.
-3. Connect it to the local MuJoCo launcher and verify the full left/right path:
-   WebXR/Televuer → PATH ZMQ → hand retargeter → BrainCo DDS → simulator state
-   feedback. Keep HOMIE as the sole `rt/lowcmd` writer.
+```bash
+pixi run -e sim mujoco-hand-xr
+```
 
-Initialize the pinned source and install the separate `hand` Pixi environment:
-`git submodule update --init --recursive`, then `pixi install -e hand`. The
-upstream project requires Python 3.12 and MuJoCo/MJX 3.6+, while the current PATH
-simulation environment pins MuJoCo 3.5.0. Its license is CC BY-NC 4.0; retain
-the submodule and attribution when using or redistributing its code.
-Use the Pixi environment for all BOOST development commands; the upstream
-repository's standalone environment instructions are not part of this workflow.
+This mode starts the runner in Pixi's separate `hand` environment and disables
+PATH's binary grip DDS publisher to avoid competing writes to the Revo2 command
+topics. `configs/hands/brainco_revo2_mppi.yaml` holds the model, optimizer,
+input-age, update-rate, and command-rate settings.
+The [MuJoCo + Galaxy XR runbook](../../../docs/mujoco_galaxy_xr_runbook.md)
+covers the headset URL, shutdown, and port cleanup steps.
+
+In `mujoco-hand-xr`, the runner also asks the MuJoCo process for object-surface
+hits over a local ZMQ request/reply endpoint. The simulator uses ten invisible,
+non-colliding mocap probes and `mj_geomDistance` against the configured object
+collision geoms. Those five hits per hand adjust the upstream wrist-to-tip and
+thumb-to-tip targets before iCEM sampling; SDF queries do not run per sample.
+Contact projection uses `d_on=1 cm`, `d_off=1.5 cm`, and a `3 mm` inward target
+offset. If a query is missing or invalid, that frame uses the original SBR
+targets. The local `configs/sim/mujoco_revo2.yaml` currently has no object geom
+names configured, so the new path is safely inactive until an object collision
+geom is added to the scene and listed there. MuJoCo contact guidance is a sim
+backend; mesh-grid and point-cloud backends for hardware have not been added.
+Set `MUJOCO_SURFACE_QUERY_ENDPOINT` to change the local service address.
+
+## MuJoCo MPPI test without XR or PATH
+
+To hold the simulated G1 upright with HOMIE and exercise hand MPPI from a user
+override pose, run:
+
+```bash
+pixi run -e sim mujoco-hand-test
+```
+
+This standalone test auto-starts HOMIE's default standing pose without loading
+its locomotion policy. The runner reads
+`configs/hands/revo2_hand_override_fist.json` directly and reloads it while
+active; `revo2_hand_override.json` provides an open-hand pose. Use
+`--override-file PATH` to select another JSON file. This route starts no
+Galaxy XR, Televuer, PATH bridge, or physical-robot transport.
+The test record is
+[`docs/test_logs/mujoco_homie_hand_mppi.md`](../../../docs/test_logs/mujoco_homie_hand_mppi.md).
+
+For a hardware runner, start the Televuer/PATH source and the BrainCo
+`brainco_hand_service`, then run the hand environment with the G1/hand DDS
+interface explicitly selected:
+
+```bash
+pixi run -e hand python -m boost.control.hand_mppi.runner \
+  --publish --interface <dds-interface> --domain-id 0
+```

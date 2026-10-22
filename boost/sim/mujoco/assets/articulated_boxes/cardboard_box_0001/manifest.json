@@ -1,0 +1,62 @@
+{
+  "id": "cardboard_box_0001",
+  "class": "articulated cardboard box (RSC four-flap)",
+  "source_variant": "cardboard_box_v2/v02_cardboard_box_v2_b96fef",
+  "dims_m": [
+    0.4006,
+    0.3001,
+    0.3062
+  ],
+  "mass_kg": 0.368,
+  "tris": 1792,
+  "links": 5,
+  "joints": [
+    {
+      "name": "flap_major_1_open_deg",
+      "type": "revolute",
+      "limits": [
+        0.0,
+        120.0
+      ],
+      "unit": "deg",
+      "damping": 0.001
+    },
+    {
+      "name": "flap_major_2_open_deg",
+      "type": "revolute",
+      "limits": [
+        0.0,
+        120.0
+      ],
+      "unit": "deg",
+      "damping": 0.001
+    },
+    {
+      "name": "flap_minor_1_open_deg",
+      "type": "revolute",
+      "limits": [
+        0.0,
+        120.0
+      ],
+      "unit": "deg",
+      "damping": 0.001
+    },
+    {
+      "name": "flap_minor_2_open_deg",
+      "type": "revolute",
+      "limits": [
+        0.0,
+        120.0
+      ],
+      "unit": "deg",
+      "damping": 0.001
+    }
+  ],
+  "formats": [
+    "usd",
+    "blend"
+  ],
+  "physics": "per-link mass/inertia, per-zone physics materials, MuJoCo gauntlet certified",
+  "generator": "ProjectSim by Kaedim",
+  "license": "cc-by-4.0"
+}

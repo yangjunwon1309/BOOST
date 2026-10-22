@@ -1,4 +1,4 @@
-"""Analytic second-order reference generators for PATH control authority."""
+"""Standalone reference filters; the active XR arm bridge bypasses these for Televuer goals."""
 
 from __future__ import annotations
 

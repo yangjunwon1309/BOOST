@@ -44,18 +44,20 @@ default_angles: [-0.1, 0.0, 0.0, 0.3, -0.2, 0.0,      # left leg
                   0.0, 0.4, 0.0, 1.2, 0.0, 0.0, 0.0,  # left arm
                   0.0, -0.4, 0.0, 1.2, 0.0, 0.0, 0.0] # right arm
 
-# Wireless-controller cmd_vel limits [vx, vy, wz] (m/s, m/s, rad/s).
+# cmd_vel limits [vx, vy, wz] (m/s, m/s, rad/s). The local MuJoCo viewer
+# publishes keyboard commands on rt/nav_cmd; connected wireless sticks remain
+# an immediate override through HOMIE's DDS nav source.
 max_cmd: [0.6, 0.4, 0.6]
 cmd_deadzone: 0.04         # stick deadzone (fraction of full scale)
 
-# cmd_vel source. UDP is the verified Thor (192.168.123.2) -> G1 PC2 path.
-# Physical wireless sticks always override it; stale or invalid input is zero.
-cmd_source: "wireless"
+# Local MuJoCo uses the rt/nav_cmd source populated by its viewer keyboard.
+# DDS command timeout returns to zero; wireless sticks still override when present.
+cmd_source: "dds"
 cmd_udp_bind_host: "192.168.123.164"
 cmd_udp_port: 15001
 cmd_udp_allowed_host: "192.168.123.2"
 cmd_udp_timeout: 0.3
-# Legacy optional source: set cmd_source to "dds" to consume rt/nav_cmd.
+# Stop locomotion if the MuJoCo viewer stops publishing keyboard commands.
 cmd_dds_timeout: 0.3
 
 # Arm-target source for joints 15..28:

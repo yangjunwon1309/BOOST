@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""PATH state-machine bridge between PICO wrist targets and G1 arm control.
+"""PATH state-machine bridge between Galaxy XR/Televuer wrist targets and G1.
 
-This bridge computes arm-only references and sends them to the G1 bridge.
+This bridge computes arm-only references and sends them to the G1 bridge. The
+wrist stream retains the repository's legacy PICO-compatible transport names.
 Other producers are subordinate inputs:
 
-  PICO manager     -> tcp://127.0.0.1:5566/vr_pose_debug
+  XR/Televuer      -> tcp://127.0.0.1:5566/vr_pose_debug
   PICO controls    -> tcp://127.0.0.1:5565/{pico_button_event,pico_controller_state}
   State command    -> tcp://*:5563/path_state_command
   G1 arm bridge    <- LCM G1_PATH_UPPER_COMMAND
@@ -13,14 +14,14 @@ Other producers are subordinate inputs:
 
 State behavior:
   teleop/intention:
-    Pass absolute PICO head-position-to-waist wrist poses directly to
+    Pass absolute XR head-position-to-waist wrist poses directly to
     CasADi/IPOPT while teleop_tracking is armed. A+X enters
     teleop_wait_ready: IPOPT receives fixed FK(Q_READY) wrist SE(3) at 50 Hz,
-    PICO arm targets are ignored while both arms return to fixed FK(Q_READY).
-    The next A+X requires measured Q_READY convergence before live PICO targets
+    XR arm targets are ignored while both arms return to fixed FK(Q_READY).
+    The next A+X requires measured Q_READY convergence before live XR targets
     resume.
     Holding Y selects the left arm and holding B selects the right arm for
-    belief/contact blending.  Without Y/B, both arms follow PICO directly.
+    belief/contact blending.  Without Y/B, both arms follow XR directly.
   damped_return:
     Smoothly return arm targets toward the measured arm posture.
 
@@ -51,9 +52,7 @@ import msgpack
 import numpy as np
 import zmq
 
-from boost.io.path_transport.zmq_wire import (
-    HEADER_SIZE,
-)
+from boost.io.path_transport.zmq_wire import unpack_pose_message
 
 from boost.teleop.legacy.intention.action_blending import (
     LEFT_WRIST_LINK,
@@ -63,15 +62,9 @@ from boost.teleop.legacy.intention.action_blending import (
     rotation_target_from_relation,
 )
 from boost.teleop.legacy.intention.reference_dynamics import (
-    FirstOrderPositionTargetFilter,
     GraspTransitionDetector,
-    OperatorFrameOffset,
-    OperatorRotationOffset,
     OrientationAuthority,
     OrientationTargetGate,
-    SecondOrderOrientationReference,
-    SecondOrderPositionReference,
-    rotation_vector,
     slerp_so3,
 )
 from boost.io.path_transport.g1_direct_protocol import (
@@ -159,6 +152,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=float, default=50.0)
     parser.add_argument("--pico-hand-timeout-sec", type=float, default=0.35)
     parser.add_argument("--pico-body-gap-hold-ms", type=float, default=100.0)
+    parser.add_argument(
+        "--auto-arm-pico-tracking",
+        action="store_true",
+        help=(
+            "For a local simulator, arm live waist-frame XR targets automatically "
+            "when the first fresh wrist frame arrives, without waiting for A+X."
+        ),
+    )
     parser.add_argument(
         "--arm-reference-mode",
         choices=["head_position", "head_yaw"],
@@ -312,27 +313,6 @@ def parse_args() -> argparse.Namespace:
             "b(g)*b(c|g) joint posterior through EMA, hysteresis, and rate limiting."
         ),
     )
-    parser.add_argument(
-        "--shared-position-alpha-lpf",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "apply a first-order LPF to the final position target only while "
-            "--shared-position-mode=alpha has nonzero belief authority"
-        ),
-    )
-    parser.add_argument(
-        "--shared-position-alpha-lpf-alpha",
-        "--shared-ref-lpf-alpha",
-        dest="shared_position_alpha_lpf_alpha",
-        type=float,
-        default=0.30,
-        help=(
-            "new-target weight for alpha-blend target LPF, in (0, 1]; "
-            "0.30 is the default (the old --shared-ref-lpf-alpha spelling "
-            "remains an alias)"
-        ),
-    )
     parser.add_argument("--shared-position-posterior-enter-confidence", type=float, default=0.45)
     parser.add_argument("--shared-position-posterior-exit-confidence", type=float, default=0.25)
     parser.add_argument("--shared-position-posterior-ema-alpha", type=float, default=0.15)
@@ -347,9 +327,6 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--grasp-closing-timeout-sec", type=float, default=0.60)
-    parser.add_argument("--operator-frame-washout-per-m", type=float, default=4.6)
-    parser.add_argument("--operator-frame-max-offset-m", type=float, default=0.30)
-    parser.add_argument("--operator-rotation-washout-per-rad", type=float, default=2.0)
     parser.add_argument(
         "--end-effector-model",
         choices=("dex1", "brainco"),
@@ -420,8 +397,8 @@ def parse_args() -> argparse.Namespace:
         default=Path(__file__).resolve().parents[3] / "assets" / "robot",
     )
     parser.add_argument("--arm-ik-max-iter", type=int, default=30)
-    # The IPOPT frame is wrist_yaw_link origin. BrainCo grasp-centre conversion
-    # is performed exactly once by the second-order reference path.
+    # The IPOPT frame is wrist_yaw_link origin. Televuer wrist targets are sent
+    # directly to IPOPT; optional shared-control targets are converted here.
     parser.add_argument("--arm-ik-ee-offset-m", type=float, default=0.0)
     parser.add_argument(
         "--arm-ik-orientation-full-error-m", type=float, default=0.01
@@ -564,29 +541,7 @@ def unpack_prefixed_msgpack(raw: bytes, topic: str) -> dict:
 
 
 def parse_packed_fields(raw: bytes, topic: str) -> dict[str, np.ndarray]:
-    topic_b = topic.encode()
-    if not raw.startswith(topic_b):
-        raise ValueError(f"unexpected topic for {topic}")
-    offset = len(topic_b)
-    header_bytes = raw[offset : offset + HEADER_SIZE].split(b"\0", 1)[0]
-    header = json.loads(header_bytes.decode("utf-8"))
-    dtype_map = {
-        "u8": np.uint8,
-        "i32": np.int32,
-        "i64": np.int64,
-        "f32": np.float32,
-        "f64": np.float64,
-        "bool": np.bool_,
-    }
-    cursor = offset + HEADER_SIZE
-    out: dict[str, np.ndarray] = {}
-    for field in header.get("fields", []):
-        dtype = np.dtype(dtype_map[field["dtype"]])
-        shape = tuple(field["shape"])
-        size = int(np.prod(shape)) * dtype.itemsize
-        out[field["name"]] = np.frombuffer(raw[cursor : cursor + size], dtype=dtype).reshape(shape).copy()
-        cursor += size
-    return out
+    return unpack_pose_message(raw, topic=topic)
 
 
 @dataclass(frozen=True)
@@ -1067,8 +1022,6 @@ def main() -> int:
     args = parse_args()
     if not 0.0 <= float(args.shared_position_alpha) <= 1.0:
         raise ValueError("--shared-position-alpha must be within [0, 1]")
-    if not 0.0 < float(args.shared_position_alpha_lpf_alpha) <= 1.0:
-        raise ValueError("--shared-position-alpha-lpf-alpha must be within (0, 1]")
     hand_axis_local_override = args.hand_axis_local is not None
     if args.hand_axis_local is None:
         args.hand_axis_local = tuple(HAND_AXIS_LOCAL[args.end_effector_model].tolist())
@@ -1164,12 +1117,15 @@ def main() -> int:
     shared_hand_pub.setsockopt(zmq.LINGER, 0)
     shared_hand_pub.bind(args.shared_hand_selection_bind)
 
-    log(f"Pico wrist target SUB {args.pico_vr_endpoint}/vr_pose_debug")
     log(
-        f"Pico controller SUB {args.button_endpoint}/"
+        f"XR wrist target SUB {args.pico_vr_endpoint}/vr_pose_debug "
+        "(shared PICO-compatible wire format)"
+    )
+    log(
+        f"XR controller SUB (PICO-compatible buttons) {args.button_endpoint}/"
         f"{args.button_topic},{args.controller_state_topic}"
     )
-    log("PICO wrist targets use manager-calibrated waist-frame SE(3)")
+    log("XR/PICO-compatible wrist targets use manager-calibrated waist-frame SE(3)")
     log(f"static EE target SUB {args.static_target_bind}/{args.static_target_topic}")
     log(f"state command SUB {args.state_command_bind}/{args.state_command_topic}")
     log(
@@ -1273,7 +1229,7 @@ def main() -> int:
     latest_pico_body_receive_us = 0
     latest_pico_session_id = -1
     pico_tracking_armed = False
-    pico_arm_pending = False
+    pico_arm_pending = bool(args.auto_arm_pico_tracking)
     last_forwarded_pose_frame = -1
     last_button_sequence = 0
     last_button_publish_us = 0
@@ -1316,18 +1272,7 @@ def main() -> int:
         orientation_gate_taper_start_fraction=float(args.orientation_gate_taper_start_fraction),
         grasp_closing_timeout_s=float(args.grasp_closing_timeout_sec),
         grasp_override_hold_s=float(args.grasp_engagement_delay_sec),
-        operator_frame_washout_per_m=float(args.operator_frame_washout_per_m),
-        operator_frame_max_offset_m=float(args.operator_frame_max_offset_m),
-        operator_rotation_washout_per_rad=float(args.operator_rotation_washout_per_rad),
     )
-    position_reference = {side: SecondOrderPositionReference(
-        zeta=shared_config.zeta_released, omega_n=shared_config.omega_n_position_released,
-        max_speed_mps=shared_config.max_speed_mps,
-    ) for side in ("left", "right")}
-    orientation_reference = {side: SecondOrderOrientationReference(
-        zeta=shared_config.zeta_released, omega_n=shared_config.omega_n_orientation_released,
-        max_rate_rps=shared_config.max_rate_rps,
-    ) for side in ("left", "right")}
     hand_axis_local = np.asarray(args.hand_axis_local, dtype=np.float64).reshape(3)
     grasp_center_local = np.asarray(args.grasp_center_local, dtype=np.float64).reshape(3)
     hand_profile = hand_frame_profile(args.end_effector_model)
@@ -1374,12 +1319,6 @@ def main() -> int:
         )
         for side in ("left", "right")
     }
-    position_alpha_lpf = {
-        side: FirstOrderPositionTargetFilter(
-            alpha=float(args.shared_position_alpha_lpf_alpha)
-        )
-        for side in ("left", "right")
-    }
     grasp_detector = {
         side: GraspTransitionDetector(
             jaw_stall_gap_min_m=shared_config.grasp_jaw_stall_gap_min_m,
@@ -1393,71 +1332,54 @@ def main() -> int:
         )
         for side in ("left", "right")
     }
-    operator_frame_offset = {
-        side: OperatorFrameOffset(
-            washout_per_m=shared_config.operator_frame_washout_per_m,
-            max_offset_m=shared_config.operator_frame_max_offset_m,
-        )
-        for side in ("left", "right")
-    }
-    operator_rotation_offset = {
-        side: OperatorRotationOffset(
-            washout_per_rad=shared_config.operator_rotation_washout_per_rad,
-        )
-        for side in ("left", "right")
-    }
-    # Position and orientation authority intentionally have independent
-    # release edges.  A confirmed grasp releases position to the rebased
-    # operator frame, but it must not remove an actively held B/Y orientation
-    # constraint.  Orientation is rebased only when that constraint itself
-    # falls away.
+    # Position and orientation authority have independent release edges. A
+    # confirmed grasp releases the shared position target without suppressing
+    # an actively held B/Y-gated orientation constraint.
     orientation_belief_active = {side: False for side in ("left", "right")}
-    operator_rotation_rebase_active = {side: False for side in ("left", "right")}
     # Y/B is a dead-man switch for the left/right belief blend.
     shared_selected_hand = "none"
     shared_hand_selection_revision = 0
     next_shared_hand_publish = 0.0
-    # Per-hand raw operator command history: (position, rotation, tick_us,
-    # filtered angular velocity).  This is intentionally separate from the
-    # assisted second-order reference history.
+    # Per-hand raw Televuer command history used only for diagnostics.
     command_history = {side: None for side in ("left", "right")}
     log(
-        "PICO absolute waist-frame controller targets enabled: "
+        "XR absolute waist-frame wrist targets enabled: "
         f"topic={args.pico_vr_endpoint}/vr_pose_debug "
-        "mode=head_position, anchor=none, gain=none; waiting for Q_READY/A+X"
+        "(shared PICO-compatible wire format), mode=head_position, "
+        "anchor=none, gain=none"
+        + (
+            "; MuJoCo auto-arms on first fresh wrist frame"
+            if args.auto_arm_pico_tracking
+            else "; waiting for Q_READY/A+X"
+        )
     )
+    if args.auto_arm_pico_tracking:
+        log(
+            "MuJoCo XR auto-arm enabled: live wrist targets arm on the first fresh "
+            "Televuer frame; stale frames remain rejected"
+        )
     log(
-        "teleop second_order_reference="
-        f"zeta=armed/released={shared_config.zeta_armed:.2f}/{shared_config.zeta_released:.2f} armed_pos/orient="
-        f"{shared_config.omega_n_position_armed:.1f}/"
-        f"{shared_config.omega_n_orientation_armed:.1f} "
+        "teleop Cartesian goal mode=direct Televuer wrist pose; no pose reference/filter "
         f"hand_model={args.end_effector_model} "
         f"axis={np.round(hand_axis_local, 4).tolist()} "
         f"grasp_local={np.round(grasp_center_local, 4).tolist()}"
     )
 
-    def resync_references(reason: str) -> None:
-        """Re-seed only on session/state discontinuities, never Y/B edges."""
-        q = latest_robot_q if latest_robot_q is not None else last_ipopt_or_measured_hold()
-        left_tf, right_tf = arm_nonlinear_ik.wrist_transforms_from_q29(q)
-        for side, transform in (("left", left_tf), ("right", right_tf)):
-            position_reference[side].reset(transform[:3, 3])
-            orientation_reference[side].reset(transform[:3, :3])
+    def resync_shared_control_state(reason: str) -> None:
+        """Reset shared-control authority after state/session discontinuities."""
+        for side in ("left", "right"):
             orientation_gate[side].reset()
             orientation_authority[side].reset()
             position_authority[side].reset()
-            position_alpha_lpf[side].reset()
             grasp_detector[side].reset()
-            operator_frame_offset[side].reset()
-            operator_rotation_offset[side].reset()
             orientation_belief_active[side] = False
-            operator_rotation_rebase_active[side] = False
-        log(f"reference resync ({reason})")
+        log(f"shared-control state reset ({reason})")
+
     def solve_authoritative_ipopt_transforms(
         left_target_tf: np.ndarray,
         right_target_tf: np.ndarray,
     ):
-        """Solve authoritative arm joints from absolute waist-frame PICO targets."""
+        """Solve authoritative arm joints from waist-frame Televuer targets."""
 
         nonlocal last_ipopt_q_ref, last_ipopt_tau_ff
         nonlocal last_arm_ik_solve_ms, last_arm_ik_error_m
@@ -1611,14 +1533,14 @@ def main() -> int:
             log(f"{source} state command: staying in {requested}")
         current_state = requested
         if requested in {"teleop", "intention"}:
-            resync_references("state_change")
+            resync_shared_control_state("state_change")
             if shared_selected_hand != "none":
                 shared_selected_hand = "none"
                 shared_hand_selection_revision += 1
             phase_mode = "none"
             phase_sync_error_rad = float("nan")
         elif requested == "damped_return":
-            resync_references("damped_return")
+            resync_shared_control_state("damped_return")
 
     def set_pico_tracking_armed(enabled: bool, source: str) -> None:
         """Switch between live PICO tracking and fixed-FK(Q_READY) IPOPT."""
@@ -1628,32 +1550,33 @@ def main() -> int:
         nonlocal blended_q
         enabled = bool(enabled)
         if enabled:
-            ready_error_rad = (
-                float(
-                    np.max(
-                        np.abs(
-                            np.asarray(latest_robot_q, dtype=np.float64)[15:29]
-                            - Q_READY[15:29]
+            if not args.auto_arm_pico_tracking:
+                ready_error_rad = (
+                    float(
+                        np.max(
+                            np.abs(
+                                np.asarray(latest_robot_q, dtype=np.float64)[15:29]
+                                - Q_READY[15:29]
+                            )
                         )
                     )
+                    if latest_robot_q is not None
+                    else float("inf")
                 )
-                if latest_robot_q is not None
-                else float("inf")
-            )
-            robot_ready = (
-                latest_robot_q is not None
-                and ready_error_rad < 0.10
-            )
-            if not robot_ready:
-                pico_arm_pending = True
-                log(
-                    f"{source}: A+X arm pending until Q_READY "
-                    f"(max_arm_error={ready_error_rad:.3f}rad, threshold=0.100rad)"
+                robot_ready = (
+                    latest_robot_q is not None
+                    and ready_error_rad < 0.10
                 )
-                return
+                if not robot_ready:
+                    pico_arm_pending = True
+                    log(
+                        f"{source}: A+X arm pending until Q_READY "
+                        f"(max_arm_error={ready_error_rad:.3f}rad, threshold=0.100rad)"
+                    )
+                    return
             if latest_wrist_targets is None:
                 pico_arm_pending = True
-                log(f"{source}: A+X arm pending until a valid Pico wrist frame arrives")
+                log(f"{source}: arm tracking pending until a valid XR wrist frame arrives")
                 return
             pico_arm_pending = False
         if enabled == pico_tracking_armed:
@@ -1665,24 +1588,34 @@ def main() -> int:
         blended_q = None
         pico_tracking_armed = enabled
         pico_arm_pending = False
-        resync_references("pico_tracking_armed" if enabled else "pico_tracking_disarmed")
+        resync_shared_control_state("pico_tracking_armed" if enabled else "pico_tracking_disarmed")
         if enabled:
-            log(
-                f"{source}: teleop_tracking armed after Q_READY confirmation; "
-                "PICO wrist targets re-enabled"
-            )
+            if args.auto_arm_pico_tracking:
+                log(f"{source}: teleop_tracking armed from a fresh XR wrist frame")
+            else:
+                log(
+                    f"{source}: teleop_tracking armed after Q_READY confirmation; "
+                    "XR wrist targets re-enabled"
+                )
         else:
             # Keep IPOPT's previous solution as the warm start while both arms
             # transition to the fixed ready target.
             log(
                 f"{source}: teleop_wait_ready active; fixed FK(Q_READY) "
-                "wrist SE(3), PICO arm targets ignored"
+                "wrist SE(3), XR arm targets ignored"
             )
 
-    def try_complete_pico_arm_request() -> None:
+    def try_complete_pico_arm_request(tick_us: int) -> None:
         if not pico_arm_pending or pico_tracking_armed:
             return
         if latest_robot_q is None or latest_wrist_targets is None:
+            return
+        target_age_us = tick_us - latest_pico_body_receive_us
+        max_target_age_us = max(1_000, int(args.pico_body_gap_hold_ms * 1_000.0))
+        if latest_pico_body_receive_us <= 0 or target_age_us > max_target_age_us:
+            return
+        if args.auto_arm_pico_tracking:
+            set_pico_tracking_armed(True, "MuJoCo XR auto-arm")
             return
         ready_error_rad = float(
             np.max(np.abs(np.asarray(latest_robot_q, dtype=np.float64)[15:29] - Q_READY[15:29]))
@@ -1807,7 +1740,7 @@ def main() -> int:
                         set_pico_tracking_armed(False, "Pico start/stop")
                         if current_state != "teleop":
                             current_state = "teleop"
-                            resync_references("pico_stop")
+                            resync_shared_control_state("pico_stop")
                     elif event_name == "ax":
                         set_pico_tracking_armed(
                             not (pico_tracking_armed or pico_arm_pending), "Pico A+X"
@@ -1834,7 +1767,7 @@ def main() -> int:
                         last_ipopt_tau_ff = None
                         blended_q = None
                         log(
-                            "PICO absolute-target session="
+                            "XR absolute-target session="
                             f"{latest_pico_session_id}; reset IPOPT warm start"
                         )
                     latest_wrist_targets = targets
@@ -1880,7 +1813,7 @@ def main() -> int:
                             incoming_uid and incoming_uid != latest_static_target_uid
                         ):
                             latest_static_target_uid = incoming_uid
-                            resync_references("static_target_update")
+                            resync_shared_control_state("static_target_update")
                         continue
                     position = np.asarray(position_value, dtype=np.float64).reshape(-1)
                     if position.shape[0] == 3 and np.isfinite(position).all():
@@ -1911,7 +1844,7 @@ def main() -> int:
                         if is_new_goal:
                             latest_static_target_uid = incoming_uid
                             static_target_plan_id += 1
-                            resync_references("static_target_replace")
+                            resync_shared_control_state("static_target_replace")
                             if (
                                 args.static_target_auto_enter
                                 and current_state != "auto_planning"
@@ -1975,7 +1908,7 @@ def main() -> int:
                 and pico_body_age_sec
                 <= max(0.001, float(args.pico_body_gap_hold_ms) / 1000.0)
             )
-            try_complete_pico_arm_request()
+            try_complete_pico_arm_request(tick_us)
 
             hand_fresh = (
                 latest_hand_us > 0
@@ -2014,8 +1947,8 @@ def main() -> int:
             if requested_shared_hand != shared_selected_hand:
                 shared_selected_hand = requested_shared_hand
                 shared_hand_selection_revision += 1
-                # Y/B only selects which target is tracked. Reference state
-                # remains continuous across the button edge.
+                # Y/B only selects whether shared constraints are considered;
+                # unselected arms receive the current Televuer goals directly.
                 log(
                     "shared-control hold "
                     + (
@@ -2072,7 +2005,7 @@ def main() -> int:
                     qp_payload = ipopt_arm_sample_reference(
                         q_arm_reference,
                         state="teleop",
-                        source="pico_wait_ready_fk",
+                        source="xr_wait_ready_fk",
                         control_mode="teleop_wait_ready",
                         feasible=bool(ready_result.success),
                         plan_id=0,
@@ -2126,7 +2059,7 @@ def main() -> int:
                         )
                         else None
                     )
-                    shared_orientation_source = "pico_operator"
+                    shared_orientation_source = "xr_operator"
                     if pico_body_fresh and latest_wrist_targets is not None:
                         left_target_tf = latest_wrist_targets.left_waist.copy()
                         right_target_tf = latest_wrist_targets.right_waist.copy()
@@ -2151,10 +2084,9 @@ def main() -> int:
                     measured_left_tf, measured_right_tf = arm_nonlinear_ik.wrist_transforms_from_q29(q_measured_for_hand)
                     measured_tf = {"left": measured_left_tf, "right": measured_right_tf}
                     human_tf = {"left": left_target_tf, "right": right_target_tf}
-                    # The reference loop below overwrites human_tf in place.
-                    # Belief must see the operator's raw command, not the
-                    # assisted reference, or it recreates a self-confirming
-                    # intent loop through the controlled robot motion.
+                    # Keep the raw command separate from any explicitly
+                    # selected shared target so belief never treats a blended
+                    # goal as fresh operator intent.
                     command_tf = {
                         side: human_tf[side].copy() for side in ("left", "right")
                     }
@@ -2231,20 +2163,16 @@ def main() -> int:
                         holding = grasp_state[side] == "holding"
                         grasp_engaged[side] = holding
 
-                        # HOLDING releases only position authority.  In
-                        # particular, do not let the post-grasp frame rebase
-                        # mask a valid B/Y-gated orientation constraint.
-                        was_orientation_belief_active = orientation_belief_active[side]
+                        # HOLDING disables the position belief target, while a
+                        # separately gated orientation constraint may remain.
                         orientation_belief_active[side] = False
                         rotation_target = rotation_command
                         orientation_source = "operator"
-                        zeta_ori = shared_config.zeta_released
-                        omega_n_ori = shared_config.omega_n_orientation_released
                         gate_reason = "no_constraint"
                         gate_weight = 0.0
                         belief_weight = 0.0
                         final_orientation_weight = 0.0
-                        current_rotation = orientation_reference[side].rotation if orientation_reference[side].rotation is not None else measured_tf[side][:3, :3]
+                        current_rotation = rotation_command
                         if belief_target is not None and belief_target.has_orientation_constraint:
                             target_model = str(args.end_effector_model).lower()
                             position_point = str(belief_target.position_point or "")
@@ -2288,51 +2216,16 @@ def main() -> int:
                         else:
                             orientation_gate[side].authority(None, current_rotation, dt)
                             orientation_authority[side].update(0.0, gate_ok=False, dt=dt)
-                        if not orientation_belief_active[side]:
-                            # Rebase only at the actual orientation-authority
-                            # falling edge: B/Y release, stale target, or an
-                            # invalid/rejected orientation constraint.  This
-                            # keeps the current reference continuous without
-                            # suppressing belief orientation merely because
-                            # position entered HOLDING.
-                            if was_orientation_belief_active:
-                                operator_rotation_offset[side].capture(
-                                    current_rotation, rotation_command
-                                )
-                                operator_rotation_rebase_active[side] = True
-                            rotation_target = operator_rotation_offset[side].apply(
-                                rotation_command
-                            )
-                            if operator_rotation_rebase_active[side]:
-                                orientation_source = "operator_rebased"
-                        # Modulate reference dynamics continuously. The state
-                        # itself is never blended or reset on authority edges.
-                        zeta_ori = (
-                            (1.0 - final_orientation_weight) * shared_config.zeta_released
-                            + final_orientation_weight * shared_config.zeta_armed
-                        )
-                        omega_n_ori = (
-                            (1.0 - final_orientation_weight) * shared_config.omega_n_orientation_released
-                            + final_orientation_weight * shared_config.omega_n_orientation_armed
-                        )
-                        r_ref = orientation_reference[side].step(
-                            rotation_target, dt, measured=measured_tf[side][:3, :3],
-                            omega_n=omega_n_ori, zeta=zeta_ori,
-                        )
-
-                        # Rebase the raw operator frame whenever position
-                        # authority ends, not only after a grasp.  ``track``
-                        # refreshes the exact p_ref - p_human offset on every
-                        # assisted tick; ``apply`` then preserves it while the
-                        # operator is still, and washes it out by path length.
+                        # Feed the current Televuer orientation directly to
+                        # IK. A shared orientation constraint may explicitly
+                        # alter this target, but no reference dynamics follow it.
+                        # The direct Televuer position is the default. Shared
+                        # target logic only changes it while a valid Y/B target
+                        # is actively selected.
                         position_target = position_command
                         position_source = "operator"
                         position_belief_weight = 0.0
-                        position_alpha_lpf_applied = False
                         position_unfiltered_target = position_command.copy()
-                        zeta_pos = shared_config.zeta_released
-                        omega_n_pos = shared_config.omega_n_position_released
-                        position_assisted = False
                         if (
                             belief_target is not None
                             and belief_target.position_valid
@@ -2344,7 +2237,7 @@ def main() -> int:
                                 or belief_target.position_point.endswith("_grasp_center")
                             )
                             goal_wrist = (
-                                goal - r_ref @ grasp_center_wrist_offset[side]
+                                goal - rotation_target @ grasp_center_wrist_offset[side]
                                 if is_canonical_grasp_center
                                 else goal
                             )
@@ -2365,40 +2258,12 @@ def main() -> int:
                                         (1.0 - alpha) * position_command
                                         + alpha * goal_wrist
                                     )
-                                    if (
-                                        bool(args.shared_position_alpha_lpf)
-                                        and alpha > 0.0
-                                    ):
-                                        # Seed at the raw operator command on
-                                        # the authority rising edge. This LPF
-                                        # smooths target updates without an
-                                        # additional Cartesian jump at B/Y.
-                                        position_target = position_alpha_lpf[side].step(
-                                            position_unfiltered_target,
-                                            seed=position_command,
-                                        )
-                                        position_alpha_lpf_applied = True
-                                    else:
-                                        position_target = position_unfiltered_target
+                                    position_target = position_unfiltered_target
                                     position_source = (
-                                        (
-                                            "belief_contact_alpha_lpf"
-                                            if position_alpha_lpf_applied
-                                            else "belief_contact_alpha"
-                                        )
-                                        if alpha > 0.0
-                                        else "operator"
+                                        "belief_contact_alpha"
+                                        if alpha > 0.0 else "operator"
                                     )
                                     position_belief_weight = float(alpha)
-                                    zeta_pos = (
-                                        (1.0 - alpha) * shared_config.zeta_released
-                                        + alpha * shared_config.zeta_armed
-                                    )
-                                    omega_n_pos = (
-                                        (1.0 - alpha) * shared_config.omega_n_position_released
-                                        + alpha * shared_config.omega_n_position_armed
-                                    )
-                                    position_assisted = alpha > 0.0
                                 else:
                                     position_target = goal_wrist
                                     position_unfiltered_target = goal_wrist.copy()
@@ -2407,9 +2272,6 @@ def main() -> int:
                                         0.0, gate_ok=False, dt=dt
                                     )
                                     position_belief_weight = 1.0
-                                    zeta_pos = shared_config.zeta_armed
-                                    omega_n_pos = shared_config.omega_n_position_armed
-                                    position_assisted = True
                             else:
                                 # A stale/remote target must not retain a
                                 # prior posterior authority while VR remains
@@ -2419,44 +2281,34 @@ def main() -> int:
                                 )
                         else:
                             position_authority[side].update(0.0, gate_ok=False, dt=dt)
-                        if not position_assisted:
-                            position_alpha_lpf[side].reset()
-                            position_target = operator_frame_offset[side].apply(
-                                position_command
-                            )
-                            position_unfiltered_target = position_target.copy()
-                            position_source = (
-                                "operator_holding_rebased"
-                                if holding
-                                else "operator_rebased"
-                            )
-                        p_ref = position_reference[side].step(
-                            position_target, dt, measured=measured_tf[side][:3, 3],
-                            omega_n=omega_n_pos, zeta=zeta_pos,
-                        )
-                        if position_assisted:
-                            # Track the *advanced* reference, rather than the
-                            # preceding tick, so a release is exactly
-                            # continuous even while the reference is moving.
-                            operator_frame_offset[side].track(
-                                p_ref, position_command
-                            )
-                        # Measured lag is telemetry only. It must never freeze,
-                        # resync, or down-weight a valid operator/belief target.
+                        # In ordinary XR teleoperation, this is the exact
+                        # Televuer waist-frame position. The optional shared
+                        # target branch above is the only Cartesian alteration.
+                        position_unfiltered_target = position_target.copy()
                         measured_lag_m = float(
-                            np.linalg.norm(p_ref - measured_tf[side][:3, 3])
+                            np.linalg.norm(position_target - measured_tf[side][:3, 3])
                         )
-                        human_tf[side][:3, :3] = r_ref
-                        human_tf[side][:3, 3] = p_ref
+                        human_tf[side][:3, :3] = rotation_target
+                        human_tf[side][:3, 3] = position_target
+                        command_velocity = command_features[side][2]
+                        command_omega = command_features[side][3]
                         reference_diagnostics[side] = {
                             "armed": bool(belief_target is not None), "position_source": position_source,
-                            "orientation_source": orientation_source, "omega_n_position": float(omega_n_pos),
-                            "omega_n_orientation": float(omega_n_ori), "position_error_m": float(np.linalg.norm(p_ref-position_target)),
-                            "orientation_error_rad": float(np.linalg.norm(rotation_vector(rotation_target @ r_ref.T))),
-                            "reference_speed_mps": float(np.linalg.norm(position_reference[side].velocity)),
-                            "reference_rate_rps": float(np.linalg.norm(orientation_reference[side].rate)),
+                            "orientation_source": orientation_source,
+                            # Compatibility telemetry: no Cartesian reference
+                            # remains between Televuer and IK in direct mode.
+                            "position_error_m": 0.0,
+                            "orientation_error_rad": 0.0,
+                            "reference_speed_mps": (
+                                0.0 if command_velocity is None
+                                else float(np.linalg.norm(command_velocity))
+                            ),
+                            "reference_rate_rps": (
+                                0.0 if command_omega is None
+                                else float(np.linalg.norm(command_omega))
+                            ),
                             "measured_lag_m": measured_lag_m,
-                            "measured_lag_policy": "diagnostic_only",
+                            "goal_mode": "direct_televuer_or_shared_target",
                             "object_id": "" if belief_target is None else belief_target.object_id,
                             "relation": "" if belief_target is None else belief_target.orientation_relation,
                             "orientation_gate_reason": gate_reason,
@@ -2466,17 +2318,20 @@ def main() -> int:
                             "orientation_authority_weight": float(final_orientation_weight),
                             "orientation_smoothed_confidence": float(orientation_authority[side].smoothed_confidence),
                             "orientation_belief_active": bool(orientation_belief_active[side]),
-                            "orientation_rebase_active": bool(operator_rotation_rebase_active[side]),
+                            "orientation_rebase_active": False,
                             "position_blend_mode": str(args.shared_position_mode),
                             "position_alpha_source": str(args.shared_position_alpha_source),
                             "position_belief_weight": float(position_belief_weight),
-                            "position_alpha_lpf_enabled": bool(args.shared_position_alpha_lpf),
-                            "position_alpha_lpf_applied": bool(position_alpha_lpf_applied),
-                            "position_alpha_lpf_alpha": float(args.shared_position_alpha_lpf_alpha),
+                            "position_alpha_lpf_enabled": False,
+                            "position_alpha_lpf_applied": False,
+                            "position_alpha_lpf_alpha": 1.0,
                             "position_unfiltered_target_m": position_unfiltered_target.tolist(),
                             "position_smoothed_confidence": float(position_authority[side].smoothed_confidence),
-                            "zeta_position": float(zeta_pos),
-                            "zeta_orientation": float(zeta_ori),
+                            "frame_offset": {
+                                "offset_m": [0.0, 0.0, 0.0],
+                                "offset_norm_m": 0.0,
+                                "peak_offset_m": 0.0,
+                            },
                             "grasp_commanded": bool(grasp_commanded[side]),
                             "grasp_engaged": bool(grasp_engaged[side]),
                             "jaw_gap_m": jaw_gap_m[side],
@@ -2491,17 +2346,11 @@ def main() -> int:
                                 "override_active": bool(detector.override_active),
                                 "override_count": int(detector.override_count),
                             },
-                            "frame_offset": {
-                                "offset_m": operator_frame_offset[side].offset.tolist(),
-                                "offset_norm_m": float(np.linalg.norm(operator_frame_offset[side].offset)),
-                                "peak_offset_m": float(operator_frame_offset[side].peak_offset_m),
-                            },
                             "grasp_state_source": "v17_physical_state_machine",
                         }
                     control_visual_hands = {
                         side: {
-                            # Exact wrist-yaw Cartesian reference handed to
-                            # solve_authoritative_ipopt_transforms below.
+                            # Exact wrist-yaw Cartesian goal handed to IPOPT.
                             "ipopt_wrist_target_m": human_tf[side][:3, 3].tolist(),
                             "ipopt_wrist_rotation": human_tf[side][:3, :3].reshape(9).tolist(),
                             "command_wrist_position_m": p_cmd.tolist(),
@@ -2545,9 +2394,8 @@ def main() -> int:
                             "position_alpha_source": reference_diagnostics[side]["position_alpha_source"],
                             "position_belief_weight": reference_diagnostics[side]["position_belief_weight"],
                             "position_smoothed_confidence": reference_diagnostics[side]["position_smoothed_confidence"],
-                            "reference_speed_mps": reference_diagnostics[side][
-                                "reference_speed_mps"
-                            ],
+                            "reference_speed_mps": reference_diagnostics[side]["reference_speed_mps"],
+                            "goal_mode": reference_diagnostics[side]["goal_mode"],
                             "grasp_commanded": bool(grasp_commanded[side]),
                             "grasp_engaged": bool(grasp_engaged[side]),
                             "jaw_gap_m": jaw_gap_m[side],
@@ -2581,7 +2429,7 @@ def main() -> int:
                         qp_payload = ipopt_arm_sample_reference(
                             q_arm_reference,
                             state=current_state,
-                            source="pico_wrist_target",
+                            source="xr_wrist_target",
                             control_mode="teleop",
                             feasible=True,
                             plan_id=0,
@@ -2594,7 +2442,7 @@ def main() -> int:
                             pico_target_held=False,
                             pico_left_target_position=left_target_tf[:3, 3].tolist(),
                             pico_right_target_position=right_target_tf[:3, 3].tolist(),
-                            q_prior_source="ipopt_pico_controller_ee",
+                            q_prior_source="ipopt_xr_controller_ee",
                             belief_enabled=bool(shared_selection_armed),
                             shared_control=bool(shared_selection_armed),
                             teleop_qp_bimanual=True,
@@ -2625,10 +2473,9 @@ def main() -> int:
                                     }
                                     for side in ("left", "right")
                                 },
-                                reference_zeta=float(shared_config.zeta_armed if shared_selection_armed else shared_config.zeta_released),
                                 shared_human_wrist_source=human_wrist_source,
                                 shared_coordinate_frame=PICO_WAIST_FRAME,
-                                shared_orientation_source="second_order_reference",
+                                shared_orientation_source="direct_xr_or_shared_constraint",
                                 shared_target_quaternion_wxyz=(
                                     None
                                     if shared_target is None
@@ -2639,7 +2486,7 @@ def main() -> int:
                             if shared_target is not None:
                                 target_tf = left_target_tf if requested_hand == "left" else right_target_tf
                                 qp_payload.update(
-                                    q_prior_source="ipopt_second_order_ee_pose",
+                                    q_prior_source="ipopt_shared_ee_pose",
                                      terminal_target_link=str(selected_target_payload.get("target_link", "") if selected_target_payload else ""),
                                      terminal_target_position=target_tf[:3, 3].tolist(),
                                      # Preserve the exact pose that was sent to
@@ -2671,7 +2518,7 @@ def main() -> int:
                         qp_payload = ipopt_arm_sample_reference(
                             hold_q,
                             state=current_state,
-                            source="pico_wrist_target",
+                            source="xr_wrist_target",
                             control_mode="teleop",
                             feasible=True,
                             plan_id=0,
@@ -2731,7 +2578,7 @@ def main() -> int:
                     qp_payload = ipopt_arm_sample_reference(
                         hold_q,
                         state=current_state,
-                        source="pico_wrist_target",
+                        source="xr_wrist_target",
                         control_mode="teleop",
                         feasible=True,
                         timestamp_us=tick_us,
@@ -3047,16 +2894,16 @@ def main() -> int:
 
             if now - last_log > 1.0:
                 shared_log = "shared=none"
-                pico_position_log = "pico_L/R=missing"
+                pico_position_log = "xr_L/R=missing"
                 if latest_wrist_targets is not None:
                     left_position = latest_wrist_targets.left_waist[:3, 3]
                     right_position = latest_wrist_targets.right_waist[:3, 3]
                     pico_position_log = (
-                        "pico_L=("
+                        "xr_L=("
                         f"{left_position[0]:+.3f},"
                         f"{left_position[1]:+.3f},"
                         f"{left_position[2]:+.3f}) "
-                        "pico_R=("
+                        "xr_R=("
                         f"{right_position[0]:+.3f},"
                         f"{right_position[1]:+.3f},"
                         f"{right_position[2]:+.3f})"
@@ -3066,16 +2913,14 @@ def main() -> int:
                     right_ref = latest_shared_result["right"]
                     shared_log = (
                         f"shared_select={shared_selected_hand} "
-                        f"ref_L[{left_ref['position_source'][:3]}/{left_ref['orientation_source'][:3]} "
-                        f"e={left_ref['position_error_m'] * 100:.1f}cm/{np.rad2deg(left_ref['orientation_error_rad']):.1f}deg "
-                        f"gate={left_ref['orientation_gate_reason']}] "
-                        f"ref_R[{right_ref['position_source'][:3]}/{right_ref['orientation_source'][:3]} "
-                        f"e={right_ref['position_error_m'] * 100:.1f}cm/{np.rad2deg(right_ref['orientation_error_rad']):.1f}deg "
-                        f"gate={right_ref['orientation_gate_reason']}]"
+                        f"goal_L[{left_ref['position_source']}/{left_ref['orientation_source']} "
+                        f"mode={left_ref['goal_mode']} gate={left_ref['orientation_gate_reason']}] "
+                        f"goal_R[{right_ref['position_source']}/{right_ref['orientation_source']} "
+                        f"mode={right_ref['goal_mode']} gate={right_ref['orientation_gate_reason']}]"
                     )
                 log(
-                    f"state={current_state} pico_fresh={pico_body_fresh} "
-                    f"pico_session={latest_pico_session_id}/"
+                    f"state={current_state} xr_wrist_fresh={pico_body_fresh} "
+                    f"xr_session={latest_pico_session_id}/"
                     f"{'teleop_tracking' if pico_tracking_armed else 'teleop_wait_ready'} "
                     f"static_target={'fresh' if static_target_fresh else 'held' if static_target_usable else 'missing'} "
                     f"static_age={static_target_age_sec if np.isfinite(static_target_age_sec) else float('nan'):.2f}s "
@@ -3094,9 +2939,9 @@ def main() -> int:
                     f"qp_type={qp_payload.get('reference_type') if qp_payload else 'none'} "
                     f"source={qp_payload.get('source', 'none') if qp_payload else 'none'} "
                     f"q_prior={qp_payload.get('q_prior_source', 'n/a') if qp_payload else 'n/a'} "
-                    f"pico_target={'absolute_head_position' if latest_wrist_targets else 'waiting'} "
+                    f"xr_target={'absolute_head_position' if latest_wrist_targets else 'waiting'} "
                     f"{pico_position_log} "
-                    f"pico_age={1000.0 * pico_body_age_sec if np.isfinite(pico_body_age_sec) else -1.0:.1f}ms "
+                    f"xr_age={1000.0 * pico_body_age_sec if np.isfinite(pico_body_age_sec) else -1.0:.1f}ms "
                     f"button_seq={last_button_sequence} "
                     f"controller_seq={latest_controller_sequence} "
                     f"controller_age={1000.0 * controller_age_sec if np.isfinite(controller_age_sec) else -1.0:.1f}ms "

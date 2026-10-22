@@ -9,6 +9,7 @@ so the WBC policy sees the sim as a real robot.
 
 import sys
 import threading
+import time
 from typing import Dict, Tuple
 
 import numpy as np
@@ -99,6 +100,13 @@ class UnitreeSdk2Bridge:
         self.low_cmd_lock = threading.Lock()
         self.left_hand_cmd_lock = threading.Lock()
         self.right_hand_cmd_lock = threading.Lock()
+        self.low_cmd_count = 0
+        self.left_hand_cmd_count = 0
+        self.right_hand_cmd_count = 0
+        self.low_cmd_last_received = None
+        self.left_hand_cmd_last_received = None
+        self.right_hand_cmd_last_received = None
+        self.low_state_count = 0
 
         self.have_imu_ = False
         self.have_frame_sensor_ = False
@@ -209,6 +217,8 @@ class UnitreeSdk2Bridge:
             self.low_cmd = msg
             self.low_cmd_received = True
             self.new_low_cmd = True
+            self.low_cmd_count += 1
+            self.low_cmd_last_received = time.monotonic()
 
     def LeftHandCmdHandler(self, msg):
         with self.left_hand_cmd_lock:
@@ -224,6 +234,8 @@ class UnitreeSdk2Bridge:
                 self.left_hand_cmd = msg
             self.left_hand_cmd_received = True
             self.new_left_hand_cmd = True
+            self.left_hand_cmd_count += 1
+            self.left_hand_cmd_last_received = time.monotonic()
 
     def RightHandCmdHandler(self, msg):
         with self.right_hand_cmd_lock:
@@ -239,6 +251,8 @@ class UnitreeSdk2Bridge:
                 self.right_hand_cmd = msg
             self.right_hand_cmd_received = True
             self.new_right_hand_cmd = True
+            self.right_hand_cmd_count += 1
+            self.right_hand_cmd_last_received = time.monotonic()
 
     def _set_revo2_binary_command(self, is_left: bool, closed: bool):
         if self.hand_backend != REVO2_BACKEND:
@@ -253,9 +267,13 @@ class UnitreeSdk2Bridge:
             if is_left:
                 self.left_hand_cmd_received = True
                 self.new_left_hand_cmd = True
+                self.left_hand_cmd_count += 1
+                self.left_hand_cmd_last_received = time.monotonic()
             else:
                 self.right_hand_cmd_received = True
                 self.new_right_hand_cmd = True
+                self.right_hand_cmd_count += 1
+                self.right_hand_cmd_last_received = time.monotonic()
 
     def SetBinaryGrip(self, is_left: bool, closed: bool):
         """Public binary-grip adapter used by tests and local sim controllers."""
@@ -295,6 +313,27 @@ class UnitreeSdk2Bridge:
             right_hand_cmd_received = self.right_hand_cmd_received
         return low_cmd_received or left_hand_cmd_received or right_hand_cmd_received
 
+    def command_status(self):
+        """Snapshot body/hand command arrival counters and freshness for sim logs."""
+        now = time.monotonic()
+        with self.low_cmd_lock:
+            body = (self.low_cmd_count, self.low_cmd_last_received)
+        with self.left_hand_cmd_lock:
+            left = (self.left_hand_cmd_count, self.left_hand_cmd_last_received)
+        with self.right_hand_cmd_lock:
+            right = (self.right_hand_cmd_count, self.right_hand_cmd_last_received)
+
+        def snapshot(value):
+            count, received_at = value
+            age_sec = None if received_at is None else max(0.0, now - received_at)
+            return {"count": count, "age_sec": age_sec}
+
+        return {
+            "lowcmd": snapshot(body),
+            "left_revo2": snapshot(left),
+            "right_revo2": snapshot(right),
+        }
+
     def PublishLowState(self, obs: Dict[str, any]):
         # publish body state
         if self.use_sensor:
@@ -325,6 +364,7 @@ class UnitreeSdk2Bridge:
             raise NotImplementedError("Frame sensor data is not implemented yet.")
         self.low_state.tick = int(obs["time"] * 1e3)
         self.low_state_puber.Write(self.low_state)
+        self.low_state_count += 1
 
         self.torso_imu_puber.Write(self.torso_imu_state)
 

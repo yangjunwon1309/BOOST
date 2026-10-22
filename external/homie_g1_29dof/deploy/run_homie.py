@@ -26,6 +26,8 @@ Policy process (homie_policy_process.py, decoupled, its own GIL):
 Usage:
   python run_homie.py --net eth0 \
       --stand ../ckpts/stand.onnx --walk ../ckpts/walk.onnx
+  python run_homie.py --net lo --stand-policy-only --auto-start \
+      --config configs/sim/homie_g1_mujoco.yaml
 """
 import argparse
 import multiprocessing as mp
@@ -74,6 +76,12 @@ def parse_args():
     p.add_argument("--dry-run", action="store_true",
                    help="connect + read state + run policy at 50 Hz, but NEVER command "
                         "motion (robot held in zero-stiffness damping). Use this first.")
+    p.add_argument("--stand-only", action="store_true",
+                   help="open-loop ramp to default pose and hold it; policy stays disabled")
+    p.add_argument("--stand-policy-only", action="store_true",
+                   help="run HOMIE stand.onnx continuously with zero cmd_vel; never walk")
+    p.add_argument("--auto-start", action="store_true",
+                   help="skip remote start/engage waits in local MuJoCo mode (requires --net lo)")
     return p.parse_args()
 
 
@@ -163,13 +171,63 @@ def dry_run(env, ipc, commands, arm_source, config, stand_cmd_threshold):
         print("Dry run finished (robot in damping).")
 
 
+def stand_only(env, config, *, auto_start=False):
+    """Ramp to and hold the default pose without starting the policy process."""
+    print("\n" + "=" * 60)
+    print("STAND ONLY: HOMIE policy disabled; A is ignored.")
+    if auto_start:
+        print("MuJoCo auto-start ramps to the configured default pose.")
+        print("Ctrl+C stops the simulation hold loop.")
+    else:
+        print("START ramps to the configured default pose; Select exits to damping.")
+        print("Keep the wireless sticks centered. Ctrl+C also exits to damping.")
+    print("=" * 60 + "\n")
+    try:
+        if not env.move_to_default_pos(
+            exit_on_select=not auto_start, auto_start=auto_start
+        ):
+            return 0
+        print("STAND ONLY: holding default pose. Policy remains disabled.")
+        while True:
+            if not auto_start:
+                controller = env.read_controller_input()
+                if controller.keys == env.controller_mapping["select"]:
+                    print("Select pressed -> leaving stand-only mode to damping.")
+                    break
+            env.send_robot_action(config.default_angles.copy())
+            time.sleep(config.control_dt)
+    except KeyboardInterrupt:
+        print("\nKeyboardInterrupt -> leaving stand-only mode to damping.")
+    finally:
+        env.close()
+        print("Stand-only mode stopped (robot in damping).")
+    return 0
+
+
 def main():
     args = parse_args()
-    for path in (args.config, args.policy_config, args.stand, args.walk):
+    if args.dry_run and (args.stand_only or args.stand_policy_only):
+        sys.exit("Error: --dry-run, --stand-only, and --stand-policy-only are separate modes")
+    if args.stand_only and args.stand_policy_only:
+        sys.exit("Error: --stand-only and --stand-policy-only are mutually exclusive")
+    if args.auto_start and args.net != "lo":
+        sys.exit("Error: --auto-start is restricted to the local MuJoCo loopback interface ('lo')")
+    if args.stand_policy_only and not args.auto_start:
+        sys.exit(
+            "Error: --stand-policy-only requires --auto-start for unattended MuJoCo bring-up"
+        )
+    required_paths = [args.config]
+    if not args.stand_only:
+        required_paths.extend((args.policy_config, args.stand, args.walk))
+    for path in required_paths:
         if not os.path.exists(path):
             sys.exit(f"Error: file not found: {path}")
 
     config = Config(args.config)
+    if args.stand_only:
+        env = G1RealWorldEnv(net=args.net, config=config)
+        return stand_only(env, config, auto_start=args.auto_start)
+
     policy_config = load_config(args.policy_config)
     stand_cmd_threshold = float(policy_config.get("stand_cmd_threshold", 0.2))
 
@@ -182,7 +240,11 @@ def main():
         policy_config, args.stand, args.walk, args.onnx_threads, control_dt
     )
 
-    commands = make_command_source(config, net=args.net)
+    # The MuJoCo stand-policy route must not depend on a remote, XR, or PATH
+    # command source. Hold cmd_vel at zero so HOMIE selects stand.onnx only.
+    commands = (
+        None if args.stand_policy_only else make_command_source(config, net=args.net)
+    )
     env = G1RealWorldEnv(net=args.net, config=config)
     arm_source = make_arm_source(config, net=args.net)
 
@@ -193,14 +255,29 @@ def main():
             stop_policy_process(ipc, policy_proc)
 
     print("\n" + "=" * 60)
-    print("SAFETY: policy runs on a REAL robot. Keep the e-stop in hand.")
-    print(f"  stand/walk threshold: ||cmd|| = {stand_cmd_threshold} m/s")
-    print("  START = ramp to default, A = start policy, Select = exit to damping.")
+    if args.stand_policy_only:
+        print("LOCAL MUJOCO TEST: HOMIE stand.onnx runs with cmd_vel fixed at zero.")
+        print("No external command source is active; stand.onnx is selected at zero velocity.")
+        print("Ctrl+C stops the local simulation stack.")
+    elif args.auto_start:
+        print("LOCAL MUJOCO TEST: HOMIE stand/walk policy auto-starts on loopback.")
+        print(f"  stand/walk threshold: ||cmd|| = {stand_cmd_threshold} m/s")
+        print("  MuJoCo viewer keyboard supplies local cmd_vel; zero selects stand.onnx.")
+        print("Ctrl+C stops the local simulation stack.")
+    else:
+        print("SAFETY: policy runs on a REAL robot. Keep the e-stop in hand.")
+        print(f"  stand/walk threshold: ||cmd|| = {stand_cmd_threshold} m/s")
+        print("  START = ramp to default, A = start policy, Select = exit to damping.")
     print("=" * 60 + "\n")
 
-    # Bring-up: ramp to the default pose, then hold until the operator presses A.
-    env.move_to_default_pos()
-    env.default_pos_state()
+    # Bring-up: first ramp into the HOMIE default pose. Hardware requires the
+    # normal A engage; local --auto-start enters the policy loop after the ramp.
+    # --stand-policy-only additionally fixes cmd_vel at zero for stand-only tests.
+    env.move_to_default_pos(auto_start=args.auto_start)
+    if not args.auto_start:
+        env.default_pos_state()
+    elif args.stand_policy_only:
+        print("[HOMIE] local stand-policy mode: zero cmd_vel; walk.onnx will not be selected", flush=True)
 
     ramp_steps = max(1, int(args.ramp_time / control_dt))
     default_full = config.default_angles.copy()
@@ -244,19 +321,26 @@ def main():
     tick_ms_sum = tick_ms_max = 0.0
     tick_n = 0
 
-    print(f"Starting HOMIE policy loop ({os.cpu_count()} CPUs visible). Press [Select] to exit.")
+    if args.stand_policy_only:
+        print(
+            f"Starting HOMIE stand policy ({os.cpu_count()} CPUs visible). Ctrl+C to exit."
+        )
+    else:
+        print(f"Starting HOMIE policy loop ({os.cpu_count()} CPUs visible). Press [Select] to exit.")
     print(f"  rt/lowcmd writer: {args.writer_rate_hz:.0f} Hz (decoupled from the 50 Hz policy tick)")
     print("  policy inference: separate process (see [policy-proc] log lines)")
     try:
         while True:
             t0 = time.time()
 
-            controller = env.read_controller_input()
-            if controller.keys == env.controller_mapping["select"]:
-                print("Select pressed -> exiting to damping.")
-                break
-
-            cmd = commands.get_command(controller)
+            if args.stand_policy_only:
+                cmd = np.zeros(3, dtype=np.float32)
+            else:
+                controller = env.read_controller_input()
+                if controller.keys == env.controller_mapping["select"]:
+                    print("Select pressed -> exiting to damping.")
+                    break
+                cmd = commands.get_command(controller)
             q29, dq29, base_quat, base_ang_vel = env.get_robot_state()
             ipc.write_state(q29, dq29, base_quat, base_ang_vel, cmd)
             q_target15, which = ipc.read_action()
@@ -273,15 +357,15 @@ def main():
             tick_ms_max = max(tick_ms_max, tick_ms)
             tick_n += 1
 
-            if t0 - last_print > 0.5:
+            if t0 - last_print > (1.0 if args.stand_policy_only else 0.5):
                 arm_kp, arm_kd = arm_source.get_arm_gains()
                 kp_str = ",".join(f"{v:.0f}" for v in arm_kp)
                 kd_str = ",".join(f"{v:.1f}" for v in arm_kd)
-                # Periodic control-loop status logging disabled to keep the console quiet.
-                # print(f"[{which:>5}] |cmd|={np.linalg.norm(cmd):.2f} "
-                #       f"cmd=[{cmd[0]:+.2f},{cmd[1]:+.2f},{cmd[2]:+.2f}]  "
-                #       f"arm_kp=[{kp_str}] arm_kd=[{kd_str}]  "
-                #       f"tick_ms avg={tick_ms_sum / tick_n:.2f} max={tick_ms_max:.2f}")
+                if args.stand_policy_only:
+                    print(
+                        f"[HOMIE] policy={which} cmd_vel=[0,0,0] (zero-velocity mode)",
+                        flush=True,
+                    )
                 last_print = t0
                 tick_ms_sum = tick_ms_max = 0.0
                 tick_n = 0

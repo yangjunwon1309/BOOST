@@ -1,0 +1,32 @@
+<mujoco model="cardboard_box_v2_gauntlet">
+  <compiler angle="degree" autolimits="true"/>
+  <option timestep="0.001" integrator="implicitfast" solver="Newton" iterations="100" tolerance="1e-10" gravity="0 0 -9.81" jacobian="dense"/>
+  <worldbody>
+    <geom name="floor" type="plane" size="5 5 0.1" contype="2" conaffinity="1" friction="0.8"/>
+    <body name="body" pos="0 0 0.002" quat="1 0 0 0">
+      <inertial pos="-1.30874367e-13 4.34061369e-14 0.0557409053" mass="0.0755475025" fullinertia="0.000625780521 0.000815924586 0.00107620578 2.20301708e-12 -5.45978174e-16 1.81104261e-16"/>
+      <geom name="g_body" type="box" size="0.075000005 0.1 0.125" pos="-0 -0 0.075000005" quat="0 0.707106781 -0 -0.707106781" contype="1" conaffinity="2"/>
+      <freejoint/>
+      <body name="flap_major_1" pos="0 -0.10005 0.1532">
+        <joint name="flap_major_1_open_deg__flap_major_1" type="hinge" pos="0 0 0" axis="1 0 0" range="0 120" damping="0.001" frictionloss="0.01" solreflimit="0.002 1" solimplimit="0.95 0.99 0.001"/>
+        <inertial pos="0 0.0492499988 0.00150000356" mass="0.0102184107" fullinertia="8.26946215e-06 5.19589128e-05 6.02130473e-05 0 0 0"/>
+        <geom name="g_flap_major_1" type="box" size="0.003 0.0492500012 0.123499997" pos="6.03138534e-18 0.0492499988 0.00150000356" quat="0.707106781 0 0.707106781 -4.32978028e-17" contype="1" conaffinity="2"/>
+      </body>
+      <body name="flap_major_2" pos="0 0.10005 0.1532">
+        <joint name="flap_major_2_open_deg__flap_major_2" type="hinge" pos="0 0 0" axis="-1 0 0" range="0 120" damping="0.001" frictionloss="0.01" solreflimit="0.002 1" solimplimit="0.95 0.99 0.001"/>
+        <inertial pos="0 -0.0492499988 0.00150000356" mass="0.0102184107" fullinertia="8.26946215e-06 5.19589128e-05 6.02130473e-05 0 0 0"/>
+        <geom name="g_flap_major_2" type="box" size="0.003 0.0492500012 0.123499997" pos="7.84640247e-18 -0.0492499988 0.00150000356" quat="0.707106781 0 0.707106781 -4.32978028e-17" contype="1" conaffinity="2"/>
+      </body>
+      <body name="flap_minor_1" pos="-0.12505 0 0.15005">
+        <joint name="flap_minor_1_open_deg__flap_minor_1" type="hinge" pos="0 0 0" axis="0 -1 0" range="0 120" damping="0.001" frictionloss="0.01" solreflimit="0.002 1" solimplimit="0.95 0.99 0.001"/>
+        <inertial pos="0.0500000036 0 0.0015000024" mass="0.00827401614" fullinertia="2.67650624e-05 6.90121817e-06 3.36538695e-05 0 0 0"/>
+        <geom name="g_flap_minor_1" type="box" size="0.003 0.049999997 0.0984999985" pos="0.0500000036 4.69293615e-18 0.0015000024" quat="0.5 -0.5 0.5 0.5" contype="1" conaffinity="2"/>
+      </body>
+      <body name="flap_minor_2" pos="0.12505 0 0.15005">
+        <joint name="flap_minor_2_open_deg__flap_minor_2" type="hinge" pos="0 0 0" axis="0 1 0" range="0 120" damping="0.001" frictionloss="0.01" solreflimit="0.002 1" solimplimit="0.95 0.99 0.001"/>
+        <inertial pos="-0.0500000036 0 0.0015000024" mass="0.00827401614" fullinertia="2.67650624e-05 6.90121817e-06 3.36538695e-05 0 0 0"/>
+        <geom name="g_flap_minor_2" type="box" size="0.003 0.049999997 0.0984999985" pos="-0.0500000036 9.18485166e-18 0.0015000024" quat="0.5 -0.5 0.5 0.5" contype="1" conaffinity="2"/>
+      </body>
+    </body>
+  </worldbody>
+</mujoco>

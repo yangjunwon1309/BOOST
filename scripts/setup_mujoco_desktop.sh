@@ -19,21 +19,20 @@ import mujoco.viewer
 import onnxruntime
 import pinocchio
 import unitree_sdk2py
+import yaml
 from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
 
 from boost.io.path_transport.g1_direct_protocol import pack_robot_state
 from boost.io.unitree_crc import make_unitree_crc
 
-scene = Path("boost/sim/mujoco/scene_29dof_with_revo2.xml")
+with Path("configs/sim/mujoco_revo2.yaml").open("r", encoding="utf-8") as stream:
+    sim_config = yaml.safe_load(stream)
+scene = Path(sim_config["scene"])
 model = mujoco.MjModel.from_xml_path(str(scene.resolve()))
-assert (model.nq, model.nv, model.nu) == (58, 57, 41), (
-    model.nq,
-    model.nv,
-    model.nu,
-)
+assert model.nu == 41, (model.nq, model.nv, model.nu)
 print(
     f"Pixi MuJoCo runtime ready: MuJoCo {mujoco.__version__}; "
-    f"G1 + Revo2 nq/nv/nu={model.nq}/{model.nv}/{model.nu}"
+    f"scene={scene}; G1 + Revo2 nq/nv/nu={model.nq}/{model.nv}/{model.nu}"
 )
 crc = make_unitree_crc()
 crc.Crc(unitree_hg_msg_dds__LowCmd_())

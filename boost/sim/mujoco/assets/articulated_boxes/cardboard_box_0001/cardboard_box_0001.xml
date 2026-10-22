@@ -1,0 +1,30 @@
+<?xml version='1.0' encoding='utf-8'?>
+<mujocoinclude>
+  <worldbody>
+    <body name="cardboard_box_0001" pos="3.25 0 0.8" quat="1 0 0 0">
+      <inertial pos="-6.02213466e-18 1.73293198e-18 0.15003012" mass="0.28106613" fullinertia="0.00421320846 0.00585811932 0.00585877143 2.17420607e-12 -7.64171487e-20 -2.31728533e-19" />
+      <geom name="cardboard_box_0001_g_body" type="box" size="0.150000005 0.15000001 0.20029999" pos="-0 -0 0.150000005" quat="0 0.707106781 -0 -0.707106781" contype="1" conaffinity="2" margin="0" rgba="0.72 0.48 0.28 1" />
+      <freejoint name="cardboard_box_0001_free" />
+      <body name="cardboard_box_0001_flap_major_1" pos="0 -0.15005 0.3032">
+        <joint name="cardboard_box_0001_flap_major_1_open_deg__flap_major_1" type="hinge" pos="0 0 0" axis="1 0 0" range="0 2.09439510239" damping="0.001" frictionloss="0.01" solreflimit="0.002 1" solimplimit="0.95 0.99 0.001" limited="true" />
+        <inertial pos="0 0.0742500003 0.00150000207" mass="0.024760818" fullinertia="4.55212158e-05 0.000325229242 0.000370713317 0 0 0" />
+        <geom name="cardboard_box_0001_g_flap_major_1" type="box" size="0.003 0.0742499995 0.198500007" pos="9.09300252e-18 0.0742500003 0.00150000207" quat="0.707106781 0 0.707106781 -4.32978028e-17" contype="1" conaffinity="2" margin="0" rgba="0.72 0.48 0.28 1" />
+      </body>
+      <body name="cardboard_box_0001_flap_major_2" pos="0 0.15005 0.3032">
+        <joint name="cardboard_box_0001_flap_major_2_open_deg__flap_major_2" type="hinge" pos="0 0 0" axis="-1 0 0" range="0 2.09439510239" damping="0.001" frictionloss="0.01" solreflimit="0.002 1" solimplimit="0.95 0.99 0.001" limited="true" />
+        <inertial pos="0 -0.0742500003 0.00150000207" mass="0.024760818" fullinertia="4.55212158e-05 0.000325229242 0.000370713317 0 0 0" />
+        <geom name="cardboard_box_0001_g_flap_major_2" type="box" size="0.003 0.0742499995 0.198500007" pos="1.86625731e-17 -0.0742500003 0.00150000207" quat="0.707106781 0 0.707106781 -4.32978028e-17" contype="1" conaffinity="2" margin="0" rgba="0.72 0.48 0.28 1" />
+      </body>
+      <body name="cardboard_box_0001_flap_minor_1" pos="-0.20005 0 0.30005">
+        <joint name="cardboard_box_0001_flap_minor_1_open_deg__flap_minor_1" type="hinge" pos="0 0 0" axis="0 -1 0" range="0 2.09439510239" damping="0.001" frictionloss="0.01" solreflimit="0.002 1" solimplimit="0.95 0.99 0.001" limited="true" />
+        <inertial pos="0.075000001 0 0.00150000091" mass="0.0187111296" fullinertia="0.000137554861 3.50973992e-05 0.000172624193 0 0 3.89659407e-21" />
+        <geom name="cardboard_box_0001_g_flap_minor_1" type="box" size="0.003 0.0749999975 0.148499996" pos="0.075000001 1.39782989e-17 0.00150000091" quat="0.5 -0.5 0.5 0.5" contype="1" conaffinity="2" margin="0" rgba="0.72 0.48 0.28 1" />
+      </body>
+      <body name="cardboard_box_0001_flap_minor_2" pos="0.20005 0 0.30005">
+        <joint name="cardboard_box_0001_flap_minor_2_open_deg__flap_minor_2" type="hinge" pos="0 0 0" axis="0 1 0" range="0 2.09439510239" damping="0.001" frictionloss="0.01" solreflimit="0.002 1" solimplimit="0.95 0.99 0.001" limited="true" />
+        <inertial pos="-0.075000001 0 0.00150000091" mass="0.0187111296" fullinertia="0.000137554861 3.50973992e-05 0.000172624193 0 0 -1.91651354e-20" />
+        <geom name="cardboard_box_0001_g_flap_minor_2" type="box" size="0.003 0.0749999975 0.148499996" pos="-0.075000001 1.37772767e-17 0.00150000091" quat="0.5 -0.5 0.5 0.5" contype="1" conaffinity="2" margin="0" rgba="0.72 0.48 0.28 1" />
+      </body>
+    </body>
+  </worldbody>
+</mujocoinclude>

@@ -10,6 +10,8 @@ close its measured-state loop against the simulator.
 from __future__ import annotations
 
 import argparse
+import json
+import threading
 import time
 from pathlib import Path
 
@@ -17,9 +19,14 @@ import mujoco
 import mujoco.viewer
 import numpy as np
 import yaml
-from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelPublisher
+from unitree_sdk2py.idl.std_msgs.msg.dds_ import String_
 
 from boost.sim.mujoco.hand_backends import REVO2_JOINT_SUFFIXES
+from boost.sim.mujoco.surface_query_service import (
+    MuJoCoSurfaceQueryService,
+    load_model_with_surface_probes,
+)
 from boost.sim.mujoco.unitree_sdk2py_bridge import REVO2_BACKEND, UnitreeSdk2Bridge
 
 
@@ -64,6 +71,61 @@ def _torque_limit(model: mujoco.MjModel, actuator_id: int, torque: float) -> flo
         low, high = model.actuator_ctrlrange[actuator_id]
         return float(np.clip(torque, low, high))
     return float(torque)
+
+
+def _format_command_status(status: dict) -> str:
+    count = int(status["count"])
+    age = status["age_sec"]
+    if count == 0 or age is None:
+        return "waiting"
+    return f"{count}@{age * 1000:.0f}ms"
+
+
+class KeyboardLocomotion:
+    """Latched MuJoCo viewer keys translated to HOMIE body-frame cmd_vel."""
+
+    SPEED_STEP = 0.1
+    INITIAL_SPEED_SCALE = 0.5
+    MIN_SPEED_SCALE = 0.2
+
+    def __init__(self, max_cmd: np.ndarray):
+        self.max_cmd = np.asarray(max_cmd, dtype=np.float32).reshape(3)
+        self._lock = threading.Lock()
+        self._direction = np.zeros(3, dtype=np.float32)
+        self._speed_scale = self.INITIAL_SPEED_SCALE
+
+    def on_key(self, keycode: int) -> None:
+        try:
+            key = chr(keycode).lower()
+        except (TypeError, ValueError):
+            return
+
+        with self._lock:
+            if key == "w":
+                self._direction[0] = 1.0
+            elif key == "s":
+                self._direction[0] = -1.0
+            elif key == "a":
+                self._direction[1] = 1.0
+            elif key == "d":
+                self._direction[1] = -1.0
+            elif key == "q":
+                self._direction[2] = 1.0
+            elif key == "r":
+                self._direction[2] = -1.0
+            elif key == "o":
+                self._speed_scale = max(
+                    self.MIN_SPEED_SCALE, self._speed_scale - self.SPEED_STEP
+                )
+            elif key == "p":
+                self._speed_scale = min(1.0, self._speed_scale + self.SPEED_STEP)
+            elif key == " ":
+                self._direction[:] = 0.0
+
+    def command(self) -> tuple[np.ndarray, float]:
+        with self._lock:
+            cmd = self._direction * self.max_cmd * self._speed_scale
+            return cmd, self._speed_scale
 
 
 def _state_observation(
@@ -136,6 +198,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--initial-height", type=float, default=None)
     parser.add_argument("--hand-kp", type=float, default=None)
     parser.add_argument("--hand-kd", type=float, default=None)
+    parser.add_argument(
+        "--surface-query-endpoint",
+        default=None,
+        help="bind a local ZMQ endpoint for contact-guided hand retargeting",
+    )
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--no-realtime", action="store_true")
     return parser.parse_args()
@@ -168,7 +235,17 @@ def main() -> int:
 
     ChannelFactoryInitialize(args.domain_id, args.interface)
     bridge = UnitreeSdk2Bridge(_make_bridge_config(sim_config, hand_config))
-    model = mujoco.MjModel.from_xml_path(str(args.scene.resolve()))
+    keyboard = KeyboardLocomotion(np.asarray(homie["max_cmd"], dtype=np.float32))
+    nav_cmd_publisher = ChannelPublisher("rt/nav_cmd", String_)
+    nav_cmd_publisher.Init()
+    surface_config = sim_config.get("surface_query", {})
+    probe_radius_m = float(surface_config.get("probe_radius_m", 0.0005))
+    if args.surface_query_endpoint:
+        model = load_model_with_surface_probes(
+            args.scene.resolve(), probe_radius_m=probe_radius_m
+        )
+    else:
+        model = mujoco.MjModel.from_xml_path(str(args.scene.resolve()))
     model.opt.timestep = float(args.sim_dt)
     data = mujoco.MjData(model)
     if model.nu != 41:
@@ -192,21 +269,80 @@ def main() -> int:
         raise RuntimeError(f"Model has no torque actuator for joint id {exc.args[0]}") from exc
     torso_id = _id(model, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
     revo2 = bridge.revo2_adapter
-    viewer = None if args.headless else mujoco.viewer.launch_passive(model, data)
+    surface_service = None
+    if args.surface_query_endpoint:
+        object_geom_names = [
+            str(name) for name in surface_config.get("object_geom_names", [])
+        ]
+        surface_service = MuJoCoSurfaceQueryService(
+            model,
+            data,
+            endpoint=args.surface_query_endpoint,
+            object_geom_names=object_geom_names,
+            distmax_m=float(surface_config.get("distmax_m", 0.03)),
+            probe_radius_m=probe_radius_m,
+        )
+        print(
+            f"[BOOST MuJoCo surface] bound {args.surface_query_endpoint}; "
+            f"object collision geoms={surface_service.object_geom_count}",
+            flush=True,
+        )
+        if surface_service.object_geom_count == 0:
+            print(
+                "[BOOST MuJoCo surface] no object geoms configured; contact guidance "
+                "will fall back to the original SBR targets",
+                flush=True,
+            )
+    viewer = (
+        None
+        if args.headless
+        else mujoco.viewer.launch_passive(
+            model, data, key_callback=keyboard.on_key
+        )
+    )
     sim_period = float(model.opt.timestep)
     next_tick = time.monotonic()
     next_report = next_tick
+    next_nav_publish = next_tick
+    nav_cmd_sequence = 0
     tick = 0
     print(
         f"[BOOST MuJoCo] scene={args.scene} interface={args.interface} "
         f"DDS domain={args.domain_id} dt={sim_period:g}s nq={model.nq} nu={model.nu}; "
-        "waiting for HOMIE rt/lowcmd and Revo2 DDS targets",
+        "publishing rt/lowstate, rt/nav_cmd, and Revo2 state; waiting for "
+        "HOMIE rt/lowcmd and Revo2 DDS commands",
         flush=True,
     )
+    if viewer is not None:
+        print(
+            "[MuJoCo keyboard] W/S forward/back, A/D left/right, "
+            "Q/R yaw left/right; O/P change linear and angular speed "
+            "(20-100%); Space stops. Direction keys latch until reversed or stopped.",
+            flush=True,
+        )
 
     try:
         while viewer is None or viewer.is_running():
             now = time.monotonic()
+            if now >= next_nav_publish:
+                cmd, _speed_scale = keyboard.command()
+                nav_payload = json.dumps(
+                    {
+                        "vx": float(cmd[0]),
+                        "vy": float(cmd[1]),
+                        "wz": float(cmd[2]),
+                        "seq": nav_cmd_sequence,
+                        "state": "keyboard",
+                    },
+                    separators=(",", ":"),
+                )
+                nav_message = String_(nav_payload)
+                nav_cmd_publisher.Write(nav_message)
+                nav_cmd_sequence += 1
+                next_nav_publish = now + 0.02
+
+            if surface_service is not None:
+                surface_service.poll_once()
             obs = _state_observation(
                 model, data, body_qpos, body_dof, body_actuators,
                 left_qpos, left_dof, left_hand_actuators,
@@ -250,10 +386,33 @@ def main() -> int:
             if viewer is not None:
                 viewer.sync()
             tick += 1
+            if viewer is not None and tick % 20 == 0:
+                cmd, speed_scale = keyboard.command()
+                viewer.set_texts(
+                    (
+                        mujoco.mjtFontScale.mjFONTSCALE_150,
+                        mujoco.mjtGridPos.mjGRID_TOPLEFT,
+                        "W/S forward/back  A/D left/right  Q/R yaw  O/P speed  Space stop",
+                        f"cmd_vel=[{cmd[0]:+.2f}, {cmd[1]:+.2f}, {cmd[2]:+.2f}]  speed={speed_scale:.1f}x",
+                    )
+                )
             if tick % 200 == 0:
+                command_status = bridge.command_status()
+                keyboard_cmd, speed_scale = keyboard.command()
+                w, x, y, z = data.qpos[3:7]
+                roll = np.arctan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y))
+                pitch = np.arcsin(np.clip(2.0 * (w * y - z * x), -1.0, 1.0))
                 print(
-                    f"[BOOST MuJoCo] t={data.time:.1f}s lowcmd={'yes' if have_body_command else 'startup-hold'} "
-                    f"base_z={data.qpos[2]:.3f}",
+                    f"[BOOST MuJoCo] t={data.time:.1f}s "
+                    f"lowstate_pub={bridge.low_state_count} "
+                    f"rt/lowcmd={_format_command_status(command_status['lowcmd'])} "
+                    f"Revo2_cmd(L/R)="
+                    f"{_format_command_status(command_status['left_revo2'])}/"
+                    f"{_format_command_status(command_status['right_revo2'])} "
+                    f"cmd_vel=[{keyboard_cmd[0]:+.2f},{keyboard_cmd[1]:+.2f},"
+                    f"{keyboard_cmd[2]:+.2f}] speed={speed_scale:.1f}x "
+                    f"base_z={data.qpos[2]:.3f} "
+                    f"tilt_deg=({np.degrees(roll):+.1f},{np.degrees(pitch):+.1f})",
                     flush=True,
                 )
 
@@ -269,6 +428,8 @@ def main() -> int:
     except KeyboardInterrupt:
         return 0
     finally:
+        if surface_service is not None:
+            surface_service.close()
         if viewer is not None:
             viewer.close()
 

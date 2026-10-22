@@ -1,0 +1,73 @@
+# Live Televuer -> Mimic sampling-based retargeter -> BrainCo Revo2 DDS.
+# The `hand` Pixi environment supplies Mimic's Python 3.12 / JAX MJX runtime.
+hand_config: configs/hands/brainco_revo2.yaml
+robot_hand:
+  mjcf_directory: external/brainco-description/revo2_system/mjcf
+
+input:
+  topic: vr_pose_debug
+  endpoint: tcp://127.0.0.1:5566
+  schema_version: 1
+  coordinate_frame: 1 # OpenXR world after PATH's configured basis correction
+  joint_count: 25
+  stale_timeout_sec: 0.35
+  future_tolerance_sec: 0.10
+
+retargeter:
+  alignment_landmarks: [thumb_base, index_base, pinky_base]
+  precomputed_scale: null
+  dexpilot_params:
+    project_distance: 0.01
+    escape_distance: 0.015
+    scale_factor: 1.0
+    gamma: 0.05
+    weight_default: 1.0
+    weight_vector_set1: 2.0
+    weight_vector_set2: 0.0
+    eta1: 0.001
+    eta2: 0.0
+    weight_loss_velocity: 0.1
+    beta: 0.02
+  sampling_params:
+    num_samples: 2048
+    num_samples_elite: 64
+    sigma: 0.20
+    lambda: 0.10
+    learning_rate: 1.0
+    update_cycle: 6
+    rng_seed: 42
+    device: cuda
+    jax_compilation_cache_enable: true
+    jax_compilation_cache_dir: ~/.cache/mimic_retargeter_lab/jax_compilation
+  contact_guidance:
+    # Active only when the runner receives --surface-query-endpoint.
+    d_on: 0.01
+    d_off: 0.015
+    epsilon: 0.003
+    query_timeout_sec: 0.02
+  debug_mode: false
+  debug_every_n_frames: 1
+  keyvectors_cfg:
+    - {name: wrist_to_thumb_tip, src_key: WRIST_to_THUMB_TIP, tgt_key: WRIST_to_THUMB_TIP}
+    - {name: wrist_to_index_tip, src_key: WRIST_to_INDEX_TIP, tgt_key: WRIST_to_INDEX_TIP}
+    - {name: wrist_to_middle_tip, src_key: WRIST_to_MIDDLE_TIP, tgt_key: WRIST_to_MIDDLE_TIP}
+    - {name: wrist_to_ring_tip, src_key: WRIST_to_RING_TIP, tgt_key: WRIST_to_RING_TIP}
+    - {name: wrist_to_pinky_tip, src_key: WRIST_to_PINKY_TIP, tgt_key: WRIST_to_PINKY_TIP}
+    - {name: thumb_tip_to_index_tip, src_key: THUMB_TIP_to_INDEX_TIP, tgt_key: THUMB_TIP_to_INDEX_TIP}
+    - {name: thumb_tip_to_middle_tip, src_key: THUMB_TIP_to_MIDDLE_TIP, tgt_key: THUMB_TIP_to_MIDDLE_TIP}
+    - {name: thumb_tip_to_ring_tip, src_key: THUMB_TIP_to_RING_TIP, tgt_key: THUMB_TIP_to_RING_TIP}
+    - {name: thumb_tip_to_pinky_tip, src_key: THUMB_TIP_to_PINKY_TIP, tgt_key: THUMB_TIP_to_PINKY_TIP}
+    - {name: index_to_middle, src_key: INDEX_TIP_to_MIDDLE_TIP, tgt_key: INDEX_TIP_to_MIDDLE_TIP}
+    - {name: index_to_ring, src_key: INDEX_TIP_to_RING_TIP, tgt_key: INDEX_TIP_to_RING_TIP}
+    - {name: index_to_pinky, src_key: INDEX_TIP_to_PINKY_TIP, tgt_key: INDEX_TIP_to_PINKY_TIP}
+    - {name: middle_to_ring, src_key: MIDDLE_TIP_to_RING_TIP, tgt_key: MIDDLE_TIP_to_RING_TIP}
+    - {name: middle_to_pinky, src_key: MIDDLE_TIP_to_PINKY_TIP, tgt_key: MIDDLE_TIP_to_PINKY_TIP}
+    - {name: ring_to_pinky, src_key: RING_TIP_to_PINKY_TIP, tgt_key: RING_TIP_to_PINKY_TIP}
+
+control:
+  update_hz: 30.0
+  command_speed: 1.0
+  max_joint_velocity_rad_s: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  stale_command_pose: open
+  state_timeout_sec: 0.25
+  log_hz: 2.0

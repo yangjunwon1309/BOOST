@@ -31,17 +31,12 @@ state_machine_command=(
   --shared-position-mode "${PATH_SHARED_POSITION_MODE:-replace}" \
   --shared-position-alpha "${PATH_SHARED_POSITION_ALPHA:-0.5}" \
   --shared-position-alpha-source "${PATH_SHARED_POSITION_ALPHA_SOURCE:-fixed}" \
-  $(if [[ "${PATH_SHARED_POSITION_ALPHA_LPF:-0}" != "0" ]]; then printf '%s' "--shared-position-alpha-lpf"; else printf '%s' "--no-shared-position-alpha-lpf"; fi) \
-  --shared-position-alpha-lpf-alpha "${PATH_SHARED_POSITION_ALPHA_LPF_ALPHA:-${PATH_SHARED_REF_LPF_ALPHA:-0.30}}" \
   --shared-position-posterior-enter-confidence "${PATH_SHARED_POSITION_POSTERIOR_ENTER_CONFIDENCE:-0.45}" \
   --shared-position-posterior-exit-confidence "${PATH_SHARED_POSITION_POSTERIOR_EXIT_CONFIDENCE:-0.25}" \
   --shared-position-posterior-ema-alpha "${PATH_SHARED_POSITION_POSTERIOR_EMA_ALPHA:-0.15}" \
   --shared-position-posterior-max-rate-per-s "${PATH_SHARED_POSITION_POSTERIOR_MAX_RATE_PER_S:-1.2}" \
   --grasp-engagement-delay-sec "${PATH_GRASP_OVERRIDE_HOLD_SEC:-1.5}" \
   --grasp-closing-timeout-sec "${PATH_GRASP_CLOSING_TIMEOUT_SEC:-0.60}" \
-  --operator-frame-washout-per-m "${PATH_OPERATOR_FRAME_WASHOUT_PER_M:-4.6}" \
-  --operator-frame-max-offset-m "${PATH_OPERATOR_FRAME_MAX_OFFSET_M:-0.30}" \
-  --operator-rotation-washout-per-rad "${PATH_OPERATOR_ROTATION_WASHOUT_PER_RAD:-2.0}" \
   --end-effector-model "${PATH_END_EFFECTOR_MODEL:-dex1}" \
   --hand-axis-local ${PATH_HAND_AXIS_LOCAL:-0.0 1.0 0.0} \
   --grasp-center-local ${PATH_GRASP_CENTER_LOCAL:-0.0 0.100 0.0} \
@@ -74,6 +69,10 @@ state_machine_command=(
   --arm-ik-output-control-hz "${PATH_ARM_IK_OUTPUT_CONTROL_HZ:-50.0}" \
   "$@"
 )
+
+if [[ "${PATH_AUTO_ARM_PICO_TRACKING:-0}" == "1" ]]; then
+  state_machine_command+=(--auto-arm-pico-tracking)
+fi
 
 if [[ -n "${PATH_CONTROL_CPUSET-6-7}" ]] && command -v taskset >/dev/null 2>&1; then
   exec taskset -c "$PATH_CONTROL_CPUSET" "${state_machine_command[@]}"

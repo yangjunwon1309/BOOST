@@ -6,6 +6,7 @@
 # Usage:
 #   ./run_homie.sh --net eth0                 # normal run
 #   ./run_homie.sh --net eth0 --dry-run        # dry run (robot held in damping)
+#   ./run_homie.sh --net lo --stand-only --auto-start --config configs/sim/homie_g1_mujoco.yaml
 #   HOMIE_NET_IFACE=eth0 ./run_homie.sh         # omit --net, use the env var default
 #   HOMIE_CONDA_ENV=other_env ./run_homie.sh --net eth0
 #

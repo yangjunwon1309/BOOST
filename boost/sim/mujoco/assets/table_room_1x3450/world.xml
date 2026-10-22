@@ -1,0 +1,55 @@
+<?xml version='1.0' encoding='utf-8'?>
+<mujocoinclude>
+  <asset>
+    <texture name="table" type="2d" file="assets/table_room_1x3450/meshes/table.png" />
+    <texture name="partition" type="2d" file="assets/table_room_1x3450/meshes/partition.png" />
+    <texture name="chips_can" type="2d" file="assets/table_room_1x3450/meshes/chips_can.png" />
+    <material name="table" texture="table" specular="0.2" shininess="0.2" />
+    <material name="partition" texture="partition" specular="0" shininess="0" />
+    <material name="chips_can" texture="chips_can" specular="0.3" shininess="0.3" />
+    <texture name="room_sky" type="skybox" builtin="flat" rgb1="1 1 1" rgb2="1 1 1" width="16" height="96" />
+    <texture name="room_floor" type="2d" file="assets/table_room_1x3450/meshes/floor.png" />
+    <material name="room_floor" texture="room_floor" texrepeat="1 1" texuniform="true" specular="0" shininess="0" reflectance="0" />
+    <material name="front_wall" rgba="0.92 0.92 0.92 1" specular="0" shininess="0" reflectance="0" />
+    <mesh name="table" file="table_room_1x3450/table.obj" />
+    <mesh name="partition" file="table_room_1x3450/partition.obj" />
+    <mesh name="chips_can" file="table_room_1x3450/chips_can.obj" />
+  </asset>
+  <worldbody>
+    <geom name="room_floor" type="plane" pos="0.1 0 0.0005" size="0 0 0.1" material="room_floor" contype="0" conaffinity="0" group="2" density="0" />
+    <geom name="front_wall" type="box" pos="3.725 0 0.9" size="0.025 1.8 0.9" material="front_wall" margin="0" />
+    <body name="back_partition" pos="-3.5 0 0" quat="0.7071068 0 0 0.7071068">
+      <geom mesh="partition" material="partition" type="mesh" contype="0" conaffinity="0" group="2" density="0" />
+      <geom name="back_partition" pos="0 0 0.9" size="1.725 0.03 0.9" type="box" group="3" rgba="0.5 0.5 0.5 0.3" margin="0" />
+    </body>
+    <body name="left_partition_1" pos="-1.625 1.8 0">
+      <geom mesh="partition" material="partition" type="mesh" contype="0" conaffinity="0" group="2" density="0" />
+      <geom name="left_partition_1" pos="0 0 0.9" size="1.725 0.03 0.9" type="box" group="3" rgba="0.5 0.5 0.5 0.3" margin="0" />
+    </body>
+    <body name="left_partition_2" pos="1.825 1.8 0">
+      <geom mesh="partition" material="partition" type="mesh" contype="0" conaffinity="0" group="2" density="0" />
+      <geom name="left_partition_2" pos="0 0 0.9" size="1.725 0.03 0.9" type="box" group="3" rgba="0.5 0.5 0.5 0.3" margin="0" />
+    </body>
+    <body name="right_partition_1" pos="-1.625 -1.8 0">
+      <geom mesh="partition" material="partition" type="mesh" contype="0" conaffinity="0" group="2" density="0" />
+      <geom name="right_partition_1" pos="0 0 0.9" size="1.725 0.03 0.9" type="box" group="3" rgba="0.5 0.5 0.5 0.3" margin="0" />
+    </body>
+    <body name="right_partition_2" pos="1.825 -1.8 0">
+      <geom mesh="partition" material="partition" type="mesh" contype="0" conaffinity="0" group="2" density="0" />
+      <geom name="right_partition_2" pos="0 0 0.9" size="1.725 0.03 0.9" type="box" group="3" rgba="0.5 0.5 0.5 0.3" margin="0" />
+    </body>
+    <body name="table" pos="3.25 0 0" quat="0 0 0 1">
+      <geom mesh="table" material="table" type="mesh" contype="0" conaffinity="0" group="2" density="0" />
+      <geom name="table_top" pos="0 0 0.785" size="0.285 0.395 0.015" friction="1.0 0.005 0.0001" type="box" group="3" rgba="0.5 0.5 0.5 0.3" margin="0" />
+      <geom name="table_column" pos="-0.075 0 0.48" size="0.045 0.04 0.28" type="box" group="3" rgba="0.5 0.5 0.5 0.3" margin="0" />
+      <geom name="table_base" pos="-0.015 0 0.06" size="0.245 0.40 0.06" type="box" group="3" rgba="0.5 0.5 0.5 0.3" margin="0" />
+    </body>
+    <body name="pringles_can" pos="3.25 -0.25 0.801" quat="0.5 0 0 -0.8660254">
+      <freejoint name="pringles_can" />
+      <geom mesh="chips_can" material="chips_can" type="mesh" contype="0" conaffinity="0" group="2" density="0" />
+      <geom name="pringles_can" type="cylinder" pos="0 0 0.125" size="0.0375 0.125" mass="0.205" condim="4" priority="2" friction="1.0 0.03 0.002" solref="0.008 1" solimp="0.97 0.995 0.001" group="3" rgba="0.5 0.5 0.5 0.3" margin="0" />
+    </body>
+    <camera name="table_view" pos="3.6 0.75 1.35" xyaxes="-0.875 0.485 0 -0.226 -0.408 0.885" fovy="60" />
+    <camera name="room_view" pos="3.55 -1.65 2.2" xyaxes="0.733 0.680 0 -0.376 0.405 0.833" fovy="70" />
+  </worldbody>
+</mujocoinclude>

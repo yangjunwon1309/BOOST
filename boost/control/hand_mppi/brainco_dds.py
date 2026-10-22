@@ -61,7 +61,8 @@ class BrainCoDDS:
             from unitree_sdk2py.idl.unitree_go.msg.dds_ import MotorCmds_, MotorStates_
         except ImportError as exc:
             raise RuntimeError(
-                "BrainCo DDS needs the BOOST Pixi sim environment; run `pixi run -e sim setup-sim`."
+                "BrainCo DDS needs BOOST's Pixi sim or hand environment; "
+                "run `pixi install -e sim` or `pixi install -e hand`."
             ) from exc
 
         ChannelFactoryInitialize(int(domain_id), interface)

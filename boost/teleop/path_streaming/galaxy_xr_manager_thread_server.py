@@ -10,7 +10,6 @@ the Pico/XRoboToolkit runtime.
 from __future__ import annotations
 
 import argparse
-import math
 import time
 from pathlib import Path
 
@@ -146,7 +145,6 @@ def _send_wrist_targets(
     tracking: bool,
     session_id: int,
     frame_index: int,
-    monitor: dict,
 ) -> None:
     valid = bool(
         tracking
@@ -218,10 +216,9 @@ def _send_wrist_targets(
         "hand_landmarks_left": hand_landmarks_left,
         "hand_landmarks_right": hand_landmarks_right,
     }
-    for key in ("source_gap_median_ms", "source_gap_p99_ms", "source_gap_max_ms", "source_dropouts_over_150ms"):
-        value = monitor.get(key)
-        if value is not None and math.isfinite(float(value)):
-            values[key] = np.array([float(value)], dtype=np.float32)
+    # Source-gap diagnostics are printed separately. Keep them out of this
+    # fixed-header packet: consumers do not use them, and they can overflow the
+    # legacy 1280-byte metadata header.
     socket.send(pack_pose_message(values, topic="vr_pose_debug"))
 
 
@@ -308,7 +305,6 @@ def main() -> int:
                     tracking=tracking,
                     session_id=session_id,
                     frame_index=frame_index,
-                    monitor=reader.monitor.report(),
                 )
                 next_pose += pose_period
                 if next_pose < now - pose_period:

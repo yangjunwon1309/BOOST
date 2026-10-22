@@ -37,6 +37,10 @@ The local configuration selects `arm_source: "arm_sdk"`. HOMIE combines PATH's
 `HomieDeploy/unitree_sdk2/g1_control` alongside it; that binary consumes a
 different arm-input protocol. See [`homie_integration.md`](homie_integration.md).
 
+The HOMIE stand-and-hand-MPPI check described in
+[`test_logs/mujoco_homie_hand_mppi.md`](test_logs/mujoco_homie_hand_mppi.md)
+is a local MuJoCo simulation procedure, not a physical G1 bring-up step.
+
 ## Transfer local HOMIE from Windows
 
 Replace `<G1_IP>` with the G1 computer's address. The commands below use the

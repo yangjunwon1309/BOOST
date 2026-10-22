@@ -1,4 +1,4 @@
-"""Task-space target contracts for the PATH second-order reference controller."""
+"""Task-space target contracts for PATH shared control."""
 
 from __future__ import annotations
 
@@ -14,14 +14,6 @@ LOG = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class SharedControlConfig:
-    zeta_armed: float = 2.0
-    zeta_released: float = 1.2
-    omega_n_position_armed: float = 1.8
-    omega_n_orientation_armed: float = 2.5
-    omega_n_position_released: float = 10.0
-    omega_n_orientation_released: float = 12.0
-    max_speed_mps: float = 0.35
-    max_rate_rps: float = 1.5
     stale_after_s: float = 0.3
     d_max_m: float = 0.9
     orientation_min_confidence: float = 0.35
@@ -42,9 +34,7 @@ class SharedControlConfig:
     grasp_comotion_min_excitation_m: float = 0.02
     grasp_closing_timeout_s: float = 0.60
     grasp_override_hold_s: float = 1.5
-    operator_frame_washout_per_m: float = 4.6
-    operator_frame_max_offset_m: float = 0.30
-    operator_rotation_washout_per_rad: float = 2.0
+
     @classmethod
     def from_dict(cls, payload: dict | None) -> "SharedControlConfig":
         data = dict(payload or {})
@@ -57,21 +47,25 @@ class SharedControlConfig:
             "startup_hold_s",
             "resync_distance_m",
             "resync_angle_rad",
+            "zeta",
+            "zeta_armed",
+            "zeta_released",
+            "omega_n_position_armed",
+            "omega_n_orientation_armed",
+            "omega_n_position_released",
+            "omega_n_orientation_released",
+            "max_speed_mps",
+            "max_rate_rps",
+            "operator_frame_washout_per_m",
+            "operator_frame_max_offset_m",
+            "operator_rotation_washout_per_rad",
         }
         if obsolete.intersection(data):
             LOG.warning(
-                "obsolete shared-control gating parameters are ignored by "
-                "second-order reference control"
+                "legacy shared-control/reference settings are ignored; "
+                "Televuer wrist goals are passed directly to arm IK"
             )
-        if "zeta" in data:
-            LOG.warning("shared-control zeta is deprecated; applying it to zeta_armed and zeta_released")
-            data.setdefault("zeta_armed", data["zeta"])
-            data.setdefault("zeta_released", data["zeta"])
         values = {key: value for key, value in data.items() if key in cls.__dataclass_fields__}
-        for key in ("zeta_armed", "zeta_released"):
-            if key in values and float(values[key]) < 1.05:
-                LOG.warning("%s=%s is below the stable overdamped limit; clamping to 1.05", key, values[key])
-                values[key] = 1.05
         return cls(**values)
 
 @dataclass(frozen=True)

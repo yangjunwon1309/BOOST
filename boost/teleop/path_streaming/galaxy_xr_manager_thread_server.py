@@ -30,6 +30,8 @@ from boost.teleop.path_streaming.xr_source_v15 import (
 
 STREAM_MODE_OFF = 0
 STREAM_MODE_TRACKING = 7
+HAND_LANDMARKS_SCHEMA_VERSION = 1
+HAND_LANDMARKS_FRAME_OPENXR_WORLD = 1
 
 
 def parse_args() -> argparse.Namespace:
@@ -163,6 +165,27 @@ def _send_wrist_targets(
     else:
         left = np.full((4, 4), np.nan, dtype=np.float64)
         right = np.full((4, 4), np.nan, dtype=np.float64)
+    hand_landmarks_valid = np.array(
+        [
+            bool(tracking and sample is not None and sample.left_hand_landmarks_valid),
+            bool(tracking and sample is not None and sample.right_hand_landmarks_valid),
+        ],
+        dtype=bool,
+    )
+    hand_landmarks_left = (
+        np.asarray(sample.left_hand_landmarks, dtype=np.float32).reshape(25, 3)
+        if hand_landmarks_valid[0]
+        and sample is not None
+        and sample.left_hand_landmarks is not None
+        else np.full((25, 3), np.nan, dtype=np.float32)
+    )
+    hand_landmarks_right = (
+        np.asarray(sample.right_hand_landmarks, dtype=np.float32).reshape(25, 3)
+        if hand_landmarks_valid[1]
+        and sample is not None
+        and sample.right_hand_landmarks is not None
+        else np.full((25, 3), np.nan, dtype=np.float32)
+    )
     values = {
         "wrist_left_waist": left.reshape(-1).astype(np.float32),
         "wrist_right_waist": right.reshape(-1).astype(np.float32),
@@ -181,6 +204,19 @@ def _send_wrist_targets(
         "right_trigger": np.array([0.0 if sample is None else sample.right_trigger], dtype=np.float32),
         "left_grip": np.array([0.0 if sample is None else sample.left_grip], dtype=np.float32),
         "right_grip": np.array([0.0 if sample is None else sample.right_grip], dtype=np.float32),
+        "hand_landmarks_schema_version": np.array(
+            [HAND_LANDMARKS_SCHEMA_VERSION], dtype=np.int32
+        ),
+        "hand_landmarks_coordinate_frame": np.array(
+            [HAND_LANDMARKS_FRAME_OPENXR_WORLD], dtype=np.int32
+        ),
+        "hand_landmarks_sequence": np.array([frame_index], dtype=np.int64),
+        "hand_landmarks_timestamp_monotonic": np.array(
+            [0.0 if sample is None else sample.arrival_monotonic], dtype=np.float64
+        ),
+        "hand_landmarks_valid": hand_landmarks_valid,
+        "hand_landmarks_left": hand_landmarks_left,
+        "hand_landmarks_right": hand_landmarks_right,
     }
     for key in ("source_gap_median_ms", "source_gap_p99_ms", "source_gap_max_ms", "source_dropouts_over_150ms"):
         value = monitor.get(key)

@@ -21,7 +21,7 @@ from unitree_sdk2py.core.channel import (
 )
 from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_, LowState_
-from unitree_sdk2py.utils.crc import CRC
+from boost.io.unitree_crc import make_unitree_crc
 
 ControllerMapping = {
     "A": 0x0100, "B": 0x0200, "X": 0x0400, "Y": 0x0800,
@@ -76,7 +76,7 @@ class G1RealWorldEnv:
         self._reader_period = 1.0 / lowstate_reader_hz
 
         ChannelFactoryInitialize(domain_id, net)
-        self._crc = CRC()
+        self._crc = make_unitree_crc()
 
         self._latest_state = None
         self._state_lock = threading.Lock()

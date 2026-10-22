@@ -1,0 +1,6 @@
+[submodule "boost/control/hand_mppi/upstream"]
+	path = boost/control/hand_mppi/upstream
+	url = https://github.com/mimicrobotics/mimic_retargeter_lab.git
+[submodule "external/brainco-description"]
+	path = external/brainco-description
+	url = https://github.com/BrainCoTech/brainco-description.git

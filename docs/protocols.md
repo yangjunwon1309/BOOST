@@ -85,12 +85,14 @@ The current local HOMIE merge forwards arm position, gains, and feed-forward
 torque but sends zero target velocity on `rt/lowcmd`; PATH's intermediate
 `dq` field is not consumed by that merge.
 
-## Revo2 hand service (planned BOOST adapter)
+## Revo2 hand service and hand-policy transport
 
 The PATH bridge's Dex1 topics do not control BrainCo Revo2. Revo2 uses
 Unitree's external `brainco_hand_service` over
 `rt/brainco/{left,right}/cmd` and `rt/brainco/{left,right}/state`; each hand
 has six normalized values in `[0, 1]`, ordered Thumb, Thumb_aux, Index,
-Middle, Ring, Pinky. The BOOST adapter is reserved under
-`boost/io/revo2_hand_service/`. The service itself is not vendored, and HOMIE
-continues to own `rt/lowcmd`.
+Middle, Ring, Pinky. `boost/control/hand_mppi/` defines the shared Revo2 mapping
+and `BrainCoDDS` transport; the simulator and future hand policy use the same
+topics and IDL types. The external hand service is not vendored, and HOMIE
+continues to own `rt/lowcmd`. PATH's LCM arm packet carries only binary grip
+flags, so continuous hand targets travel directly over the BrainCo DDS topics.

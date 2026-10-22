@@ -20,6 +20,7 @@ from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelPublish
 from unitree_sdk2py.idl.default import unitree_go_msg_dds__MotorCmd_
 from unitree_sdk2py.idl.unitree_go.msg.dds_ import MotorCmds_
 
+from boost.control.hand_mppi.revo2 import BRAINCO_COMMAND_TOPICS
 from boost.io.path_transport.g1_direct_protocol import (
     UPPER_COMMAND_CHANNEL,
     unpack_upper_command,
@@ -53,6 +54,9 @@ def main() -> int:
     args = parse_args()
     with args.config.open("r", encoding="utf-8") as stream:
         config = yaml.safe_load(stream)
+    hand_config_path = (ROOT / config["hand_config"]).resolve()
+    with hand_config_path.open("r", encoding="utf-8") as stream:
+        hand_config = yaml.safe_load(stream)
     args.lcm_url = args.lcm_url or os.environ.get(
         "PATH_LCM_URL", "udpm://239.255.76.67:7667?ttl=1"
     )
@@ -64,14 +68,14 @@ def main() -> int:
     args.stale_open_after_sec = (
         args.stale_open_after_sec
         if args.stale_open_after_sec is not None
-        else float(config.get("grip_stale_open_after_sec", 0.35))
+        else float(hand_config["control"]["stale_command_timeout_sec"])
     )
     if args.thumb_close is None:
-        args.thumb_close = float(config["binary_close"][0])
+        args.thumb_close = float(hand_config["binary_close"][0])
 
     ChannelFactoryInitialize(args.domain_id, args.interface)
-    left_pub = ChannelPublisher("rt/brainco/left/cmd", MotorCmds_)
-    right_pub = ChannelPublisher("rt/brainco/right/cmd", MotorCmds_)
+    left_pub = ChannelPublisher(BRAINCO_COMMAND_TOPICS["left"], MotorCmds_)
+    right_pub = ChannelPublisher(BRAINCO_COMMAND_TOPICS["right"], MotorCmds_)
     left_pub.Init()
     right_pub.Init()
     bus = lcm.LCM(args.lcm_url)
@@ -103,8 +107,9 @@ def main() -> int:
             fresh = latest["received"] > 0 and now - latest["received"] <= args.stale_open_after_sec
             left_closed = fresh and bool(latest["left"])
             right_closed = fresh and bool(latest["right"])
-            open_pose = (0.0,) * 6
-            close_pose = (args.thumb_close, 1.0, 1.0, 1.0, 1.0, 1.0)
+            open_pose = tuple(float(value) for value in hand_config["binary_open"])
+            close_pose = tuple(float(value) for value in hand_config["binary_close"])
+            close_pose = (args.thumb_close, *close_pose[1:])
             left_pub.Write(_new_message(close_pose if left_closed else open_pose))
             right_pub.Write(_new_message(close_pose if right_closed else open_pose))
             next_tick += period

@@ -3,7 +3,10 @@ name = "boost"
 version = "0.1.0"
 description = "BOOST host-side teleoperation and service launch tools"
 channels = ["conda-forge"]
-platforms = ["linux-64"]
+platforms = [
+  "linux-64",
+  { name = "desktop-hand", platform = "linux-64", cuda = "12", glibc = "2.35" },
+]
 
 # This is intentionally a CPU/host tooling environment. CUDA, PyTorch, SAM3,
 # TensorRT, and their Python bindings stay inside the NVIDIA Docker image.
@@ -48,3 +51,71 @@ PYTHONPATH = "$PIXI_PROJECT_ROOT:$PIXI_PROJECT_ROOT/services/pose_service"
 verify-host = "python services/pose_service/tools/verify_pixi_host_environment.py"
 test-perception = "python -m pytest -q services/pose_service/tests"
 sam3-worker = { cmd = "bash tools/run_remote_sam3_wrist_d405_v11.sh", cwd = "services/pose_service" }
+
+# The desktop MuJoCo stack is isolated from the host/perception environment.
+# `mujoco` runs the G1 simulator, HOMIE, PATH's arm bridge, and the Revo2 DDS
+# adapter on loopback. Televuer and Unitree SDK2 Python are installed as pinned
+# Pixi-managed Git dependencies; the local PATH bridge uses the same Python DDS
+# and LCM contracts as BOOST.
+[feature.sim.dependencies]
+python = "3.10.*"
+cyclonedds = "==0.10.5"
+glfw = "*"
+libglvnd = "*"
+xorg-libx11 = "*"
+xorg-libxext = "*"
+xorg-libxrender = "*"
+xorg-libxrandr = "*"
+xorg-libxinerama = "*"
+xorg-libxcursor = "*"
+xorg-libxi = "*"
+xorg-libxfixes = "*"
+
+[feature.sim.pypi-dependencies]
+boost = { path = ".", editable = true, extras = ["sim"] }
+televuer = { git = "https://github.com/unitreerobotics/televuer.git", rev = "766de45e74373ae0ea66321d942ce538385655a5" }
+# Keep the Vuer server extra explicit so Televuer's WebSocket server runtime is
+# installed in the desktop environment.
+vuer = { version = "==0.0.60", extras = ["all"] }
+# vuer 0.0.60 uses the params-proto v2 Flag API; v3 removed it while still
+# satisfying vuer's open-ended >=2.13.0 requirement.
+params-proto = "==2.13.2"
+unitree_sdk2py = { git = "https://github.com/unitreerobotics/unitree_sdk2_python.git", rev = "814556d15970dd2ecf1c9984e845ca02ab07e206", editable = true }
+
+[feature.sim.activation.env]
+PYTHONPATH = "$PIXI_PROJECT_ROOT:$PIXI_PROJECT_ROOT/services/pose_service"
+CYCLONEDDS_HOME = "$CONDA_PREFIX"
+
+[feature.sim.tasks]
+setup-sim = { cmd = "bash scripts/setup_mujoco_desktop.sh", description = "Prepare and inspect the Pixi desktop MuJoCo runtime" }
+mujoco = { cmd = "bash scripts/run_galaxy_homie_mujoco.sh", description = "Run MuJoCo with HOMIE, PATH, and Galaxy XR" }
+mujoco-no-xr = { cmd = "bash scripts/run_galaxy_homie_mujoco.sh --no-xr", description = "Run MuJoCo with HOMIE and PATH without Galaxy XR" }
+mujoco-headless = { cmd = "bash scripts/run_galaxy_homie_mujoco.sh --no-xr --headless", description = "Run the HOMIE/PATH MuJoCo stack without XR or a viewer" }
+
+[environments.sim]
+features = ["sim"]
+no-default-feature = true
+
+# mimic_retargeter_lab uses Python 3.12 and a newer MuJoCo/MJX stack than PATH.
+# Keep it isolated; the upstream repository's optional GPU extra selects its
+# JAX CUDA 12 build for the local RTX desktop.
+[feature.hand.dependencies]
+python = "==3.12.3"
+cyclonedds = "==0.10.5"
+
+[feature.hand.pypi-dependencies]
+boost = { path = ".", editable = true }
+mimic_retargeter_lab = { path = "boost/control/hand_mppi/upstream", editable = true, extras = ["gpu"] }
+geort = { path = "boost/control/hand_mppi/upstream/third_party/geort", editable = true }
+unitree_sdk2py = { git = "https://github.com/unitreerobotics/unitree_sdk2_python.git", rev = "814556d15970dd2ecf1c9984e845ca02ab07e206", editable = true }
+
+[feature.hand]
+platforms = ["desktop-hand"]
+
+[feature.hand.activation.env]
+PYTHONPATH = "$PIXI_PROJECT_ROOT:$PIXI_PROJECT_ROOT/services/pose_service"
+CYCLONEDDS_HOME = "$CONDA_PREFIX"
+
+[environments.hand]
+features = ["hand"]
+no-default-feature = true

@@ -7,6 +7,8 @@ driver to `rt/brainco/{left,right}/cmd` and
 `rt/brainco/{left,right}/state`. Each hand has six normalized values in
 `[0, 1]`, ordered Thumb, Thumb_aux, Index, Middle, Ring, Pinky.
 
-BOOST still needs an adapter for command/state conversion and recording. The
-PATH G1 bridge under `../g1_bridge/` only supports the older Dex1 packet and
-does not implement this interface. HOMIE remains the only `rt/lowcmd` writer.
+The BrainCo command/state mapping and DDS transport shared with the future
+retargeter live in `boost/control/hand_mppi/`. The PATH G1 bridge under
+`../g1_bridge/` still only supports the older Dex1 packet and does not implement
+this interface. HOMIE remains the only `rt/lowcmd` writer; hand commands are
+published on the separate BrainCo topics.

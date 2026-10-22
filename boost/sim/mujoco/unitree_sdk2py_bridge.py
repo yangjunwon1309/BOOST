@@ -26,13 +26,14 @@ from unitree_sdk2py.idl.unitree_go.msg.dds_ import (
     MotorStates_,
     WirelessController_,
 )
-from unitree_sdk2py.idl.unitree_hg.msg.dds_ import HandCmd_, HandState_, OdoState_
+from unitree_sdk2py.idl.unitree_hg.msg.dds_ import HandCmd_, HandState_
 
 from boost.sim.mujoco.hand_backends import (
     DEX3_BACKEND,
     REVO2_BACKEND,
     Revo2CommandAdapter,
 )
+from boost.control.hand_mppi.revo2 import BRAINCO_COMMAND_TOPICS, BRAINCO_STATE_TOPICS
 
 
 def _new_brainco_command(count: int) -> MotorCmds_:
@@ -60,7 +61,6 @@ class UnitreeSdk2Bridge:
                 unitree_hg_msg_dds__IMUState_ as IMUState_default,
                 unitree_hg_msg_dds__LowCmd_,
                 unitree_hg_msg_dds__LowState_ as LowState_default,
-                unitree_hg_msg_dds__OdoState_ as OdoState_default,
             )
             from unitree_sdk2py.idl.unitree_hg.msg.dds_ import IMUState_, LowCmd_, LowState_
 
@@ -83,6 +83,8 @@ class UnitreeSdk2Bridge:
         if self.hand_backend not in (DEX3_BACKEND, REVO2_BACKEND):
             raise ValueError(f"Unsupported HAND_BACKEND: {self.hand_backend}")
         self.revo2_adapter = Revo2CommandAdapter(
+            q_min=tuple(config.get("BRAINCO_Q_MIN", (0.0,) * 6)),
+            q_max=tuple(config.get("BRAINCO_Q_MAX", (1.57, 1.03, 1.41, 1.41, 1.41, 1.41))),
             binary_open=tuple(config.get("BRAINCO_BINARY_OPEN", (0.0,) * 6)),
             binary_close=tuple(
                 config.get("BRAINCO_BINARY_CLOSE", (0.70, 1.0, 1.0, 1.0, 1.0, 1.0))
@@ -106,14 +108,6 @@ class UnitreeSdk2Bridge:
         self.low_state_puber = ChannelPublisher("rt/lowstate", LowState_)
         self.low_state_puber.Init()
 
-        # Only create odo_state for supported robot types
-        if "g1" in robot_type or "h1-2" in robot_type:
-            self.odo_state = OdoState_default()
-            self.odo_state_puber = ChannelPublisher("rt/odostate", OdoState_)
-            self.odo_state_puber.Init()
-        else:
-            self.odo_state = None
-            self.odo_state_puber = None
         self.torso_imu_state = IMUState_default()
         self.torso_imu_puber = ChannelPublisher("rt/secondary_imu", IMUState_)
         self.torso_imu_puber.Init()
@@ -121,12 +115,12 @@ class UnitreeSdk2Bridge:
         if self.hand_backend == REVO2_BACKEND:
             self.left_hand_state = _new_brainco_state(self.num_hand_motor)
             self.left_hand_state_puber = ChannelPublisher(
-                "rt/brainco/left/state", MotorStates_
+                BRAINCO_STATE_TOPICS["left"], MotorStates_
             )
             self.left_hand_state_puber.Init()
             self.right_hand_state = _new_brainco_state(self.num_hand_motor)
             self.right_hand_state_puber = ChannelPublisher(
-                "rt/brainco/right/state", MotorStates_
+                BRAINCO_STATE_TOPICS["right"], MotorStates_
             )
             self.right_hand_state_puber.Init()
         else:
@@ -145,12 +139,12 @@ class UnitreeSdk2Bridge:
         if self.hand_backend == REVO2_BACKEND:
             self.left_hand_cmd = _new_brainco_command(self.num_hand_motor)
             self.left_hand_cmd_suber = ChannelSubscriber(
-                "rt/brainco/left/cmd", MotorCmds_
+                BRAINCO_COMMAND_TOPICS["left"], MotorCmds_
             )
             self.left_hand_cmd_suber.Init(self.LeftHandCmdHandler, 1)
             self.right_hand_cmd = _new_brainco_command(self.num_hand_motor)
             self.right_hand_cmd_suber = ChannelSubscriber(
-                "rt/brainco/right/cmd", MotorCmds_
+                BRAINCO_COMMAND_TOPICS["right"], MotorCmds_
             )
             self.right_hand_cmd_suber.Init(self.RightHandCmdHandler, 1)
             if self.accept_legacy_dex3:
@@ -316,10 +310,6 @@ class UnitreeSdk2Bridge:
             raise NotImplementedError("Frame sensor data is not implemented yet.")
         else:
             # Get data from ground truth
-            self.odo_state.position[:] = obs["floating_base_pose"][:3]
-            self.odo_state.linear_velocity[:] = obs["floating_base_vel"][:3]
-            self.odo_state.orientation[:] = obs["floating_base_pose"][3:7]
-            self.odo_state.angular_velocity[:] = obs["floating_base_vel"][3:6]
             # quaternion: w, x, y, z
             self.low_state.imu_state.quaternion[:] = obs["floating_base_pose"][3:7]
             # angular velocity
@@ -335,9 +325,6 @@ class UnitreeSdk2Bridge:
             raise NotImplementedError("Frame sensor data is not implemented yet.")
         self.low_state.tick = int(obs["time"] * 1e3)
         self.low_state_puber.Write(self.low_state)
-
-        self.odo_state.tick = int(obs["time"] * 1e3)
-        self.odo_state_puber.Write(self.odo_state)
 
         self.torso_imu_puber.Write(self.torso_imu_state)
 

@@ -1,6 +1,7 @@
 # Python
 __pycache__/
 *.py[cod]
+*.egg-info/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -34,6 +35,8 @@ external/*
 !external/README.md
 !external/homie_g1_29dof/
 !external/homie_g1_29dof/**
+!external/brainco-description/
+!external/brainco-description/**
 external/homie_g1_29dof/**/__pycache__/
 
 

@@ -90,7 +90,7 @@ CONST_RIGHT_ARM_POSE = np.array(
 
 @dataclass(frozen=True)
 class XrSample:
-    """One head-plus-controller input sample in the raw OpenXR basis."""
+    """One head/arm sample with optional WebXR hand landmarks."""
 
     head: np.ndarray
     left: np.ndarray
@@ -107,6 +107,10 @@ class XrSample:
     buttons: dict[str, bool]
     arrival_monotonic: float
     source_timestamp_ns: int | None
+    left_hand_landmarks: np.ndarray | None = None
+    right_hand_landmarks: np.ndarray | None = None
+    left_hand_landmarks_valid: bool = False
+    right_hand_landmarks_valid: bool = False
 
 
 @dataclass
@@ -207,6 +211,8 @@ def _stale_safe_sample(
         right_trigger=0.0,
         left_grip=0.0,
         right_grip=0.0,
+        left_hand_landmarks_valid=False,
+        right_hand_landmarks_valid=False,
     )
     if age <= invalid_s:
         return released
@@ -295,6 +301,11 @@ def _axis(value: Any) -> tuple[float, float]:
 
 
 def _same_sample(first: XrSample, second: XrSample) -> bool:
+    def same_landmarks(a: np.ndarray | None, b: np.ndarray | None) -> bool:
+        if a is None or b is None:
+            return a is None and b is None
+        return a.shape == b.shape and bool(np.allclose(a, b, atol=1e-9))
+
     return (
         np.allclose(first.head, second.head, atol=1e-9)
         and np.allclose(first.left, second.left, atol=1e-9)
@@ -307,6 +318,15 @@ def _same_sample(first: XrSample, second: XrSample) -> bool:
         and first.buttons == second.buttons
         and (first.head_valid, first.left_valid, first.right_valid)
         == (second.head_valid, second.left_valid, second.right_valid)
+        and (
+            first.left_hand_landmarks_valid,
+            first.right_hand_landmarks_valid,
+        ) == (
+            second.left_hand_landmarks_valid,
+            second.right_hand_landmarks_valid,
+        )
+        and same_landmarks(first.left_hand_landmarks, second.left_hand_landmarks)
+        and same_landmarks(first.right_hand_landmarks, second.right_hand_landmarks)
     )
 
 
@@ -469,6 +489,23 @@ class TeleVuerSource(_LatestSampleSource):
         inverse = np.linalg.inv(self.basis_correction)
         return _as_se3(self.basis_correction @ raw @ inverse)
 
+    def _correct_hand_landmarks(
+        self, value: Any, *, ready: bool
+    ) -> tuple[np.ndarray | None, bool]:
+        if not ready:
+            return None, False
+        try:
+            points = np.asarray(value, dtype=np.float64).reshape(25, 3)
+        except (TypeError, ValueError):
+            return None, False
+        if not np.isfinite(points).all():
+            return None, False
+        corrected = (
+            points @ self.basis_correction[:3, :3].T
+            + self.basis_correction[:3, 3]
+        )
+        return corrected, True
+
     def latest(self) -> XrSample | None:
         with self._lock:
             sample = self._latest
@@ -491,6 +528,12 @@ class TeleVuerSource(_LatestSampleSource):
         left, left_ok = self._correct(getattr(raw, "left_arm_pose", None))
         right, right_ok = self._correct(getattr(raw, "right_arm_pose", None))
         if self.use_hand_tracking:
+            left_hand_landmarks, left_hand_landmarks_valid = self._correct_hand_landmarks(
+                getattr(raw, "left_hand_positions", None), ready=ready
+            )
+            right_hand_landmarks, right_hand_landmarks_valid = self._correct_hand_landmarks(
+                getattr(raw, "right_hand_positions", None), ready=ready
+            )
             left_pinch = bool(getattr(raw, "left_hand_pinch", False)) if ready else False
             right_pinch = bool(getattr(raw, "right_hand_pinch", False)) if ready else False
             left_trigger = 1.0 if left_pinch else 0.0
@@ -508,6 +551,8 @@ class TeleVuerSource(_LatestSampleSource):
                 "left_menu": False,
             }
         else:
+            left_hand_landmarks = right_hand_landmarks = None
+            left_hand_landmarks_valid = right_hand_landmarks_valid = False
             left_trigger = _unit_interval(getattr(raw, "left_ctrl_triggerValue", 0.0)) if ready else 0.0
             right_trigger = _unit_interval(getattr(raw, "right_ctrl_triggerValue", 0.0)) if ready else 0.0
             left_grip = _unit_interval(getattr(raw, "left_ctrl_squeezeValue", 0.0)) if ready else 0.0
@@ -536,6 +581,10 @@ class TeleVuerSource(_LatestSampleSource):
             buttons=buttons,
             arrival_monotonic=time.monotonic(),
             source_timestamp_ns=None,
+            left_hand_landmarks=left_hand_landmarks,
+            right_hand_landmarks=right_hand_landmarks,
+            left_hand_landmarks_valid=left_hand_landmarks_valid,
+            right_hand_landmarks_valid=right_hand_landmarks_valid,
         )
         return self._accept(sample)
 

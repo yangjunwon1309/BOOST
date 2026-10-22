@@ -1,0 +1,49 @@
+# BrainCo Revo2 command/state contract shared by the simulator, hand controller,
+# and Unitree brainco_hand_service adapter.
+name: brainco_revo2
+channels: [Thumb, Thumb_aux, Index, Middle, Ring, Pinky]
+dof: 6
+normalized_range: [0.0, 1.0]
+
+dds:
+  command_topics:
+    left: rt/brainco/left/cmd
+    right: rt/brainco/right/cmd
+  state_topics:
+    left: rt/brainco/left/state
+    right: rt/brainco/right/state
+  command_type: unitree_go.msg.dds.MotorCmds_
+  state_type: unitree_go.msg.dds.MotorStates_
+
+# Command positions are normalized on DDS and converted to these physical
+# MuJoCo joint ranges in the same six-channel order above.
+joint_names:
+  - thumb_metacarpal_joint
+  - thumb_proximal_joint
+  - index_proximal_joint
+  - middle_proximal_joint
+  - ring_proximal_joint
+  - pinky_proximal_joint
+q_min: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+q_max: [1.57, 1.03, 1.41, 1.41, 1.41, 1.41]
+
+binary_open: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+binary_close: [0.70, 1.0, 1.0, 1.0, 1.0, 1.0]
+legacy_close_threshold: 0.10
+
+control:
+  update_hz: 100.0
+  command_speed: 1.0
+  state_timeout_sec: 0.25
+  stale_command_timeout_sec: 0.35
+  stale_command_pose: open
+
+# MJCF equality semantics: q_proximal = multiplier * q_distal. The adapter
+# solves those constraints for q_distal; dynamic MuJoCo simulation enforces
+# the same relation.
+distal_couplings:
+  thumb: {parent: thumb_proximal_joint, joint: thumb_distal_joint, multiplier: 1.155, max_rad: 1.03}
+  index: {parent: index_proximal_joint, joint: index_distal_joint, multiplier: 1.0, max_rad: 1.63}
+  middle: {parent: middle_proximal_joint, joint: middle_distal_joint, multiplier: 1.155, max_rad: 1.63}
+  ring: {parent: ring_proximal_joint, joint: ring_distal_joint, multiplier: 1.155, max_rad: 1.63}
+  pinky: {parent: pinky_proximal_joint, joint: pinky_distal_joint, multiplier: 1.155, max_rad: 1.63}

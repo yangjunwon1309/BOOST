@@ -6,9 +6,10 @@ and staged implementation plan are in [`BOOST_dev_plan.md`](BOOST_dev_plan.md).
 
 The current source is a reorganized PATH-G1 starting point. The teleop state
 machine, XR streams, arm IK, G1 bridge, and wrist perception service have been
-moved into the subsystem layout below. This layout does not mean the planned
-Revo2 command path, FoundationPose integration, object-aware MPPI, episode
-schema, or MuJoCo task are already implemented.
+moved into the subsystem layout below. The local Revo2 MuJoCo path is wired for
+binary grip commands; continuous hand retargeting, physical Revo2 service
+support, FoundationPose, object-aware MPPI, and the episode schema remain
+future work.
 
 Git workflow: `main` is the README-only landing branch; ongoing development is
 on `deploy`. See [`docs/git_workflow.md`](docs/git_workflow.md) and
@@ -22,6 +23,9 @@ on `deploy`. See [`docs/git_workflow.md`](docs/git_workflow.md) and
 - `boost/io/path_transport/`: the PATH LCM protocol and ZMQ transport layer.
 - `boost/io/revo2_hand_service/`: the planned adapter contract for the external
   BrainCo hand service; its driver source is not vendored.
+- `boost/control/hand_mppi/`: the shared BrainCo DDS mapping and adapter, with
+  `mimic_retargeter_lab` pinned as a submodule. Revo2 model registration and the
+  continuous landmark-to-target policy are the next hand-control work.
 - `boost/control/arm/`: PATH-derived nonlinear G1 arm IK.
 - `boost/io/g1_bridge/`: PATH-derived Unitree arm and Dex1 bridge. It still
   speaks the old Dex1 interface; Revo2 uses the separate
@@ -53,3 +57,28 @@ These entry points retain the current PATH packet and controller behavior;
 they do not send Revo2 hand commands. The service deployment notes are in
 [`docs/deployment.md`](docs/deployment.md). The separate G1/Dex1 installation
 document is retained as a PATH reference, not a BOOST Revo2 runbook.
+
+## Local MuJoCo desktop
+
+The local G1 + Revo2 model and HOMIE/PATH stack run in the Pixi `sim`
+environment. Install and inspect the runtime with:
+
+```bash
+pixi install -e sim
+pixi run -e sim setup-sim
+```
+
+Start the desktop simulation without a headset
+with `pixi run -e sim mujoco-no-xr`; use `pixi run -e sim mujoco` when Galaxy XR
+certificates are configured. To stream Televuer's 25 hand joints over PATH's
+ZMQ pose message, set `PATH_TELEVUER_HAND_TRACKING=1` when starting `mujoco`.
+See [`boost/sim/README.md`](boost/sim/README.md)
+for network, channel, and configuration details. The separate `hand` Pixi
+environment holds the Python 3.12 and GPU dependencies for the future
+retargeter, without changing MuJoCo 3.5.0 in the current sim environment. Run
+`git submodule update --init --recursive` followed by `pixi install -e hand` to
+install its pinned upstream and GPU dependencies. The
+desktop dependency workflow is defined by `pixi.toml` and `pixi.lock`; it does
+not require the `uv` executable, `.venv_runtime`, or manual Televuer/Unitree
+SDK source directories. If this shell cannot find Pixi, use
+`$HOME/.pixi/bin/pixi` or add `$HOME/.pixi/bin` to `PATH`.

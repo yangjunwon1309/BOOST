@@ -107,7 +107,7 @@ def _state_observation(
     }
 
 
-def _make_bridge_config(sim_config: dict) -> dict:
+def _make_bridge_config(sim_config: dict, hand_config: dict) -> dict:
     return {
         "ROBOT_TYPE": "g1",
         "NUM_MOTORS": int(sim_config["num_body_motors"]),
@@ -115,8 +115,11 @@ def _make_bridge_config(sim_config: dict) -> dict:
         "NUM_HAND_JOINTS": int(sim_config["num_hand_joints"]),
         "HAND_BACKEND": str(sim_config["hand_backend"]),
         "USE_SENSOR": False,
-        "BRAINCO_BINARY_OPEN": sim_config["binary_open"],
-        "BRAINCO_BINARY_CLOSE": sim_config["binary_close"],
+        "BRAINCO_Q_MIN": hand_config["q_min"],
+        "BRAINCO_Q_MAX": hand_config["q_max"],
+        "BRAINCO_BINARY_OPEN": hand_config["binary_open"],
+        "BRAINCO_BINARY_CLOSE": hand_config["binary_close"],
+        "BRAINCO_LEGACY_CLOSE_THRESHOLD": hand_config["legacy_close_threshold"],
         "BRAINCO_ACCEPT_LEGACY_DEX3": False,
     }
 
@@ -142,6 +145,9 @@ def main() -> int:
     args = parse_args()
     with args.config.open("r", encoding="utf-8") as stream:
         sim_config = yaml.safe_load(stream)
+    hand_config_path = ROOT / sim_config["hand_config"]
+    with hand_config_path.open("r", encoding="utf-8") as stream:
+        hand_config = yaml.safe_load(stream)
     args.scene = args.scene or ROOT / sim_config["scene"]
     args.homie_config = args.homie_config or ROOT / sim_config["homie_config"]
     args.interface = args.interface or sim_config.get("interface", "lo")
@@ -161,7 +167,7 @@ def main() -> int:
     startup_kd = np.asarray(homie["kds"], dtype=np.float64).reshape(29)
 
     ChannelFactoryInitialize(args.domain_id, args.interface)
-    bridge = UnitreeSdk2Bridge(_make_bridge_config(sim_config))
+    bridge = UnitreeSdk2Bridge(_make_bridge_config(sim_config, hand_config))
     model = mujoco.MjModel.from_xml_path(str(args.scene.resolve()))
     model.opt.timestep = float(args.sim_dt)
     data = mujoco.MjData(model)

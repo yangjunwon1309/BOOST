@@ -1,5 +1,12 @@
 # Legacy PATH/Dex1 G1 deployment reference
 
+> These instructions describe a separate physical G1/PATH deployment. They do
+> not apply to the desktop MuJoCo stack. For the desktop, install Pixi and use
+> `pixi run -e sim setup-sim` followed by `pixi run -e sim mujoco` (or
+> `mujoco-no-xr` without a headset). Televuer and Unitree SDK2 Python are
+> installed by the Pixi environment; do not clone their Python repositories for
+> the desktop workflow.
+
 This document records the PATH-G1 arm and Dex1 deployment. It is retained for
 reproducing the imported PATH setup and does not configure BOOST's planned
 BrainCo Revo2 interface. In the reorganized BOOST tree, the carried bridge is

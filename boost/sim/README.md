@@ -1,19 +1,29 @@
 # MuJoCo simulation
 
-The checked-in G1 model is loadable with its local mesh assets. The Revo2
-variant, `mujoco/scene_29dof_with_revo2.xml`, is based on the integrated model
-and MuJoCo adapter in `PATH-G1-main-rollback/sonic_runtime`. It contains the
-29 G1 body actuators plus six commanded joints per Revo2 hand; five distal
-joints per hand follow the model's coupling constraints. The scene loads as
-`nq=58`, `nv=57`, `nu=41`.
+The Revo2 variant, `mujoco/scene_29dof_with_revo2.xml`, uses official BrainCo
+Revo2 hand geometry, inertias, and joint limits from the pinned
+`external/brainco-description` submodule. BOOST adds the G1 wrist mounts,
+six-channel actuators, and five distal-joint coupling constraints per hand.
+The scene loads as `nq=58`, `nv=57`, `nu=41`.
 
-For whole-body Galaxy XR teleoperation, run `bash scripts/setup_external_runtime.sh`
-once, then `bash scripts/run_galaxy_homie_mujoco.sh`. Televuer and Unitree SDK
-checkouts/installations live under `external/`, outside the source packages.
+Install and inspect the desktop environment with `pixi install -e sim` and
+`pixi run -e sim setup-sim`, then launch the complete HOMIE/PATH/Galaxy XR stack
+with `pixi run -e sim mujoco`. Use `pixi run -e sim mujoco-no-xr` to bring up
+MuJoCo, HOMIE, and PATH without a headset, or `pixi run -e sim mujoco-headless`
+to run without XR or a viewer. Pixi installs Televuer and Unitree SDK2 Python
+from pinned Git revisions; the desktop setup script initializes the BrainCo
+description submodule. The local LCM/DDS relay is Python and follows the
+existing PATH packet and Unitree DDS contracts, so the desktop setup does not
+require a native SDK checkout or C++ build.
+
+The headless stack starts, but HOMIE waits for its START/controller input. In a
+desktop-only run with no controller event, the G1 model drops to the floor;
+the next simulation bring-up task is a repeatable stand/hold input and stable
+startup check. This is separate from the Revo2 retargeter path.
+
 The launcher places DDS on loopback and uses an isolated same-host LCM
 multicast URL so the simulated command stream does not join the normal G1
-teleoperation group. Its Galaxy XR server starts tracking automatically once
-valid controller poses arrive. Galaxy XR also needs a TLS certificate and key trusted by
+teleoperation group. Galaxy XR requires a TLS certificate and key trusted by
 the headset; set `PATH_TELEVUER_CERT` and `PATH_TELEVUER_KEY` if they are not at
 `~/.config/xr_teleoperate/cert.pem` and `key.pem`.
 
@@ -32,13 +42,15 @@ flowchart LR
 HOMIE is the sole `rt/lowcmd` writer: it combines its leg/waist policy output
 with PATH's 14 arm targets and gains. MuJoCo applies
 `tau + kp * (q_des - q) + kd * (dq_des - dq)` to the 29 body actuators and
-publishes simulated state back to DDS. The Revo2 adapter maps PATH's existing
-binary left/right grip flags to the six normalized BrainCo command channels;
-continuous hand tracking is not part of this PATH packet yet.
+publishes simulated state back to DDS. PATH's existing adapter maps binary
+left/right grip flags to the six normalized BrainCo command channels. The new
+`boost/control/hand_mppi` module exposes that same six-channel DDS contract for
+continuous Revo2 targets. Televuer supplies 25 tracked hand joints, and the
+Galaxy XR path now forwards those points over its existing ZMQ pose message.
+The low-level Revo2 retargeter runner still needs to consume them and publish
+the six DDS targets.
 
-The simulation stack is adapted from PATH's Sonic runtime. Its declared
-NumPy/SciPy versions are pinned in the `sim` extra; MuJoCo is pinned to 3.5.0,
-the version installed in the reference PATH environment. PATH does not declare
-exact Pinocchio or CasADi versions, so BOOST leaves those constraints
-unversioned. See `configs/sim/mujoco_revo2.yaml` and
+The simulation stack is adapted from PATH's Sonic runtime. The `sim` Pixi
+environment uses the pinned MuJoCo/PATH Python dependencies declared in the
+project's `sim` extra. See `configs/sim/mujoco_revo2.yaml` and
 `configs/sim/homie_g1_mujoco.yaml` for model, hand, and HOMIE settings.

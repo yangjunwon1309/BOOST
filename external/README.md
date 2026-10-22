@@ -16,10 +16,17 @@ runtime components are installed separately:
   hand state and consumes the DDS command topics from `boost/io/g1_bridge/`; see
   [`../docs/g1_installation.md`](../docs/g1_installation.md).
 - **XRoboToolkit / PICO SDK** supplies the live PICO manager's controller input.
-- **Televuer and Unitree SDK2 Python** are installed separately under
-  `external/televuer`, `external/unitree_sdk2_python`, and
-  `external/unitree_sdk2`; `bash scripts/setup_external_runtime.sh` prepares
-  these checkouts and the `.venv_runtime` environment.
+- **Televuer and Unitree SDK2 Python** are installed into the Pixi `sim`
+  environment from pinned Git revisions in `pixi.toml`.
+- **BrainCo Revo2 descriptions** are pinned in the `brainco-description`
+  submodule. The MuJoCo model uses the official left/right MJCF and mesh
+  assets, then adds BOOST's G1 wrist mounts and six-channel control.
+- **Desktop MuJoCo** uses the Pixi-managed Unitree SDK2 Python dependency and
+  BOOST's Python LCM/DDS bridge. `pixi install -e sim` followed by
+  `pixi run -e sim setup-sim` prepares and loads the local scene without a C++
+  SDK checkout. The native
+  `boost/io/g1_bridge/` remains the hardware bridge and requires a separately
+  installed Unitree SDK2 C++ tree when building for a robot.
 - **Remote SAM3 worker** runs on the selected inference host and sends camera
   segmentation and geometry to the Thor gateway.
 

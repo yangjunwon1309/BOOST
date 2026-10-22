@@ -23,6 +23,9 @@ ROBOT_STATE_CHANNEL = "G1_ROBOT_STATE"
 # ASCII "PDU1" in a little-endian uint32.
 PATH_UPPER_COMMAND_MAGIC = 0x31554450
 PATH_UPPER_COMMAND_VERSION = 1
+ROBOT_STATE_MAGIC = 0x31545347
+ROBOT_STATE_VERSION = 1
+ROBOT_STATE_FLAG_HAS_TORSO_IMU = 1 << 0
 
 FLAG_LEFT_GRIP = 1 << 1
 FLAG_RIGHT_GRIP = 1 << 2
@@ -100,6 +103,8 @@ def unpack_upper_command(packet: bytes) -> UpperCommand:
         )
     sequence = int(values[3])
     timestamp_us = int(values[4])
+    if flags & ~(FLAG_LEFT_GRIP | FLAG_RIGHT_GRIP):
+        raise ValueError(f"upper command contains unsupported flags 0x{flags:04x}")
     arms = np.asarray(values[5:], dtype=np.float32)
     if not np.isfinite(arms).all():
         raise ValueError("upper command contains non-finite values")
@@ -111,6 +116,57 @@ def unpack_upper_command(packet: bytes) -> UpperCommand:
         tau_arm=arms[2 * ARM_COUNT :].copy(),
         left_grip=bool(flags & FLAG_LEFT_GRIP),
         right_grip=bool(flags & FLAG_RIGHT_GRIP),
+    )
+
+
+def pack_robot_state(
+    *,
+    sequence: int,
+    lowstate_sequence: int,
+    timestamp_us: int,
+    mode_machine: int,
+    base_quat_wxyz: Sequence[float] | np.ndarray,
+    base_gyro: Sequence[float] | np.ndarray,
+    base_accel: Sequence[float] | np.ndarray,
+    torso_quat_wxyz: Sequence[float] | np.ndarray | None,
+    torso_gyro: Sequence[float] | np.ndarray | None,
+    torso_accel: Sequence[float] | np.ndarray | None,
+    q: Sequence[float] | np.ndarray,
+    dq: Sequence[float] | np.ndarray,
+    tau_est: Sequence[float] | np.ndarray,
+) -> bytes:
+    """Encode the packed GST1 telemetry format consumed by PATH and HOMIE."""
+    has_torso_imu = torso_quat_wxyz is not None
+    torso_quat = _float_vector(
+        (0.0,) * 4 if torso_quat_wxyz is None else torso_quat_wxyz, 4, "torso_quat"
+    )
+    torso_angular = _float_vector(
+        (0.0,) * 3 if torso_gyro is None else torso_gyro, 3, "torso_gyro"
+    )
+    torso_linear = _float_vector(
+        (0.0,) * 3 if torso_accel is None else torso_accel, 3, "torso_accel"
+    )
+    values = (
+        _float_vector(base_quat_wxyz, 4, "base_quat_wxyz").tolist()
+        + _float_vector(base_gyro, 3, "base_gyro").tolist()
+        + _float_vector(base_accel, 3, "base_accel").tolist()
+        + torso_quat.tolist()
+        + torso_angular.tolist()
+        + torso_linear.tolist()
+        + _float_vector(q, NUM_MOTORS, "q").tolist()
+        + _float_vector(dq, NUM_MOTORS, "dq").tolist()
+        + _float_vector(tau_est, NUM_MOTORS, "tau_est").tolist()
+    )
+    flags = ROBOT_STATE_FLAG_HAS_TORSO_IMU if has_torso_imu else 0
+    return _STATE_PACKET.pack(
+        ROBOT_STATE_MAGIC,
+        ROBOT_STATE_VERSION,
+        flags,
+        int(sequence),
+        int(lowstate_sequence),
+        int(timestamp_us),
+        int(mode_machine),
+        *values,
     )
 
 

@@ -29,5 +29,8 @@ sim = [
   "onnxruntime",
 ]
 
+[tool.setuptools.packages.find]
+include = ["boost*"]
+
 [tool.ruff]
 line-length = 100

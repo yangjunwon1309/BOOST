@@ -9,8 +9,9 @@ state_machine_command=(
 "$PATH_PYTHON" -u boost/teleop/path_streaming/path_state_machine_bridge.py \
   --state "${PATH_STATE:-teleop}" \
   --fps "${PATH_FPS:-50}" \
-  --pico-hand-timeout-sec "${PATH_PICO_HAND_TIMEOUT_SEC:-0.35}" \
-  --pico-body-gap-hold-ms "${PATH_PICO_BODY_GAP_HOLD_MS:-100}" \
+  --pico-hand-timeout-sec "${PATH_PICO_HAND_TIMEOUT_SEC:-0.20}" \
+  --pico-body-gap-hold-ms "${PATH_PICO_BODY_GAP_HOLD_MS:-200}" \
+  --xr-future-tolerance-ms "${PATH_XR_FUTURE_TOLERANCE_MS:-100}" \
   --arm-reference-mode head_position \
   --pico-vr-endpoint "${PATH_PICO_VR_ENDPOINT:-tcp://127.0.0.1:5566}" \
   --button-endpoint "${PATH_PICO_BUTTON_ENDPOINT:-tcp://127.0.0.1:5565}" \
@@ -37,10 +38,7 @@ state_machine_command=(
   --shared-position-posterior-max-rate-per-s "${PATH_SHARED_POSITION_POSTERIOR_MAX_RATE_PER_S:-1.2}" \
   --grasp-engagement-delay-sec "${PATH_GRASP_OVERRIDE_HOLD_SEC:-1.5}" \
   --grasp-closing-timeout-sec "${PATH_GRASP_CLOSING_TIMEOUT_SEC:-0.60}" \
-  --end-effector-model "${PATH_END_EFFECTOR_MODEL:-dex1}" \
-  --hand-axis-local ${PATH_HAND_AXIS_LOCAL:-0.0 1.0 0.0} \
-  --grasp-center-local ${PATH_GRASP_CENTER_LOCAL:-0.0 0.100 0.0} \
-  --grasp-center-wrist-x-offset-m "${PATH_GRASP_CENTER_WRIST_X_OFFSET_M:-0.070}" \
+  --end-effector-model brainco_revo2 \
   --shared-hand-h-margin-m "${PATH_SHARED_HAND_H_MARGIN_M:-0.05}" \
   --shared-hand-switch-confirm-n "${PATH_SHARED_HAND_SWITCH_CONFIRM_N:-10}" \
   --direct-lcm-url "${PATH_LCM_URL:-udpm://239.255.76.67:7667?ttl=1}" \
@@ -62,16 +60,16 @@ state_machine_command=(
   --arm-ik-orientation-full-error-m "${PATH_ARM_IK_ORIENTATION_FULL_ERROR_M:-0.01}" \
   --arm-ik-orientation-zero-error-m "${PATH_ARM_IK_ORIENTATION_ZERO_ERROR_M:-0.03}" \
   --arm-ik-orientation-min-scale "1.0" \
-  --arm-ik-residual-projection-threshold-m "${PATH_ARM_IK_RESIDUAL_PROJECTION_THRESHOLD_M:-0.03}" \
-  --arm-ik-residual-success-threshold-m "${PATH_ARM_IK_RESIDUAL_SUCCESS_THRESHOLD_M:-0.05}" \
-  --arm-ik-projection-step-m "${PATH_ARM_IK_PROJECTION_STEP_M:-0.05}" \
-  --arm-ik-output-velocity-limit-rad-s "${PATH_ARM_IK_OUTPUT_VELOCITY_LIMIT_RAD_S:-10.0}" \
-  --arm-ik-output-control-hz "${PATH_ARM_IK_OUTPUT_CONTROL_HZ:-50.0}" \
+  --arm-ik-residual-warning-threshold-m "${PATH_ARM_IK_RESIDUAL_WARNING_THRESHOLD_M:-0.05}" \
   "$@"
 )
 
 if [[ "${PATH_AUTO_ARM_PICO_TRACKING:-0}" == "1" ]]; then
   state_machine_command+=(--auto-arm-pico-tracking)
+fi
+
+if [[ "${PATH_ENABLE_SHARED_TARGET_ASSIST:-0}" == "1" ]]; then
+  state_machine_command+=(--enable-shared-target-assist)
 fi
 
 if [[ -n "${PATH_CONTROL_CPUSET-6-7}" ]] && command -v taskset >/dev/null 2>&1; then

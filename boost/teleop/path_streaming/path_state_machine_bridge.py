@@ -20,15 +20,10 @@ State behavior:
     XR arm targets are ignored while both arms return to fixed FK(Q_READY).
     The next A+X requires measured Q_READY convergence before live XR targets
     resume.
-    Holding Y selects the left arm and holding B selects the right arm for
-    belief/contact blending.  Without Y/B, both arms follow XR directly.
-  damped_return:
-    Smoothly return arm targets toward the measured arm posture.
-
+    Televuer wrist poses go directly to IK by default. Y/B can select optional
+    belief/contact targets only when --enable-shared-target-assist is enabled.
 Runtime hotkeys:
-  q/w/e/r switch PATH state.
-  p arm-disable requests are rejected because IPOPT owns both arms.
-  q/e switch between direct teleoperation and belief-assisted targets.
+  w enters intention mode; p cannot disable the PATH arm reference stream.
 """
 
 from __future__ import annotations
@@ -99,7 +94,7 @@ from services.pose_service.remote_offload.wrist_d405_protocol_v11 import (
 
 # ``auto_planning`` remains an accepted external compatibility value, but is
 # canonicalized to teleop. Y/B selects the arm for belief assistance.
-VALID_STATES = {"teleop", "intention", "auto_planning", "damped_return"}
+VALID_STATES = {"teleop", "intention", "auto_planning"}
 SHARED_HAND_PUBLISH_HZ = 50.0
 
 # Canonical task-space contract used by PICO wrists, manual shared-control
@@ -150,8 +145,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state", choices=sorted(VALID_STATES), default="teleop")
     parser.add_argument("--fps", type=float, default=50.0)
-    parser.add_argument("--pico-hand-timeout-sec", type=float, default=0.35)
-    parser.add_argument("--pico-body-gap-hold-ms", type=float, default=100.0)
+    parser.add_argument("--pico-hand-timeout-sec", type=float, default=0.20)
+    parser.add_argument("--pico-body-gap-hold-ms", type=float, default=200.0)
+    parser.add_argument("--xr-future-tolerance-ms", type=float, default=100.0)
     parser.add_argument(
         "--auto-arm-pico-tracking",
         action="store_true",
@@ -173,7 +169,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--button-endpoint", default="tcp://127.0.0.1:5565")
     parser.add_argument("--button-topic", default="pico_button_event")
-    parser.add_argument("--controller-stale-timeout-sec", type=float, default=0.30)
+    parser.add_argument("--controller-stale-timeout-sec", type=float, default=0.20)
     parser.add_argument(
         "--controller-state-topic", default="pico_controller_state"
     )
@@ -269,7 +265,6 @@ def parse_args() -> argparse.Namespace:
         help="Topic carrying the Y/B-selected shared-control hand heartbeat.",
     )
 
-    parser.add_argument("--damped-return-rate", type=float, default=3.0)
     parser.add_argument(
         "--terminal-capture-radius-m",
         type=float,
@@ -289,6 +284,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--shared-stale-after-sec", type=float, default=0.3)
     parser.add_argument("--shared-d-max-m", type=float, default=0.9)
+    parser.add_argument(
+        "--enable-shared-target-assist",
+        action="store_true",
+        help=(
+            "Allow held Y/B to replace the selected Televuer arm target with a "
+            "fresh perception/contact target. Disabled by default for direct XR teleop."
+        ),
+    )
     parser.add_argument(
         "--shared-position-mode",
         choices=("replace", "alpha"),
@@ -329,8 +332,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grasp-closing-timeout-sec", type=float, default=0.60)
     parser.add_argument(
         "--end-effector-model",
-        choices=("dex1", "brainco"),
-        default="dex1",
+        choices=("brainco_revo2",),
+        default="brainco_revo2",
         help="Canonical hand-frame profile used by belief orientation/EE targets.",
     )
     parser.add_argument(
@@ -350,11 +353,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--grasp-center-wrist-x-offset-m",
         type=float,
-        default=0.045,
-        help=(
-            "Wrist-yaw +X offset to the Dex1 hand-base/palm centre; 0.045 m "
-            "matches the calibrated Dex1 attachment profile."
-        ),
+        default=None,
+        help="Explicit override for the Revo2 wrist-to-grasp-center X offset.",
     )
     parser.add_argument(
         "--shared-reset-alpha-on-target-switch",
@@ -408,29 +408,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--arm-ik-orientation-min-scale", type=float, default=1.0)
     parser.add_argument(
-        "--arm-ik-residual-projection-threshold-m",
-        type=float,
-        default=0.03,
-    )
-    parser.add_argument(
-        "--arm-ik-residual-success-threshold-m",
+        "--arm-ik-residual-warning-threshold-m",
         type=float,
         default=0.05,
-    )
-    parser.add_argument(
-        "--arm-ik-projection-step-m", type=float, default=0.05
-    )
-    parser.add_argument(
-        "--arm-ik-output-velocity-limit-rad-s",
-        type=float,
-        default=10.0,
-        help="XR G1-29 arm command velocity limit applied after the weighted filter.",
-    )
-    parser.add_argument(
-        "--arm-ik-output-control-hz",
-        type=float,
-        default=50.0,
-        help="PATH state-machine rate used to derive the per-command arm step.",
     )
     parser.add_argument(
         "--arm-ik-hard-lock-inactive-arm",
@@ -462,7 +442,6 @@ class KeyboardController:
     TOGGLE_QP = "__toggle_qp__"
     KEY_TO_STATE = {
         "w": "intention",
-        "r": "damped_return",
         "p": TOGGLE_QP,
     }
 
@@ -613,6 +592,8 @@ def wrist_targets_from_message(
     raw: bytes,
     topic: str,
     fallback_timestamp_us: int,
+    max_age_us: int,
+    future_tolerance_us: int,
 ) -> WaistWristTargets | None:
     """Read absolute waist-frame wrist transforms without anchor or gain."""
 
@@ -651,7 +632,7 @@ def wrist_targets_from_message(
             fields.get("session_id", [-1]), dtype=np.int32
         ).reshape(-1)
         session_id = int(sessions[-1]) if sessions.size else -1
-        source_timestamp_us = int(fallback_timestamp_us)
+        source_timestamp_us: int | None = None
         monotonic_value = fields.get("timestamp_monotonic")
         if monotonic_value is not None:
             values = np.asarray(monotonic_value, dtype=np.float64).reshape(-1)
@@ -666,6 +647,13 @@ def wrist_targets_from_message(
                 if values.size and int(values[-1]) > 0:
                     source_timestamp_us = int(values[-1])
                     break
+        if source_timestamp_us is None:
+            return None
+        source_age_us = int(fallback_timestamp_us) - source_timestamp_us
+        max_age_us = max(1_000, int(max_age_us))
+        future_tolerance_us = max(0, int(future_tolerance_us))
+        if source_age_us > max_age_us or source_age_us < -future_tolerance_us:
+            return None
 
         return WaistWristTargets(
             left_waist=left_waist.copy(),
@@ -1042,7 +1030,7 @@ def main() -> int:
         )
     if args.qp_reference_disabled:
         raise RuntimeError(
-            "PATH requires the CasADi/IPOPT arm reference stream in q/e modes; "
+            "PATH requires the CasADi/IPOPT arm reference stream; "
             "--qp-reference-disabled is not supported."
         )
     ctx = zmq.Context.instance()
@@ -1156,18 +1144,8 @@ def main() -> int:
             orientation_full_error_m=args.arm_ik_orientation_full_error_m,
             orientation_zero_error_m=args.arm_ik_orientation_zero_error_m,
             orientation_min_scale=args.arm_ik_orientation_min_scale,
-            residual_projection_threshold_m=(
-                args.arm_ik_residual_projection_threshold_m
-            ),
-            residual_success_threshold_m=(
-                args.arm_ik_residual_success_threshold_m
-            ),
-            projection_step_m=args.arm_ik_projection_step_m,
-            output_velocity_limit_rad_s=(
-                args.arm_ik_output_velocity_limit_rad_s
-            ),
-            output_control_dt_s=(
-                1.0 / max(float(args.arm_ik_output_control_hz), 1.0)
+            residual_warning_threshold_m=(
+                args.arm_ik_residual_warning_threshold_m
             ),
         )
         log(
@@ -1175,12 +1153,8 @@ def main() -> int:
             f"urdf={args.arm_ik_urdf}, max_iter={args.arm_ik_max_iter}, "
             f"hard_lock_inactive={args.arm_ik_hard_lock_inactive_arm}, "
             "orientation_weight_scale=fixed_1.0, "
-            f"residual_project/success="
-            f"{100.0 * args.arm_ik_residual_projection_threshold_m:.1f}/"
-            f"{100.0 * args.arm_ik_residual_success_threshold_m:.1f}cm, "
-            "q_output=xr_wma[0.4,0.3,0.2,0.1]+"
-            f"{args.arm_ik_output_velocity_limit_rad_s:.1f}rad/s@"
-            f"{args.arm_ik_output_control_hz:.0f}Hz"
+            f"residual_warn={100.0 * args.arm_ik_residual_warning_threshold_m:.1f}cm, "
+            "q_output=direct (fresh IK result)"
         )
     if arm_nonlinear_ik is None:
         raise RuntimeError(
@@ -1254,7 +1228,6 @@ def main() -> int:
     arm_ik_cached_source = "none"
     last_ipopt_q_ref: np.ndarray | None = None
     last_ipopt_tau_ff: np.ndarray | None = None
-    blended_q: np.ndarray | None = None
     last_plan_q: np.ndarray | None = None
     qp_reference_enabled = not args.qp_reference_disabled
     last_tick = time.monotonic()
@@ -1282,12 +1255,11 @@ def main() -> int:
         @ grasp_center_local
         for side in ("left", "right")
     }
-    # Use the calibrated wrist-yaw -> Dex1 hand-base +X translation for both
-    # hands.  Any explicit CLI value remains a deliberate hardware override.
-    for side in ("left", "right"):
-        grasp_center_wrist_offset[side][0] = float(
-            args.grasp_center_wrist_x_offset_m
-        )
+    if args.grasp_center_wrist_x_offset_m is not None:
+        for side in ("left", "right"):
+            grasp_center_wrist_offset[side][0] = float(
+                args.grasp_center_wrist_x_offset_m
+            )
     latest_shared_result = None
     orientation_gate = {
         side: OrientationTargetGate(
@@ -1343,7 +1315,7 @@ def main() -> int:
     # Per-hand raw Televuer command history used only for diagnostics.
     command_history = {side: None for side in ("left", "right")}
     log(
-        "XR absolute waist-frame wrist targets enabled: "
+            "XR absolute waist-frame wrist targets enabled: "
         f"topic={args.pico_vr_endpoint}/vr_pose_debug "
         "(shared PICO-compatible wire format), mode=head_position, "
         "anchor=none, gain=none"
@@ -1363,6 +1335,14 @@ def main() -> int:
         f"hand_model={args.end_effector_model} "
         f"axis={np.round(hand_axis_local, 4).tolist()} "
         f"grasp_local={np.round(grasp_center_local, 4).tolist()}"
+    )
+    log(
+        "shared contact target assist="
+        + (
+            "enabled (held Y/B may select a fresh perception target)"
+            if args.enable_shared_target_assist
+            else "disabled (arm goals stay on Televuer)"
+        )
     )
 
     def resync_shared_control_state(reason: str) -> None:
@@ -1416,10 +1396,6 @@ def main() -> int:
             f"{100.0 * result.right_position_error_m:.1f}cm "
             f"ori_w={result.left_orientation_weight_scale:.3f}/"
             f"{result.right_orientation_weight_scale:.3f} "
-            f"projected={int(result.target_projected)} "
-            f"post_rate={int(result.postprocess_rate_limited)} "
-            f"post_scale={result.postprocess_motion_scale:.2f} "
-            f"post_step={result.postprocess_max_step_rad:.3f}rad"
         )
         if result.success:
             result.q_ref[:15] = 0.0
@@ -1515,7 +1491,7 @@ def main() -> int:
         return (tick_us - latest_static_target_us) <= args.static_target_hold_sec * 1.0e6
 
     def apply_state_request(requested: str, source: str, tick_us: int | None = None) -> None:
-        nonlocal current_state, blended_q
+        nonlocal current_state
         nonlocal phase_mode, phase_sync_error_rad
         nonlocal shared_selected_hand, shared_hand_selection_revision
         if tick_us is None:
@@ -1539,15 +1515,12 @@ def main() -> int:
                 shared_hand_selection_revision += 1
             phase_mode = "none"
             phase_sync_error_rad = float("nan")
-        elif requested == "damped_return":
-            resync_shared_control_state("damped_return")
 
     def set_pico_tracking_armed(enabled: bool, source: str) -> None:
         """Switch between live PICO tracking and fixed-FK(Q_READY) IPOPT."""
 
         nonlocal pico_tracking_armed
         nonlocal pico_arm_pending
-        nonlocal blended_q
         enabled = bool(enabled)
         if enabled:
             if not args.auto_arm_pico_tracking:
@@ -1585,7 +1558,6 @@ def main() -> int:
                 f"{'armed' if enabled else 'disarmed'}"
             )
             return
-        blended_q = None
         pico_tracking_armed = enabled
         pico_arm_pending = False
         resync_shared_control_state("pico_tracking_armed" if enabled else "pico_tracking_disarmed")
@@ -1611,8 +1583,15 @@ def main() -> int:
         if latest_robot_q is None or latest_wrist_targets is None:
             return
         target_age_us = tick_us - latest_pico_body_receive_us
+        source_age_us = tick_us - latest_wrist_targets.source_timestamp_us
         max_target_age_us = max(1_000, int(args.pico_body_gap_hold_ms * 1_000.0))
-        if latest_pico_body_receive_us <= 0 or target_age_us > max_target_age_us:
+        future_tolerance_us = max(0, int(args.xr_future_tolerance_ms * 1_000.0))
+        if (
+            latest_pico_body_receive_us <= 0
+            or target_age_us > max_target_age_us
+            or source_age_us > max_target_age_us
+            or source_age_us < -future_tolerance_us
+        ):
             return
         if args.auto_arm_pico_tracking:
             set_pico_tracking_armed(True, "MuJoCo XR auto-arm")
@@ -1636,7 +1615,7 @@ def main() -> int:
 
     if keyboard.enabled:
         log(
-            "keyboard hotkeys enabled: w=intention, r=damped_return, "
+            "keyboard hotkeys enabled: w=intention, "
             "p=IPOPT arm disable rejected"
         )
     else:
@@ -1758,14 +1737,17 @@ def main() -> int:
                 raw = pico_vr_body.recv(zmq.NOBLOCK)
                 remember_pico_hand_fields(raw, "vr_pose_debug", tick_us)
                 targets = wrist_targets_from_message(
-                    raw, "vr_pose_debug", tick_us
+                    raw,
+                    "vr_pose_debug",
+                    tick_us,
+                    max_age_us=int(args.pico_body_gap_hold_ms * 1_000.0),
+                    future_tolerance_us=int(args.xr_future_tolerance_ms * 1_000.0),
                 )
                 if targets is not None:
                     if targets.session_id != latest_pico_session_id:
                         latest_pico_session_id = targets.session_id
                         last_ipopt_q_ref = None
                         last_ipopt_tau_ff = None
-                        blended_q = None
                         log(
                             "XR absolute-target session="
                             f"{latest_pico_session_id}; reset IPOPT warm start"
@@ -1902,10 +1884,18 @@ def main() -> int:
                 if latest_pico_body_receive_us > 0
                 else float("inf")
             )
+            pico_source_age_sec = (
+                (tick_us - latest_wrist_targets.source_timestamp_us) / 1.0e6
+                if latest_wrist_targets is not None
+                else float("inf")
+            )
             pico_body_fresh = (
                 pico_tracking_armed
                 and latest_wrist_targets is not None
                 and pico_body_age_sec
+                <= max(0.001, float(args.pico_body_gap_hold_ms) / 1000.0)
+                and -max(0.0, float(args.xr_future_tolerance_ms) / 1000.0)
+                <= pico_source_age_sec
                 <= max(0.001, float(args.pico_body_gap_hold_ms) / 1000.0)
             )
             try_complete_pico_arm_request(tick_us)
@@ -1918,7 +1908,7 @@ def main() -> int:
             grasp_commanded = {
                 side: pico_grip_active(side, tick_us) for side in ("left", "right")
             }
-            # No measured Dex1 jaw gap reaches this bridge yet.  ``None``
+            # No measured Revo2 contact state reaches this bridge yet. ``None``
             # leaves the jaw-stall channel inactive; co-motion and the
             # explicit long-hold override remain available.
             jaw_gap_m = {side: None for side in ("left", "right")}
@@ -1939,7 +1929,11 @@ def main() -> int:
             # Y/B are a dead-man arm selector in teleop.  Never retain the
             # selected arm after a release or controller-state timeout.
             requested_shared_hand = "none"
-            if current_state == "teleop" and controller_fresh:
+            if (
+                current_state == "teleop"
+                and controller_fresh
+                and args.enable_shared_target_assist
+            ):
                 if latest_controller_y and not latest_controller_b:
                     requested_shared_hand = "left"
                 elif latest_controller_b and not latest_controller_y:
@@ -2106,7 +2100,7 @@ def main() -> int:
                         omega = None
                         previous = command_history[side]
                         if previous is not None:
-                            p_prev, r_prev, t_prev, omega_prev = previous
+                            p_prev, r_prev, t_prev = previous
                             delta = (tick_us - t_prev) / 1.0e6
                             if 1.0e-4 <= delta <= 0.5:
                                 velocity = (p_cmd - p_prev) / delta
@@ -2114,17 +2108,11 @@ def main() -> int:
                                     r_prev, r_cmd, delta
                                 )
                                 if raw_omega is not None:
-                                    omega = (
-                                        raw_omega
-                                        if omega_prev is None
-                                        else 0.25 * raw_omega
-                                        + 0.75 * omega_prev
-                                    )
+                                    omega = raw_omega
                         command_history[side] = (
                             p_cmd.copy(),
                             r_cmd.copy(),
                             int(tick_us),
-                            None if omega is None else omega.copy(),
                         )
                         command_features[side] = (
                             p_cmd,
@@ -2555,110 +2543,35 @@ def main() -> int:
                         else -1
                     )
                     hold_tracking_target = bool(pico_tracking_armed)
-                    hold_q = (
-                        last_ipopt_or_measured_hold()
-                        if hold_tracking_target
-                        else Q_READY.copy()
-                    )
+                    hold_q = last_ipopt_or_measured_hold()
                     hold_left_tf, hold_right_tf = (
                         arm_nonlinear_ik.wrist_transforms_from_q29(hold_q)
                     )
                     control_visual_hands = ipopt_visual_hands_from_transforms(
                         hold_left_tf,
                         hold_right_tf,
-                        target_source=(
-                            "stale_pico_ipopt_hold"
-                            if hold_tracking_target
-                            else "teleop_wait_ready_q_ready"
-                        ),
+                        target_source="stale_xr_display_hold",
                     )
-                    # Q_READY is used only before tracking is armed. Once A+X
-                    # completes the one-shot alignment, transient source gaps
-                    # hold the last successful IPOPT solution.
-                    qp_payload = ipopt_arm_sample_reference(
-                        hold_q,
+                    # Keep the last wrist marker visible for diagnostics, but
+                    # release arm-SDK ownership when the live XR target ages
+                    # out. A display hold is not a new robot command.
+                    qp_payload = qp_none_reference(
                         state=current_state,
-                        source="xr_wrist_target",
-                        control_mode="teleop",
-                        feasible=True,
+                        source="xr_wrist_target_stale",
+                        control_mode="stale_wait",
+                        feasible=False,
                         timestamp_us=tick_us,
-                        tau_ff_ref=(
-                            last_ipopt_tau_ff
-                            if hold_tracking_target
-                            and last_ipopt_tau_ff is not None
-                            else np.zeros(29, dtype=np.float64)
-                        ),
                         bridge_timestamp_us=tick_us,
                         pico_source_timestamp_us=missing_pico_source_us,
                         pico_frame_index=missing_pico_frame,
                         pico_target_reason=(
-                            "stale_absolute_target_hold"
+                            "stale_absolute_target_release"
                             if hold_tracking_target
-                            else "q_ready_waiting_pico_ax"
+                            else "waiting_fresh_absolute_target"
                         ),
-                        pico_target_held=hold_tracking_target,
-                        arm_target_owner=(
-                            "casadi_ipopt_hold"
-                            if hold_tracking_target
-                            else "q_ready_direct"
-                        ),
-                        solver_backend=(
-                            "casadi_opti_ipopt_hold"
-                            if hold_tracking_target
-                            else "q_ready_direct"
-                        ),
-                        arm_target_valid=True,
+                        pico_target_held=False,
+                        arm_target_valid=False,
                     )
-            else:  # damped_return
-                if pico_body_fresh and latest_wrist_targets is not None:
-                    return_result = solve_authoritative_ipopt_transforms(
-                        latest_wrist_targets.left_waist,
-                        latest_wrist_targets.right_waist,
-                    )
-                    return_target = (
-                        return_result.q_ref.copy()
-                        if return_result.success
-                        else last_ipopt_or_measured_hold()
-                    )
-                    if blended_q is None:
-                        blended_q = (
-                            last_plan_q.copy()
-                            if last_plan_q is not None
-                            else return_target.copy()
-                        )
-                    alpha = 1.0 - np.exp(-args.damped_return_rate * dt)
-                    blended_q = (1.0 - alpha) * blended_q + alpha * return_target
-                    blended_left_tf, blended_right_tf = (
-                        arm_nonlinear_ik.wrist_transforms_from_q29(blended_q)
-                    )
-                    control_visual_hands = ipopt_visual_hands_from_transforms(
-                        blended_left_tf,
-                        blended_right_tf,
-                        target_source="damped_return_ipopt_reference",
-                    )
-                    qp_payload = ipopt_arm_sample_reference(
-                        blended_q,
-                        tau_ff_ref=return_result.tau_ff_ref,
-                        state="damped_return",
-                        source="pico_body_damped_return",
-                        control_mode="blend_back",
-                        feasible=bool(return_result.success),
-                        plan_id=0,
-                        timestamp_us=tick_us,
-                        pico_source_timestamp_us=int(
-                            latest_wrist_targets.source_timestamp_us
-                        ),
-                        pico_frame_index=int(latest_wrist_targets.frame_index),
-                    )
-                else:
-                    qp_payload = qp_none_reference(
-                        state="damped_return",
-                        source="damped_return",
-                        control_mode="blend_back",
-                        feasible=False,
-                        timestamp_us=tick_us,
-                    )
-
             # IK owns q, while arm gravity compensation is evaluated independently
             # at the 50 Hz bridge rate. This keeps arm-load feedforward
             # synchronized with the latest pelvis gravity even when a static IK
@@ -2942,6 +2855,7 @@ def main() -> int:
                     f"xr_target={'absolute_head_position' if latest_wrist_targets else 'waiting'} "
                     f"{pico_position_log} "
                     f"xr_age={1000.0 * pico_body_age_sec if np.isfinite(pico_body_age_sec) else -1.0:.1f}ms "
+                    f"xr_source_age={1000.0 * pico_source_age_sec if np.isfinite(pico_source_age_sec) else -1.0:.1f}ms "
                     f"button_seq={last_button_sequence} "
                     f"controller_seq={latest_controller_sequence} "
                     f"controller_age={1000.0 * controller_age_sec if np.isfinite(controller_age_sec) else -1.0:.1f}ms "

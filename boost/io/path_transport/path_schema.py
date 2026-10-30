@@ -10,7 +10,7 @@ SCHEMA_IPOPT_ARM_REFERENCE_V1 = "path.ipopt_arm_reference.v1"
 QP_REFERENCE_TOPIC = "path_qp_reference"
 STATIC_EE_TARGET_TOPIC = "path_static_ee_target"
 
-PATH_STATES = {"teleop", "intention", "auto_planning", "damped_return", "idle"}
+PATH_STATES = {"teleop", "intention", "auto_planning", "idle"}
 REFERENCE_TYPES = {"none", "sample", "cartesian_target"}
 
 

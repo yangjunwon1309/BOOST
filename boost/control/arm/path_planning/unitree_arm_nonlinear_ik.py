@@ -21,8 +21,6 @@ import time
 import numpy as np
 import pinocchio as pin
 
-from boost.teleop.xr.xr_arm_postprocessing import XrArmCommandPostprocessor
-
 try:
     import casadi
 except ImportError as exc:  # pragma: no cover - exercised on machines without CasADi.
@@ -126,10 +124,6 @@ class ArmIkResult:
     right_rotation_error_rad: float = float("inf")
     left_orientation_weight_scale: float = 0.0
     right_orientation_weight_scale: float = 0.0
-    target_projected: bool = False
-    postprocess_rate_limited: bool = False
-    postprocess_motion_scale: float = 1.0
-    postprocess_max_step_rad: float = 0.0
 
 
 def quat_wxyz_to_rot(quat_wxyz: np.ndarray) -> np.ndarray:
@@ -245,11 +239,7 @@ class UnitreeG1ArmNonlinearIK:
         orientation_full_error_m: float = 0.01,
         orientation_zero_error_m: float = 0.03,
         orientation_min_scale: float = 1.0,
-        residual_projection_threshold_m: float = 0.03,
-        residual_success_threshold_m: float = 0.05,
-        projection_step_m: float = 0.05,
-        output_velocity_limit_rad_s: float = 20.0,
-        output_control_dt_s: float = 1.0 / 250.0,
+        residual_warning_threshold_m: float = 0.05,
     ) -> None:
         if casadi is None:
             raise RuntimeError(
@@ -433,16 +423,7 @@ class UnitreeG1ArmNonlinearIK:
         self.orientation_full_error_m = float(orientation_full_error_m)
         self.orientation_zero_error_m = float(orientation_zero_error_m)
         self.orientation_min_scale = float(orientation_min_scale)
-        self.residual_projection_threshold_m = float(
-            residual_projection_threshold_m
-        )
-        self.residual_success_threshold_m = float(residual_success_threshold_m)
-        self.projection_step_m = float(projection_step_m)
-        self.arm_postprocessor = XrArmCommandPostprocessor(
-            velocity_limit_rad_s=output_velocity_limit_rad_s,
-            control_dt_s=output_control_dt_s,
-            data_size=self.reduced_robot.model.nq,
-        )
+        self.residual_warning_threshold_m = float(residual_warning_threshold_m)
 
     def _joint_chain_to_root(self, joint_id: int) -> list[int]:
         chain: list[int] = []
@@ -573,21 +554,6 @@ class UnitreeG1ArmNonlinearIK:
             right_rotation_error,
         )
 
-    def _project_target_from_current(
-        self,
-        current_tf: np.ndarray,
-        requested_tf: np.ndarray,
-    ) -> np.ndarray:
-        projected = np.asarray(requested_tf, dtype=np.float64).copy()
-        delta = requested_tf[:3, 3] - current_tf[:3, 3]
-        distance = float(np.linalg.norm(delta))
-        if distance > self.projection_step_m > 0.0:
-            projected[:3, 3] = (
-                current_tf[:3, 3]
-                + delta * (self.projection_step_m / distance)
-            )
-        return projected
-
     def _solve_once(
         self,
         *,
@@ -680,71 +646,18 @@ class UnitreeG1ArmNonlinearIK:
                 smooth_scale=smooth_weight_scale,
             )
             q_raw = self.arm_q_to_q29(q_seed29, arm_q)
-            first_metrics = self._solution_metrics(
+            raw_metrics = self._solution_metrics(
                 q_raw, left_target_tf, right_target_tf
             )
-
-            target_projected = (
-                first_metrics[0] > self.residual_projection_threshold_m
-                or first_metrics[1] > self.residual_projection_threshold_m
-            )
-            applied_left_tf = left_target_tf
-            applied_right_tf = right_target_tf
-            if target_projected:
-                if first_metrics[0] > self.residual_projection_threshold_m:
-                    applied_left_tf = self._project_target_from_current(
-                        current_left, left_target_tf
-                    )
-                if first_metrics[1] > self.residual_projection_threshold_m:
-                    applied_right_tf = self._project_target_from_current(
-                        current_right, right_target_tf
-                    )
-                left_projected_distance = float(
-                    np.linalg.norm(
-                        current_left[:3, 3] - applied_left_tf[:3, 3]
-                    )
-                )
-                right_projected_distance = float(
-                    np.linalg.norm(
-                        current_right[:3, 3] - applied_right_tf[:3, 3]
-                    )
-                )
-                left_orientation_scale = self._orientation_scale(
-                    left_projected_distance
-                )
-                right_orientation_scale = self._orientation_scale(
-                    right_projected_distance
-                )
-                arm_q = self._solve_once(
-                    left_target_tf=applied_left_tf,
-                    right_target_tf=applied_right_tf,
-                    q_last=q_last,
-                    lower=lower,
-                    upper=upper,
-                    initial=arm_q,
-                    left_position_scale=left_position_weight_scale,
-                    right_position_scale=right_position_weight_scale,
-                    left_orientation_scale=left_orientation_scale,
-                    right_orientation_scale=right_orientation_scale,
-                    smooth_scale=smooth_weight_scale,
-                )
-
-            q_raw = self.arm_q_to_q29(q_seed29, arm_q)
-            raw_metrics = self._solution_metrics(
-                q_raw, applied_left_tf, applied_right_tf
-            )
-            postprocessed = self.arm_postprocessor.apply(
-                arm_q,
-                self.q29_to_arm_q(q_seed29),
-            )
-            q_ref = self.arm_q_to_q29(q_seed29, postprocessed.command_q)
+            # Send this fresh IK solution directly. Temporal continuity is
+            # already part of the optimization objective; a downstream moving
+            # average or rate clamp would add delay and change operator intent.
+            q_ref = self.arm_q_to_q29(q_seed29, arm_q)
             command_metrics = self._solution_metrics(
-                q_ref, applied_left_tf, applied_right_tf
+                q_ref, left_target_tf, right_target_tf
             )
 
-            # XR teleop warms IPOPT from the filtered solution; controller-side
-            # velocity clipping does not alter the next optimization seed.
-            self.init_data = postprocessed.filtered_q.copy()
+            self.init_data = arm_q.copy()
             q_ref[12:15] = 0.0
             tau_ff = self.gravity_torque_from_q29(
                 q_ref, base_quaternion_wxyz=base_quaternion_wxyz
@@ -761,21 +674,23 @@ class UnitreeG1ArmNonlinearIK:
             ) = command_metrics
             position_error = max(left_position_error, right_position_error)
             rotation_error = max(left_rotation_error, right_rotation_error)
-            raw_solution_success = (
-                max(raw_metrics[:2]) <= self.residual_success_threshold_m
+            success = bool(
+                np.isfinite(arm_q).all()
+                and np.isfinite(q_ref).all()
+                and np.isfinite(tau_ff).all()
+                and np.all(arm_q >= lower - 1.0e-8)
+                and np.all(arm_q <= upper + 1.0e-8)
             )
-            success = raw_solution_success
+            residual_text = (
+                f"left={raw_metrics[0]:.4f}m,right={raw_metrics[1]:.4f}m"
+            )
             message = (
-                "ok_projected_postprocessed"
-                if success and target_projected
-                else "ok_postprocessed"
-                if success
-                else (
-                    "ee_residual_exceeded:"
-                    f"left={raw_metrics[0]:.4f}m,"
-                    f"right={raw_metrics[1]:.4f}m"
-                )
+                "ok"
+                if max(raw_metrics[:2]) <= self.residual_warning_threshold_m
+                else f"ik_residual_high:{residual_text}"
             )
+            if not success:
+                message = "ik_solution_invalid_or_outside_joint_bounds"
             return ArmIkResult(
                 success=success,
                 q_ref=q_ref,
@@ -790,10 +705,6 @@ class UnitreeG1ArmNonlinearIK:
                 right_rotation_error_rad=right_rotation_error,
                 left_orientation_weight_scale=left_orientation_scale,
                 right_orientation_weight_scale=right_orientation_scale,
-                target_projected=target_projected,
-                postprocess_rate_limited=postprocessed.rate_limited,
-                postprocess_motion_scale=postprocessed.motion_scale,
-                postprocess_max_step_rad=postprocessed.max_command_step_rad,
             )
         except Exception as exc:
             return ArmIkResult(

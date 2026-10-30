@@ -3,15 +3,11 @@
 from __future__ import annotations
 
 import collections
-import logging
 import math
 
 import numpy as np
 
 from .lcm_protocol import RobotState
-
-LOG = logging.getLogger(__name__)
-
 
 JOINT_NAMES_URDF = [
     "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint",
@@ -169,7 +165,7 @@ def g1_wrist_ee_position(
     return (transform @ local)[:3].copy()
 
 
-_BRAINCO_HAND_BASE_ROTATION_FROM_WRIST = {
+_BRAINCO_REVO2_HAND_BASE_ROTATION_FROM_WRIST = {
     # MuJoCo g1_29dof_with_revo2.xml: wrist_yaw_link -> {side}_base_link.
     # Quaternions are wxyz. BrainCo's spread axis is base-local +Y.
     "left": np.array([
@@ -183,76 +179,37 @@ _BRAINCO_HAND_BASE_ROTATION_FROM_WRIST = {
         [0.0, 1.0, 0.0],
     ], dtype=np.float64),
 }
-_BRAINCO_HAND_BASE_TRANSLATION_FROM_WRIST = {
+_BRAINCO_REVO2_HAND_BASE_TRANSLATION_FROM_WRIST = {
     "left": np.array([0.0415, 0.0030, 0.0], dtype=np.float64),
     "right": np.array([0.0415, -0.0030, 0.0], dtype=np.float64),
 }
 
-# The wrist-to-base attachment is retained from the existing assembly model.
-# Its exact Dex1-1 verification remains a hardware/URDF preflight item.
-_DEX1_OFFSET_VERIFIED = False
-_DEX1_OFFSET_WARNING_EMITTED = False
-_DEX1_HAND_BASE_ROTATION_FROM_WRIST = {
-    "left": np.eye(3, dtype=np.float64),
-    "right": np.eye(3, dtype=np.float64),
-}
-_DEX1_HAND_BASE_TRANSLATION_FROM_WRIST = {
-    # Measured usable Dex1 grasp-base reference: +X is forward from the
-    # wrist-yaw axis, 45 mm in the plane normal to the yaw axis.
-    "left": np.array([0.0450, 0.0, 0.0], dtype=np.float64),
-    "right": np.array([0.0450, 0.0, 0.0], dtype=np.float64),
-}
+_BRAINCO_REVO2_GRASP_CENTER_LOCAL = np.array([0.0, 0.0, 0.060], dtype=np.float64)
 
-# The commanded Dex1 grasp point is the palm/hand-base centre.  Any physical
-# finger-extension or fingertip target must be an explicit, separately
-# calibrated task offset rather than a silent default in the hand profile.
-_BRAINCO_GRASP_CENTER_LOCAL = np.array([0.0, 0.0, 0.060], dtype=np.float64)
-_DEX1_GRASP_CENTER_LOCAL = np.zeros(3, dtype=np.float64)
-
-# The orientation relation is defined against this physical hand axis.  It is
-# deliberately exported so perception and the PATH bridge cannot silently use
-# different Dex1/BrainCo conventions.
-HAND_AXIS_LOCAL = {
-    "brainco": np.array([0.0, 1.0, 0.0], dtype=np.float64),
-    "dex1": np.array([0.0, 1.0, 0.0], dtype=np.float64),
-}
+# The Revo2 hand frame follows the BOOST MuJoCo attachment model. Confirm the
+# wrist attachment and grasp-center offset against the installed hardware before
+# enabling contact-guided commands on a physical G1.
+HAND_AXIS_LOCAL = {"brainco_revo2": np.array([0.0, 1.0, 0.0], dtype=np.float64)}
 
 _HAND_FRAME_PROFILES = {
-    "brainco": {
-        "rotation": _BRAINCO_HAND_BASE_ROTATION_FROM_WRIST,
-        "translation": _BRAINCO_HAND_BASE_TRANSLATION_FROM_WRIST,
-        "grasp_center_local": _BRAINCO_GRASP_CENTER_LOCAL,
-        "orientation_axis_local": HAND_AXIS_LOCAL["brainco"],
-        "approach_axis_local": HAND_AXIS_LOCAL["brainco"],
+    "brainco_revo2": {
+        "rotation": _BRAINCO_REVO2_HAND_BASE_ROTATION_FROM_WRIST,
+        "translation": _BRAINCO_REVO2_HAND_BASE_TRANSLATION_FROM_WRIST,
+        "grasp_center_local": _BRAINCO_REVO2_GRASP_CENTER_LOCAL,
+        "orientation_axis_local": HAND_AXIS_LOCAL["brainco_revo2"],
+        "approach_axis_local": HAND_AXIS_LOCAL["brainco_revo2"],
         "spread_axis_local": np.array([1.0, 0.0, 0.0], dtype=np.float64),
         "stagger_axis_local": np.array([0.0, 0.0, 1.0], dtype=np.float64),
-    },
-    "dex1": {
-        "rotation": _DEX1_HAND_BASE_ROTATION_FROM_WRIST,
-        "translation": _DEX1_HAND_BASE_TRANSLATION_FROM_WRIST,
-        "grasp_center_local": _DEX1_GRASP_CENTER_LOCAL,
-        # Dex1-1: +Y is finger extension; +/-X is the parallel-jaw spread.
-        "orientation_axis_local": HAND_AXIS_LOCAL["dex1"],
-        "approach_axis_local": np.array([0.0, 1.0, 0.0], dtype=np.float64),
-        "spread_axis_local": np.array([1.0, 0.0, 0.0], dtype=np.float64),
-        "stagger_axis_local": np.array([0.0, 0.0, 1.0], dtype=np.float64),
-        "jaw_stroke_m": 0.089,
-        "jaw_gap_open_m": 0.0951,
-        "jaw_gap_closed_m": 0.0061,
     },
 }
 
 
-def hand_frame_profile(hand_model: str = "dex1") -> dict[str, object]:
+def hand_frame_profile(hand_model: str = "brainco_revo2") -> dict[str, object]:
     """Return copies of the selected physical hand-frame convention."""
     model = str(hand_model).strip().lower()
     if model not in _HAND_FRAME_PROFILES:
         raise ValueError(f"unsupported hand model: {hand_model!r}")
     profile = _HAND_FRAME_PROFILES[model]
-    global _DEX1_OFFSET_WARNING_EMITTED
-    if model == "dex1" and not _DEX1_OFFSET_VERIFIED and not _DEX1_OFFSET_WARNING_EMITTED:
-        LOG.warning("Dex1 wrist/base offset is unverified; validate against the installed Dex1 URDF and hardware before tuning grasp offsets")
-        _DEX1_OFFSET_WARNING_EMITTED = True
     return {
         "name": model,
         "rotation": {side: value.copy() for side, value in profile["rotation"].items()},
@@ -265,14 +222,14 @@ def hand_frame_profile(hand_model: str = "dex1") -> dict[str, object]:
         "jaw_stroke_m": float(profile.get("jaw_stroke_m", 0.0)),
         "jaw_gap_open_m": float(profile.get("jaw_gap_open_m", 0.0)),
         "jaw_gap_closed_m": float(profile.get("jaw_gap_closed_m", 0.0)),
-        "offset_verified": bool(_DEX1_OFFSET_VERIFIED) if model == "dex1" else True,
+        "offset_verified": False,
     }
 
 
 def hand_rotation_from_wrist_rotation(
     wrist_rotation: np.ndarray,
     side: str,
-    hand_model: str = "dex1",
+    hand_model: str = "brainco_revo2",
 ) -> np.ndarray:
     """Apply the fixed wrist-to-hand-base mount rotation.
 
@@ -293,7 +250,7 @@ def grasp_center_from_wrist(
     wrist_position: np.ndarray,
     wrist_rotation: np.ndarray,
     side: str,
-    hand_model: str = "dex1",
+    hand_model: str = "brainco_revo2",
     grasp_center_local_m: np.ndarray | None = None,
 ) -> np.ndarray:
     """Convert a wrist-origin pose to the canonical grasp centre.
@@ -326,7 +283,7 @@ def _hand_profile_for_link(hand_model: str, target_link: str) -> tuple[str, dict
 def g1_hand_base_rotation(
     q: np.ndarray,
     target_link: str,
-    hand_model: str = "dex1",
+    hand_model: str = "brainco_revo2",
 ) -> np.ndarray:
     """Return pelvis<-selected-hand-base rotation from a wrist-yaw link."""
     side, profile = _hand_profile_for_link(hand_model, target_link)
@@ -340,7 +297,7 @@ def g1_hand_base_rotation(
 def g1_hand_base_transform(
     q: np.ndarray,
     target_link: str,
-    hand_model: str = "dex1",
+    hand_model: str = "brainco_revo2",
 ) -> np.ndarray:
     """Return the pelvis<-selected-hand-base transform from a wrist link."""
     side, profile = _hand_profile_for_link(hand_model, target_link)
@@ -355,7 +312,7 @@ def g1_grasp_center_position(
     q: np.ndarray,
     target_link: str = "left_wrist_yaw_link",
     grasp_center_local_m: np.ndarray | None = None,
-    hand_model: str = "dex1",
+    hand_model: str = "brainco_revo2",
 ) -> np.ndarray:
     """Return the pelvis-frame canonical grasp centre for the selected hand."""
     _, profile = _hand_profile_for_link(hand_model, target_link)
@@ -372,7 +329,7 @@ def g1_wrist_to_grasp_offset(
     q: np.ndarray,
     target_link: str,
     grasp_center_local_m: np.ndarray | None = None,
-    hand_model: str = "dex1",
+    hand_model: str = "brainco_revo2",
 ) -> np.ndarray:
     """Return the pelvis-frame canonical grasp-centre offset from the wrist."""
     wrist = g1_link_transforms(q).get(target_link)
@@ -417,8 +374,7 @@ def pelvis_to_world_rotation(
         return None
 
 
-BRAINCO_GRASP_CENTER_LOCAL = _BRAINCO_GRASP_CENTER_LOCAL.copy()
-DEX1_GRASP_CENTER_LOCAL = _DEX1_GRASP_CENTER_LOCAL.copy()
+BRAINCO_REVO2_GRASP_CENTER_LOCAL = _BRAINCO_REVO2_GRASP_CENTER_LOCAL.copy()
 HAND_BASE_ROTATION_FROM_WRIST = {
     name: {side: value.copy() for side, value in profile["rotation"].items()}
     for name, profile in _HAND_FRAME_PROFILES.items()

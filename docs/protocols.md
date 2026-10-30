@@ -9,7 +9,7 @@ little-endian, with packed layout `<IHHQq42f`:
 | ---: | --- | --- |
 | 0 | magic `PDU1` (`0x31554450`) | `uint32` |
 | 4 | version (`1`) | `uint16` |
-| 6 | flags: bit 1 closes left Dex1, bit 2 closes right Dex1 | `uint16` |
+| 6 | flags: bit 1 closes left, bit 2 closes right (MuJoCo compatibility adapter only) | `uint16` |
 | 8 | sequence | `uint64` |
 | 16 | PATH monotonic timestamp, microseconds | `int64` |
 | 24 | 14 arm positions, radians | `float32[14]` |
@@ -18,15 +18,14 @@ little-endian, with packed layout `<IHHQq42f`:
 
 Arm array order is G1 motor order 15-28: left shoulder pitch/roll/yaw,
 elbow, wrist roll/pitch/yaw, then the same seven right-arm joints. This packet
-contains no leg or waist command. A set grip bit means close; a clear bit means
-open. The G1 bridge routes changes to the corresponding Dex1 hand DDS topic.
-Grip commands are ignored in dry-run mode. Hand targets remain latched until a
-later packet changes the bit; bridge shutdown commands both hands open.
+contains no leg, waist, or hand joint command. A set grip bit means close; a
+clear bit means open. Only MuJoCo's optional binary Revo2 compatibility adapter
+uses these flags. The physical G1 SDK bridge ignores them; real Revo2 targets
+come from the continuous hand MPPI DDS publisher.
 
 The G1 bridge accepts this packet size, magic, version, defined flags, and
 finite joint values. A received-command timeout releases arm SDK ownership;
-the ported bridge's default timeout is 150 ms. The timeout does not change the
-latched hand target.
+the bridge's default timeout is 150 ms.
 
 ## G1 state: `G1_ROBOT_STATE`
 
@@ -59,40 +58,17 @@ follow Unitree's [G1 arm SDK DDS example](https://github.com/unitreerobotics/uni
 The bridge fills other fixed-width motor entries from measured state; HOMIE
 uses only the arm range and enable marker from this topic.
 
-## Dex1-1 service DDS
-
-The hand interface matches Unitree's [`dex1_1_service`](https://github.com/unitreerobotics/dex1_1_service):
-the service subscribes to `rt/dex1/left/cmd` and `rt/dex1/right/cmd`, and
-publishes `rt/dex1/left/state` and `rt/dex1/right/state`. Both sides use
-Unitree SDK2's `unitree_go::msg::dds_::MotorCmds_` and `MotorStates_` DDS types.
-Each topic carries one motor entry; motor ID 0 is right and ID 1 is left in the
-service's serial mapping.
-
-The PATH bridge subscribes to both state topics and publishes both command
-topics. Each command sets `mode=1`, position `q` in radians, zero `dq` and
-`tau`, `kp=5.0`, `kd=0.05`, and a zeroed reserve field, matching Unitree's
-official Dex1-1 test publisher. The bridge sends at 200 Hz with bounded
-position steps. Both `dex1_1_service` and `boost/io/g1_bridge` initialize Unitree DDS on
-domain 0; their selected network interfaces must share DDS traffic. Run the
-service on the computer connected to the grippers' serial cables. The bridge
-does not open the serial ports itself.
-
-These topics are separate from the body command path and do not change
-`rt/lowcmd` ownership. The service publishes state; the PATH bridge publishes
-commands. Grip flags from PATH select the targets sent to that service.
-
 The current local HOMIE merge forwards arm position, gains, and feed-forward
 torque but sends zero target velocity on `rt/lowcmd`; PATH's intermediate
 `dq` field is not consumed by that merge.
 
-## Revo2 hand service and hand-policy transport
+## BrainCo Revo2 service and hand-policy transport
 
-The PATH bridge's Dex1 topics do not control BrainCo Revo2. Revo2 uses
-Unitree's external `brainco_hand_service` over
+Revo2 uses Unitree's external [`brainco_hand_service`](https://github.com/unitreerobotics/brainco_hand_service) over
 `rt/brainco/{left,right}/cmd` and `rt/brainco/{left,right}/state`; each hand
 has six normalized values in `[0, 1]`, ordered Thumb, Thumb_aux, Index,
-Middle, Ring, Pinky. `boost/control/hand_mppi/` defines the shared Revo2 mapping
-and `BrainCoDDS` transport; the simulator and future hand policy use the same
-topics and IDL types. The external hand service is not vendored, and HOMIE
-continues to own `rt/lowcmd`. PATH's LCM arm packet carries only binary grip
-flags, so continuous hand targets travel directly over the BrainCo DDS topics.
+Middle, Ring, Pinky. `boost/control/hand_mppi/` defines the shared mapping and
+`BrainCoDDS` transport. On a physical G1, Thor publishes fresh retargeted
+targets directly to those DDS topics and receives the measured state. The G1
+service owns the hand serial links; the arm bridge does not publish hand DDS.
+The external service is not vendored. HOMIE continues to own `rt/lowcmd`.

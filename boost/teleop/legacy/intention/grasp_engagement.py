@@ -11,17 +11,17 @@ class GraspEngagementDetector:
     """Detect a completed grasp, with a command-delay fallback without jaw FK.
 
     A measured non-empty jaw gap must stall before it is considered a grasp.
-    The current bridge has no Dex1 jaw-state stream, so ``jaw_gap_m=None``
-    uses the nominal close travel delay instead and preserves the reach phase
-    while the fingers are closing.
+    The PATH belief bridge has no hand joint-state input, so
+    ``jaw_gap_m=None`` uses the configured close dwell instead and preserves
+    the reach phase while the hand is closing.
     """
 
     stall_gap_min_m: float = 0.008
     stall_rate_max_mps: float = 0.004
     engage_ticks: int = 5
     release_ticks: int = 3
-    # No measured Dex1 jaw state reaches the live bridge.  Keep belief
-    # position authority through a deliberate, continuous 1.5 s close hold
+    # No measured hand joint state reaches the live bridge. Keep belief
+    # position authority through a deliberate, continuous close hold
     # before handing position back to VR for transport.
     command_delay_sec: float = 1.5
     engaged: bool = False

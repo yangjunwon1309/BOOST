@@ -218,7 +218,12 @@ class ThorWristD405Gateway:
                  right_state_lookup_bias_ms: float = 0.0,
                  state_pairing_reference_range_m: float = 0.30,
                  camera_recovery_initial_delay_ms: float = 300.0,
-                 camera_recovery_max_delay_ms: float = 2000.0) -> None:
+                 camera_recovery_max_delay_ms: float = 2000.0,
+                 hand_surface_query_enabled: bool = False,
+                 hand_surface_query_endpoint: str = "tcp://127.0.0.1:5571",
+                 hand_surface_max_cloud_age_ms: float = 350.0,
+                 hand_surface_max_pairing_error_mm: float = 8.0,
+                 hand_surface_target_label: str = "") -> None:
         self.g1_bus = lcm.LCM(g1_lcm_url)
         self.wifi_bus = lcm.LCM(wifi_lcm_url)
         self.config = config
@@ -289,6 +294,16 @@ class ThorWristD405Gateway:
                 ee_target_duration_sec=ee_target_duration_sec,
                 ee_target_final_hold_sec=ee_target_final_hold_sec,
                 ee_target_quaternion_wxyz=ee_target_quaternion_wxyz,
+            )
+        self.hand_surface_query = None
+        if hand_surface_query_enabled:
+            from .wrist_surface_query_v11 import WristSurfaceQueryServer
+
+            self.hand_surface_query = WristSurfaceQueryServer(
+                endpoint=hand_surface_query_endpoint,
+                max_cloud_age_sec=float(hand_surface_max_cloud_age_ms) / 1000.0,
+                max_pairing_error_m=float(hand_surface_max_pairing_error_mm) / 1000.0,
+                target_label=hand_surface_target_label,
             )
 
     def _on_robot_state(self, _channel: str, data: bytes) -> None:
@@ -406,15 +421,28 @@ class ThorWristD405Gateway:
             self.capture = None
 
     def start(self, *, state_pairing: bool = True) -> None:
-        self._start_capture()
-        if state_pairing:
-            self._start_state_pump()
-        if self.belief is not None:
-            self.belief.start()
+        if self.hand_surface_query is not None:
+            self.hand_surface_query.start()
+        try:
+            self._start_capture()
+            if state_pairing:
+                self._start_state_pump()
+            if self.belief is not None:
+                self.belief.start()
+        except Exception:
+            if self.hand_surface_query is not None:
+                self.hand_surface_query.stop()
+            if self.belief is not None:
+                self.belief.stop()
+            self._stop_state_pump()
+            self._stop_capture()
+            raise
         LOG.info("direct D405 capture started for %s", sorted(self.capture.specs))
 
     def stop(self) -> None:
         self._stop_state_pump()
+        if self.hand_surface_query is not None:
+            self.hand_surface_query.stop()
         if self.belief is not None:
             self.belief.stop()
         self._stop_capture()
@@ -466,14 +494,21 @@ class ThorWristD405Gateway:
     def _on_result(self, _channel: str, data: bytes) -> None:
         try:
             result = unpack_result(data)
+            if self.hand_surface_query is not None:
+                self.hand_surface_query.update_result(result)
             objects = [obj for obj in result.get("objects", []) if isinstance(obj, dict)]
             valid_centers = sum(obj.get("center_goal_m") is not None for obj in objects)
             primitives = sum(bool(obj.get("surface_primitives")) for obj in objects)
+            surface_points = sum(
+                int((obj.get("surface_cloud") or {}).get("count", 0))
+                for obj in objects
+                if isinstance(obj.get("surface_cloud"), dict)
+            )
             geometry_status = dict(result.get("geometry_status") or {})
             LOG.info(
-                "v11 result sequence=%s objects=%s center_goal=%s primitives=%s "
+                "v11 result sequence=%s objects=%s center_goal=%s primitives=%s hand_surface_points=%s "
                 "seam_discarded=%s geometry_status=%s",
-                result.get("sequence"), len(objects), valid_centers, primitives,
+                result.get("sequence"), len(objects), valid_centers, primitives, surface_points,
                 result.get("discarded_seam_masks"), geometry_status,
             )
             if self.belief is not None:
@@ -736,6 +771,33 @@ def main() -> None:
                         help="match the legacy gateway's belief hand-input selection")
     parser.add_argument("--belief-command-max-delta-ms", type=float, default=25.0)
     parser.add_argument("--belief-command-divergence-max-m", type=float, default=0.20)
+    parser.add_argument(
+        "--hand-surface-query",
+        action="store_true",
+        help="serve opt-in SAM3/D405 surface queries to hand MPPI on Thor",
+    )
+    parser.add_argument(
+        "--hand-surface-query-endpoint",
+        default="tcp://127.0.0.1:5571",
+        help="Thor-local REP endpoint for the optional hand surface backend",
+    )
+    parser.add_argument(
+        "--hand-surface-max-cloud-age-ms",
+        type=float,
+        default=350.0,
+        help="reject cached perception surfaces older than this Thor-local age",
+    )
+    parser.add_argument(
+        "--hand-surface-max-pairing-error-mm",
+        type=float,
+        default=8.0,
+        help="reject SAM3 clouds with a larger camera/state pairing error estimate",
+    )
+    parser.add_argument(
+        "--hand-surface-target-label",
+        default="",
+        help="optional exact SAM3 label used to restrict hand contact queries",
+    )
     parser.add_argument("--shared-hand-selection-endpoint",
                         default=os.environ.get("PATH_SHARED_HAND_SELECTION_ENDPOINT", "tcp://127.0.0.1:5567"))
     parser.add_argument("--shared-hand-selection-topic",
@@ -836,6 +898,11 @@ def main() -> None:
         state_pairing_reference_range_m=args.state_pairing_reference_range_m,
         camera_recovery_initial_delay_ms=args.camera_recovery_initial_delay_ms,
         camera_recovery_max_delay_ms=args.camera_recovery_max_delay_ms,
+        hand_surface_query_enabled=args.hand_surface_query,
+        hand_surface_query_endpoint=args.hand_surface_query_endpoint,
+        hand_surface_max_cloud_age_ms=args.hand_surface_max_cloud_age_ms,
+        hand_surface_max_pairing_error_mm=args.hand_surface_max_pairing_error_mm,
+        hand_surface_target_label=args.hand_surface_target_label,
     )
     if args.diagnose:
         diagnose_runtime(_import_realsense())

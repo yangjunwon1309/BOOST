@@ -446,7 +446,7 @@ class ThorRemoteGateway:
         # Compatibility handle for callers that inspect a single selected hand.
         self.tasc_belief = self.parallel_tasc_belief.trackers["left"]
         self.belief_hand_model = str(
-            belief_config.get("hand_model", "dex1")
+            belief_config.get("hand_model", "brainco_revo2")
         ).strip().lower()
         self.belief_hand_profile = hand_frame_profile(self.belief_hand_model)
         self.belief_grasp_center_local_m = np.asarray(

@@ -100,7 +100,9 @@ class LcmActionSource final : public ActionSource {
 
     g1_path::UpperCommandPacket packet{};
     std::memcpy(&packet, buffer->data, sizeof(packet));
-    constexpr uint16_t kPathGripFlags =
+    // Retain the known wire bits for PATH/simulator compatibility. The
+    // physical G1 arm bridge intentionally does not route them to a hand.
+    constexpr uint16_t kKnownGripFlags =
         g1_path::kFlagLeftGrip | g1_path::kFlagRightGrip;
     const auto finite_arm = [](const auto& values) {
       for (const float value : values) {
@@ -110,7 +112,7 @@ class LcmActionSource final : public ActionSource {
     };
     if (packet.magic != g1_path::kUpperCommandMagic ||
         packet.version != g1_path::kUpperCommandVersion ||
-        (packet.flags & ~kPathGripFlags) != 0 || !finite_arm(packet.q_arm) ||
+        (packet.flags & ~kKnownGripFlags) != 0 || !finite_arm(packet.q_arm) ||
         !finite_arm(packet.dq_arm) || !finite_arm(packet.tau_arm)) {
       ReportBadPacket("invalid PATH arm packet header, flags, or joint values");
       return;
@@ -123,8 +125,6 @@ class LcmActionSource final : public ActionSource {
       command.dq_target[motor] = packet.dq_arm[i];
       command.tau_ff[motor] = packet.tau_arm[i];
     }
-    command.left_grip = (packet.flags & g1_path::kFlagLeftGrip) != 0;
-    command.right_grip = (packet.flags & g1_path::kFlagRightGrip) != 0;
     command.sequence = packet.sequence;
     command.received_at = std::chrono::steady_clock::now();
 

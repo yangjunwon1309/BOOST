@@ -173,11 +173,12 @@ def test_wrist_ipopt_visual_round_trip() -> None:
     }
 
 
-def test_dex1_canonical_grasp_center_is_hand_base_origin() -> None:
-    profile = hand_frame_profile("dex1")
-    np.testing.assert_allclose(profile["grasp_center_local"], [0.0, 0.0, 0.0])
-    np.testing.assert_allclose(profile["translation"]["left"], [0.045, 0.0, 0.0])
-    np.testing.assert_allclose(profile["translation"]["right"], [0.045, 0.0, 0.0])
+def test_revo2_grasp_center_uses_the_revo2_attachment_profile() -> None:
+    profile = hand_frame_profile("brainco_revo2")
+    np.testing.assert_allclose(profile["grasp_center_local"], [0.0, 0.0, 0.060])
+    np.testing.assert_allclose(profile["translation"]["left"], [0.0415, 0.003, 0.0])
+    np.testing.assert_allclose(profile["translation"]["right"], [0.0415, -0.003, 0.0])
+    assert profile["offset_verified"] is False
 
 
 def test_ipopt_marker_is_belief_tinted_only_when_belief_position_is_applied() -> None:

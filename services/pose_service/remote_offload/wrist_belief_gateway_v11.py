@@ -146,7 +146,7 @@ class WristBeliefGateway(ThorRemoteGateway):
         self.tasc_belief = self.parallel_tasc_belief.trackers["left"]
         self.belief_update_hz = max(0.1, float(belief_config.get("belief_update_hz", 30.0)))
         self.geometry_update_hz = max(0.1, float(belief_config.get("geometry_update_hz", 8.0)))
-        self.belief_hand_model = str(belief_config.get("hand_model", "dex1")).strip().lower()
+        self.belief_hand_model = str(belief_config.get("hand_model", "brainco_revo2")).strip().lower()
         self.belief_hand_profile = hand_frame_profile(self.belief_hand_model)
         self.belief_grasp_center_local_m = np.asarray(
             belief_config.get("grasp_center_local_m", self.belief_hand_profile["grasp_center_local"]),

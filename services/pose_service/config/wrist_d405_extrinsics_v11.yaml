@@ -2,7 +2,7 @@
 #
 # p_wrist = T_wrist_camera @ p_camera
 #
-# CAD initial estimate from the assembled Dex1 holder:
+# CAD initial estimate from the assembled G1 wrist camera bracket:
 # - wrist-yaw origin: center of the two-ring hull, (0, 0, 0) mm;
 # - camera optical-center approximation: midpoint of the symmetric camera
 #   mount screw pair, (0, -70.878, -11.106) mm;
@@ -13,7 +13,7 @@
 # This applies the same upright printed-holder orientation on each side. These
 # CAD-derived transforms are accepted for the current installation. Verify the
 # camera serial-to-side assignment and recheck the transforms if a mount changes.
-extrinsics_source: CAD_APPROXIMATE_G1_DEX1_D405_HOLDER_2026_08_20
+extrinsics_source: CAD_APPROXIMATE_G1_WRIST_D405_BRACKET_2026_08_20
 calibration_status: provisional_cad_only
 translation_uncertainty_m: 0.025
 orientation_uncertainty_deg: 10.0

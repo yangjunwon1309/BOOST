@@ -215,8 +215,8 @@ def test_belief_csv_records_fk_timing_and_all_object_grip_features(tmp_path):
             "belief_robot_state_timestamp_us": 1_100_000,
             "belief_robot_q": list(range(29)),
             "belief_base_quat_wxyz": [1.0, 0.0, 0.0, 0.0],
-            "belief_hand_model": "dex1",
-            "belief_grasp_center_local_m": [0.0, 0.1, 0.0],
+            "belief_hand_model": "brainco_revo2",
+            "belief_grasp_center_local_m": [0.0, 0.0, 0.06],
             "image_width": 640,
             "image_height": 360,
             "remote_objects": [

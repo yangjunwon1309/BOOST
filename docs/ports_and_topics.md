@@ -19,8 +19,8 @@ topics are local SDK channels and do not use the ZMQ TCP ports below.
 | Unitree DDS | G1 -> bridge | `rt/lowstate` | Measured G1 state |
 | Unitree DDS | G1 bridge -> local HOMIE | `rt/arm_sdk` | PATH arm targets and SDK gains/torque |
 | Unitree DDS | Local HOMIE -> G1 | `rt/lowcmd` | Final combined 29-DoF command |
-| Unitree DDS | G1 bridge -> Unitree `dex1_1_service` | `rt/dex1/{left,right}/cmd` (`MotorCmds_`) | One position command per hand |
-| Unitree DDS | Unitree `dex1_1_service` -> G1 bridge | `rt/dex1/{left,right}/state` (`MotorStates_`) | Measured hand state and response monitoring |
+| Unitree DDS | Thor hand MPPI -> G1 BrainCo service | `rt/brainco/{left,right}/cmd` (`MotorCmds_`) | Six normalized Revo2 target positions per hand |
+| Unitree DDS | G1 BrainCo service -> Thor hand MPPI | `rt/brainco/{left,right}/state` (`MotorStates_`) | Six measured Revo2 positions per hand |
 
 TCP ports 5556-5559 and the `G1_PATH_MOTOR_COMMAND` full-body LCM packet are
 not used by this deployment. Do not allocate them to PATH processes.

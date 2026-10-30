@@ -7,9 +7,10 @@ and staged implementation plan are in [`BOOST_dev_plan.md`](BOOST_dev_plan.md).
 The current source is a reorganized PATH-G1 starting point. The teleop state
 machine, XR streams, arm IK, G1 bridge, and wrist perception service have been
 moved into the subsystem layout below. The local Revo2 MuJoCo path supports
-binary grip commands and continuous landmark retargeting. Physical Revo2
-service validation, FoundationPose, object-aware MPPI, and the episode schema
-remain future work.
+binary grip commands and continuous landmark retargeting. The real G1 plan
+keeps HOMIE as the only 29-DoF body command writer and routes Revo2 through its
+separate BrainCo service. Hardware preflight, FoundationPose, object-aware
+MPPI, and the episode schema remain future work.
 
 Git workflow: `main` is the README-only landing branch; ongoing development is
 on `deploy`. See [`docs/git_workflow.md`](docs/git_workflow.md) and
@@ -21,15 +22,14 @@ on `deploy`. See [`docs/git_workflow.md`](docs/git_workflow.md) and
   intention code. Its source pin and move map are in
   [`boost/teleop/UPSTREAM.md`](boost/teleop/UPSTREAM.md).
 - `boost/io/path_transport/`: the PATH LCM protocol and ZMQ transport layer.
-- `boost/io/revo2_hand_service/`: the planned adapter contract for the external
+- `boost/io/revo2_hand_service/`: the adapter contract for the external
   BrainCo hand service; its driver source is not vendored.
 - `boost/control/hand_mppi/`: the shared BrainCo DDS mapping, official Revo2
   MJCF adapter, and Televuer/override landmark retargeter, with
   `mimic_retargeter_lab` pinned as a submodule.
 - `boost/control/arm/`: PATH-derived nonlinear G1 arm IK.
-- `boost/io/g1_bridge/`: PATH-derived Unitree arm and Dex1 bridge. It still
-  speaks the old Dex1 interface; Revo2 uses the separate
-  `unitreerobotics/brainco_hand_service` DDS interface and needs a new adapter.
+- `boost/io/g1_bridge/`: Unitree SDK2 arm bridge. It does not command the
+  external hands; Revo2 targets use the BrainCo DDS service and hand MPPI.
 - `services/pose_service/`: the moved PATH wrist RGB-D/SAM3 service. It
   currently publishes surface and target data; FoundationPose pose estimation
   is planned work.
@@ -53,10 +53,10 @@ bash scripts/run_state_machine_bridge.sh
 ```
 
 Use `bash scripts/run_galaxy_xr_manager.sh` for the Galaxy XR input route.
-These entry points retain the current PATH packet and controller behavior;
-they do not send Revo2 hand commands. The service deployment notes are in
-[`docs/deployment.md`](docs/deployment.md). The separate G1/Dex1 installation
-document is retained as a PATH reference, not a BOOST Revo2 runbook.
+These entry points retain the current PATH arm-control behavior. Revo2 hand
+targets are sent by the separate hand MPPI publisher. The physical deployment
+split and ordered bring-up are in
+[`docs/g1_installation.md`](docs/g1_installation.md).
 
 ## Local MuJoCo desktop
 
@@ -92,3 +92,14 @@ SDK source directories. If this shell cannot find Pixi, use
 `$HOME/.pixi/bin/pixi` or add `$HOME/.pixi/bin` to `PATH`.
 The Galaxy XR URL, stack shutdown, and port cleanup steps are in the
 [`MuJoCo + Galaxy XR runbook`](docs/mujoco_galaxy_xr_runbook.md).
+
+## Real G1 Thor runtime
+
+Thor uses separate ARM64 `thor-teleop` (Televuer/PATH, NumPy 1) and `thor`
+(hand MPPI, JAX CUDA 13/NumPy 2) Pixi environments because those dependencies
+require different NumPy majors. On Jetson Thor, install both with
+`pixi install -e thor-teleop && pixi install -e thor`, then run their
+`verify-thor-teleop` and `verify-thor` tasks. They are separate from the x86
+desktop `hand` environment; see
+[`docs/g1_installation.md`](docs/g1_installation.md) for the physical bring-up
+sequence.

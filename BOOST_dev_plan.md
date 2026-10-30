@@ -165,46 +165,24 @@ class HandSpec(Protocol):
 
 ## 4. 환경 (pixi)
 
-환경은 **core, vla, pose** 세 개이며, 하나의 `pixi.toml`에 feature로 정의하고 `pixi.lock` 하나로 고정한다. pixi는 환경마다 따로 의존성을 풀기 때문에 서로 다른 torch/CUDA 버전이 공존할 수 있다.
+기본 호스트, MuJoCo, 데스크톱 hand-MPPI, Jetson Thor teleop을 하나의 `pixi.toml` feature/environment로 나누고 `pixi.lock` 하나로 고정한다. 환경별로 의존성을 풀어 CUDA/JAX 버전과 Python을 분리한다.
 
 ```toml
 [workspace]
 name = "boost"
-channels = ["conda-forge", "nvidia"]
-platforms = ["linux-64"]          # linux-aarch64(Thor)는 6.x절 TBD 참고
+platforms = ["linux-64", "linux-aarch64"]
 
-[system-requirements]
-cuda = "12"
-
-[feature.core.dependencies]
-python = "3.11.*"
-numpy = "*"
-# torch, mujoco, zarr, hydra-core, scipy ...
-
-[feature.core.pypi-dependencies]
-boost = { path = ".", editable = true }
-
-[feature.vla.dependencies]
-python = "3.10.*"                 # GR00T 요구 버전에 맞춤 (확인 필요)
-
-[feature.vla.pypi-dependencies]
-gr00t = { path = "third_party/Isaac-GR00T", editable = true }
-
-[feature.pose.dependencies]
-python = "3.10.*"                 # FoundationPose 요구 버전에 맞춤 (확인 필요)
-
-[feature.pose.tasks]
-build-foundationpose = "bash services/pose_service/build_ext.sh"
-
-[environments]
-core = ["core"]
-vla  = ["vla"]
-pose = ["pose"]
+[feature.thor]
+platforms = ["linux-aarch64"]
+# Python 3.12, CUDA 13 JAX wheel, no desktop Torch dependency.
 ```
 
-- 실행 예: `pixi run -e core python scripts/teleop_sim.py`, `pixi run -e pose python -m services.pose_service`
+- 현재 environment 이름과 정확한 패키지 pin은 `pixi.toml`을 기준으로 한다: `default`, `sim`, `hand`, `thor-teleop`, `thor`.
+- Thor 설치 및 CUDA 초기화: `pixi install -e thor-teleop && pixi install -e thor`; `pixi run -e thor-teleop verify-thor-teleop`와 `pixi run -e thor verify-thor`. 실제 CUDA 실행 여부는 Thor의 JetPack/driver 위에서 확인해야 한다.
 - `pixi.lock`은 반드시 커밋한다.
-- **Thor(linux-aarch64) 배포 위험**: Jetson 계열의 GPU용 torch는 JetPack 전용 빌드라 conda-forge/PyPI로 해결되지 않을 수 있다. Thor에서 돌릴 서비스(pose, vla)는 NVIDIA 컨테이너 사용을 대안으로 둔다. 현재는 x86 + RTX 3080 기준으로 개발한다.
+- 데스크톱 `hand`는 x86_64/CUDA 12와 NumPy 1.26.4를 사용한다. Thor `thor`는 ARM64/CUDA 13 JAX와 NumPy 2를 별도로 해결하며 PyTorch/GeoRT 추론 스택은 설치하지 않는다.
+- JetPack 7 계열 Thor CUDA 13 호환성은 JAX wheel과 device driver 조합으로 확인한다. Pixi lock은 의존성 호환성을 고정하지만 JetPack driver를 설치하거나 실제 Thor GPU 동작을 증명하지 않는다.
+- `pose`, `vla` 환경은 각각 Stage 1의 원격 SAM3/FoundationPose와 Stage 3의 GR00T 작업에서 별도 dependency feature로 추가한다. 현재 실물 teleop 환경과 혼합하지 않는다.
 
 ---
 
@@ -266,6 +244,13 @@ pose = ["pose"]
 | 물체 표면 (point cloud / SDF) | SAM3 마스크 + depth 표면 피팅 (**PATH 기존 그대로**) | world(pelvis) | 손 MPPI 목표 생성(손끝을 표면으로 투영) |
 | 물체 6D pose $\hat T_o$ | FoundationPose (**신규**), SAM3 마스크로 초기화 | canonical 물체 좌표계 → pelvis | 그래프 상태, 해석적 손목 보정. **teleop 제어 루프에는 쓰지 않고 녹화만** |
 
+실물 hand-contact 경로는 D405 direct-left-imager RGB와 Z16 depth의 native grid를
+사용한다. 현재 입력에서는 depth-to-color resampling을 하지 않고, 동일 크기와
+intrinsics를 확인한 뒤 마스크 depth를 카메라→wrist→pelvis로 변환한다. SAM3
+point-cloud export, Thor query server, hand MPPI client는 연결돼 있지만
+config/launch opt-in이며 기본은 꺼져 있다. 실물 serial/extrinsics 및 Televuer
+wrist-to-hand frame 검증 전에는 켜지 않는다.
+
 - FoundationPose 메쉬: 박스는 실측 치수로 CAD, 마우스는 스캔 또는 SAM 3D로 1회 생성. canonical frame 정의와 대칭군을 `configs/tasks/packaging.yaml`에 기록.
 - 실행 방식: **pose 추정(estimation)은 에피소드 시작과 tracking 실패 시에만**, 이후 프레임은 **tracking**. 물체당 tracker 하나 (박스, 마우스).
 - 손에 가려지는 구간 대비: tracking 신뢰도가 낮아지면 SAM3 마스크로 재초기화. 물체가 손에 쥐어진 뒤에는 "파지 순간의 손-물체 상대 pose 유지" 가정으로 손 FK에서 물체 pose를 전파하는 fallback을 둔다.
@@ -280,7 +265,7 @@ pose = ["pose"]
 - 목표 생성(제어 주기당 1회): 사람 손끝 $\tilde x_i$의 표면 부호 거리 $d_i$, 최근접점 $s_i$, 법선 $n_i$를 구하고, hysteresis 활성화 $\alpha_i$로 $p^*_i = \tilde x_i - \alpha_i(d_i+\varepsilon)n_i$ (표면 안쪽 $\varepsilon$, 파지력 설정값).
 - 샘플당 비용: $J(q) = \sum_i w_i\rho_\beta({}^{w}p_i(q) - {}^{w}p^*_i) + w_{th}\sum_{i\ge2}\rho_\beta(v_{1i}(q) - v^*_{1i}) + w_v\lVert q-q_{\text{prev}}\rVert^2$, 한 시점 문제($H_m=1$).
 - 이전 초안의 물체 좌표계 keypoint 항, squeeze 항, 샘플별 SDF 침투 항은 **삭제**. teleop에서 물체 좌표계 정합은 강체 변환 불변성 때문에 의미가 없다 (상세 문서 2.5절). 침투가 관찰되면 접평면 hinge만 선택적으로 켠다.
-- 표면 질의는 `SurfaceQuery` 인터페이스 뒤에 둔다. **sim: `mj_geomDistance` + probe (MuJoCo 충돌 기하와 정확히 일치, 실측 검증 완료)**, 실물: SAM3 점군 또는 메쉬 SDF + FoundationPose.
+- 표면 질의는 `SurfaceQuery` 인터페이스 뒤에 둔다. **sim: `mj_geomDistance` + probe (MuJoCo 충돌 기하와 정확히 일치, 실측 검증 완료)**. 실물 SAM3/D405 점군 경로는 연결했으며, 최근접점 + 카메라 방향 PCA 법선의 local signed-distance 근사를 사용한다. 부분 시야라 watertight/global voxel SDF는 아니다. 실물 설정은 카메라 serial, extrinsics, RGB/depth grid, Televuer wrist-to-hand frame 검증이 끝날 때까지 `enabled: false`로 유지한다.
 - 이전의 목표 모드 A/B 구분과 PATH 접촉점 추론 경로는 **이 투영 방식 하나로 통합**한다.
 - **사람 원본 keypoint, 투영 목표, MPPI 출력 $q$, 실행된 $q$를 모두 녹화**한다 (7.3절).
 
@@ -309,6 +294,13 @@ pose = ["pose"]
 - 실물 teleop 확인 후 **pose 정확도를 fiducial로 1회 측정** (fiducial은 정책 카메라에 보이지 않는 위치에 부착하거나 평가 전용 에피소드에서만 사용).
 - 시연 30개: 물체 pose를 학습 영역 $\mathcal R_{\text{train}}$ 안에서 분산 배치. 각 물체 pose는 7.4절 메타데이터에 기록.
 - pilot용 **학습 영역 밖 pose 목록**도 이때 정의해 둔다.
+
+#### 6.1.7 실물 G1/Thor teleop 배포 순서
+
+- Thor에서 Galaxy XR/Televuer와 PATH arm IK, Revo2 hand MPPI를 실행한다. Televuer의 fresh wrist pose는 추가 reference/smoother 없이 PATH IK 입력으로 사용하고, fresh retarget 결과는 Revo2의 공식 관절 범위만 적용해 BrainCo DDS로 보낸다.
+- G1 내부 Orin에서 HOMIE/WBC가 `rt/lowcmd`의 유일한 writer로 동작한다. BOOST Unitree SDK2 bridge는 PATH의 14 arm target을 `rt/arm_sdk`로 전달하며, HOMIE가 그 arm target을 body command에 병합한다. 별도의 BrainCo hand service는 Revo2의 serial interface와 `rt/brainco/{left,right}/{cmd,state}`를 맡는다.
+- 유효성·finite 값·joint 범위와 timestamp age만 검사한다. Fresh target에는 moving average, interpolation, output rate clamp, 목표 projection을 적용하지 않는다. Stale/invalid stream에서는 새 명령 발행을 멈추고 수신기 watchdog으로 전환한다.
+- 하드웨어 수용 기준: HOMIE 단독 `rt/lowcmd` 확인, G1 bridge dry-run 상태/packet 확인, 손 service state 양쪽 확인, 각 target sequence/age 기록, 이후 팔/손을 개별 live enable. 이 순서를 완료하기 전까지 Thor/G1 물리 실시간 성능은 미검증으로 표시한다.
 
 ### 6.2 Stage 2: graph (오프라인, 로봇 불필요)
 
@@ -554,10 +546,10 @@ pose = ["pose"]
 |---|---|
 | PATH 전송 계층 방식 (ZMQ 등) 확인 및 메시지 스키마 확정 | Stage 1 첫 주 |
 | 손 MPPI 투영 파라미터 $\varepsilon$, $d_{\text{on}}/d_{\text{off}}$ 기본값 | `teleop-sim-v0.1` |
-| 실물 표면 backend: SAM3 점군 vs 메쉬 SDF + FoundationPose | 실물 이전 시 (sim에서 `mj_geom` 대비 오차 측정 후) |
+| 실물 표면 표현: 현재 SAM3 점군 local-SDF 근사에서 global voxel/mesh SDF가 필요한지 | 카메라 calibration 후 부분 시야 오차와 latency 측정 |
 | 손 행동 라벨: `q_cmd` vs `q_goal` | Stage 5 시작 전 (둘 다 녹화하므로 지연 가능) |
 | keyframe 간격 $n$, chunk 길이 $H$ | Stage 2 |
 | BrainCo 전류·힘 센서 제공 범위 | Stage 1 |
 | 머리 카메라 외에 손목 카메라 사용 여부 | Stage 1 (사용 시 7.3절에 그룹 추가) |
-| Thor(aarch64) 배포 경로 (pixi vs NVIDIA 컨테이너) | Stage 3 |
+| Thor에서 Pixi CUDA 13 JAX 설치 및 실시간 성능 실측 | 실물 G1 commissioning 전 |
 | 마우스 메쉬 획득 방법 (스캔 vs SAM 3D) | Stage 1 |

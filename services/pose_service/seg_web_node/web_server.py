@@ -616,7 +616,7 @@ class SegmentationRuntime:
         self.belief_overlay_normals = bool(target_config.get("overlay_normals", True))
         self.tasc_gravity_warned = False
         self.tasc_hand_model = str(
-            belief_config.get("hand_model", "dex1")
+            belief_config.get("hand_model", "brainco_revo2")
         ).strip().lower()
         self.tasc_hand_profile = hand_frame_profile(self.tasc_hand_model)
         # Perception and control must share one physical hand-axis convention.

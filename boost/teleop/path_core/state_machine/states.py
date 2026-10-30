@@ -7,5 +7,4 @@ class PathState(str, Enum):
     TELEOP = "teleop"
     INTENTION = "intention"
     AUTO_PLANNING = "auto_planning"
-    DAMPED_RETURN = "damped_return"
 

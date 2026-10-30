@@ -59,6 +59,39 @@ selected JSON file while active, so it can be changed to exercise different hand
 poses. The procedure and fillable record are in
 [`docs/test_logs/mujoco_homie_hand_mppi.md`](../../docs/test_logs/mujoco_homie_hand_mppi.md).
 
+To stream a synthetic two-hand fist/open cycle through the same hand MPPI
+runner, use the dedicated task:
+
+```bash
+pixi run -e sim mujoco-hand-motion-test
+```
+
+It repeats at 30 Hz: fist hold 1 s → linear open transition 1.5 s → open hold
+1 s → linear close transition 1.5 s. The streamer interpolates both 25×3
+landmark arrays and atomically replaces a temporary JSON file; the two source
+templates remain unchanged. To run the generator by itself for a finite number
+of cycles, use:
+
+```bash
+pixi run -e sim python scripts/stream_mujoco_hand_motion.py \
+  --output /tmp/boost_hand_motion.json --cycles 1
+```
+
+The motion test uses the normal Revo2 hand retargeter and publishes each fresh
+six-joint result directly after enforcing model joint limits. Retargeting still
+maps the generated landmarks through the iCEM objective. It starts only the
+local MuJoCo simulation, HOMIE's stand policy at
+zero velocity, and hand MPPI on DDS `lo`, domain 0. MuJoCo holds its initial
+pose for five seconds and until HOMIE is publishing body commands; no PATH arm
+target is started, so HOMIE holds its configured arm pose without subscribing
+to `rt/arm_sdk`. It does not start XR, Televuer, PATH, surface queries, or a
+physical-robot publisher. `--motion` cannot be combined with `--override-file`;
+use `mujoco-hand-test --override-file PATH` for a static editable pose. Ctrl+C
+stops the streamer and other child processes and removes the temporary JSON
+directory. See
+[`docs/test_logs/mujoco_hand_motion_test.md`](../../docs/test_logs/mujoco_hand_motion_test.md)
+for the motion-test checks.
+
 With the viewer focused, W/S set forward/backward velocity, A/D set left/right,
 and Q/R set left/right yaw. O/P lower/raise a shared speed scale from 20% to
 100% in 10% steps. Direction inputs stay active until the opposite direction
@@ -96,8 +129,9 @@ flowchart LR
 HOMIE is the sole `rt/lowcmd` writer: it combines its leg/waist policy output
 with PATH's 14 arm targets and gains. MuJoCo applies
 `tau + kp * (q_des - q) + kd * (dq_des - dq)` to the 29 body actuators and
-publishes simulated state back to DDS. PATH's existing adapter maps binary
-left/right grip flags to the six normalized BrainCo command channels. The
+publishes simulated state back to DDS. The simulator-only compatibility
+adapter maps binary left/right grip flags to the six normalized BrainCo command
+channels. The
 `boost/control/hand_mppi` runner consumes either Televuer's 25 landmarks from
 the existing `vr_pose_debug` ZMQ message or an editable local JSON pose, runs
 Mimic's sampling-based retargeter against BrainCo's official Revo2 hand model,

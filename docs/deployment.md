@@ -1,44 +1,44 @@
 # Deployment layout
 
-BOOST keeps controller, robot I/O, and perception services in separate
-packages. The current runtime pieces were carried over from PATH-G1; this
-deployment map records where they live after the repository reorganization.
+The real G1 teleoperation target keeps fast operator and optimization work on
+Thor and keeps whole-body stabilization local to the robot.
 
-- `boost/teleop/`: XR managers, PATH state machine, teleop messages, and
-  isolated legacy intention modules.
-- `boost/io/path_transport/`: PATH LCM packets and ZMQ transport helpers.
-- `boost/control/arm/path_planning/`: nonlinear bimanual G1 arm IK.
-- `boost/io/g1_bridge/`: Unitree arm SDK and legacy Dex1 hand bridge.
-- `services/pose_service/`: wrist D405 capture, remote SAM3, surface geometry,
-  and the existing target publisher.
-- `external/homie_g1_29dof/`: local HOMIE/WBC deployment snapshot. It remains
-  the sole `rt/lowcmd` writer; BOOST's G1 bridge ends at `rt/arm_sdk`.
-- `assets/robot/`: G1 model and BrainCo Revo2 model assets.
+- `boost/teleop/` and `boost/control/arm/`: Televuer/PATH input handling and
+  G1 arm IK on Thor.
+- `boost/control/hand_mppi/`: JAX/MJX sampling retargeter and Revo2 DDS adapter
+  on Thor.
+- `boost/io/g1_bridge/`: C++ Unitree SDK2 arm bridge on G1. It ends at
+  `rt/arm_sdk` and publishes robot state for Thor.
+- `boost/io/revo2_hand_service/`: contract for Unitree's external
+  `brainco_hand_service`, which owns the Revo2 USB-serial devices on G1.
+- `external/homie_g1_29dof/`: local HOMIE/WBC deployment. It is the only
+  `rt/lowcmd` writer and merges body policy with the 14 G1 arm targets.
+- `boost/sim/`: local MuJoCo/HOMIE/Revo2 test stack; it is isolated from the
+  physical robot by its loopback DDS and LCM configuration.
 
-## Current runtime boundary
+## Real G1 command boundary
 
-The G1 bridge and its protocol still use PATH's 14-joint arm packet and Dex1
-open/close flags. They are not a Revo2 driver. The Revo2 service uses separate
-left/right six-joint command and state topics; BOOST's adapter is future work.
-Likewise, the current wrist service is SAM3/surface based. FoundationPose,
-BOOST's pose schema, recording pipeline, and object-aware MPPI remain planned
-in [`../BOOST_dev_plan.md`](../BOOST_dev_plan.md).
+Thor sends arm-only LCM packets to the SDK2 bridge on G1. The bridge maps the
+14 arm joints to `rt/arm_sdk`; HOMIE consumes them while it controls the legs
+and waist and publishes the final 29-DoF body command to `rt/lowcmd`.
 
-## Existing PATH launch sequence
+Revo2 is not part of that 29-motor body command. Thor's hand runner publishes
+the two six-joint Revo2 targets directly to the BrainCo DDS command topics. The
+G1 `brainco_hand_service` converts those topics to USB-serial commands and
+publishes measured hand state back to Thor. Both DDS endpoints must use the
+same domain and a network interface that can exchange traffic.
 
-The current PATH-derived XR and state-machine processes can be launched from
-the BOOST repository root:
+The desktop CUDA 12 hand environment remains available for simulation and
+development. `pixi.toml` defines a separate `thor` ARM64 environment using JAX
+CUDA 13 for JetPack 7. The lock can be generated on the desktop; install that
+environment on Thor itself so Pixi selects ARM64 packages and the device's
+runtime libraries. Bring-up order, commands, and preflight checks are in
+[`g1_installation.md`](g1_installation.md).
 
-1. Start the G1 bridge in dry-run mode on G1 with
-   `boost/io/g1_bridge/run.sh`, then confirm the `G1_ROBOT_STATE` stream.
-2. Start `scripts/run_pico_manager.sh` or
-   `scripts/run_galaxy_xr_manager.sh` for the selected XR input.
-3. Start `scripts/run_state_machine_bridge.sh` for the PATH teleop bridge.
-4. Start the wrist capture and remote SAM3 processes from
-   `services/pose_service/` when checking the existing perception pipeline.
-5. Run the local HOMIE/WBC separately as the only `rt/lowcmd` publisher.
+## Current limits
 
-The existing Dex1 live route requires Unitree's `dex1_1_service` and must not
-be treated as the Revo2 route. The old PATH/Dex1 installation details remain in
-[`g1_installation.md`](g1_installation.md); the interface contracts are in
-[`protocols.md`](protocols.md) and [`control_ownership.md`](control_ownership.md).
+The PATH arm bridge and Revo2 hand service use independent command paths and
+independent watchdogs. A single HOMIE process does not command the six external
+Revo2 actuators. The system still needs an on-robot hardware preflight for DDS
+interface selection, service behavior, wrist attachment calibration, and
+command loss behavior before physical teleoperation.

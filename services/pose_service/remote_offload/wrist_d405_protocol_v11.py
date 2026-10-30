@@ -149,6 +149,35 @@ def unpack_mask(data: bytes, *, width: int, height: int) -> np.ndarray:
     return np.unpackbits(np.frombuffer(raw, dtype=np.uint8), bitorder="little")[:expected_bits].reshape(height, width).astype(bool)
 
 
+def pack_surface_points(points_goal_m: np.ndarray, *, max_points: int = 1024) -> tuple[bytes, int]:
+    """Bound and compress one pelvis-frame surface cloud for the wrist result."""
+    points = np.asarray(points_goal_m, dtype=np.float32).reshape(-1, 3)
+    if points.shape[0] == 0 or not np.isfinite(points).all():
+        raise ValueError("surface cloud must contain finite XYZ points")
+    limit = max(1, min(int(max_points), 2048))
+    if len(points) > limit:
+        # Evenly spaced deterministic decimation preserves support across the
+        # whole masked object without adding an Open3D dependency to the worker.
+        indices = np.linspace(0, len(points) - 1, num=limit, dtype=np.int64)
+        points = points[indices]
+    return zlib.compress(points.astype("<f4", copy=False).tobytes(order="C"), level=1), len(points)
+
+
+def unpack_surface_points(data: bytes, *, count: int) -> np.ndarray:
+    """Decode a bounded little-endian float32 XYZ surface cloud."""
+    count = int(count)
+    if not 1 <= count <= 2048:
+        raise ValueError("surface cloud point count must be within [1, 2048]")
+    expected = count * 3 * 4
+    raw = zlib.decompress(data, bufsize=expected)
+    if len(raw) != expected:
+        raise ValueError("surface cloud has an invalid compressed length")
+    points = np.frombuffer(raw, dtype="<f4").reshape(count, 3).copy()
+    if not np.isfinite(points).all():
+        raise ValueError("surface cloud contains non-finite coordinates")
+    return points
+
+
 def _validate_intrinsics(value: Any, *, width: int, height: int) -> dict[str, float | int]:
     if not isinstance(value, dict):
         raise ValueError("D405 frame is missing intrinsics")

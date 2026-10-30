@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-state="${1:?usage: $0 teleop|intention|auto_planning|damped_return}"
+state="${1:?usage: $0 teleop|intention|auto_planning}"
 port="${PATH_STATE_COMMAND_PORT:-5563}"
 topic="${PATH_STATE_COMMAND_TOPIC:-path_state_command}"
 PATH_STATE_TO_SEND="$state" python3 - <<'INNERPY'

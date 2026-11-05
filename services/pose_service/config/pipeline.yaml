@@ -138,9 +138,9 @@ tasc_belief:
     # Uniform posterior-drift probability per nominal 30 Hz belief tick.
     # Runtime scales it exponentially by elapsed time.
     persist_leak: 0.02
-  # Object/contact and orientation belief are separate posteriors. Dex1 uses
-  # base-local +Y as finger extension/approach and +/-X as jaw spread.
-  hand_model: dex1
+  # Object/contact and orientation belief are separate posteriors. Revo2 uses
+  # base-local +Y as the canonical hand orientation axis.
+  hand_model: brainco_revo2
   orientation:
     enabled: true
     beta: 1.0
@@ -204,10 +204,9 @@ tasc_belief:
   max_objects: 10
   max_contacts_per_object: 6
   max_orientation_candidates: 96
-  # The physical Dex1 palm centre is aligned with its hand-base origin.  Keep
-  # no extra base-local finger-extension offset; wrist-yaw -> base is modeled
-  # separately by the calibrated +X attachment translation.
-  grasp_center_local_m: [0.0, 0.0, 0.0]
+  # Match the Revo2 hand-frame offset used by PATH and the MuJoCo attachment.
+  # Validate this assembly-derived offset on the installed robot before contact use.
+  grasp_center_local_m: [0.0, 0.0, 0.060]
   fallback_eef_position_m: [0.0, 0.0, 0.0]
   features:
     w_proximity: 2.0

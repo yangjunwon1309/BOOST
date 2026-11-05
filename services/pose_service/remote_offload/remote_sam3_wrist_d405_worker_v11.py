@@ -52,6 +52,7 @@ from .wrist_d405_protocol_v11 import (
     pack_heartbeat,
     pack_mask,
     pack_result,
+    pack_surface_points,
     unpack_bundle,
     unpack_concept_control,
     unpack_depth_z16,
@@ -196,7 +197,8 @@ class WristD405Sam3Worker:
                  geometry_fallback_ttl_frames: int = 3,
                  geometry_fallback_score_decay: float = 0.97,
                  pairing_max_error_m: float = 0.008,
-                 pairing_max_residual_ms: float | None = None) -> None:
+                 pairing_max_residual_ms: float | None = None,
+                 publish_contact_clouds: bool = False) -> None:
         self.bus = lcm.LCM(wifi_lcm_url)
         self.concepts, self.backend, self.extrinsics = concepts, backend, extrinsics
         self.seam_guard_px, self.min_depth_m, self.max_depth_m = int(seam_guard_px), float(min_depth_m), float(max_depth_m)
@@ -211,6 +213,7 @@ class WristD405Sam3Worker:
             else pairing_max_residual_ms
         )
         self.pairing_max_error_m = max(0.0, float(pairing_max_error_m))
+        self.publish_contact_clouds = bool(publish_contact_clouds)
         self.track_association_radius_m = max(0.0, float(track_association_radius_m))
         self.states = RobotStateBuffer()
         self.point_filter = point_filter or ObjectPointFilterConfig()
@@ -526,6 +529,7 @@ class WristD405Sam3Worker:
                 resolved_pairing, pairing_accepted = self._pairing_error_for_object(
                     camera_id, obj.get("center_camera_m"), pairings[camera_id] or {}
                 )
+                resolved_pairing["accepted"] = bool(pairing_accepted)
                 obj["state_pairing"] = resolved_pairing
                 if not pairing_accepted:
                     self.stats["pairing_rejects"] = int(self.stats.get("pairing_rejects", 0)) + 1
@@ -546,6 +550,7 @@ class WristD405Sam3Worker:
                     obj["point_filter"] = dict(obj["geometry"])
                     camera_objects.append(obj)
                     continue
+                surface_points_goal = obj.get("_points_goal_m")
                 if attach_surface_geometry(
                     obj, track_id=obj["track_id"], label=str(obj["label"]),
                     source_timestamp_us=int(frame["host_timestamp_us"]),
@@ -555,6 +560,18 @@ class WristD405Sam3Worker:
                     t_goal_cam=t_goal_cameras[camera_id],
                 ):
                     active_surface_tracks.add(obj["track_id"])
+                    if self.publish_contact_clouds and surface_points_goal is not None:
+                        packed_points, point_count = pack_surface_points(
+                            surface_points_goal, max_points=1024
+                        )
+                        obj["surface_cloud"] = {
+                            "encoding": "zlib-f32le-xyz-v1",
+                            "frame": "pelvis_identity_fk",
+                            "count": point_count,
+                            "points": packed_points,
+                            "source_timestamp_us": int(frame["host_timestamp_us"]),
+                            "track_id": str(obj["track_id"]),
+                        }
                 obj.update(
                     mask_encoding="bitpack-zlib-row-major",
                     mask_data=pack_mask(detected["mask"]),
@@ -572,9 +589,18 @@ class WristD405Sam3Worker:
                     # Goal-frame contact can bridge a short detector dropout;
                     # older surface normals and image masks must not be reused.
                     obj["surface_primitives"] = []
+                    obj.pop("surface_cloud", None)
                     obj["fallback_contact_only"] = True
                     obj.pop("mask_data", None)
                     obj.pop("mask_encoding", None)
+            if self.publish_contact_clouds:
+                cloud_objects = sorted(
+                    (obj for obj in completed if isinstance(obj.get("surface_cloud"), dict)),
+                    key=lambda obj: float(obj.get("score", 0.0)),
+                    reverse=True,
+                )
+                for obj in cloud_objects[2:]:
+                    obj.pop("surface_cloud", None)
             objects.extend(completed)
         self.stats["geometry_fallback_objects"] = int(
             self.stats.get("geometry_fallback_objects", 0)
@@ -746,6 +772,11 @@ def main() -> None:
     )
     parser.add_argument("--geometry-fallback-ttl-frames", type=int, default=3)
     parser.add_argument("--geometry-fallback-score-decay", type=float, default=0.97)
+    parser.add_argument(
+        "--publish-contact-clouds",
+        action="store_true",
+        help="include bounded depth-derived point clouds for opt-in hand surface queries",
+    )
     args = parser.parse_args()
     if args.backend == "mock":
         backend: Any = MockSam3Backend()
@@ -764,7 +795,8 @@ def main() -> None:
                         geometry_fallback_ttl_frames=args.geometry_fallback_ttl_frames,
                         geometry_fallback_score_decay=args.geometry_fallback_score_decay,
                         pairing_max_residual_ms=args.pairing_max_residual_ms,
-                        pairing_max_error_m=args.pairing_max_error_m).run()
+                        pairing_max_error_m=args.pairing_max_error_m,
+                        publish_contact_clouds=args.publish_contact_clouds).run()
 
 
 if __name__ == "__main__":

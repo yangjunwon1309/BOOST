@@ -5,7 +5,7 @@ description = "Object-centric teleoperation and manipulation research for Unitre
 requires-python = ">=3.10"
 dependencies = [
   "msgpack",
-  "numpy<2",
+  "numpy>=1.26,<3",
   "pyyaml",
   "pyzmq",
   "scipy",
@@ -27,6 +27,11 @@ sim = [
   "pin",
   "casadi",
   "onnxruntime",
+]
+teleop = [
+  "lcm==1.5.2",
+  "pin",
+  "casadi",
 ]
 
 [tool.setuptools.packages.find]

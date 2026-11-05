@@ -10,7 +10,7 @@ input:
   schema_version: 1
   coordinate_frame: 1 # OpenXR world after PATH's configured basis correction
   joint_count: 25
-  stale_timeout_sec: 0.35
+  stale_timeout_sec: 0.20
   future_tolerance_sec: 0.10
 
 retargeter:
@@ -40,7 +40,12 @@ retargeter:
     jax_compilation_cache_enable: true
     jax_compilation_cache_dir: ~/.cache/mimic_retargeter_lab/jax_compilation
   contact_guidance:
-    # Active only when the runner receives --surface-query-endpoint.
+    # Keep perception-derived hand contact targets disabled until the two
+    # D405 serials, camera extrinsics, RGB/depth grid, and wrist frame mapping
+    # have been measured and signed off. MuJoCo remains an explicit CLI opt-in.
+    enabled: false
+    backend: wrist_point_cloud
+    wrist_point_cloud_endpoint: tcp://127.0.0.1:5571
     d_on: 0.01
     d_off: 0.015
     epsilon: 0.003
@@ -67,7 +72,5 @@ retargeter:
 control:
   update_hz: 30.0
   command_speed: 1.0
-  max_joint_velocity_rad_s: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
-  stale_command_pose: open
   state_timeout_sec: 0.25
   log_hz: 2.0

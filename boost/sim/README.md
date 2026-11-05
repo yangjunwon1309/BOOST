@@ -24,10 +24,70 @@ The `sim` environment installs the pinned MuJoCo/PATH packages, Unitree SDK2 Pyt
 
 The sim evaluates the selected DreamWaQ policy and action compiler in-process at the target 20 ms control period. MuJoCo state supplies policy observations; the PATH DDS bridge supplies arm targets on `rt/arm_sdk`. The sim applies target gains and torque limits to MuJoCo actuators. It neither subscribes to nor publishes hardware `rt/lowcmd`. The hardware DreamWaQ process is not started.
 
+<<<<<<< HEAD
 In the viewer, W/S, A/D, and Q/R request forward/back, lateral, and yaw velocity. O/P change the command scale, Space stops, and X toggles DreamWaQ standing/walking. Commands remain local on DDS loopback and the simulation LCM multicast URL.
+=======
+To stream a synthetic two-hand fist/open cycle through the same hand MPPI
+runner, use the dedicated task:
+
+```bash
+pixi run -e sim mujoco-hand-motion-test
+```
+
+It repeats at 30 Hz: fist hold 1 s → linear open transition 1.5 s → open hold
+1 s → linear close transition 1.5 s. The streamer interpolates both 25×3
+landmark arrays and atomically replaces a temporary JSON file; the two source
+templates remain unchanged. To run the generator by itself for a finite number
+of cycles, use:
+
+```bash
+pixi run -e sim python scripts/stream_mujoco_hand_motion.py \
+  --output /tmp/boost_hand_motion.json --cycles 1
+```
+
+The motion test uses the normal Revo2 hand retargeter and publishes each fresh
+six-joint result directly after enforcing model joint limits. Retargeting still
+maps the generated landmarks through the iCEM objective. It starts only the
+local MuJoCo simulation, HOMIE's stand policy at
+zero velocity, and hand MPPI on DDS `lo`, domain 0. MuJoCo holds its initial
+pose for five seconds and until HOMIE is publishing body commands; no PATH arm
+target is started, so HOMIE holds its configured arm pose without subscribing
+to `rt/arm_sdk`. It does not start XR, Televuer, PATH, surface queries, or a
+physical-robot publisher. `--motion` cannot be combined with `--override-file`;
+use `mujoco-hand-test --override-file PATH` for a static editable pose. Ctrl+C
+stops the streamer and other child processes and removes the temporary JSON
+directory. See
+[`docs/test_logs/mujoco_hand_motion_test.md`](../../docs/test_logs/mujoco_hand_motion_test.md)
+for the motion-test checks.
+
+With the viewer focused, W/S set forward/backward velocity, A/D set left/right,
+and Q/R set left/right yaw. O/P lower/raise a shared speed scale from 20% to
+100% in 10% steps. Direction inputs stay active until the opposite direction
+or Space is pressed. The initial scale is 50%; the viewer overlay and periodic
+sim log show the current `cmd_vel`.
+>>>>>>> 228019f83417f222bc20e79b837865e645492e13
 
 The hand MPPI routes use the separate Pixi `hand` environment. In XR mode they disable PATH's binary grip publisher so only the MPPI process sends continuous Revo2 commands. The local JSON hand override defaults to `configs/hands/revo2_hand_override_fist.json`; select another with `--override-file PATH` or `MUJOCO_HAND_OVERRIDE_FILE`.
 
 The surface query only targets the configured object geoms in `configs/sim/mujoco_revo2.yaml`. D405 RGB-D capture and depth-based BOOST estimation remain a separate perception path.
 
+<<<<<<< HEAD
 For XR certificate setup and occupied-port cleanup, see [the Galaxy XR runbook](../../docs/mujoco_galaxy_xr_runbook.md). Asset provenance is in [`mujoco/assets/ASSET_SOURCES.md`](mujoco/assets/ASSET_SOURCES.md).
+=======
+HOMIE is the sole `rt/lowcmd` writer: it combines its leg/waist policy output
+with PATH's 14 arm targets and gains. MuJoCo applies
+`tau + kp * (q_des - q) + kd * (dq_des - dq)` to the 29 body actuators and
+publishes simulated state back to DDS. The simulator-only compatibility
+adapter maps binary left/right grip flags to the six normalized BrainCo command
+channels. The
+`boost/control/hand_mppi` runner consumes either Televuer's 25 landmarks from
+the existing `vr_pose_debug` ZMQ message or an editable local JSON pose, runs
+Mimic's sampling-based retargeter against BrainCo's official Revo2 hand model,
+then publishes six normalized DDS targets. Both MPPI launchers disable the
+binary grip publisher so only one process writes the Revo2 command topics.
+
+The simulation stack is adapted from PATH's Sonic runtime. The `sim` Pixi
+environment uses the pinned MuJoCo/PATH Python dependencies declared in the
+project's `sim` extra. See `configs/sim/mujoco_revo2.yaml` and
+`configs/sim/homie_g1_mujoco.yaml` for model, hand, and HOMIE settings.
+>>>>>>> 228019f83417f222bc20e79b837865e645492e13

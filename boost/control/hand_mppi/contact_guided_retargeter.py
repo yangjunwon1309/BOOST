@@ -8,7 +8,6 @@ import jax.numpy as jnp
 import numpy as np
 from mimic_retargeter_lab.retargeting.online import SamplingBasedRetargeter
 
-from .surface.mujoco_client import MujocoSurfaceClient
 
 
 FINGERS = ("THUMB", "INDEX", "MIDDLE", "RING", "PINKY")
@@ -26,7 +25,7 @@ class ContactGuidedRetargeter(SamplingBasedRetargeter):
         self,
         *args: Any,
         side: str,
-        surface_client: MujocoSurfaceClient,
+        surface_client: Any,
         contact_config: dict[str, Any],
         **kwargs: Any,
     ) -> None:
@@ -46,14 +45,33 @@ class ContactGuidedRetargeter(SamplingBasedRetargeter):
         if not np.isfinite(self._contact_epsilon) or self._contact_epsilon < 0.0:
             raise ValueError("contact epsilon must be finite and non-negative")
         self._contact_sequence = -1
+        self._wrist_pose_world: np.ndarray | None = None
+        self._hand_timestamp_monotonic: float | None = None
+        self._contact_target_id: int | None = None
         self._contact_active = np.zeros(5, dtype=bool)
         self._contact_alpha = np.zeros(5, dtype=np.float32)
         self._contact_distances = np.full(5, np.nan, dtype=np.float32)
         self._contact_geom_ids = np.full(5, -1, dtype=np.int32)
         super().__init__(*args, **kwargs)
 
-    def set_input_sequence(self, sequence: int) -> None:
+    def set_input_sequence(
+        self,
+        sequence: int,
+        *,
+        wrist_pose_world: np.ndarray | None = None,
+        hand_timestamp_monotonic: float | None = None,
+    ) -> None:
         self._contact_sequence = int(sequence)
+        self._wrist_pose_world = (
+            None
+            if wrist_pose_world is None
+            else np.asarray(wrist_pose_world, dtype=np.float64).reshape(4, 4).copy()
+        )
+        self._hand_timestamp_monotonic = (
+            None
+            if hand_timestamp_monotonic is None
+            else float(hand_timestamp_monotonic)
+        )
 
     @property
     def contact_debug(self) -> dict[str, np.ndarray]:
@@ -78,12 +96,23 @@ class ContactGuidedRetargeter(SamplingBasedRetargeter):
             self.side,
             tips_wrist,
             sequence=self._contact_sequence,
+            wrist_pose_world=self._wrist_pose_world,
+            hand_timestamp_monotonic=self._hand_timestamp_monotonic,
         )
         alpha = np.zeros(5, dtype=np.float32)
         # Invalid or unavailable surface samples force alpha to zero for this
         # frame, but do not erase the hysteresis state needed by the next valid
         # sample.
         active = self._contact_active.copy()
+        target_id = getattr(reply, "target_id", None)
+        if target_id is not None:
+            target_id = int(target_id)
+            if target_id < 0:
+                active[:] = False
+                self._contact_target_id = None
+            elif target_id != self._contact_target_id:
+                active[:] = False
+                self._contact_target_id = target_id
         distances = np.full(5, np.nan, dtype=np.float32)
         geom_ids = np.full(5, -1, dtype=np.int32)
         projected_tips = tips_wrist.copy()

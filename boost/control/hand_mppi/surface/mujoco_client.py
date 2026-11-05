@@ -61,7 +61,10 @@ class MujocoSurfaceClient:
         points_wrist: np.ndarray,
         *,
         sequence: int,
+        wrist_pose_world: np.ndarray | None = None,
+        hand_timestamp_monotonic: float | None = None,
     ) -> MujocoSurfaceReply | None:
+        del wrist_pose_world, hand_timestamp_monotonic
         if side not in SIDE_TO_ID:
             raise ValueError(f"unknown hand side {side!r}")
         points = np.asarray(points_wrist, dtype=np.float32)

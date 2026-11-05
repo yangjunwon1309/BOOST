@@ -287,11 +287,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--no-realtime", action="store_true")
+    parser.add_argument(
+        "--hold-start-delay-s",
+        type=float,
+        default=0.0,
+        help="hold initial physics until this delay has elapsed and HOMIE sends rt/lowcmd",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    if not np.isfinite(args.hold_start_delay_s) or args.hold_start_delay_s < 0.0:
+        raise ValueError("--hold-start-delay-s must be finite and non-negative")
     with args.config.open("r", encoding="utf-8") as stream:
         sim_config = yaml.safe_load(stream)
     hand_config_path = ROOT / sim_config["hand_config"]
@@ -487,10 +495,12 @@ def main() -> int:
     )
     sim_period = float(model.opt.timestep)
     next_tick = time.monotonic()
+    physics_start_wall = next_tick
     next_report = next_tick
     next_nav_publish = next_tick
     nav_cmd_sequence = 0
     tick = 0
+    physics_started = args.hold_start_delay_s <= 0.0
     print(
         f"[BOOST MuJoCo] scene={args.scene} interface={args.interface} "
         f"DDS domain={args.domain_id} dt={sim_period:g}s nq={model.nq} nu={model.nu}; "
@@ -500,6 +510,12 @@ def main() -> int:
         "waiting for Revo2 DDS commands",
         flush=True,
     )
+    if args.hold_start_delay_s > 0.0:
+        print(
+            "[BOOST MuJoCo] holding the initial HOMIE pose until "
+            f"{args.hold_start_delay_s:.1f}s and a fresh rt/lowcmd",
+            flush=True,
+        )
     if viewer is not None:
         print(
             "[MuJoCo keyboard] W/S forward/back, A/D left/right, "
@@ -627,7 +643,18 @@ def main() -> int:
                     torque = args.hand_kp * (q_des - data.qpos[qpos_adr]) - args.hand_kd * data.qvel[dof_adr]
                     data.ctrl[actuator_id] = _torque_limit(model, actuator_id, torque)
 
-            mujoco.mj_step(model, data)
+            physics_ready = args.hold_start_delay_s <= 0.0 or (
+                have_body_command
+                and now - physics_start_wall >= args.hold_start_delay_s
+            )
+            if physics_ready:
+                if not physics_started:
+                    print(
+                        "[BOOST MuJoCo] HOMIE command ready; starting physics",
+                        flush=True,
+                    )
+                    physics_started = True
+                mujoco.mj_step(model, data)
             if viewer is not None:
                 viewer.sync()
             tick += 1

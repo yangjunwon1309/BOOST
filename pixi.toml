@@ -6,6 +6,8 @@ channels = ["conda-forge"]
 platforms = [
   "linux-64",
   { name = "desktop-hand", platform = "linux-64", cuda = "12", glibc = "2.35" },
+  { name = "thor", platform = "linux-aarch64", cuda = "13", glibc = "2.39" },
+  { name = "thor-teleop", platform = "linux-aarch64", glibc = "2.39" },
 ]
 
 # This is intentionally a CPU/host tooling environment. CUDA, PyTorch, SAM3,
@@ -90,11 +92,20 @@ CYCLONEDDS_HOME = "$CONDA_PREFIX"
 
 [feature.sim.tasks]
 setup-sim = { cmd = "bash scripts/setup_mujoco_desktop.sh", description = "Prepare and inspect the Pixi desktop MuJoCo runtime" }
+<<<<<<< HEAD
 mujoco = { cmd = "bash scripts/run_galaxy_dreamwaq_mujoco.sh", description = "Run MuJoCo with DreamWaQ, PATH, and Galaxy XR" }
 mujoco-hand-test = { cmd = "bash scripts/run_mujoco_hand_test.sh", description = "Run the backpack-trained DreamWaQ policy and Revo2 MPPI in local MuJoCo with an editable JSON hand pose; no XR/PATH" }
 mujoco-hand-xr = { cmd = "bash scripts/run_galaxy_dreamwaq_mujoco.sh --hand-mppi-xr", description = "Run live Galaxy XR to Televuer/PATH to Revo2 MPPI in DreamWaQ MuJoCo" }
 mujoco-no-xr = { cmd = "bash scripts/run_galaxy_dreamwaq_mujoco.sh --no-xr", description = "Run DreamWaQ MuJoCo and PATH without Galaxy XR" }
 mujoco-headless = { cmd = "bash scripts/run_galaxy_dreamwaq_mujoco.sh --no-xr --headless", description = "Run the DreamWaQ/PATH MuJoCo stack without XR or a viewer" }
+=======
+mujoco = { cmd = "bash scripts/run_galaxy_homie_mujoco.sh", description = "Run MuJoCo with HOMIE, PATH, and Galaxy XR" }
+mujoco-hand-test = { cmd = "bash scripts/run_mujoco_hand_test.sh", description = "Run HOMIE stand.onnx and Revo2 MPPI in local MuJoCo with an editable JSON hand pose; no XR/PATH" }
+mujoco-hand-motion-test = { cmd = "bash scripts/run_mujoco_hand_test.sh --motion", description = "Run a synthetic repeated fist/open Revo2 MPPI test in local MuJoCo; no XR/PATH" }
+mujoco-hand-xr = { cmd = "bash scripts/run_galaxy_homie_mujoco.sh --hand-mppi-xr", description = "Run live Galaxy XR to Televuer/PATH to Revo2 MPPI in MuJoCo" }
+mujoco-no-xr = { cmd = "bash scripts/run_galaxy_homie_mujoco.sh --no-xr", description = "Run MuJoCo with HOMIE and PATH without Galaxy XR" }
+mujoco-headless = { cmd = "bash scripts/run_galaxy_homie_mujoco.sh --no-xr --headless", description = "Run the HOMIE/PATH MuJoCo stack without XR or a viewer" }
+>>>>>>> 228019f83417f222bc20e79b837865e645492e13
 
 [environments.sim]
 features = ["sim"]
@@ -109,7 +120,8 @@ cyclonedds = "==0.10.5"
 
 [feature.hand.pypi-dependencies]
 boost = { path = ".", editable = true }
-mimic_retargeter_lab = { path = "boost/control/hand_mppi/upstream", editable = true, extras = ["gpu"] }
+numpy = "==1.26.4"
+mimic_retargeter_lab = { path = "boost/control/hand_mppi/upstream", editable = true, extras = ["gpu", "desktop"] }
 geort = { path = "boost/control/hand_mppi/upstream/third_party/geort", editable = true }
 unitree_sdk2py = { git = "https://github.com/unitreerobotics/unitree_sdk2_python.git", rev = "814556d15970dd2ecf1c9984e845ca02ab07e206", editable = true }
 
@@ -125,4 +137,64 @@ hand-mppi = { cmd = "python -m boost.control.hand_mppi.runner", description = "I
 
 [environments.hand]
 features = ["hand"]
+no-default-feature = true
+
+# Jetson Thor ARM64 hand runtime. JAX/CUDA 13 and NumPy 2 are isolated from
+# Televuer/PATH's NumPy 1 environment and the x86 desktop's CUDA 12 stack.
+# PyTorch is not installed: live retargeting uses JAX/MJX, not GeoRT inference.
+[feature.thor.dependencies]
+python = "==3.12.3"
+cyclonedds = "==0.10.5"
+
+[feature.thor.pypi-dependencies]
+boost = { path = ".", editable = true }
+numpy = ">=2.0,<3"
+mimic_retargeter_lab = { path = "boost/control/hand_mppi/upstream", editable = true, extras = ["thor"] }
+geort = { path = "boost/control/hand_mppi/upstream/third_party/geort", editable = true }
+unitree_sdk2py = { git = "https://github.com/unitreerobotics/unitree_sdk2_python.git", rev = "814556d15970dd2ecf1c9984e845ca02ab07e206", editable = true }
+
+[feature.thor]
+platforms = ["thor"]
+
+[feature.thor.activation.env]
+PYTHONPATH = "$PIXI_PROJECT_ROOT:$PIXI_PROJECT_ROOT/services/pose_service"
+CYCLONEDDS_HOME = "$CONDA_PREFIX"
+
+[feature.thor.tasks]
+hand-mppi-publish = { cmd = "bash scripts/run_hand_mppi_thor.sh", description = "Publish fresh Revo2 MPPI targets over DDS to the G1 BrainCo hand service" }
+verify-thor = { cmd = "python scripts/verify_thor_environment.py", description = "Check Thor's ARM64, JAX CUDA, MuJoCo MJX, and Unitree SDK imports" }
+
+[environments.thor]
+features = ["thor"]
+no-default-feature = true
+
+# Televuer and PATH's current dependency stack remains NumPy 1.x. Keep the
+# webcam/XR and IK processes separate from the NumPy 2 / CUDA 13 JAX runtime;
+# they exchange fresh poses using the existing local ZMQ port 5566.
+[feature.thor_teleop.dependencies]
+python = "==3.12.3"
+cyclonedds = "==0.10.5"
+
+[feature.thor_teleop.pypi-dependencies]
+boost = { path = ".", editable = true, extras = ["teleop"] }
+numpy = "==1.26.4"
+televuer = { git = "https://github.com/unitreerobotics/televuer.git", rev = "766de45e74373ae0ea66321d942ce538385655a5" }
+vuer = { version = "==0.0.60", extras = ["all"] }
+params-proto = "==2.13.2"
+unitree_sdk2py = { git = "https://github.com/unitreerobotics/unitree_sdk2_python.git", rev = "814556d15970dd2ecf1c9984e845ca02ab07e206", editable = true }
+
+[feature.thor_teleop]
+platforms = ["thor-teleop"]
+
+[feature.thor_teleop.activation.env]
+PYTHONPATH = "$PIXI_PROJECT_ROOT:$PIXI_PROJECT_ROOT/services/pose_service"
+CYCLONEDDS_HOME = "$CONDA_PREFIX"
+
+[feature.thor_teleop.tasks]
+path-state = { cmd = "bash scripts/run_state_machine_bridge.sh", description = "Run PATH arm IK and Televuer pose bridge on Thor" }
+galaxy-xr = { cmd = "bash scripts/run_galaxy_xr_manager.sh", description = "Run the Galaxy XR/Televuer service on Thor" }
+verify-thor-teleop = { cmd = "python scripts/verify_thor_teleop_environment.py", description = "Check Thor PATH, Televuer, LCM and Unitree SDK imports" }
+
+[environments.thor-teleop]
+features = ["thor_teleop"]
 no-default-feature = true

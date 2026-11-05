@@ -40,6 +40,7 @@ class TelevuerFrame:
     sequence: int
     timestamp_monotonic: float
     hands: dict[str, np.ndarray | None]
+    wrist_poses_waist: dict[str, np.ndarray | None]
 
 
 def decode_televuer_frame(
@@ -99,7 +100,27 @@ def decode_televuer_frame(
             points.copy() if valid[index] and np.isfinite(points).all() else None
         )
 
-    return TelevuerFrame(sequence, timestamp, hands)
+    wrist_poses: dict[str, np.ndarray | None] = {"left": None, "right": None}
+    try:
+        targets_valid = bool(np.asarray(payload.get("targets_valid", [False])).reshape(-1)[0])
+    except (TypeError, ValueError, IndexError):
+        targets_valid = False
+    if targets_valid:
+        for side in SIDES:
+            try:
+                pose = np.asarray(payload[f"wrist_{side}_waist"], dtype=np.float64).reshape(4, 4)
+            except (KeyError, TypeError, ValueError):
+                continue
+            rotation = pose[:3, :3]
+            if (
+                np.isfinite(pose).all()
+                and np.allclose(pose[3], [0.0, 0.0, 0.0, 1.0], atol=1.0e-4)
+                and np.allclose(rotation @ rotation.T, np.eye(3), atol=2.0e-3)
+                and abs(float(np.linalg.det(rotation)) - 1.0) <= 2.0e-3
+            ):
+                wrist_poses[side] = pose.copy()
+
+    return TelevuerFrame(sequence, timestamp, hands, wrist_poses)
 
 
 def decode_override_frame(
@@ -128,7 +149,12 @@ def decode_override_frame(
         hands[side] = points.copy()
     if not any(points is not None for points in hands.values()):
         raise ValueError("hand override JSON must provide at least one hand")
-    return TelevuerFrame(sequence, time.monotonic(), hands)
+    return TelevuerFrame(
+        sequence,
+        time.monotonic(),
+        hands,
+        {"left": None, "right": None},
+    )
 
 
 @dataclass
@@ -138,12 +164,9 @@ class SideRuntime:
     jax_numpy: Any
     q_min: np.ndarray
     q_max: np.ndarray
-    max_velocity: np.ndarray
     last_sequence: int | None = None
     last_valid_timestamp: float | None = None
     desired_rad: np.ndarray | None = None
-    command_rad: np.ndarray | None = None
-    output_timestamp: float | None = None
     state_seeded: bool = False
 
 
@@ -246,13 +269,8 @@ def _create_retargeter(
     adapter = BrainCoRevo2Adapter.from_mapping(hand_config)
     q_min = np.asarray(adapter.q_min, dtype=np.float32)
     q_max = np.asarray(adapter.q_max, dtype=np.float32)
-    max_velocity = np.asarray(
-        config["control"]["max_joint_velocity_rad_s"], dtype=np.float32
-    )
-    if q_min.shape != (6,) or q_max.shape != (6,) or max_velocity.shape != (6,):
-        raise ValueError("Revo2 range and velocity settings must each have six channels")
-    if not np.isfinite(max_velocity).all() or np.any(max_velocity <= 0):
-        raise ValueError("max_joint_velocity_rad_s values must be positive and finite")
+    if q_min.shape != (6,) or q_max.shape != (6,):
+        raise ValueError("Revo2 position ranges must each have six channels")
     if np.any(q_max <= q_min):
         raise ValueError("BrainCo q_max must exceed q_min for all six channels")
     model_limits = hand_model.get_actuated_joint_limits()
@@ -270,7 +288,7 @@ def _create_retargeter(
 
     # Keep Mimic's warm start aligned with measured hardware/simulator state.
     # It is filled when fresh BrainCo DDS state first arrives.
-    return retargeter, jnp, q_min, q_max, max_velocity
+    return retargeter, jnp, q_min, q_max
 
 
 def parse_args() -> argparse.Namespace:
@@ -296,7 +314,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--surface-query-endpoint",
         default=None,
-        help="enable contact-guided targets from a live MuJoCo surface-query REP endpoint",
+        help="override the selected surface REP endpoint; without --surface-backend, enables MuJoCo",
+    )
+    parser.add_argument(
+        "--surface-backend",
+        choices=("mujoco", "wrist_point_cloud"),
+        default=None,
+        help="explicitly select MuJoCo or SAM3/D405 point-cloud signed-distance queries",
     )
     parser.add_argument("--side", choices=("left", "right", "both"), default="both")
     parser.add_argument("--device", choices=("cuda", "cpu"), default=None)
@@ -338,27 +362,47 @@ def main() -> int:
         raise ValueError("Televuer stale_timeout_sec must be positive and finite")
     if not np.isfinite(future_tolerance) or future_tolerance < 0:
         raise ValueError("Televuer future_tolerance_sec must be finite and non-negative")
-    if config["control"]["stale_command_pose"] not in {"open", "hold"}:
-        raise ValueError("stale_command_pose must be 'open' or 'hold'")
     command_speed = float(config["control"]["command_speed"])
     if not np.isfinite(command_speed) or not 0.0 <= command_speed <= 1.0:
         raise ValueError("command_speed must be finite and within [0, 1]")
 
-    surface_client = None
+    surface_cfg = config["retargeter"].get("contact_guidance", {})
+    configured_surface_enabled = bool(surface_cfg.get("enabled", False))
+    surface_backend = args.surface_backend or str(surface_cfg.get("backend", "mujoco"))
+    surface_enabled = configured_surface_enabled or args.surface_backend is not None
     if args.surface_query_endpoint:
-        from boost.control.hand_mppi.surface.mujoco_client import MujocoSurfaceClient
+        surface_enabled = True
+        if args.surface_backend is None:
+            surface_backend = "mujoco"
 
-        surface_cfg = config["retargeter"].get("contact_guidance", {})
-        surface_timeout = float(surface_cfg.get("query_timeout_sec", 0.05))
-        surface_client = MujocoSurfaceClient(
-            args.surface_query_endpoint,
-            timeout_sec=surface_timeout,
-        )
+    surface_client = None
+    if surface_enabled:
+        surface_timeout = float(surface_cfg.get("query_timeout_sec", 0.02))
+        if surface_backend == "mujoco":
+            from boost.control.hand_mppi.surface.mujoco_client import MujocoSurfaceClient
+
+            surface_endpoint = args.surface_query_endpoint or str(
+                surface_cfg.get("mujoco_endpoint", "tcp://127.0.0.1:5570")
+            )
+            surface_client = MujocoSurfaceClient(surface_endpoint, timeout_sec=surface_timeout)
+        elif surface_backend == "wrist_point_cloud":
+            from boost.control.hand_mppi.surface.point_cloud_client import PointCloudSurfaceClient
+
+            surface_endpoint = args.surface_query_endpoint or str(
+                surface_cfg.get(
+                    "wrist_point_cloud_endpoint", "tcp://127.0.0.1:5571"
+                )
+            )
+            surface_client = PointCloudSurfaceClient(surface_endpoint, timeout_sec=surface_timeout)
+        else:
+            raise ValueError(f"unsupported hand surface backend {surface_backend!r}")
         print(
-            f"[hand-mppi] contact guidance enabled via MuJoCo surface query "
-            f"{args.surface_query_endpoint} (timeout={surface_timeout * 1000:.0f}ms)",
+            f"[hand-mppi] contact guidance enabled backend={surface_backend} "
+            f"endpoint={surface_endpoint} (timeout={surface_timeout * 1000:.0f}ms)",
             flush=True,
         )
+    else:
+        print("[hand-mppi] contact guidance disabled by config", flush=True)
 
     if args.input_mode == "televuer":
         print(
@@ -380,7 +424,7 @@ def main() -> int:
             f"[hand-mppi] initializing {side} Revo2 retargeter (MJX/JAX warmup)",
             flush=True,
         )
-        retargeter, jax_numpy, q_min, q_max, max_velocity = _create_retargeter(
+        retargeter, jax_numpy, q_min, q_max = _create_retargeter(
             side,
             config,
             hand_config,
@@ -393,7 +437,6 @@ def main() -> int:
             jax_numpy=jax_numpy,
             q_min=q_min,
             q_max=q_max,
-            max_velocity=max_velocity,
         )
         print(
             f"[hand-mppi] {side} retargeter ready in "
@@ -521,7 +564,11 @@ def main() -> int:
 
                         set_sequence = getattr(runtime.retargeter, "set_input_sequence", None)
                         if callable(set_sequence):
-                            set_sequence(frame.sequence)
+                            set_sequence(
+                                frame.sequence,
+                                wrist_pose_world=frame.wrist_poses_waist.get(side),
+                                hand_timestamp_monotonic=frame.timestamp_monotonic,
+                            )
 
                         if args.publish and not runtime.state_seeded:
                             state = dds.state(
@@ -538,8 +585,6 @@ def main() -> int:
                             runtime.retargeter._qpos_prev = (
                                 runtime.jax_numpy.asarray(measured_rad, dtype=np.float32)
                             )
-                            runtime.command_rad = measured_rad
-                            runtime.output_timestamp = time.monotonic()
                             runtime.state_seeded = True
 
                         retarget_start = time.perf_counter()
@@ -588,26 +633,20 @@ def main() -> int:
                     continue
 
                 age = max(0.0, now - runtime.last_valid_timestamp)
-                desired_rad = (
-                    runtime.q_min.copy()
-                    if age > stale_timeout
-                    and config["control"]["stale_command_pose"] == "open"
-                    else runtime.desired_rad
-                )
-                if desired_rad is None:
+                if age > stale_timeout:
+                    # Stop issuing commands when operator input is no longer
+                    # fresh. The BrainCo service owns its configured stale
+                    # command watchdog; do not synthesize a new hand target here.
+                    status_parts.append(f"{side}:stale-stop age={age:.2f}s")
+                    continue
+                if runtime.desired_rad is None:
                     status_parts.append(f"{side}:waiting-target")
                     continue
-
-                if runtime.command_rad is None:
-                    runtime.command_rad = np.clip(desired_rad, runtime.q_min, runtime.q_max)
-                    runtime.output_timestamp = now
-                elapsed = max(0.0, now - (runtime.output_timestamp or now))
-                max_step = runtime.max_velocity * elapsed
-                runtime.command_rad = runtime.command_rad + np.clip(
-                    desired_rad - runtime.command_rad, -max_step, max_step
-                )
-                runtime.output_timestamp = now
-                normalized = adapter.actuated_to_normalized(runtime.command_rad)
+                # Publish the latest valid retarget result directly. There is
+                # no output EMA, interpolation, or rate limiter; model limits
+                # are enforced before normalization.
+                command_rad = np.clip(runtime.desired_rad, runtime.q_min, runtime.q_max)
+                normalized = adapter.actuated_to_normalized(command_rad)
 
                 state = None
                 if dds is not None:

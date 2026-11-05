@@ -147,16 +147,16 @@ def test_command_path_matches_fk_path_for_both_hands():
         wrist = transforms[link]
         np.testing.assert_allclose(
             grasp_center_from_wrist(
-                wrist[:3, 3], wrist[:3, :3], side, "dex1"
+                wrist[:3, 3], wrist[:3, :3], side, "brainco_revo2"
             ),
-            g1_grasp_center_position(q, link, None, "dex1"),
+            g1_grasp_center_position(q, link, None, "brainco_revo2"),
             atol=1.0e-9,
         )
         np.testing.assert_allclose(
             hand_rotation_from_wrist_rotation(
-                wrist[:3, :3], side, "dex1"
+                wrist[:3, :3], side, "brainco_revo2"
             ),
-            g1_hand_base_rotation(q, link, "dex1"),
+            g1_hand_base_rotation(q, link, "brainco_revo2"),
             atol=1.0e-9,
         )
 
@@ -255,8 +255,8 @@ def test_operator_command_divergence_uses_fk_fallback():
     gateway.belief_enabled = True
     gateway.belief_use_operator_command = True
     gateway.belief_command_divergence_max_m = 0.20
-    gateway.belief_hand_model = "dex1"
-    gateway.belief_hand_profile = hand_frame_profile("dex1")
+    gateway.belief_hand_model = "brainco_revo2"
+    gateway.belief_hand_profile = hand_frame_profile("brainco_revo2")
     gateway.belief_grasp_center_local_m = np.asarray(
         gateway.belief_hand_profile["grasp_center_local"], dtype=np.float64
     )

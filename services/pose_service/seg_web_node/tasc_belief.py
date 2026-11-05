@@ -342,8 +342,8 @@ class TascBeliefConfig:
     orientation_ema_alpha: float = 0.25
     orientation_switch_gamma: float = 4.0
     orientation_relations: tuple[str, ...] = ("parallel", "perpendicular")
-    hand_model: str = "dex1"
-    hand_axis_local: tuple[float, float, float] = tuple(HAND_AXIS_LOCAL["dex1"].tolist())
+    hand_model: str = "brainco_revo2"
+    hand_axis_local: tuple[float, float, float] = tuple(HAND_AXIS_LOCAL["brainco_revo2"].tolist())
     orientation_match_max_distance_m: float = 0.08
     orientation_match_max_normal_deg: float = 25.0
     orientation_track_missing_ttl_frames: int = 5
@@ -484,8 +484,8 @@ class TascBeliefConfig:
             orientation_ema_alpha=float(orientation.get("ema_alpha", data.get("orientation_ema_alpha", 0.25))),
             orientation_switch_gamma=float(orientation.get("switch_gamma", data.get("orientation_switch_gamma", 4.0))),
             orientation_relations=tuple(str(v).lower() for v in orientation.get("relations", data.get("orientation_relations", ("parallel", "perpendicular")))),
-            hand_model=str(data.get("hand_model", orientation.get("hand_model", "dex1"))).lower(),
-            hand_axis_local=tuple(float(v) for v in orientation.get("hand_axis_local", data.get("hand_axis_local", HAND_AXIS_LOCAL["dex1"]))),
+            hand_model=str(data.get("hand_model", orientation.get("hand_model", "brainco_revo2"))).lower(),
+            hand_axis_local=tuple(float(v) for v in orientation.get("hand_axis_local", data.get("hand_axis_local", HAND_AXIS_LOCAL["brainco_revo2"]))),
             orientation_match_max_distance_m=float(orientation.get("match_max_distance_m", data.get("orientation_match_max_distance_m", 0.08))),
             orientation_match_max_normal_deg=float(orientation.get("match_max_normal_deg", data.get("orientation_match_max_normal_deg", 25.0))),
             orientation_track_missing_ttl_frames=int(orientation.get("track_missing_ttl_frames", data.get("orientation_track_missing_ttl_frames", 5))),
@@ -1027,7 +1027,7 @@ def grasp_frame_from_cylinder(
     reference_rotation: np.ndarray,
     profile: dict[str, object] | None = None,
 ) -> np.ndarray | None:
-    """Construct an SO(3) Dex1 grasp frame from a cylinder contact frame."""
+    """Construct an SO(3) Revo2 grasp frame from a cylinder contact frame."""
     cylinder_axis = _unit(axis)
     contact_normal = _unit(normal)
     if cylinder_axis is None or contact_normal is None:

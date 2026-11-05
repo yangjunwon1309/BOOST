@@ -17,6 +17,14 @@
 - 조건: **샘플당 연산은 원본과 같은 차수로 유지**한다. 물체 정보는 샘플링 루프 밖의 "목표 생성" 단계에서만 사용한다.
 - 이 단계의 용도는 **teleop**이다. 물체 좌표계 keypoint는 쓰지 않는다 (2.5절).
 
+**현재 구현 상태 (2026-10-30)**
+- `ContactGuidedRetargeter`는 SBR의 robust loss와 iCEM sampling loop를 그대로 두고, 샘플링 전에 5개 손끝의 표면 질의 결과로 wrist-to-tip 및 thumb-to-tip 목표 벡터를 조정한다. 이는 SBR 비용에 별도 항을 더하는 구현이 아니다.
+- MuJoCo backend는 `mj_geomDistance`로 collision surface signed distance를 질의한다. MuJoCo 실행 스크립트에서 명시적으로 backend를 전달할 때만 켜진다.
+- 실물 backend 연결도 구현했다. SAM3/D405의 filtered depth cloud를 pelvis frame으로 보내고 Thor의 local ZMQ query service가 nearest point와 PCA normal로 local signed-distance 근사를 반환한다.
+- 실물 backend의 켜짐 여부는 `configs/hands/brainco_revo2_mppi.yaml`의 `retargeter.contact_guidance.enabled`로 제어하며 기본값은 `false`다. 카메라 serial, extrinsics, depth/RGB grid, Televuer wrist-to-hand frame을 검증하기 전까지 계속 끈다.
+- 실물의 현재 query는 부분 관측 점군에서 만든 접평면 근사이며, watertight 또는 global voxel SDF는 아니다. 고정된 카메라 설정으로 충분한 검증 데이터를 얻은 뒤 global SDF가 필요한지 결정한다.
+- 입력 hand pose를 smoothing하거나 보간하지 않는다. stale hand frame, 오래된 cloud, state-pairing 오차 초과, normal support 부족은 해당 query를 무효화하여 접촉 목표 변경을 하지 않는다.
+
 ---
 
 ## 1. 설계 원칙
@@ -86,7 +94,7 @@ $$
 
 **표면 질의 실패 처리**
 - 질의 결과가 없거나(거리 상한 밖) 법선이 정의되지 않으면 $\alpha_i = 0$으로 처리한다.
-- $s_i, n_i$에는 짧은 지수 이동 평균을 건다 (sim에서는 끄고, 실물 점군 backend에서만 켬).
+- 현재 구현에서는 $s_i, n_i$ 또는 Televuer hand goal에 EMA를 적용하지 않는다. 유효하지 않은 표면 query는 해당 프레임에서 접촉 유도를 끈다.
 
 ### 2.3 샘플당 비용
 

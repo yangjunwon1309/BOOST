@@ -1,7 +1,7 @@
 """Binary LCM protocol between PATH on Thor and the G1 arm SDK bridge.
 
-PATH sends only the 14 arm joints. The G1 bridge owns SDK publication and
-robot-state telemetry; HOMIE/WBC remains an independent owner of legs/waist.
+PATH sends only the 14 arm joints. The G1 bridge owns arm SDK publication and
+robot-state telemetry; DreamWaQ merges arm targets with the lower-body policy.
 """
 
 from __future__ import annotations
@@ -135,7 +135,7 @@ def pack_robot_state(
     dq: Sequence[float] | np.ndarray,
     tau_est: Sequence[float] | np.ndarray,
 ) -> bytes:
-    """Encode the packed GST1 telemetry format consumed by PATH and HOMIE."""
+    """Encode the packed GST1 telemetry format consumed by PATH and DreamWaQ."""
     has_torso_imu = torso_quat_wxyz is not None
     torso_quat = _float_vector(
         (0.0,) * 4 if torso_quat_wxyz is None else torso_quat_wxyz, 4, "torso_quat"

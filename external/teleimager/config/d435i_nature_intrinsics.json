@@ -1,0 +1,26 @@
+{
+  "serial": "405622072600",
+  "width": 640,
+  "height": 480,
+  "fx": 605.4773559570312,
+  "fy": 604.6244506835938,
+  "cx": 328.0508728027344,
+  "cy": 246.0647735595703,
+  "distortion_model": "distortion.inverse_brown_conrady",
+  "coefficients": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "sdk_fov_deg": [
+    55.706295013427734,
+    43.2962760925293
+  ],
+  "camera_model": "Intel RealSense D435i RGB",
+  "verified_on": "2026-10-01",
+  "profile_fps": 30,
+  "rotation": 0,
+  "source": "librealsense RGB stream intrinsics on G1-29; valid for this serial and 640x480 profile"
+}

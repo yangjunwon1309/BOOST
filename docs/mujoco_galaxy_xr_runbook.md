@@ -1,8 +1,9 @@
 # MuJoCo + Galaxy XR runbook
 
 This runbook covers the local G1 + Revo2 MuJoCo teleoperation stack launched by
-`pixi run -e sim mujoco-hand-xr`. It runs the simulator, HOMIE, the PATH arm
-bridge and IK, Televuer, and the Revo2 hand MPPI runner on this desktop.
+`pixi run -e sim mujoco-hand-xr`. It runs the simulator with DreamWaQ evaluated
+in-process, the PATH arm bridge and IK, Televuer, and the Revo2 hand MPPI runner.
+It does not start a hardware `rt/lowcmd` writer.
 
 ## One-time desktop setup
 
@@ -63,7 +64,7 @@ until reversed or stopped.
 ## Stop the stack
 
 Press **Ctrl+C** in the launcher terminal. The launcher stops the simulator,
-Televuer, PATH, HOMIE, and hand-MPPI child processes together.
+Televuer, PATH, and hand-MPPI child processes together.
 
 ## If startup says ports are already in use
 

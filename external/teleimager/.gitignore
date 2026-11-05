@@ -1,0 +1,13 @@
+.vscode/
+build/
+*pycache*
+*.pyc
+*.egg-info
+*.pem
+*.srl
+*.csr
+*.key
+*.cnf
+*_client.yaml
+# Local HTTPS certificates; private keys must stay on the camera host.
+certs/

@@ -20,5 +20,5 @@ the relocated copy and may change it independently of PATH.
 The legacy intention package remains isolated because the existing PATH state
 machine imports it. Removing that behavior is a planned BOOST teleop change.
 The carried G1 bridge only understands the PATH arm packet and Dex1 flags; it
-does not implement BrainCo Revo2 commands. HOMIE/WBC remains an external
-component and continues to own `rt/lowcmd`.
+does not implement BrainCo Revo2 commands. The target DreamWaQ runtime is an
+external component and owns hardware `rt/lowcmd`.

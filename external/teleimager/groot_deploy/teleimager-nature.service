@@ -1,0 +1,17 @@
+[Unit]
+Description=G1-29 Nature head and wrist camera streams
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/home/unitree/00_workspace/url_lerobot_nature/g1_deploy/thirdparty/teleimager
+ExecStart=/bin/bash /home/unitree/00_workspace/url_lerobot_nature/g1_deploy/thirdparty/teleimager/groot_deploy/run_nature_camera.sh
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+KillMode=control-group
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

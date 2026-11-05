@@ -30,6 +30,11 @@ on `deploy`. See [`docs/git_workflow.md`](docs/git_workflow.md) and
 - `boost/io/g1_bridge/`: PATH-derived Unitree arm and Dex1 bridge. It still
   speaks the old Dex1 interface; Revo2 uses the separate
   `unitreerobotics/brainco_hand_service` DDS interface and needs a new adapter.
+- `external/dreamwaq_g1_29dof/`: selected backpack-trained DreamWaQ runtime
+  and export; its sim backend and G1 launch path are in
+  [`docs/dreamwaq_integration.md`](docs/dreamwaq_integration.md).
+- `external/g1_ws/` and `external/teleimager/`: pinned target schema/reference
+  sources and TIM2 camera server.
 - `services/pose_service/`: the moved PATH wrist RGB-D/SAM3 service. It
   currently publishes surface and target data; FoundationPose pose estimation
   is planned work.
@@ -37,8 +42,6 @@ on `deploy`. See [`docs/git_workflow.md`](docs/git_workflow.md) and
   settings under `configs/teleop/`.
 - `boost/sim/`: MuJoCo assets and model work.
 - `assets/robot/`: pinned G1 model and the BrainCo Revo2 description snapshot.
-- `external/homie_g1_29dof/`: local HOMIE/WBC snapshot. HOMIE remains the sole
-  `rt/lowcmd` writer; BOOST sends arm targets through `rt/arm_sdk`.
 - `scripts/`, `docs/`, `tests/`, `datasets/`, and `third_party/`: launch tools,
   deployment references, verification, dataset guidance, and pinned external
   dependencies.
@@ -53,14 +56,13 @@ bash scripts/run_state_machine_bridge.sh
 ```
 
 Use `bash scripts/run_galaxy_xr_manager.sh` for the Galaxy XR input route.
-These entry points retain the current PATH packet and controller behavior;
-they do not send Revo2 hand commands. The service deployment notes are in
-[`docs/deployment.md`](docs/deployment.md). The separate G1/Dex1 installation
-document is retained as a PATH reference, not a BOOST Revo2 runbook.
+These entry points retain PATH's arm packet and IK behavior. On hardware, the
+PATH G1 adapter feeds `rt/arm_sdk` and target DreamWaQ owns `rt/lowcmd`. See
+[`docs/dreamwaq_integration.md`](docs/dreamwaq_integration.md).
 
 ## Local MuJoCo desktop
 
-The local G1 + Revo2 model and HOMIE/PATH stack run in the Pixi `sim`
+The local G1 + Revo2 model and DreamWaQ/PATH stack run in the Pixi `sim`
 environment. Install and inspect the runtime with:
 
 ```bash
@@ -72,7 +74,7 @@ Start the desktop simulation without a headset
 with `pixi run -e sim mujoco-no-xr`; use `pixi run -e sim mujoco` when Galaxy XR
 certificates are configured. To stream Televuer's 25 hand joints over PATH's
 ZMQ pose message, set `PATH_TELEVUER_HAND_TRACKING=1` when starting `mujoco`.
-Use `pixi run -e sim mujoco-hand-test` to run the simulated G1 under HOMIE
+Use `pixi run -e sim mujoco-hand-test` to run the simulated G1 under DreamWaQ
 while hand MPPI reads an editable JSON pose; it starts no XR, Televuer, or PATH
 bridge. The MuJoCo viewer keys drive local locomotion: W/S forward/back, A/D
 left/right, Q/R yaw, O/P adjust both linear and angular speed, and Space stops.

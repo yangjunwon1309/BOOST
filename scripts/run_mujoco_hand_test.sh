@@ -19,7 +19,7 @@ fi
 
 usage() {
   cat <<'EOF'
-Run MuJoCo + HOMIE stand/walk + Revo2 hand MPPI with a local JSON pose.
+Run MuJoCo + DreamWaQ stand/walk + Revo2 hand MPPI with a local JSON pose.
 This test starts no Galaxy XR, Televuer, PATH bridge, or physical-robot route.
 
 Usage: pixi run -e sim mujoco-hand-test [--headless] [--override-file PATH]
@@ -46,8 +46,8 @@ if [[ "${PIXI_PROJECT_ROOT:-}" != "$BOOST_ROOT" ]]; then
   echo "Run this test through Pixi: pixi run -e sim mujoco-hand-test" >&2
   exit 2
 fi
-if [[ ! -d "$BOOST_HOMIE_ROOT/deploy" ]]; then
-  echo "HOMIE snapshot not found at $BOOST_HOMIE_ROOT" >&2
+if [[ ! -f "$BOOST_DREAMWAQ_EXPORT/manifest.json" ]]; then
+  echo "DreamWaQ export manifest not found at $BOOST_DREAMWAQ_EXPORT/manifest.json" >&2
   exit 2
 fi
 if [[ "$override_file" != /* ]]; then
@@ -89,6 +89,7 @@ start() {
 sim_args=(
   "$PATH_PYTHON" boost/sim/mujoco/run_dds_sim.py
   --config "$sim_config"
+  --dreamwaq-export "$BOOST_DREAMWAQ_EXPORT"
   --interface "$SIM_DDS_INTERFACE"
   --domain-id "$SIM_DDS_DOMAIN_ID"
 )
@@ -97,17 +98,13 @@ if ((headless)); then
 fi
 
 echo "Starting local MuJoCo Revo2 simulation on $SIM_DDS_INTERFACE, domain $SIM_DDS_DOMAIN_ID"
-echo "Starting HOMIE stand/walk policy; use the MuJoCo viewer keyboard for locomotion"
+echo "DreamWaQ runs inside the MuJoCo loop; no rt/lowcmd subscriber or hardware writer is started."
+echo "Use the MuJoCo viewer keyboard for locomotion"
 echo "W/S forward/back, A/D left/right, Q/R yaw, O/P speed, Space stop"
 echo "Hand MPPI input: $override_file"
 start "${sim_args[@]}"
 sleep 2
-start "$PATH_PYTHON" "$BOOST_HOMIE_ROOT/deploy/run_homie.py" \
-  --net "$SIM_DDS_INTERFACE" \
-  --config configs/sim/homie_g1_mujoco.yaml \
-  --auto-start
-# Let HOMIE finish its default-pose ramp and load the stand/walk policy before
-# starting the JAX retargeter's first compilation.
+# Let MuJoCo publish state before starting the JAX retargeter's first compilation.
 sleep 3
 start "$PIXI_CLI" run -e hand python -m boost.control.hand_mppi.runner \
   --config configs/hands/brainco_revo2_mppi.yaml \

@@ -1,0 +1,75 @@
+# G1 publishes the head camera and both wrist cameras to Thor/GR00T.
+# Run `teleimager-server --cf` to recheck camera discovery and USB paths.
+
+head_camera:
+  # Legacy ZMQ stream consumed by the Thor policy clients.
+  enable_zmq: true
+  zmq_port: 55555
+
+  # TIM2 envelope: sequence + capture timestamps + dimensions + original JPEG.
+  enable_recording_zmq: false
+  recording_zmq_port: 55558
+
+  # Enable later for XR/PICO display.
+  enable_webrtc: false
+  webrtc_port: 60001
+  webrtc_codec: h264
+
+  # OpenCV uses /dev/video* permissions and avoids raw USB permission requirements.
+  type: opencv
+  image_shape: [480, 1280]
+  binocular: true
+  fps: 30
+
+  # Pinned to the HBVCAM USB interface; /dev/videoN changes when RealSense
+  # cameras enumerate. This interface currently maps to /dev/video12-13.
+  video_id: null
+  serial_number: null
+  physical_path: /sys/devices/platform/3610000.xhci/usb1/1-2/1-2.2/1-2.2.2/1-2.2.2:1.0
+  rotation: 0
+
+# Wrist cameras are Intel RealSense D405. These serials were detected on
+# this G1; re-run camera identification if either camera is replaced.
+# Each camera is captured and published on its own threads. Only the latest
+# packet is queued, so a slow Thor receiver cannot build up camera latency.
+#
+# `rotation` is applied on the G1 right after capture, so the recording stream,
+# the legacy ZMQ stream and WebRTC all carry the same upright image. Allowed
+# values are 0, 90, 180 and 270 (clockwise); the "uvc" backend rejects a
+# non-zero rotation because it forwards the camera's MJPEG buffer undecoded.
+left_wrist_camera:
+  enable_zmq: true
+  zmq_port: 55556
+  enable_recording_zmq: false
+  recording_zmq_port: 55559
+  enable_webrtc: false
+  webrtc_port: 60002
+  webrtc_codec: h264
+
+  type: realsense
+  image_shape: [480, 640]
+  binocular: false
+  fps: 30
+  video_id: null
+  serial_number: "427622272202"
+  physical_path: null
+  # This camera is physically mounted upside down on the left wrist.
+  rotation: 0
+
+right_wrist_camera:
+  enable_zmq: true
+  zmq_port: 55557
+  enable_recording_zmq: false
+  recording_zmq_port: 55560
+  enable_webrtc: false
+  webrtc_port: 60003
+  webrtc_codec: h264
+
+  type: realsense
+  image_shape: [480, 640]
+  binocular: false
+  fps: 30
+  video_id: null
+  serial_number: "260322274973"
+  physical_path: null
+  rotation: 0

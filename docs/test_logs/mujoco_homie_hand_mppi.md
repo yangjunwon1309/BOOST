@@ -1,4 +1,9 @@
-# MuJoCo HOMIE stand and Revo2 hand MPPI test log
+# Historical MuJoCo HOMIE stand and Revo2 hand MPPI test log
+
+> Archive of the previous HOMIE implementation. The active MuJoCo controller
+> is the backpack-trained DreamWaQ path documented in
+> [`../dreamwaq_integration.md`](../dreamwaq_integration.md); these old commands
+> and acceptance fields are not the current run procedure.
 
 **Status:** Not run. This is a local MuJoCo simulation test; it does not target a
 physical G1.

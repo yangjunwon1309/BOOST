@@ -1,47 +1,28 @@
 # Control ownership
 
-The current BOOST teleop still uses the imported PATH arm-control path and
-produces arm-only targets. On G1, its bridge publishes those targets to
-`rt/arm_sdk`. The selected local
-`homie_g1_29dof` deployment reads that topic, combines the arms with its
-leg/waist policy output, and is the sole publisher to `rt/lowcmd`.
+BOOST keeps PATH's Galaxy XR arm teleoperation and IK. On G1, its 14 arm targets travel in the PATH PDU1 packet over LCM, then the G1 adapter publishes `rt/arm_sdk`. The DreamWaQ runtime reads that topic together with `rt/lowstate` and is the only hardware process that publishes `rt/lowcmd`.
 
-| Joint/device group | Target producer | Final SDK path |
+| Joint/device group | Target producer | Final path |
 | --- | --- | --- |
-| Legs, motors 0-11 | HOMIE policy | HOMIE merged `rt/lowcmd` |
-| Waist, motors 12-14 | HOMIE policy | HOMIE merged `rt/lowcmd` |
-| Left/right arms, motors 15-28 | PATH-derived nonlinear IK | `rt/arm_sdk` into HOMIE, then merged `rt/lowcmd` |
-| Dex1 hands | PATH grip bits over LCM | G1 bridge publishes `rt/dex1/{left,right}/cmd` |
-| Robot state | G1 bridge | Reads `rt/lowstate`, publishes `G1_ROBOT_STATE` |
-| Camera masks, surface geometry, belief | Thor/remote SAM3 pipeline | Target and belief messages only |
+| 12 exported lower-body joints | Selected DreamWaQ export | DreamWaQ `rt/lowcmd` writer |
+| Waist/spine | Export manifest action compiler and target config | DreamWaQ `rt/lowcmd` writer |
+| Left/right arms, motors 15–28 | PATH nonlinear IK | `rt/arm_sdk` → DreamWaQ merge → `rt/lowcmd` |
+| G1 state | Unitree DDS | `rt/lowstate` → DreamWaQ; G1 adapter also relays GST1 over LCM |
+| Physical G1 cameras | Teleimager | TIM2/ZMQ → Thor relay → wrist-image LCM |
+| Revo2 hands in MuJoCo | BOOST binary grip adapter or hand MPPI, one at a time | Simulated BrainCo DDS channels |
 
-The G1 bridge publishes arm targets on `rt/arm_sdk` and hand targets on the
-separate Dex1 DDS topics. It does not publish `rt/lowcmd`. The HOMIE process
-owns the final full-body `rt/lowcmd` writer and must be configured with
-`arm_source: "arm_sdk"`.
+The G1 bridge publishes arm targets and relays state. It does not publish `rt/lowcmd`. `g1_ws/g1_lowlevel_bridge` is not part of the live command path: even its null-action smoke mode publishes `rt/lowcmd`, so it must not run next to DreamWaQ. The GCA1 `G1_POLICY_ACTION` packet is a separate 29-joint policy format; it does not replace PATH's PDU1 `G1_PATH_UPPER_COMMAND` packet.
 
 ```text
-PICO / SAM3 surface target
-          |
-          v
-BOOST teleop state machine + nonlinear arm IK (Thor)
-          |
-          v
-G1_PATH_UPPER_COMMAND over LCM
-          |
-          v
-G1 bridge: arm slots 15-28 -> rt/arm_sdk
-          |
-          v
-HOMIE reads rt/arm_sdk and combines 14 arm + 15 leg/waist targets
-          |
-          v
-HOMIE sole rt/lowcmd writer
+Galaxy XR → PATH IK → PDU1/LCM → G1 adapter → rt/arm_sdk ─┐
+                                                          ├→ DreamWaQ → rt/lowcmd → G1
+G1 rt/lowstate ───────────────────────────────────────────┘
 
-PATH-era grip bits ------------------> G1 bridge -> rt/dex1/*/cmd
+Galaxy XR hand input → existing BOOST Revo2/MPOPI path → simulated Revo2
+
+G1 Teleimager TIM2/ZMQ → Thor relay → pose service / RGB SAM3 path
 ```
 
-Use the local `homie_g1_29dof` deployment for this interface. Do not run the
-upstream HOMIE `g1_control` lowcmd writer at the same time: it accepts a
-different LCM arm packet and also publishes `rt/lowcmd`. See
-[`homie_integration.md`](homie_integration.md).
+The MuJoCo backend runs the same DreamWaQ policy and action compiler directly inside the simulator loop. It reads MuJoCo state and PATH adapter `rt/arm_sdk` targets, applies target PD gains and actuator torque limits, and never subscribes to or publishes hardware `rt/lowcmd`.
+
+See [`dreamwaq_integration.md`](dreamwaq_integration.md) for installation, launch commands, protocol details, and selected export provenance.

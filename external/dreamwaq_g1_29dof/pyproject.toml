@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dreamwaq-g1-29dof-deploy"
+version = "0.2.0"
+description = "HOMIE-base FlashSAC DreamWaQ deployment runtime for Unitree G1 29-DoF"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+dependencies = ["numpy>=1.23", "PyYAML>=6"]
+
+[project.optional-dependencies]
+inference = ["torch>=2.1"]
+test = ["pytest>=7"]
+dev = ["torch>=2.1", "pytest>=7"]
+
+[project.scripts]
+dreamwaq-g1-29dof = "dreamwaq_interface.scripts.homie_base_dreamwaq:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["dreamwaq_interface*", "deploy*"]

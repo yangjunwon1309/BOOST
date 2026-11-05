@@ -1,0 +1,53 @@
+# GR00T live-inference profile for the cameras already mounted on this G1.
+# Hardware identity, resolution and rotation match config/hbvcam_4m2214hd_g1.yaml.
+
+head_camera:
+  enable_zmq: true
+  zmq_port: 55555
+  enable_recording_zmq: false
+  recording_zmq_port: 55558
+  enable_webrtc: false
+  webrtc_port: 60001
+  webrtc_codec: h264
+  type: opencv
+  image_shape: [480, 1280]
+  binocular: true
+  fps: 30
+  video_id: null
+  serial_number: null
+  physical_path: /sys/devices/platform/3610000.xhci/usb1/1-2/1-2.1/1-2.1.3/1-2.1.3:1.0
+  rotation: 0
+
+left_wrist_camera:
+  enable_zmq: true
+  zmq_port: 55556
+  enable_recording_zmq: false
+  recording_zmq_port: 55559
+  enable_webrtc: false
+  webrtc_port: 60002
+  webrtc_codec: h264
+  type: realsense
+  image_shape: [480, 640]
+  binocular: false
+  fps: 30
+  video_id: null
+  serial_number: '037522250828'
+  physical_path: null
+  rotation: 180
+
+right_wrist_camera:
+  enable_zmq: true
+  zmq_port: 55557
+  enable_recording_zmq: false
+  recording_zmq_port: 55560
+  enable_webrtc: false
+  webrtc_port: 60003
+  webrtc_codec: h264
+  type: realsense
+  image_shape: [480, 640]
+  binocular: false
+  fps: 30
+  video_id: null
+  serial_number: '053422251379'
+  physical_path: null
+  rotation: 0

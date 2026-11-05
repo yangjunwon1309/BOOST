@@ -1,0 +1,41 @@
+# Thor: directly connected USB stereo camera, serial 01.00.00 (1bcf:0b15).
+# Run from the teleimager directory in the teleimager conda environment:
+# PYTHONPATH=src teleimager-server --no-affinity --config config/dex1_cam_nature_head_stereo.yaml
+# On the same Thor, use: teleimager-client --host 127.0.0.1
+
+head_camera:
+  enable_zmq: true
+  zmq_port: 55555
+  enable_recording_zmq: true
+  recording_zmq_port: 55558
+  enable_webrtc: true
+  webrtc_port: 60001
+  webrtc_codec: h264
+
+  # MJPEG side-by-side stereo: each eye is 640x480 at 30 FPS.
+  type: opencv
+  image_shape: [480, 1280]
+  binocular: true
+  fps: 30
+  enable_depth: false
+  rotation: 0
+
+  # Pin the Thor USB port; /dev/videoN can change after reconnecting.
+  # Re-read /sys/class/video4linux/videoN/device if the USB port changes.
+  video_id: null
+  serial_number: null
+  physical_path: /sys/devices/platform/bus@0/a80aa10000.usb/usb1/1-4/1-4.1/1-4.1:1.0
+
+# Disabled entries retain the ImageClient's three-camera configuration format.
+# Only head_camera is captured and published by this preset.
+left_wrist_camera:
+  enable_zmq: false
+  zmq_port: 55556
+  enable_recording_zmq: false
+  enable_webrtc: false
+
+right_wrist_camera:
+  enable_zmq: false
+  zmq_port: 55557
+  enable_recording_zmq: false
+  enable_webrtc: false

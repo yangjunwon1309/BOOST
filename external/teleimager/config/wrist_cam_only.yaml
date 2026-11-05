@@ -1,0 +1,28 @@
+# Wrist cameras are Intel RealSense D405. The serials below were verified on
+# this G1 with librealsense frame capture. Re-run the camera identification
+# step if either camera is replaced. Each camera is captured and published on
+# its own threads. Only the latest packet is queued, so a slow Thor receiver
+# cannot build up camera latency.
+#
+# `rotation` is applied on the G1 right after capture, so the recording stream,
+# the legacy ZMQ stream and WebRTC all carry the same upright image. Allowed
+# values are 0, 90, 180 and 270 (clockwise); the "uvc" backend rejects a
+# non-zero rotation because it forwards the camera's MJPEG buffer undecoded.
+
+right_wrist_camera:
+  enable_zmq: true
+  zmq_port: 55557
+  enable_recording_zmq: false
+  recording_zmq_port: 55560
+  enable_webrtc: false
+  webrtc_port: 60003
+  webrtc_codec: h264
+
+  type: realsense
+  image_shape: [480, 640]
+  binocular: false
+  fps: 30
+  video_id: null
+  serial_number: "260322274973"
+  physical_path: null
+  rotation: 0

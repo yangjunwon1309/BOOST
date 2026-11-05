@@ -1,40 +1,12 @@
 # External runtime components
 
-BOOST owns arm teleoperation, perception integration, the packaged robot
-models, and the G1-local arm/Dex1 DDS bridge carried over from PATH. These
-runtime components are installed separately:
+These source snapshots are pinned to url_g1_deploy commit `3d37aa43f88964fc4255857c840dd33dd08e6eda` and keep source metadata in each directory's `SOURCE.md`.
 
-- **Unitree SDK2** builds and runs `boost/io/g1_bridge/`. The local MuJoCo
-  bring-up uses this DDS bridge on loopback, with the simulator acting as the
-  low-state endpoint.
-- **Local HOMIE/WBC** owns legs and waist, merges PATH's `rt/arm_sdk` arm data,
-  and remains the only `rt/lowcmd` publisher. Its source snapshot is included
-  at [`homie_g1_29dof/`](homie_g1_29dof/) without upstream Git metadata; its
-  source and scoped license are recorded there. See
-  [`../docs/homie_integration.md`](../docs/homie_integration.md).
-- **Unitree `dex1_1_service`** owns the Dex1-1 serial connection. It publishes
-  hand state and consumes the DDS command topics from `boost/io/g1_bridge/`; see
-  [`../docs/g1_installation.md`](../docs/g1_installation.md).
-- **XRoboToolkit / PICO SDK** supplies the live PICO manager's controller input.
-- **Televuer and Unitree SDK2 Python** are installed into the Pixi `sim`
-  environment from pinned Git revisions in `pixi.toml`.
-- **BrainCo Revo2 descriptions** are pinned in the `brainco-description`
-  submodule. The MuJoCo model uses the official left/right MJCF and mesh
-  assets, then adds BOOST's G1 wrist mounts and six-channel control.
-- **Desktop MuJoCo** uses the Pixi-managed Unitree SDK2 Python dependency and
-  BOOST's Python LCM/DDS bridge. `pixi install -e sim` followed by
-  `pixi run -e sim setup-sim` prepares and loads the local scene without a C++
-  SDK checkout. The native
-  `boost/io/g1_bridge/` remains the hardware bridge and requires a separately
-  installed Unitree SDK2 C++ tree when building for a robot.
-- **Remote SAM3 worker** runs on the selected inference host and sends camera
-  segmentation and geometry to the Thor gateway.
+- [`dreamwaq_g1_29dof/`](dreamwaq_g1_29dof/) contains the target DreamWaQ deployment runtime and only the selected `new3_4_backpack_440000` export. The full deployment runtime owns hardware `rt/lowcmd`; the sim calls its policy and action compiler in-process.
+- [`g1_ws/`](g1_ws/) records the target DDS and packet schemas. Its low-level bridge is not launched with DreamWaQ because it publishes the same `rt/lowcmd` topic.
+- [`teleimager/`](teleimager/) contains the TIM2 image server/protocol and selected HBVCAM/D455 G1 camera preset. The server is installed separately from DreamWaQ.
+- [`brainco-description/`](brainco-description/) pins the Revo2 hand assets used by the MuJoCo model.
+- Unitree SDK2 C++ and Python components are installed as runtime dependencies; they are not copied from a complete upstream workspace.
+- Televuer and existing PATH Python dependencies remain pinned in Pixi for the desktop simulation/teleop environment.
 
-The checked-in hardware bridge still sends Dex1 open/close commands. The PATH
-Sonic MuJoCo adapter and model are included for Revo2 simulation, with PATH grip
-flags translated to the BrainCo DDS command topics; this does not add Revo2
-serial/service support for physical hardware. Other external runtime projects
-are not vendored here.
-Keep host-specific checkout paths and credentials in deployment environment
-files, not BOOST source. The HOMIE snapshot has no upstream commit metadata;
-record an archive checksum when producing a deployment package.
+DreamWaQ and Teleimager virtual environments default to `$HOME/.local/share/boost/external/venvs/`. No camera service, low-level G1 controller, or external runtime starts automatically when the repository is imported or when MuJoCo is launched.

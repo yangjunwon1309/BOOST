@@ -1,0 +1,79 @@
+# HBVCAM-4M2214HD-2 V11 side-by-side stereo camera on the G1.
+# Run `teleimager-server --cf` and prefer physical_path for a fixed robot USB port.
+
+head_camera:
+  # Keep the legacy raw-JPEG stream off when only the Thor recorder is used.
+  enable_zmq: false
+  zmq_port: 55555
+
+  # TIM2 envelope: sequence + capture timestamps + dimensions + original JPEG.
+  enable_recording_zmq: true
+  recording_zmq_port: 55558
+
+  # Enable later for XR/PICO display.
+  enable_webrtc: false
+  webrtc_port: 60001
+  webrtc_codec: h264
+
+  # OpenCV uses /dev/video* permissions and avoids raw USB permission requirements.
+  type: opencv
+  image_shape: [480, 1280]
+  binocular: true
+  fps: 30
+
+  # Pinned to the USB port, not to /dev/videoN. Enumeration order is not stable
+  # here: the RealSense cameras claim /dev/video0..11 and this camera came up as
+  # /dev/video12, so the old `video_id: 0` selected a RealSense instead.
+  # Re-read with `readlink -f /sys/class/video4linux/videoN/device` if the
+  # camera is ever moved to a different USB port.
+  video_id: null
+  serial_number: null
+  physical_path: /sys/devices/platform/3610000.xhci/usb1/1-2/1-2.1/1-2.1.3/1-2.1.3:1.0
+  rotation: 0
+
+# Wrist cameras are Intel RealSense D455 (not D405). Serials were confirmed by
+# covering each lens in turn; re-verify with tools/rs_identify.py if a camera is
+# ever swapped. Each camera is captured and published on its own threads. Only
+# the latest packet is queued, so a slow Thor receiver cannot build up camera
+# latency.
+#
+# `rotation` is applied on the G1 right after capture, so the recording stream,
+# the legacy ZMQ stream and WebRTC all carry the same upright image. Allowed
+# values are 0, 90, 180 and 270 (clockwise); the "uvc" backend rejects a
+# non-zero rotation because it forwards the camera's MJPEG buffer undecoded.
+left_wrist_camera:
+  enable_zmq: false
+  zmq_port: 55556
+  enable_recording_zmq: true
+  recording_zmq_port: 55559
+  enable_webrtc: false
+  webrtc_port: 60002
+  webrtc_codec: h264
+
+  type: realsense
+  image_shape: [480, 640]
+  binocular: false
+  fps: 30
+  video_id: null
+  serial_number: '037522250828'
+  physical_path: null
+  # This camera is physically mounted upside down on the left wrist.
+  rotation: 180
+
+right_wrist_camera:
+  enable_zmq: false
+  zmq_port: 55557
+  enable_recording_zmq: true
+  recording_zmq_port: 55560
+  enable_webrtc: false
+  webrtc_port: 60003
+  webrtc_codec: h264
+
+  type: realsense
+  image_shape: [480, 640]
+  binocular: false
+  fps: 30
+  video_id: null
+  serial_number: '053422251379'
+  physical_path: null
+  rotation: 0

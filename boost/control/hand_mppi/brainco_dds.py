@@ -45,7 +45,7 @@ class BrainCoDDS:
 
     This adapter deliberately uses the same DDS topics and IDL types as the
     Revo2 MuJoCo backend and Unitree BrainCo service. It never publishes
-    ``rt/lowcmd``; HOMIE remains the sole body command writer.
+    ``rt/lowcmd``; DreamWaQ remains the sole hardware body command writer.
     """
 
     def __init__(self, *, domain_id: int = 0, interface: str = "lo") -> None:

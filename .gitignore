@@ -19,6 +19,7 @@ compile_commands.json
 .venv/
 .venv_*/
 .pixi/
+.external_runtime/
 *.npz
 *.npy
 *.pkl
@@ -30,14 +31,21 @@ compile_commands.json
 logs/
 *.log
 
-# Ignore external checkouts, while tracking the reviewed HOMIE deployment snapshot.
+# Ignore external checkouts, while tracking the selected DreamWaQ, g1_ws, and Teleimager snapshots.
 external/*
 !external/README.md
-!external/homie_g1_29dof/
-!external/homie_g1_29dof/**
+!external/dreamwaq_g1_29dof/
+!external/dreamwaq_g1_29dof/**
+!external/g1_ws/
+!external/g1_ws/**
+!external/teleimager/
+!external/teleimager/**
 !external/brainco-description/
 !external/brainco-description/**
-external/homie_g1_29dof/**/__pycache__/
+external/dreamwaq_g1_29dof/**/__pycache__/
+external/g1_ws/**/build/
+external/teleimager/**/__pycache__/
+external/teleimager/**/*.egg-info/
 
 
 # TensorRT generated engines

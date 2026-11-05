@@ -81,6 +81,7 @@ class UnitreeSdk2Bridge:
         self.num_body_motor = config["NUM_MOTORS"]
         self.num_hand_motor = config.get("NUM_HAND_MOTORS", 0)
         self.hand_backend = config.get("HAND_BACKEND", DEX3_BACKEND)
+        self.accept_low_cmd = bool(config.get("ACCEPT_LOW_CMD", True))
         if self.hand_backend not in (DEX3_BACKEND, REVO2_BACKEND):
             raise ValueError(f"Unsupported HAND_BACKEND: {self.hand_backend}")
         self.revo2_adapter = Revo2CommandAdapter(
@@ -139,8 +140,10 @@ class UnitreeSdk2Bridge:
             self.right_hand_state_puber = ChannelPublisher("rt/dex3/right/state", HandState_)
             self.right_hand_state_puber.Init()
 
-        self.low_cmd_suber = ChannelSubscriber("rt/lowcmd", LowCmd_)
-        self.low_cmd_suber.Init(self.LowCmdHandler, 1)
+        self.low_cmd_suber = None
+        if self.accept_low_cmd:
+            self.low_cmd_suber = ChannelSubscriber("rt/lowcmd", LowCmd_)
+            self.low_cmd_suber.Init(self.LowCmdHandler, 1)
 
         self.legacy_left_hand_cmd_suber = None
         self.legacy_right_hand_cmd_suber = None

@@ -749,7 +749,7 @@ class UnitreeG1ArmNonlinearIK:
             tau_ff = self.gravity_torque_from_q29(
                 q_ref, base_quaternion_wxyz=base_quaternion_wxyz
             )
-            # PATH supplies arm feedforward only; WBC/HOMIE owns the base,
+            # PATH supplies arm feedforward only; DreamWaQ owns the base,
             # legs, and waist through its separate controller.
             tau_ff[:15] = 0.0
 

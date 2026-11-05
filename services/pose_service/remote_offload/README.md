@@ -5,11 +5,15 @@ on a separate x86/GPU host. Thor owns camera capture, timestamp-pairs results
 with `G1_ROBOT_STATE`, runs surface/belief processing, and publishes selected
 `path_static_ee_target` messages to PATH's nonlinear arm IK.
 
-## G1 teleimager UVC RGB path (image-only)
+## G1 Teleimager TIM2 wrist RGB path (image-only)
 
-The G1 teleimager setup in `dex1_cam_nature.yaml` publishes raw JPEG wrist
-frames on TCP ports 55556 (left) and 55557 (right). Thor can relay those
-frames to the SAM3 worker over LCM:
+The selected G1 preset is
+`external/teleimager/config/hbvcam_4m2214hd_g1.yaml`. It publishes TIM2 on
+head port 55558 and wrist ports 55559 (left) and 55560 (right); wrist images
+are 640×480. The relay reads these values from the selected Teleimager preset,
+validates the TIM2 header, and publishes a version 2 wrist RGB message with the
+original JPEG, camera sequence, G1 capture wall/monotonic time, and Thor
+receive timestamp:
 
 ```bash
 cd BOOST/services/pose_service
@@ -26,12 +30,13 @@ WIFI_LCM_URL='udpm://239.255.77.67:7667?ttl=1' \
 ./tools/run_remote_sam3_wrist_d405_v11.sh
 ```
 
-This UVC path logs SAM3 detection counts and labels. It does not publish masks
-to the viewer or create targets. The teleimager JPEG stream has no depth
-channel or camera exposure timestamp, so it cannot produce calibrated 3-D
-targets or arm IK commands. Keep it as a perception check until depth and
-capture-time/state synchronization are available. The D405 RGB-D mode remains
-the default for the production geometry path.
+The wrist image receiver accepts both legacy version 1 messages and version 2.
+It uses the Thor receive timestamp for freshness checks and does not compare
+monotonic clocks across G1 and Thor. Sequence gaps are logged by the relay.
+This RGB-only path logs SAM3 detections; it does not publish masks to the viewer
+or create targets. It has no depth channel and cannot produce calibrated 3-D
+targets or arm IK commands. The D405 RGB-D mode remains the production geometry
+path and is not replaced by Teleimager JPEG.
 
 ## Thor camera preflight
 

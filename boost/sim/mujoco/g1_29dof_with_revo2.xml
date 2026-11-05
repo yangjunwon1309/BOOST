@@ -171,7 +171,7 @@
         <geom type="mesh" rgba="0.2 0.2 0.2 1" mesh="left_hip_pitch_link" />
         <body name="left_hip_roll_link" pos="0 0.052 -0.030465" quat="0.996179 0 -0.0873386 0">
           <inertial pos="0.029812 -0.001045 -0.087934" quat="0.977808 -1.97119e-05 0.205576 -0.0403793" mass="1.52" diaginertia="0.00254986 0.00241169 0.00148755" />
-          <joint name="left_hip_roll_joint" pos="0 0 0" axis="1 0 0" range="-0.5236 2.9671" actuatorfrcrange="-88 88" class="leg_motor" />
+          <joint name="left_hip_roll_joint" pos="0 0 0" axis="1 0 0" range="-0.5236 2.9671" actuatorfrcrange="-139 139" class="leg_motor" />
           <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.7 0.7 0.7 1" mesh="left_hip_roll_link" />
           <geom type="mesh" rgba="0.7 0.7 0.7 1" mesh="left_hip_roll_link" />
           <body name="left_hip_yaw_link" pos="0.025001 0 -0.12412">
@@ -210,7 +210,7 @@
         <geom type="mesh" rgba="0.2 0.2 0.2 1" mesh="right_hip_pitch_link" />
         <body name="right_hip_roll_link" pos="0 -0.052 -0.030465" quat="0.996179 0 -0.0873386 0">
           <inertial pos="0.029812 0.001045 -0.087934" quat="0.977808 1.97119e-05 0.205576 0.0403793" mass="1.52" diaginertia="0.00254986 0.00241169 0.00148755" />
-          <joint name="right_hip_roll_joint" pos="0 0 0" axis="1 0 0" range="-2.9671 0.5236" actuatorfrcrange="-88 88" class="leg_motor" />
+          <joint name="right_hip_roll_joint" pos="0 0 0" axis="1 0 0" range="-2.9671 0.5236" actuatorfrcrange="-139 139" class="leg_motor" />
           <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.7 0.7 0.7 1" mesh="right_hip_roll_link" />
           <geom type="mesh" rgba="0.7 0.7 0.7 1" mesh="right_hip_roll_link" />
           <body name="right_hip_yaw_link" pos="0.025001 0 -0.12412">
@@ -261,6 +261,14 @@
             <geom pos="0.0039635 0 -0.054" type="mesh" rgba="0.2 0.2 0.2 1" mesh="head_link" />
             <geom pos="0.0039635 0 -0.054" quat="1 0 0 0" type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.7 0.7 0.7 1" mesh="waist_support_link" />
             <geom pos="0.0039635 0 -0.054" quat="1 0 0 0" type="mesh" rgba="0.7 0.7 0.7 1" mesh="waist_support_link" />
+            <!-- Nominal DreamWaQ backpack payload from the NEW3-4 export. The
+                 training randomizes 2-5 kg and COM around this center; the sim
+                 uses the 3.5 kg nominal payload without changing torso mass. -->
+            <!-- Nominal 3.5 kg payload from the selected DreamWaQ export receipt. -->
+            <body name="dreamwaq_backpack_payload" pos="-0.12464276 0 0.1">
+              <inertial pos="0 0 0" mass="3.5" diaginertia="0.043166667 0.037245833 0.012979167" />
+              <geom name="dreamwaq_backpack_box" type="box" size="0.055 0.09 0.17" mass="0" rgba="0.18 0.20 0.24 1" />
+            </body>
             <body name="left_shoulder_pitch_link" pos="0.0039563 0.10022 0.23778" quat="0.990264 0.139201 1.38722e-05 -9.86868e-05">
               <inertial pos="0 0.035892 -0.011628" quat="0.654152 0.0130458 -0.326267 0.68225" mass="0.718" diaginertia="0.000465864 0.000432842 0.000406394" />
               <joint name="left_shoulder_pitch_joint" pos="0 0 0" axis="0 1 0" range="-3.0892 2.6704" actuatorfrcrange="-25 25" class="arm_motor" />
@@ -559,13 +567,13 @@
   </worldbody>
   <actuator>
     <motor name="left_hip_pitch" joint="left_hip_pitch_joint" ctrlrange="-88 88" />
-    <motor name="left_hip_roll" joint="left_hip_roll_joint" ctrlrange="-88 88" />
+    <motor name="left_hip_roll" joint="left_hip_roll_joint" ctrlrange="-139 139" />
     <motor name="left_hip_yaw" joint="left_hip_yaw_joint" ctrlrange="-88 88" />
     <motor name="left_knee" joint="left_knee_joint" ctrlrange="-139 139" />
     <motor name="left_ankle_pitch" joint="left_ankle_pitch_joint" ctrlrange="-50 50" />
     <motor name="left_ankle_roll" joint="left_ankle_roll_joint" ctrlrange="-50 50" />
     <motor name="right_hip_pitch" joint="right_hip_pitch_joint" ctrlrange="-88 88" />
-    <motor name="right_hip_roll" joint="right_hip_roll_joint" ctrlrange="-88 88" />
+    <motor name="right_hip_roll" joint="right_hip_roll_joint" ctrlrange="-139 139" />
     <motor name="right_hip_yaw" joint="right_hip_yaw_joint" ctrlrange="-88 88" />
     <motor name="right_knee" joint="right_knee_joint" ctrlrange="-139 139" />
     <motor name="right_ankle_pitch" joint="right_ankle_pitch_joint" ctrlrange="-50 50" />

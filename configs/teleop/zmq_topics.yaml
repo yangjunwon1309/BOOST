@@ -28,7 +28,7 @@ unitree_g1:
   state_topic: "rt/lowstate"
   arm_command_topic: "rt/arm_sdk"
   path_forbidden_command_topic: "rt/lowcmd"
-  whole_body_command_owner: "homie_g1_29dof"
+  whole_body_command_owner: "dreamwaq_g1_29dof"
 perception_web:
   port: 8080
 path_state_command:

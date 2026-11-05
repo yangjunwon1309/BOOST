@@ -1423,7 +1423,7 @@ def main() -> int:
         )
         if result.success:
             result.q_ref[:15] = 0.0
-            # HOMIE/WBC owns the lower body and waist. Only arm feed-forward
+            # DreamWaQ owns the lower body and waist. Only arm feed-forward
             # torque accompanies the authoritative IPOPT arm target.
             result.tau_ff_ref[:12] = 0.0
             result.tau_ff_ref[12:15] = 0.0
@@ -1642,7 +1642,7 @@ def main() -> int:
     else:
         log("keyboard hotkeys disabled; use tcp://*:5563/path_state_command")
     log(f"QP reference gate initial state: {'ON' if qp_reference_enabled else 'OFF'}")
-    log("PATH publishes arm joints only; WBC/HOMIE owns base, legs, and waist")
+    log("PATH publishes arm joints only; DreamWaQ owns base, legs, and waist")
 
     next_deadline = time.monotonic()
     try:
@@ -2694,7 +2694,7 @@ def main() -> int:
                     gravity_estimator.accel_correction_active
                 )
 
-            # Direct path: Thor owns *only* IPOPT arm q/dq/tau. HOMIE/WBC owns
+            # Direct path: Thor owns *only* IPOPT arm q/dq/tau. DreamWaQ owns
             # the waist and legs; PATH sends no command for those joints.
             direct_command_sent = False
             direct_left_grip = grasp_commanded["left"]

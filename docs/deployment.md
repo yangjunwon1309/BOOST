@@ -1,44 +1,19 @@
 # Deployment layout
 
-BOOST keeps controller, robot I/O, and perception services in separate
-packages. The current runtime pieces were carried over from PATH-G1; this
-deployment map records where they live after the repository reorganization.
+BOOST keeps teleoperation, robot I/O, perception, and hardware-specific controller runtimes separate.
 
-- `boost/teleop/`: XR managers, PATH state machine, teleop messages, and
-  isolated legacy intention modules.
-- `boost/io/path_transport/`: PATH LCM packets and ZMQ transport helpers.
-- `boost/control/arm/path_planning/`: nonlinear bimanual G1 arm IK.
-- `boost/io/g1_bridge/`: Unitree arm SDK and legacy Dex1 hand bridge.
-- `services/pose_service/`: wrist D405 capture, remote SAM3, surface geometry,
-  and the existing target publisher.
-- `external/homie_g1_29dof/`: local HOMIE/WBC deployment snapshot. It remains
-  the sole `rt/lowcmd` writer; BOOST's G1 bridge ends at `rt/arm_sdk`.
-- `assets/robot/`: G1 model and BrainCo Revo2 model assets.
+- `boost/teleop/`: Galaxy XR manager, PATH state machine, and teleop messages.
+- `boost/control/arm/path_planning/`: PATH nonlinear bimanual arm IK.
+- `boost/io/g1_bridge/`: G1 arm-only DDS adapter and GST1 state relay.
+- `boost/sim/mujoco/`: G1/Revo2 MuJoCo scene, in-process DreamWaQ policy, DDS state bridge, and local surface-query service.
+- `external/dreamwaq_g1_29dof/`: selected target DreamWaQ deployment source and the `new3_4_backpack_440000` export.
+- `external/g1_ws/`: source snapshot and protocol reference. Its `g1_lowlevel_bridge` is not run with DreamWaQ because it writes `rt/lowcmd`.
+- `external/teleimager/`: selected G1 camera server and TIM2 protocol source.
+- `services/pose_service/`: Thor wrist-image relay, RGB/RGB-D perception, SAM3, and surface geometry.
+- `configs/`: sim scene/controller selection, camera relay settings, and machine-local environment defaults.
 
-## Current runtime boundary
+The hardware low-level owner is the target DreamWaQ parent process. PATH's G1 bridge only publishes `rt/arm_sdk` and GST1 state; camera capture runs in Teleimager as its own service. DreamWaQ and Teleimager use separate Python 3.10 environments outside the repository under `$HOME/.local/share/boost/external/` by default. Their setup and launch scripts are in `scripts/`.
 
-The G1 bridge and its protocol still use PATH's 14-joint arm packet and Dex1
-open/close flags. They are not a Revo2 driver. The Revo2 service uses separate
-left/right six-joint command and state topics; BOOST's adapter is future work.
-Likewise, the current wrist service is SAM3/surface based. FoundationPose,
-BOOST's pose schema, recording pipeline, and object-aware MPPI remain planned
-in [`../BOOST_dev_plan.md`](../BOOST_dev_plan.md).
+The desktop simulation remains isolated on DDS loopback and its own LCM multicast group. It evaluates DreamWaQ in-process and uses MuJoCo actuators; the hardware controller and camera server are not started by the sim task. Televuer, PATH dependencies, and the Revo2 MPPI environment remain managed by the existing Pixi desktop environments.
 
-## Existing PATH launch sequence
-
-The current PATH-derived XR and state-machine processes can be launched from
-the BOOST repository root:
-
-1. Start the G1 bridge in dry-run mode on G1 with
-   `boost/io/g1_bridge/run.sh`, then confirm the `G1_ROBOT_STATE` stream.
-2. Start `scripts/run_pico_manager.sh` or
-   `scripts/run_galaxy_xr_manager.sh` for the selected XR input.
-3. Start `scripts/run_state_machine_bridge.sh` for the PATH teleop bridge.
-4. Start the wrist capture and remote SAM3 processes from
-   `services/pose_service/` when checking the existing perception pipeline.
-5. Run the local HOMIE/WBC separately as the only `rt/lowcmd` publisher.
-
-The existing Dex1 live route requires Unitree's `dex1_1_service` and must not
-be treated as the Revo2 route. The old PATH/Dex1 installation details remain in
-[`g1_installation.md`](g1_installation.md); the interface contracts are in
-[`protocols.md`](protocols.md) and [`control_ownership.md`](control_ownership.md).
+For command ownership, selected checkpoint hashes, camera protocol, and machine commands, see [`dreamwaq_integration.md`](dreamwaq_integration.md).

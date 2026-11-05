@@ -1,0 +1,100 @@
+# G1-29 nature: built-in D435i RGB head camera + two USB wrist cameras.
+# Run on G1-29 from this teleimager directory:
+# teleimager-server --rs --no-affinity --config "$PWD/config/dex1_cam_nature.yaml"
+
+head_camera:
+  # D435i's metric depth, aligned to the same RGB frame, for Nature Dock 2.
+  enable_depth: true
+  rgbd_port: 55561
+  # All three cameras are published by G1-29 to the policy client.
+  enable_zmq: true
+  zmq_port: 55555
+
+  # TIM2 envelope: sequence + capture timestamps + dimensions + original JPEG.
+  enable_recording_zmq: true
+  recording_zmq_port: 55558
+
+  # Monocular XR/PICO view; the recording stream retains the original JPEG.
+  enable_webrtc: true
+  webrtc_port: 60001
+  webrtc_codec: h264
+
+  # The D435i provides one RGB image, not a side-by-side stereo image.
+  # Native depth is enabled above and published separately from the mono RGB.
+  type: realsense
+  image_shape: [480, 640]
+  binocular: false
+  fps: 30
+
+  # Match HBVCAM's per-eye image format (640x480 at 30 FPS). These RGB values
+  # are a D435i tuning baseline, not a measured HBVCAM color calibration.
+  # HBVCAM exposure/color controls were not saved in the old configuration.
+  # Lab HBVCAM raw intrinsics: fx/fy about 338-342 px at 640x480; D435i:
+  # about 605 px. RGB controls cannot recover the wider HBVCAM field of view.
+  # This D435i's measured geometry is in config/d435i_nature_intrinsics.json.
+  color_options:
+    enable_auto_exposure: true
+    enable_auto_white_balance: true
+    auto_exposure_priority: false  # do not let AE reduce the requested FPS
+    power_line_frequency: 2       # 60 Hz lighting; 1 = 50 Hz, 3 = auto
+    brightness: 0
+    contrast: 50
+    saturation: 64
+    gamma: 300
+    hue: 0
+    sharpness: 50
+    backlight_compensation: 0
+    # For repeatable color under fixed lighting, turn the corresponding auto
+    # flag off and tune these controls using the same scene as the HBVCAM:
+    # exposure: 166
+    # gain: 64
+    # white_balance: 4600
+
+  # Verified with librealsense on G1-29. Use the device serial, not the
+  # ASIC/udev serial 252943060732; the RealSense backend selects by SDK serial.
+  video_id: null
+  serial_number: "405622072600"
+  physical_path: null
+  rotation: 0
+
+# The new wrist cameras are UVC/MJPEG USB cameras, not RealSense.
+# Left/right was verified on G1-29 by covering the left lens: JR0001 was covered.
+# OpenCV captures MJPEG at 640x480 / 30 FPS and supports rotation if needed.
+# Select by USB serial rather than /dev/videoN, which can change after reboot.
+# Current ports: JR0001 = 1-2.3 (video8), JR0002 = 1-2.2 (video0).
+# Both views already have the jaws entering from the bottom; no rotation.
+left_wrist_camera:
+  enable_zmq: true
+  zmq_port: 55556
+  enable_recording_zmq: true
+  recording_zmq_port: 55559
+  enable_webrtc: false
+  webrtc_port: 60002
+  webrtc_codec: h264
+
+  type: opencv
+  image_shape: [480, 640]
+  binocular: false
+  fps: 30
+  video_id: null
+  serial_number: "JR0001"
+  physical_path: null
+  rotation: 0
+
+right_wrist_camera:
+  enable_zmq: true
+  zmq_port: 55557
+  enable_recording_zmq: true
+  recording_zmq_port: 55560
+  enable_webrtc: false
+  webrtc_port: 60003
+  webrtc_codec: h264
+
+  type: opencv
+  image_shape: [480, 640]
+  binocular: false
+  fps: 30
+  video_id: null
+  serial_number: "JR0002"
+  physical_path: null
+  rotation: 0

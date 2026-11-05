@@ -45,7 +45,7 @@ if [[ "${G1_BRIDGE_LIVE:-1}" != "1" ]]; then
   exit 2
 fi
 if command -v pgrep >/dev/null 2>&1 && pgrep -af 'run_dreamwaq\.py|dreamwaq-g1-29dof|run_homie\.py|g1_lowlevel_bridge' >/dev/null; then
-  echo "A DreamWaQ/HOMIE/g1_ws low-level controller or bridge is already running." >&2
+  echo "A DreamWaQ deployment or g1_ws low-level bridge is already running." >&2
   echo "Stop the existing owner before starting this stack; there must be one rt/lowcmd writer." >&2
   exit 2
 fi

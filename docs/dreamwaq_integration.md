@@ -54,8 +54,8 @@ the selected export, standing mode, 15 ms action deadline, and three-timeout
 diagnostic window. It intentionally requires the explicit
 `BOOST_ALLOW_HARDWARE_CONTROL=1` environment setting. The target runtime still
 requires its START then A enable procedure; X switches standing/walking. Do
-not start a HOMIE process or `g1_ws/g1_lowlevel_bridge` at the same time. The
-`g1_ws` bridge publishes `rt/lowcmd` even in its null-action smoke mode.
+not start a second body controller or `g1_ws/g1_lowlevel_bridge` alongside it.
+The `g1_ws` bridge publishes `rt/lowcmd` even in its null-action smoke mode.
 
 The target runner's default CPU partition reserves camera cores 0–2, DDS I/O
 cores 3–5, and selects policy/control cores from the remaining CPUs. The

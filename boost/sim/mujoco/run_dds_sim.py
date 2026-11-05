@@ -291,7 +291,7 @@ def parse_args() -> argparse.Namespace:
         "--hold-start-delay-s",
         type=float,
         default=0.0,
-        help="hold initial physics until this delay has elapsed and HOMIE sends rt/lowcmd",
+        help="hold initial physics for a delay, or until external rt/lowcmd is fresh",
     )
     return parser.parse_args()
 
@@ -512,8 +512,9 @@ def main() -> int:
     )
     if args.hold_start_delay_s > 0.0:
         print(
-            "[BOOST MuJoCo] holding the initial HOMIE pose until "
-            f"{args.hold_start_delay_s:.1f}s and a fresh rt/lowcmd",
+            "[BOOST MuJoCo] holding initial physics until "
+            f"{args.hold_start_delay_s:.1f}s"
+            + (" and a fresh rt/lowcmd" if args.controller == "external-lowcmd" else ""),
             flush=True,
         )
     if viewer is not None:
@@ -554,6 +555,7 @@ def main() -> int:
             )
             bridge.PublishLowState(obs)
 
+            have_body_command = args.controller == "dreamwaq"
             if dreamwaq_policy is not None:
                 if data.time + 1.0e-9 >= dreamwaq_next_time:
                     command, _speed_scale = keyboard.command()
@@ -643,14 +645,14 @@ def main() -> int:
                     torque = args.hand_kp * (q_des - data.qpos[qpos_adr]) - args.hand_kd * data.qvel[dof_adr]
                     data.ctrl[actuator_id] = _torque_limit(model, actuator_id, torque)
 
+            delay_elapsed = now - physics_start_wall >= args.hold_start_delay_s
             physics_ready = args.hold_start_delay_s <= 0.0 or (
-                have_body_command
-                and now - physics_start_wall >= args.hold_start_delay_s
+                delay_elapsed and have_body_command
             )
             if physics_ready:
                 if not physics_started:
                     print(
-                        "[BOOST MuJoCo] HOMIE command ready; starting physics",
+                        "[BOOST MuJoCo] startup condition met; starting physics",
                         flush=True,
                     )
                     physics_started = True

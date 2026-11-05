@@ -19,13 +19,9 @@ the relocated copy and may change it independently of PATH.
 
 The legacy intention package remains isolated because the existing PATH state
 machine imports it. Removing that behavior is a planned BOOST teleop change.
-<<<<<<< HEAD
 The carried G1 bridge only understands the PATH arm packet and Dex1 flags; it
-does not implement BrainCo Revo2 commands. The target DreamWaQ runtime is an
-external component and owns hardware `rt/lowcmd`.
-=======
-The G1 bridge publishes PATH arm targets on `rt/arm_sdk`. Thor's hand MPPI
-publishes BrainCo Revo2 targets directly over Unitree DDS. The external
-BrainCo serial service owns the physical hands, while HOMIE/WBC remains the
-sole publisher to `rt/lowcmd`.
->>>>>>> 228019f83417f222bc20e79b837865e645492e13
+does not implement BrainCo Revo2 commands. The G1 bridge publishes PATH arm
+targets on `rt/arm_sdk`; DreamWaQ merges them with its lower-body targets and
+is the sole hardware `rt/lowcmd` publisher. Thor's hand MPPI publishes Revo2
+targets over Unitree DDS, and the external BrainCo serial service owns the
+physical hands.

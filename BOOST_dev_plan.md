@@ -298,9 +298,9 @@ wrist-to-hand frame 검증 전에는 켜지 않는다.
 #### 6.1.7 실물 G1/Thor teleop 배포 순서
 
 - Thor에서 Galaxy XR/Televuer와 PATH arm IK, Revo2 hand MPPI를 실행한다. Televuer의 fresh wrist pose는 추가 reference/smoother 없이 PATH IK 입력으로 사용하고, fresh retarget 결과는 Revo2의 공식 관절 범위만 적용해 BrainCo DDS로 보낸다.
-- G1 내부 Orin에서 HOMIE/WBC가 `rt/lowcmd`의 유일한 writer로 동작한다. BOOST Unitree SDK2 bridge는 PATH의 14 arm target을 `rt/arm_sdk`로 전달하며, HOMIE가 그 arm target을 body command에 병합한다. 별도의 BrainCo hand service는 Revo2의 serial interface와 `rt/brainco/{left,right}/{cmd,state}`를 맡는다.
+- G1 ?? Orin??? ?? ?? ??? ??? DreamWaQ? `rt/lowcmd`? ??? writer? ????. BOOST Unitree SDK2 bridge? PATH? 14 arm target? `rt/arm_sdk`? ????, DreamWaQ? ?? body command? ????. ?? BrainCo hand service? Revo2 serial interface? `rt/brainco/{left,right}/{cmd,state}`? ???.
 - 유효성·finite 값·joint 범위와 timestamp age만 검사한다. Fresh target에는 moving average, interpolation, output rate clamp, 목표 projection을 적용하지 않는다. Stale/invalid stream에서는 새 명령 발행을 멈추고 수신기 watchdog으로 전환한다.
-- 하드웨어 수용 기준: HOMIE 단독 `rt/lowcmd` 확인, G1 bridge dry-run 상태/packet 확인, 손 service state 양쪽 확인, 각 target sequence/age 기록, 이후 팔/손을 개별 live enable. 이 순서를 완료하기 전까지 Thor/G1 물리 실시간 성능은 미검증으로 표시한다.
+- G1 ?? Orin??? ?? ?? ??? ??? DreamWaQ? `rt/lowcmd`? ??? writer? ????. BOOST Unitree SDK2 bridge? PATH? 14 arm target? `rt/arm_sdk`? ????, DreamWaQ? ?? body command? ????. ?? BrainCo hand service? Revo2 serial interface? `rt/brainco/{left,right}/{cmd,state}`? ???.
 
 ### 6.2 Stage 2: graph (오프라인, 로봇 불필요)
 

@@ -14,9 +14,6 @@ BOOST connects Televuer landmarks to BrainCo Revo2 with the pinned `mimic_retarg
 
 The runner checks schema, coordinate frame, age, validity, shape, and finite values before optimizing either hand. Its six radian targets are clamped to official BrainCo limits, converted to normalized `[0,1]` values, then rate-limited. Live publishing waits for fresh Revo2 state. It never publishes `rt/lowcmd`; DreamWaQ remains the sole hardware body writer.
 
-<<<<<<< HEAD
-## Runtime
-=======
 ## Runtime behavior
 
 `runner.py` uses Mimic's sampling-based iCEM retargeter with the local Revo2
@@ -25,11 +22,10 @@ through `BrainCoRevo2Adapter` to `[0, 1]`, and published directly. Live
 publishing waits for fresh Revo2 state on each side and seeds the optimizer from
 the measured pose. When Televuer input becomes stale, the runner stops
 publishing; the BrainCo service owns its command-loss watchdog. There is no
-post-retarget EMA, interpolation, or rate limiter. HOMIE remains the sole writer
+post-retarget EMA, interpolation, or rate limiter. DreamWaQ remains the sole writer
 to `rt/lowcmd`.
 
 The runner is read-only unless `--publish` is supplied:
->>>>>>> 228019f83417f222bc20e79b837865e645492e13
 
 ```bash
 pixi install -e hand
@@ -40,9 +36,6 @@ For the full Galaxy XR + Revo2 simulation, use `pixi run -e sim mujoco-hand-xr`.
 
 The XR hand route can query object surface hits from MuJoCo over local ZMQ. The active scene's collision geom names are configured in `configs/sim/mujoco_revo2.yaml`. D405 RGB-D geometry and depth synchronization remain separate from this simulation-only contact query.
 
-<<<<<<< HEAD
-See the [MuJoCo README](../../sim/README.md) for launch details and the [Galaxy XR runbook](../../../docs/mujoco_galaxy_xr_runbook.md) for the headset URL, shutdown, and port cleanup.
-=======
 This mode starts the runner in Pixi's separate `hand` environment and disables
 PATH's binary grip DDS publisher to avoid competing writes to the Revo2 command
 topics. `configs/hands/brainco_revo2_mppi.yaml` holds the model, optimizer,
@@ -101,21 +94,20 @@ not enable the hardware point-cloud backend.
 
 ## MuJoCo MPPI test without XR or PATH
 
-To hold the simulated G1 upright with HOMIE and exercise hand MPPI from a user
+To run the simulated G1 under the DreamWaQ policy and exercise hand MPPI from a user
 override pose, run:
 
 ```bash
 pixi run -e sim mujoco-hand-test
 ```
 
-This static test auto-starts HOMIE's stand/walk policy and begins with zero
-keyboard velocity, which selects `stand.onnx`; viewer movement keys select
-`walk.onnx`. The runner reads
+This static test runs DreamWaQ in standing mode at zero keyboard velocity;
+viewer movement keys and X switch the locomotion command/mode. The runner reads
 `configs/hands/revo2_hand_override_fist.json` directly and reloads it while
 active; `revo2_hand_override.json` provides an open-hand pose. Use
 `--override-file PATH` to select another JSON file. This route starts no
 Galaxy XR, Televuer, PATH bridge, or physical-robot transport.
-The test record is
+The prior HOMIE-era test record is archived at
 [`docs/test_logs/mujoco_homie_hand_mppi.md`](../../../docs/test_logs/mujoco_homie_hand_mppi.md).
 
 For a repeated synthetic two-hand motion test, run:
@@ -135,12 +127,11 @@ three-dimensional points. The streamer's default input templates are
 timing, rate, source files, and output path. Its output updates use atomic file
 replacement so the runner cannot observe a partially written JSON frame.
 
-This test runs HOMIE's stand policy at zero command, keeps arm targets at the
-configured default pose, and does not start Galaxy XR, Televuer, PATH arm
-tracking, or a surface-query service. MuJoCo holds its initial pose for five
-seconds and until HOMIE is publishing body commands, then starts physics. It
-uses a temporary HOMIE config that holds arm joints at their configured default
-and does not subscribe to `rt/arm_sdk`. It keeps the hand retargeter's
+This test runs DreamWaQ in standing mode, keeps arm targets at the configured
+default pose, and does not start Galaxy XR, Televuer, PATH arm tracking, or a
+surface-query service. The simulator evaluates DreamWaQ in-process and does not
+subscribe to or publish `rt/lowcmd`. A temporary body config selects the
+DreamWaQ runtime's `hold` arm source. It keeps the hand retargeter's
 optimization and hard joint limits; fresh retarget outputs are published
 directly. `--motion` and `--override-file` are mutually
 exclusive. The original static test remains available as
@@ -169,4 +160,3 @@ BRAINCO_DDS_INTERFACE=eth0 pixi run -e thor hand-mppi-publish
 
 See [`docs/g1_installation.md`](../../../docs/g1_installation.md) for the
 JetPack compatibility notes and full arm/hand startup sequence.
->>>>>>> 228019f83417f222bc20e79b837865e645492e13

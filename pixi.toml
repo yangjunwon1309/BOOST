@@ -55,10 +55,9 @@ test-perception = "python -m pytest -q services/pose_service/tests"
 sam3-worker = { cmd = "bash tools/run_remote_sam3_wrist_d405_v11.sh", cwd = "services/pose_service" }
 
 # The desktop MuJoCo stack is isolated from the host/perception environment.
-# `mujoco` runs the G1 simulator, DreamWaQ, PATH's arm bridge, and the Revo2 DDS
-# adapter on loopback. Televuer and Unitree SDK2 Python are installed as pinned
-# Pixi-managed Git dependencies; the local PATH bridge uses the same Python DDS
-# and LCM contracts as BOOST.
+# `mujoco` runs the G1 simulator, the in-process DreamWaQ policy, PATH's arm
+# bridge, and the Revo2 DDS adapter on loopback. Televuer and Unitree SDK2
+# Python are pinned Pixi dependencies.
 [feature.sim.dependencies]
 python = "3.10.*"
 cyclonedds = "==0.10.5"
@@ -92,20 +91,12 @@ CYCLONEDDS_HOME = "$CONDA_PREFIX"
 
 [feature.sim.tasks]
 setup-sim = { cmd = "bash scripts/setup_mujoco_desktop.sh", description = "Prepare and inspect the Pixi desktop MuJoCo runtime" }
-<<<<<<< HEAD
 mujoco = { cmd = "bash scripts/run_galaxy_dreamwaq_mujoco.sh", description = "Run MuJoCo with DreamWaQ, PATH, and Galaxy XR" }
 mujoco-hand-test = { cmd = "bash scripts/run_mujoco_hand_test.sh", description = "Run the backpack-trained DreamWaQ policy and Revo2 MPPI in local MuJoCo with an editable JSON hand pose; no XR/PATH" }
+mujoco-hand-motion-test = { cmd = "bash scripts/run_mujoco_hand_test.sh --motion", description = "Run a synthetic repeated fist/open Revo2 MPPI test with DreamWaQ in local MuJoCo; no XR/PATH" }
 mujoco-hand-xr = { cmd = "bash scripts/run_galaxy_dreamwaq_mujoco.sh --hand-mppi-xr", description = "Run live Galaxy XR to Televuer/PATH to Revo2 MPPI in DreamWaQ MuJoCo" }
 mujoco-no-xr = { cmd = "bash scripts/run_galaxy_dreamwaq_mujoco.sh --no-xr", description = "Run DreamWaQ MuJoCo and PATH without Galaxy XR" }
 mujoco-headless = { cmd = "bash scripts/run_galaxy_dreamwaq_mujoco.sh --no-xr --headless", description = "Run the DreamWaQ/PATH MuJoCo stack without XR or a viewer" }
-=======
-mujoco = { cmd = "bash scripts/run_galaxy_homie_mujoco.sh", description = "Run MuJoCo with HOMIE, PATH, and Galaxy XR" }
-mujoco-hand-test = { cmd = "bash scripts/run_mujoco_hand_test.sh", description = "Run HOMIE stand.onnx and Revo2 MPPI in local MuJoCo with an editable JSON hand pose; no XR/PATH" }
-mujoco-hand-motion-test = { cmd = "bash scripts/run_mujoco_hand_test.sh --motion", description = "Run a synthetic repeated fist/open Revo2 MPPI test in local MuJoCo; no XR/PATH" }
-mujoco-hand-xr = { cmd = "bash scripts/run_galaxy_homie_mujoco.sh --hand-mppi-xr", description = "Run live Galaxy XR to Televuer/PATH to Revo2 MPPI in MuJoCo" }
-mujoco-no-xr = { cmd = "bash scripts/run_galaxy_homie_mujoco.sh --no-xr", description = "Run MuJoCo with HOMIE and PATH without Galaxy XR" }
-mujoco-headless = { cmd = "bash scripts/run_galaxy_homie_mujoco.sh --no-xr --headless", description = "Run the HOMIE/PATH MuJoCo stack without XR or a viewer" }
->>>>>>> 228019f83417f222bc20e79b837865e645492e13
 
 [environments.sim]
 features = ["sim"]

@@ -23,6 +23,12 @@ serial I/O; Thor's hand-MPPI process publishes the separate hand DDS targets.
 Teleimager runs as a single camera service on G1 and sends TIM2/ZMQ frames to
 the Thor relay.
 
+For a direct, finger-free XR arm route, `g1-arm-teleop` on Thor publishes
+`rt/arm_sdk` from Televuer/G1_29 IK and DreamWaQ runs through
+`run_g1_dreamwaq_body_controller.sh` on G1. This route and the PATH adapter
+route are mutually exclusive because both publish `rt/arm_sdk`; its setup and
+recording schema are in [`g1_xr_arm_teleop.md`](g1_xr_arm_teleop.md).
+
 DreamWaQ and Teleimager use separate Python 3.10 environments outside the
 repository, under `$HOME/.local/share/boost/external/venvs/` by default. Their
 setup and launch scripts are in `scripts/`.

@@ -10,8 +10,9 @@ moved into the subsystem layout below. The local Revo2 MuJoCo path supports
 binary grip commands and continuous landmark retargeting. The real G1 body
 controller is the backpack-trained DreamWaQ deployment; its arm adapter and
 the separate BrainCo Revo2 service have independent command paths. Hardware
-preflight, FoundationPose, object-aware MPPI, and the episode schema remain
-future work.
+control is still awaiting physical bring-up validation. FoundationPose and
+object-aware MPPI remain future work; the direct arm-only XR recorder has a
+documented whole-body episode schema.
 
 Git workflow: main is the README-only landing branch; ongoing development is
 on deploy. See [docs/git_workflow.md](docs/git_workflow.md) and
@@ -34,6 +35,8 @@ python scripts/boost_git.py --help.
 - external/dreamwaq_g1_29dof/: selected backpack-trained DreamWaQ runtime
   and export; its sim backend and G1 launch path are in
   [docs/dreamwaq_integration.md](docs/dreamwaq_integration.md).
+- external/g1_arm_teleop/: G1_29 arm-only Galaxy XR teleop and recorder
+  adapted from the locally verified `url_g1_deploy` snapshot.
 - external/g1_ws/ and external/teleimager/: pinned target schema/reference
   sources and TIM2 camera server.
 - services/pose_service/: the moved PATH wrist RGB-D/SAM3 service. It
@@ -63,6 +66,10 @@ PATH G1 adapter feeds rt/arm_sdk and target DreamWaQ owns rt/lowcmd. See
 Revo2 targets use the separate hand MPPI publisher and BrainCo serial service.
 The physical deployment split and ordered bring-up are in
 [docs/g1_installation.md](docs/g1_installation.md).
+The alternative direct arm-only Galaxy XR route runs the Pixi task
+`g1-arm-teleop` on Thor and `scripts/run_g1_dreamwaq_body_controller.sh` on
+G1; it publishes arm targets directly to `rt/arm_sdk` and does not control fingers.
+See [docs/g1_xr_arm_teleop.md](docs/g1_xr_arm_teleop.md).
 
 ## Local MuJoCo desktop
 

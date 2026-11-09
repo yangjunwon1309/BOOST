@@ -38,11 +38,14 @@ external/*
 !external/dreamwaq_g1_29dof/**
 !external/g1_ws/
 !external/g1_ws/**
+!external/g1_arm_teleop/
+!external/g1_arm_teleop/**
 !external/teleimager/
 !external/teleimager/**
 !external/brainco-description/
 !external/brainco-description/**
 external/dreamwaq_g1_29dof/**/__pycache__/
+external/g1_arm_teleop/**/__pycache__/
 external/g1_ws/**/build/
 external/teleimager/**/__pycache__/
 external/teleimager/**/*.egg-info/

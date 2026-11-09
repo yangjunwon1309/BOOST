@@ -5,20 +5,19 @@ completed hardware validation. MuJoCo commands in
 [../boost/sim/README.md](../boost/sim/README.md) run locally and do not
 connect to a physical robot.
 
-## Process ownership
+## Mutually exclusive arm command routes
 
-| Machine | Process | Responsibility |
-| --- | --- | --- |
-| Jetson Thor | Galaxy XR / Televuer and PATH | Wrist goals, arm IK, and PDU1 commands |
-| Jetson Thor | Revo2 hand MPPI | Fresh six-joint targets per hand over Unitree DDS |
-| G1 internal Orin | DreamWaQ | Sole hardware writer to rt/lowcmd; body policy and arm-target merge |
-| G1 internal Orin | BOOST Unitree SDK2 arm bridge | Reads PATH arm packets, publishes rt/arm_sdk, relays G1 state |
-| G1 internal Orin | External brainco_hand_service | Revo2 serial I/O and measured hand-state topics |
-| G1 internal Orin | Teleimager | Head and wrist RGB capture over TIM2/ZMQ |
+DreamWaQ is the sole G1 hardware writer to `rt/lowcmd`. Choose one source for
+its `rt/arm_sdk` arm targets:
 
-The G1 body command has 29 joints. Revo2 hands are separate actuators and use
-their own DDS topics. Do not start g1_ws/g1_lowlevel_bridge, an older body
-controller, or another rt/lowcmd writer with DreamWaQ.
+| Route | Thor/XR host | G1 host | Hand control |
+| --- | --- | --- | --- |
+| PATH + Revo2 | Galaxy XR/PATH publishes PDU1; Revo2 MPPI may publish hand targets | BOOST arm bridge publishes `rt/arm_sdk`; DreamWaQ publishes `rt/lowcmd` | Optional external BrainCo service |
+| Direct arm-only XR | `g1-arm-teleop` publishes `rt/arm_sdk` from Televuer + G1_29 IK | DreamWaQ body controller publishes `rt/lowcmd` | Disabled; no finger topics or commands |
+
+Never run both arm publishers at once: the PATH adapter and direct XR process
+both publish `rt/arm_sdk`. Do not start `g1_ws/g1_lowlevel_bridge`, another
+body controller, or any other `rt/lowcmd` writer alongside DreamWaQ.
 
 ## Prepare Thor
 
@@ -42,8 +41,10 @@ pixi run -e thor verify-thor
 ~~~
 
 verify-thor requires ARM64 and a visible JAX CUDA device. Televuer and
-Unitree SDK2 Python are Pixi dependencies. The G1 C++ arm bridge separately
-requires the Unitree SDK2 C++ checkout already used on the robot.
+Unitree SDK2 Python are Pixi dependencies. The direct arm-only route needs
+`thor-teleop`; the separate PATH/Revo2 route also uses the `thor` environment.
+The G1 C++ arm bridge is needed only for the PATH route and requires the
+Unitree SDK2 C++ checkout already used on the robot.
 
 ## Prepare G1
 
@@ -61,7 +62,7 @@ bash scripts/setup_dreamwaq_runtime.sh
 bash scripts/setup_teleimager_runtime.sh
 ~~~
 
-Build the arm bridge against the installed Unitree SDK2 C++ tree:
+For the PATH route, build the arm bridge against the installed Unitree SDK2 C++ tree:
 
 ~~~bash
 cd ~/BOOST
@@ -74,9 +75,9 @@ Start Teleimager as the single camera owner:
 bash scripts/run_g1_teleimager.sh
 ~~~
 
-The combined DreamWaQ/controller launcher is gated. First check its dry-run
-configuration and network interface, then enable hardware control when the
-robot is in the supported posture and command ownership is confirmed:
+The combined DreamWaQ/PATH-controller launcher is gated. Check its config and
+network interface, then enable hardware control when the robot is in the
+supported posture and command ownership is confirmed:
 
 ~~~bash
 BOOST_ALLOW_HARDWARE_CONTROL=1 \
@@ -88,6 +89,20 @@ DreamWaQ starts in standing mode and follows the target deployment START then
 A enable procedure; X toggles standing/walking. This launcher starts the PATH
 adapter on rt/arm_sdk and DreamWaQ as the sole rt/lowcmd owner. It does not
 start the physical Dex1 or Revo2 service.
+
+For the direct arm-only route, start the alternative body-only launcher on G1:
+
+~~~bash
+BOOST_ALLOW_HARDWARE_CONTROL=1 \
+G1_NETWORK_INTERFACE=eth0 \
+bash scripts/run_g1_dreamwaq_body_controller.sh
+~~~
+
+Then on Thor, use `pixi run -e thor-teleop g1-arm-teleop`. This direct route
+does not run PATH, `g1_lowlevel_bridge`, or Revo2 hand MPPI. Follow
+[`g1_xr_arm_teleop.md`](g1_xr_arm_teleop.md) for XR TLS, camera, recording,
+keyboard, and data schema details. The two G1 launchers are alternatives; do
+not start both.
 
 Install and start Unitree's external
 [brainco_hand_service](https://github.com/unitreerobotics/brainco_hand_service)

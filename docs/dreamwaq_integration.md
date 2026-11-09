@@ -2,11 +2,19 @@
 
 ## Runtime boundary
 
-The active hardware path retains Galaxy XR, PATH upper-body IK, and Revo2 hand
-control. PATH sends its 14 arm targets as PDU1 over LCM. The arm-only G1
-adapter publishes `rt/arm_sdk`; DreamWaQ reads that topic and `rt/lowstate`,
-then sends the merged body target through the sole hardware `rt/lowcmd` writer.
-The G1 adapter does not own `rt/lowcmd`.
+DreamWaQ is the sole hardware `rt/lowcmd` writer. It can receive arm targets
+from either of two mutually exclusive sources:
+
+1. The existing PATH flow sends 14 arm targets as PDU1 over LCM; the G1 arm
+   adapter republishes them on `rt/arm_sdk`.
+2. The direct, arm-only Galaxy XR flow in
+   [`g1_xr_arm_teleop.md`](g1_xr_arm_teleop.md) runs Televuer and G1_29 IK on
+   Thor, publishing `rt/arm_sdk` directly.
+
+Both use the same `arm_source: arm_sdk` DreamWaQ reader and G1 29-joint
+contract. Do not run the PATH adapter and direct XR publisher together: both
+publish `rt/arm_sdk`. Revo2 MPPI is a separate optional hand route in the PATH
+flow; the direct arm-only runner does not start it or publish finger commands.
 
 The selected deployment source is `url_g1_deploy` commit
 `3d37aa43f88964fc4255857c840dd33dd08e6eda`. The selected model/export pair is
@@ -24,7 +32,7 @@ arm-target smoothing. BOOST does not layer additional reference filtering or a
 backpack compensation torque onto that runtime. The selected export manifest
 and target deployment config govern those values.
 
-## G1 hardware launch
+## G1 hardware launch: PATH adapter flow
 
 The DreamWaQ and Teleimager Python 3.10 environments are installed separately
 outside the repository, under `$HOME/.local/share/boost/external/venvs/` by
@@ -62,6 +70,13 @@ cores 3–5, and selects policy/control cores from the remaining CPUs. The
 Teleimager launcher uses camera cores 0–2. Check these masks against the G1's
 available cores before deployment; change the target runner's CPU options and
 `G1_TELEIMAGER_CAMERA_CPUSET` together if the layout differs.
+
+For direct arm-only Galaxy XR control, use the separate G1 body-controller
+launcher and the Thor launcher documented in
+[`g1_xr_arm_teleop.md`](g1_xr_arm_teleop.md). In that mode, start
+`scripts/run_g1_dreamwaq_body_controller.sh` on G1 and
+`pixi run -e thor-teleop g1-arm-teleop` on Thor. Do not run
+`run_g1_dreamwaq_controller.sh` or `g1_lowlevel_bridge` in that mode.
 
 ## G1 DDS and packet contracts
 

@@ -121,10 +121,14 @@ remain separate. The JPEG-only Teleimager wrist stream does not replace them.
 Install the desktop environment and run the active table/objects scene:
 
 ```bash
+export PIXI_FROZEN=true
 pixi install -e sim
 pixi run -e sim setup-sim
 pixi run -e sim mujoco
 ```
+
+Keep `PIXI_FROZEN=true` exported for subsequent desktop sim commands so Pixi
+uses the committed sim lock without re-solving the separate Thor environment.
 
 `pixi run -e sim mujoco-no-xr` starts the same sim and PATH bridge without the
 headset. `pixi run -e sim mujoco-hand-test` adds the existing Revo2 MPPI runner

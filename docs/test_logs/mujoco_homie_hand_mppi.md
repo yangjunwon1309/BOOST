@@ -35,6 +35,7 @@ Televuer, PATH, or their topics.
 From the BOOST repository root:
 
 ```bash
+export PIXI_FROZEN=true
 pixi install -e sim
 pixi install -e hand
 pixi run -e sim setup-sim

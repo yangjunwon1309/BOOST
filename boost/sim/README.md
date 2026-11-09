@@ -3,7 +3,7 @@
 The Revo2 model uses the pinned BrainCo geometry, inertias, and joint limits
 from external/brainco-description. BOOST adds the G1 wrist mounts,
 six-channel actuators, and distal-joint coupling constraints. The complete
-scene has nq=58, nv=57, and nu=41.
+scene currently has nq=76, nv=73, and nu=41.
 
 configs/sim/mujoco_revo2.yaml selects the table-room scene with the articulated
 box and can assets. configs/sim/mujoco_revo2_vacant.yaml selects the vacant
@@ -13,10 +13,15 @@ new3_4_backpack_440000 DreamWaQ export metadata.
 ## Start the integrated scene
 
 ~~~bash
+export PIXI_FROZEN=true
 pixi install -e sim
 pixi run -e sim setup-sim
 pixi run -e sim mujoco
 ~~~
+
+Keep `PIXI_FROZEN=true` exported in each desktop shell when running sim tasks;
+it uses the committed desktop lock without resolving Thor's separate NumPy 2
+runtime.
 
 Available launch tasks:
 

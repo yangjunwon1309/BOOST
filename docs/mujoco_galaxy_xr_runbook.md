@@ -11,6 +11,7 @@ From the BOOST repository root:
 
 ```bash
 git submodule update --init --recursive
+export PIXI_FROZEN=true
 pixi install -e sim
 pixi run -e sim setup-sim
 pixi install -e hand
@@ -25,6 +26,7 @@ headset may need to trust or import `cert.pem`.
 Run this in a terminal and leave it open while teleoperating:
 
 ```bash
+export PIXI_FROZEN=true
 pixi run -e sim mujoco-hand-xr
 ```
 

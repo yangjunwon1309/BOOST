@@ -4,7 +4,7 @@ set -euo pipefail
 BOOST_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 if [[ "${PIXI_PROJECT_ROOT:-}" != "$BOOST_ROOT" ]]; then
-  echo "Run setup through Pixi: pixi run -e sim setup-sim" >&2
+  echo "Run setup through Pixi: PIXI_FROZEN=true pixi run -e sim setup-sim" >&2
   exit 2
 fi
 cd "$BOOST_ROOT"
@@ -44,5 +44,5 @@ if [[ -z "$PIXI_CLI" && -x "$HOME/.pixi/bin/pixi" ]]; then
   PIXI_CLI="$HOME/.pixi/bin/pixi"
 fi
 PIXI_CLI="${PIXI_CLI:-pixi}"
-echo "Run: $PIXI_CLI run -e sim mujoco"
-echo "Without a Galaxy XR headset: $PIXI_CLI run -e sim mujoco-no-xr"
+echo "Run: PIXI_FROZEN=true $PIXI_CLI run -e sim mujoco"
+echo "Without a Galaxy XR headset: PIXI_FROZEN=true $PIXI_CLI run -e sim mujoco-no-xr"

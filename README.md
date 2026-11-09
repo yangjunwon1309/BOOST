@@ -77,9 +77,13 @@ The local G1 + Revo2 model and DreamWaQ/PATH stack run in the Pixi sim
 environment. Install and inspect the runtime with:
 
 ~~~bash
+export PIXI_FROZEN=true
 pixi install -e sim
 pixi run -e sim setup-sim
 ~~~
+
+Keep `PIXI_FROZEN=true` in each desktop shell so Pixi uses the committed sim
+lock instead of re-solving the separate Thor NumPy 2 environment.
 
 Start the desktop simulation without a headset with
 pixi run -e sim mujoco-no-xr; use pixi run -e sim mujoco when Galaxy XR

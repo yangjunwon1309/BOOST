@@ -27,8 +27,21 @@ echo
 echo "--- IPv4 addresses, route, and peer reachability ---"
 ip -brief -4 addr 2>/dev/null || true
 ip route get "$peer_ip" 2>&1 || true
-ip route get 239.255.76.67 2>&1 || true
+path_route="$(ip route get 239.255.76.67 2>&1 || true)"
+printf '%s\n' "$path_route"
 ip route get 239.255.77.67 2>&1 || true
+path_route_dev="$(awk '{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}' <<<"$path_route")"
+interface_src="$(ip -o -4 addr show dev "$interface" 2>/dev/null | awk 'NR == 1 {split($4, a, "/"); print a[1]}')"
+if [[ -n "$path_route_dev" && "$path_route_dev" != "$interface" ]]; then
+  echo "WARNING: PATH LCM multicast route uses $path_route_dev; wired teleop expects $interface."
+  if [[ -n "$interface_src" ]]; then
+    echo "On this host, apply for the current boot with: sudo ip route replace 239.255.76.67/32 dev $interface src $interface_src"
+  else
+    echo "On this host, apply for the current boot with: sudo ip route replace 239.255.76.67/32 dev $interface"
+  fi
+elif [[ -n "$path_route_dev" ]]; then
+  echo "PATH LCM multicast route is on $path_route_dev."
+fi
 ip neigh show dev "$interface" 2>/dev/null | awk -v peer="$peer_ip" '$1 == peer {print}'
 if command -v ping >/dev/null 2>&1; then
   ping -I "$interface" -c 2 -W 1 "$peer_ip" 2>&1 || true
@@ -77,7 +90,16 @@ fi
 echo
 echo "--- Relevant runtime processes ---"
 if command -v pgrep >/dev/null 2>&1; then
-  pgrep -af 'g1_lowlevel_bridge|run_dreamwaq|path_state_machine_bridge|galaxy_xr_manager_thread_server|record_wrist_experiment_v11|hand_mppi' || true
+  runtime_processes="$(pgrep -af 'g1_lowlevel_bridge|run_dreamwaq|path_state_machine_bridge|galaxy_xr_manager_thread_server|record_wrist_experiment_v11|hand_mppi' || true)"
+  if [[ -n "$runtime_processes" ]]; then
+    printf '%s\n' "$runtime_processes"
+  else
+    echo "No matching BOOST teleop, G1 bridge, or DreamWaQ processes are running."
+    case " $local_ipv4 " in
+      *" $g1_ip "*) echo "WARNING: G1 runtime is inactive; expected g1_lowlevel_bridge and run_dreamwaq.py." ;;
+      *" $thor_ip "*) echo "Thor teleop is inactive; TCP listeners and PATH command packets are not expected yet." ;;
+    esac
+  fi
 else
   echo "pgrep is unavailable."
 fi

@@ -63,9 +63,14 @@ trap cleanup EXIT INT TERM
 
 echo "Starting PATH arm/state adapter on $network_interface; it publishes rt/arm_sdk only."
 G1_BRIDGE_LIVE=1 bash "$BOOST_ROOT/boost/io/g1_bridge/run.sh" \
-  "$network_interface" --hand-backend none &
+  "$network_interface" &
 pids+=("$!")
 sleep 1
+if ! kill -0 "${pids[0]}" 2>/dev/null; then
+  wait "${pids[0]}" 2>/dev/null || true
+  echo "PATH arm/state adapter exited; DreamWaQ will not be started without the bridge." >&2
+  exit 1
+fi
 
 echo "Starting the target DreamWaQ hardware runtime as the sole rt/lowcmd owner."
 echo "Initial mode is standing. Use the target deployment's START then A procedure to enable control."

@@ -21,7 +21,7 @@ from unitree_sdk2py.core.channel import (
 )
 from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_, LowState_
-from unitree_sdk2py.utils.crc import CRC
+from boost.io.unitree_crc import make_unitree_crc
 from cpu_affinity import pin_current_thread
 
 from dreamwaq_interface.g1_29dof.contract import (
@@ -92,7 +92,7 @@ class G1RealWorldEnv:
         self._writer_ready = None
 
         ChannelFactoryInitialize(domain_id, net)
-        self._crc = CRC()
+        self._crc = make_unitree_crc()
 
         self._latest_state = None
         self._latest_state_monotonic_ns = 0

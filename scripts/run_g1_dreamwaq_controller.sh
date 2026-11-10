@@ -19,6 +19,9 @@ if [[ ! -f "$BOOST_DREAMWAQ_CONFIG" || ! -f "$BOOST_DREAMWAQ_EXPORT/manifest.jso
   echo "export: $BOOST_DREAMWAQ_EXPORT" >&2
   exit 2
 fi
+echo "Checking Unitree CRC initialization before hardware startup..."
+"$BOOST_DREAMWAQ_PYTHON" -c \
+  'from boost.io.unitree_crc import make_unitree_crc; make_unitree_crc(); print("CRC init OK")'
 "$BOOST_DREAMWAQ_PYTHON" - "$BOOST_DREAMWAQ_EXPORT" <<'PY'
 import json
 import pathlib

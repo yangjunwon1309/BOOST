@@ -34,6 +34,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pose-hz", type=float, default=50.0)
     parser.add_argument("--source-poll-hz", type=float, default=120.0)
     parser.add_argument(
+        "--inward-wrist-roll-deg",
+        type=float,
+        default=90.0,
+        help="Mirror-signed local wrist-X roll applied to XR arm targets (degrees).",
+    )
+    parser.add_argument(
         "--televuer-root",
         type=Path,
         default=None,
@@ -67,6 +73,7 @@ def _send_wrist_targets(
     tracking: bool,
     session_id: int,
     frame_index: int,
+    inward_wrist_roll_rad: float,
 ) -> None:
     valid = bool(
         tracking
@@ -82,6 +89,18 @@ def _send_wrist_targets(
             right_ok=sample.right_valid,
             head_ok=sample.head_valid,
         )
+        # G1's neutral wrist-yaw frames leave both palms facing up. Roll about
+        # each wrist's local +X axis toward the torso: +X roll on the left,
+        # mirrored -X roll on the right. Position is unchanged.
+        left_roll = inward_wrist_roll_rad
+        right_roll = -inward_wrist_roll_rad
+        for transform, angle in ((left, left_roll), (right, right_roll)):
+            c, s = np.cos(angle), np.sin(angle)
+            local_roll = np.array(
+                [[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]],
+                dtype=np.float64,
+            )
+            transform[:3, :3] = transform[:3, :3] @ local_roll
     else:
         left = np.full((4, 4), np.nan, dtype=np.float64)
         right = np.full((4, 4), np.nan, dtype=np.float64)
@@ -144,6 +163,8 @@ def _send_wrist_targets(
 
 def main() -> int:
     args = parse_args()
+    if not np.isfinite(args.inward_wrist_roll_deg) or abs(args.inward_wrist_roll_deg) > 180.0:
+        raise SystemExit("--inward-wrist-roll-deg must be finite and within [-180, 180]")
     basis_correction = parse_basis_correction(args.basis_correction)
     source = TeleVuerSource(
         cert_file=args.televuer_cert,
@@ -166,7 +187,9 @@ def main() -> int:
     )
     print(
         f"[GalaxyXR] PUB tcp://*:{args.vr_pose_debug_port}/vr_pose_debug "
-        f"pose={args.pose_hz:.0f}Hz hand_tracking=on",
+        f"pose={args.pose_hz:.0f}Hz hand_tracking=on "
+        f"wrist_roll_inward=L:+{args.inward_wrist_roll_deg:.1f}/"
+        f"R:-{args.inward_wrist_roll_deg:.1f}deg",
         flush=True,
     )
 
@@ -187,6 +210,7 @@ def main() -> int:
                     tracking=source.connected,
                     session_id=session_id,
                     frame_index=frame_index,
+                    inward_wrist_roll_rad=np.deg2rad(args.inward_wrist_roll_deg),
                 )
                 next_pose += pose_period
                 if next_pose < now - pose_period:
@@ -194,9 +218,31 @@ def main() -> int:
             if now >= next_report:
                 report = reader.monitor.report()
                 status = report if report else {"waiting_for_webxr_frame": True}
+                sample = reader.latest()
+                wrist_valid = (
+                    "L:0 R:0"
+                    if sample is None
+                    else f"L:{int(sample.left_valid)} R:{int(sample.right_valid)}"
+                )
+                hand_valid = (
+                    "L:0 R:0"
+                    if sample is None
+                    else "L:{} R:{}".format(
+                        int(sample.left_hand_landmarks_valid),
+                        int(sample.right_hand_landmarks_valid),
+                    )
+                )
+                decoder_status = source.hand_tracking_status
+                decoder_valid = (
+                    f"L:{int(decoder_status.get('left_valid', False))} "
+                    f"R:{int(decoder_status.get('right_valid', False))} "
+                    f"err:{decoder_status.get('error_count', 0)}"
+                )
                 print(
                     f"[GalaxyXR] connected={source.connected} "
-                    f"hand_tracking={source.connected} {status}",
+                    f"hand_tracking={source.connected} "
+                    f"wrist_valid=({wrist_valid}) sample_hands=({hand_valid}) "
+                    f"vuer_hands=({decoder_valid}) {status}",
                     flush=True,
                 )
                 next_report = now + 2.0

@@ -10,6 +10,7 @@ cd "$PATH_G1_ROOT"
 args=(
   --televuer-cert "${PATH_TELEVUER_CERT:-$HOME/.config/xr_teleoperate/cert.pem}"
   --televuer-key "${PATH_TELEVUER_KEY:-$HOME/.config/xr_teleoperate/key.pem}"
+  --inward-wrist-roll-deg "${PATH_XR_INWARD_WRIST_ROLL_DEG:-90}"
 )
 if [[ -n "${PATH_TELEVUER_ROOT:-}" ]]; then
   args+=(--televuer-root "$PATH_TELEVUER_ROOT")

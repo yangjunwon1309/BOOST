@@ -487,6 +487,20 @@ class TeleVuerSource(_LatestSampleSource):
     def connected(self) -> bool:
         return bool(self._raw is not None and getattr(self._raw, "motion_data_ready", False))
 
+    @property
+    def hand_tracking_status(self) -> dict[str, Any]:
+        """Expose TeleVuer's per-hand decode result for live link diagnostics."""
+        if self._raw is None:
+            return {}
+        stats = getattr(self._raw, "hand_tracking_stats", {})
+        if not isinstance(stats, dict):
+            return {}
+        return {
+            "left_valid": bool(stats.get("left_valid", False)),
+            "right_valid": bool(stats.get("right_valid", False)),
+            "error_count": int(stats.get("error_count", 0)),
+        }
+
     def _correct(self, value: Any) -> tuple[np.ndarray, bool]:
         raw, valid = _as_se3(value)
         if not valid:

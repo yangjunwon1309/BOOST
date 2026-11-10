@@ -57,7 +57,7 @@ if ((start_xr)); then
 import socket
 import sys
 
-ports = (5565, 5566, 8012)
+ports = (5566, 8012)
 busy = []
 for port in ports:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -73,7 +73,7 @@ if busy:
         "Galaxy XR startup ports are already in use: "
         + ", ".join(map(str, busy))
         + ". Stop the old Televuer/PATH process; inspect owners with "
-        + "`ss -ltnp '( sport = :5565 or sport = :5566 or sport = :8012 )'`.",
+        + "`ss -ltnp '( sport = :5566 or sport = :8012 )`.",
         file=sys.stderr,
     )
     raise SystemExit(2)
@@ -85,10 +85,8 @@ if ((hand_mppi && !start_xr)); then
 fi
 
 if ((hand_mppi)); then
-  export PATH_TELEVUER_HAND_TRACKING=1
-  # Galaxy hand tracking has no physical A+X buttons. In this MuJoCo-only
-  # launcher, enable arm tracking on a fresh Televuer wrist frame.
-  export PATH_AUTO_ARM_PICO_TRACKING=1
+  # In this MuJoCo-only hand-XR mode, enable arm tracking on the first fresh
+  # hand-tracked Televuer wrist frame only after the operator presses r.
   surface_query_endpoint="${MUJOCO_SURFACE_QUERY_ENDPOINT:-tcp://127.0.0.1:5570}"
   PIXI_CLI="${PIXI_CLI:-$(command -v pixi || true)}"
   if [[ -z "$PIXI_CLI" && -x "$HOME/.pixi/bin/pixi" ]]; then
@@ -99,6 +97,7 @@ if ((hand_mppi)); then
     exit 2
   fi
 fi
+export PATH_AUTO_ARM_XR_TRACKING=0
 
 "$PATH_PYTHON" -c 'import mujoco, unitree_sdk2py, pinocchio, casadi, lcm, onnxruntime, torch'
 
@@ -145,7 +144,7 @@ start "$PATH_PYTHON" boost/sim/mujoco/path_dds_bridge.py \
   --lcm-url "$PATH_LCM_URL"
 sleep 1
 if ((hand_mppi)); then
-  echo "Galaxy XR wrist poses feed PATH arm IK; PATH auto-arms on the first fresh XR frame."
+  echo "Galaxy XR hand poses feed PATH arm IK; press r in the PATH terminal to start tracking."
   echo "Continuous Revo2 retargeting is enabled; PATH's legacy binary grip DDS publisher is disabled."
 else
   start "$PATH_PYTHON" boost/sim/mujoco/path_revo2_grip_bridge.py \
@@ -170,7 +169,7 @@ if ((hand_mppi)); then
   sleep 1
   start "$PIXI_CLI" run -e hand python -m boost.control.hand_mppi.runner \
     --config configs/hands/brainco_revo2_mppi.yaml \
-    --input-endpoint "${PATH_PICO_VR_ENDPOINT:-tcp://127.0.0.1:5566}" \
+    --input-endpoint "${PATH_XR_HAND_ENDPOINT:-tcp://127.0.0.1:5566}" \
     --surface-query-endpoint "$surface_query_endpoint" \
     --interface "$SIM_DDS_INTERFACE" --domain-id "$SIM_DDS_DOMAIN_ID" \
     --publish

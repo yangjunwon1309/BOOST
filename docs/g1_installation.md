@@ -113,17 +113,21 @@ to Thor.
 
 ## Start Thor teleoperation
 
-On Thor, start the following in separate terminals:
+On Thor, start the hand-tracking PATH stack in one interactive terminal:
 
 ~~~bash
 cd ~/BOOST
-pixi run -e thor-teleop galaxy-xr
+pixi run -e thor-teleop path-teleop
 ~~~
 
-~~~bash
-cd ~/BOOST
-pixi run -e thor-teleop path-state
-~~~
+Open the printed secure Televuer URL on Galaxy XR and wait until the PATH log
+shows fresh XR wrist frames. Press `r` in that same terminal to start/resume
+arm following, `s` to start a wrist experiment CSV, `s` again to stop and save,
+or `q` to stop and exit. The CSV and summary JSON are written under
+`$HOME/data/boost/path_wrist_experiments` by default; override that directory
+with `BOOST_PATH_EXPERIMENT_DATA_ROOT`.
+
+In a second Thor terminal, start Revo2 hand MPPI:
 
 ~~~bash
 cd ~/BOOST
@@ -146,6 +150,25 @@ adapter republishes them on rt/arm_sdk. Thor and G1 must permit the configured
 LCM multicast group 239.255.76.67:7667. Revo2 topics are listed in
 [protocols.md](protocols.md). Open the Galaxy XR URL printed by Televuer using
 the Thor Wi-Fi address reachable by the headset.
+
+If G1 state does not appear in PATH, run the same read-only link report on both
+hosts:
+
+Thor:
+
+~~~bash
+PIXI_FROZEN=true pixi run -e thor-teleop bash scripts/diagnose_g1_teleop_links.sh 192.168.123.164
+~~~
+
+G1:
+
+~~~bash
+PATH_PYTHON="$HOME/miniconda3/envs/boost-py310/bin/python" bash scripts/diagnose_g1_teleop_links.sh 192.168.123.2
+~~~
+
+The report checks the wired route, listeners, running owners, and live LCM
+counts for G1_ROBOT_STATE and G1_PATH_UPPER_COMMAND. On G1, set `PATH_PYTHON`
+to the Conda/Pixi Python that imports `lcm` if the base Python does not.
 
 ## Bring-up checks
 

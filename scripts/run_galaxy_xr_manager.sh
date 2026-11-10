@@ -14,7 +14,4 @@ args=(
 if [[ -n "${PATH_TELEVUER_ROOT:-}" ]]; then
   args+=(--televuer-root "$PATH_TELEVUER_ROOT")
 fi
-if [[ "${PATH_TELEVUER_HAND_TRACKING:-0}" == "1" ]]; then
-  args+=(--televuer-hand-tracking --auto-tracking)
-fi
 exec "$PATH_PYTHON" boost/teleop/path_streaming/galaxy_xr_manager_thread_server.py "${args[@]}" "$@"

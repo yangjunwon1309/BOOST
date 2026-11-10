@@ -18,4 +18,4 @@ exec python -u -m boost.control.hand_mppi.runner \
   --publish \
   --interface "$dds_interface" \
   --domain-id "${BRAINCO_DDS_DOMAIN_ID:-0}" \
-  --input-endpoint "${HAND_MPPI_INPUT_ENDPOINT:-tcp://127.0.0.1:5566}"
+  --input-endpoint "${HAND_MPPI_INPUT_ENDPOINT:-${PATH_XR_HAND_ENDPOINT:-tcp://127.0.0.1:5566}}"

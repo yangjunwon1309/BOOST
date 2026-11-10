@@ -47,17 +47,15 @@ https://<DESKTOP-LAN-IP>:8012
 For example, if the desktop address is `192.168.1.42`, open
 `https://192.168.1.42:8012`. Do not use `localhost` or `127.0.0.1` on the
 headset; those refer to the headset itself. Port 8012 is Televuer's HTTPS web
-service. Ports 5565 and 5566 carry local PATH button and pose/hand messages.
+service. Port 5566 carries Galaxy XR hand pose and landmark messages to PATH.
 
-In this MuJoCo hand-XR mode, PATH arms follow Televuer wrist targets as soon as
-the first fresh XR wrist frame arrives. The startup log should include
-`MuJoCo XR auto-arm enabled`, followed by
-`MuJoCo XR auto-arm: teleop_tracking armed from a fresh XR wrist frame`.
-`[PATH-state]` should then report `teleop_tracking` and
-`xr_wrist_fresh=True`. Its internal PICO-compatible wire format is shared with
-Televuer; in this launcher the publisher is Galaxy XR/Televuer.
-Revo2 finger targets are handled by hand MPPI in parallel. Stale XR frames are
-still rejected so an old target is not replayed after tracking drops.
+Wait until the headset reports live hand tracking, then press `r` in the PATH
+terminal to start or resume arm following. PATH first confirms the G1 is in its
+Q_READY pose. `[PATH-state]` should then report `teleop_tracking` and
+`xr_wrist_fresh=True`. Press `s` to start a wrist experiment CSV and again to
+stop and save it; press `q` to stop and exit. Revo2 finger targets are handled
+by hand MPPI in parallel. Stale XR frames are rejected so an old target is not
+replayed after tracking drops.
 
 With the MuJoCo viewer focused, locomotion keys are W/S (forward/back), A/D
 (left/right), Q/R (yaw), O/P (speed), and Space (stop). Direction keys latch
@@ -73,16 +71,16 @@ Televuer, PATH, and hand-MPPI child processes together.
 Inspect the listeners first:
 
 ```bash
-ss -ltnp '( sport = :5565 or sport = :5566 or sport = :8012 )'
+ss -ltnp '( sport = :5566 or sport = :8012 )'
 ```
 
 If they are stale Televuer/PATH processes from an earlier run, stop the owners
 of these dedicated ports and verify they are free:
 
 ```bash
-sudo fuser -k -TERM 5565/tcp 5566/tcp 8012/tcp
+sudo fuser -k -TERM 5566/tcp 8012/tcp
 sleep 1
-ss -ltnp '( sport = :5565 or sport = :5566 or sport = :8012 )'
+ss -ltnp '( sport = :5566 or sport = :8012 )'
 ```
 
 No listener rows after the `ss` header means the ports are free. `fuser` is

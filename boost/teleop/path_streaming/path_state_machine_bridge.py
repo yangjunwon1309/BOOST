@@ -1,29 +1,15 @@
 #!/usr/bin/env python3
-"""PATH state-machine bridge between Galaxy XR/Televuer wrist targets and G1.
+"""PATH arm bridge between continuous Galaxy XR hand tracking and the G1.
 
-This bridge computes arm-only references and sends them to the G1 bridge. The
-wrist stream retains the repository's legacy PICO-compatible transport names.
-Other producers are subordinate inputs:
+The operator controls this session only from the PATH terminal: ``r`` starts
+or resumes wrist following, ``s`` toggles the experiment recorder and parks
+the arms on stop, and ``q`` saves any active trial and exits.
 
-  XR/Televuer      -> tcp://127.0.0.1:5566/vr_pose_debug
-  PICO controls    -> tcp://127.0.0.1:5565/{pico_button_event,pico_controller_state}
-  State command    -> tcp://*:5563/path_state_command
-  G1 arm bridge    <- LCM G1_PATH_UPPER_COMMAND
-  G1 state         <- LCM G1_ROBOT_STATE
-  Telemetry        <- tcp://*:5560/path_qp_reference
-
-State behavior:
-  teleop/intention:
-    Pass absolute XR head-position-to-waist wrist poses directly to
-    CasADi/IPOPT while teleop_tracking is armed. A+X enters
-    teleop_wait_ready: IPOPT receives fixed FK(Q_READY) wrist SE(3) at 50 Hz,
-    XR arm targets are ignored while both arms return to fixed FK(Q_READY).
-    The next A+X requires measured Q_READY convergence before live XR targets
-    resume.
-    Televuer wrist poses go directly to IK by default. Y/B can select optional
-    belief/contact targets only when --enable-shared-target-assist is enabled.
-Runtime hotkeys:
-  w enters intention mode; p cannot disable the PATH arm reference stream.
+  XR hands       -> tcp://127.0.0.1:5566/vr_pose_debug
+  PATH -> G1     -> LCM G1_PATH_UPPER_COMMAND
+  G1 -> PATH     -> LCM G1_ROBOT_STATE
+  Recording      -> LCM PATH_V11_WRIST_EXPERIMENT_RECORD_CONTROL
+  Telemetry      -> tcp://*:5560/path_qp_reference
 """
 
 from __future__ import annotations
@@ -43,7 +29,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import lcm
-import msgpack
 import numpy as np
 import zmq
 
@@ -93,13 +78,13 @@ from services.pose_service.remote_offload.wrist_d405_protocol_v11 import (
 )
 
 # ``auto_planning`` remains an accepted external compatibility value, but is
-# canonicalized to teleop. Y/B selects the arm for belief assistance.
+# canonicalized to teleop. Hand pinch can select an arm for optional assistance.
 VALID_STATES = {"teleop", "intention", "auto_planning"}
 SHARED_HAND_PUBLISH_HZ = 50.0
 
-# Canonical task-space contract used by PICO wrists, manual shared-control
-# targets, and the arm-only IPOPT FK.  PICO world poses are first expressed as
-# controller - headset + WAIST_OFFSET_XYZ by pico_manager_thread_server.py.
+# Canonical task-space contract used by Galaxy XR wrists, shared-control
+# targets, and the arm-only IPOPT FK. World poses are expressed relative to the
+# headset and offset into the waist frame by xr_source_v15.py.
 PICO_WAIST_FRAME = "pico_head_position_waist"
 STATIC_TARGET_FRAME_ALIASES = {
     PICO_WAIST_FRAME,
@@ -149,11 +134,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pico-body-gap-hold-ms", type=float, default=200.0)
     parser.add_argument("--xr-future-tolerance-ms", type=float, default=100.0)
     parser.add_argument(
-        "--auto-arm-pico-tracking",
+        "--auto-arm-xr-tracking",
         action="store_true",
         help=(
-            "For a local simulator, arm live waist-frame XR targets automatically "
-            "when the first fresh wrist frame arrives, without waiting for A+X."
+            "For simulation only, arm live wrist targets when the first fresh "
+            "XR frame arrives instead of waiting for terminal r."
         ),
     )
     parser.add_argument(
@@ -163,15 +148,9 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--pico-vr-endpoint",
+        "--xr-hand-endpoint",
         default="tcp://127.0.0.1:5566",
-        help="Independent absolute PICO waist-frame wrist stream.",
-    )
-    parser.add_argument("--button-endpoint", default="tcp://127.0.0.1:5565")
-    parser.add_argument("--button-topic", default="pico_button_event")
-    parser.add_argument("--controller-stale-timeout-sec", type=float, default=0.20)
-    parser.add_argument(
-        "--controller-state-topic", default="pico_controller_state"
+        help="Independent absolute Galaxy XR waist-frame wrist stream.",
     )
     parser.add_argument("--static-target-bind", default="tcp://*:5564")
     parser.add_argument("--static-target-topic", default=STATIC_EE_TARGET_TOPIC)
@@ -182,8 +161,8 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help=(
             "Automatically enter auto_planning when a new static EE target arrives. "
-            "Disabled by default so perception gateways can buffer targets without "
-            "moving the robot until the operator explicitly presses e."
+            "Disabled by default so perception gateways can buffer targets until "
+            "the teleop session is started."
         ),
     )
     parser.add_argument(
@@ -217,7 +196,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--wrist-record-control-channel",
         default=WRIST_EXPERIMENT_RECORD_CONTROL_CHANNEL,
-        help="Wi-Fi LCM channel relaying unchorded controller-X recorder toggles.",
+        help="Wi-Fi LCM channel relaying terminal-s recording toggles.",
     )
     parser.add_argument(
         "--direct-upper-command-channel",
@@ -257,12 +236,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--shared-hand-selection-bind",
         default="tcp://*:5567",
-        help="PUB endpoint that reports the Y/B-selected shared-control hand.",
+        help="PUB endpoint that reports the pinch-selected shared-control hand.",
     )
     parser.add_argument(
         "--shared-hand-selection-topic",
         default="path_shared_control_hand",
-        help="Topic carrying the Y/B-selected shared-control hand heartbeat.",
+        help="Topic carrying the pinch-selected shared-control hand heartbeat.",
     )
 
     parser.add_argument(
@@ -280,7 +259,7 @@ def parse_args() -> argparse.Namespace:
         "--shared-startup-hold-sec",
         type=float,
         default=0.0,
-        help="Delay shared-control alpha after a Y/B hold (0 injects immediately).",
+        help="Delay shared-control alpha after a hand pinch (0 injects immediately).",
     )
     parser.add_argument("--shared-stale-after-sec", type=float, default=0.3)
     parser.add_argument("--shared-d-max-m", type=float, default=0.9)
@@ -288,7 +267,7 @@ def parse_args() -> argparse.Namespace:
         "--enable-shared-target-assist",
         action="store_true",
         help=(
-            "Allow held Y/B to replace the selected Televuer arm target with a "
+            "Allow a hand pinch to replace the selected Televuer arm target with a "
             "fresh perception/contact target. Disabled by default for direct XR teleop."
         ),
     )
@@ -421,12 +400,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-keyboard",
         action="store_true",
-        help="Disable terminal hotkeys q/w/e/r/p.",
-    )
-    parser.add_argument(
-        "--qp-reference-disabled",
-        action="store_true",
-        help="Start with QP reference gated off. Press p to toggle at runtime.",
+        help="Disable terminal hotkeys r/s/q.",
     )
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
@@ -436,14 +410,13 @@ def log(message: str) -> None:
     print(f"[PATH-state] {message}", flush=True)
 
 
-class KeyboardController:
-    """Tiny non-blocking stdin controller for live demo state switching."""
+class TerminalKeyInput:
+    """Non-blocking r/s/q terminal input for the PATH session."""
 
-    TOGGLE_QP = "__toggle_qp__"
-    KEY_TO_STATE = {
-        "w": "intention",
-        "p": TOGGLE_QP,
-    }
+    START = "start"
+    RECORD = "record"
+    QUIT = "quit"
+    KEY_TO_COMMAND = {"r": START, "s": RECORD, "q": QUIT}
 
     def __init__(self, enabled: bool):
         self.enabled = bool(enabled and sys.stdin.isatty())
@@ -468,7 +441,7 @@ class KeyboardController:
         key = sys.stdin.read(1)
         if key == "\x03":
             raise KeyboardInterrupt
-        return self.KEY_TO_STATE.get(key.lower())
+        return self.KEY_TO_COMMAND.get(key.lower())
 
 
 class DirectLcmRobotStateSubscriber:
@@ -509,14 +482,6 @@ class DirectLcmRobotStateSubscriber:
     def close(self) -> None:
         self._running = False
         self._thread.join(timeout=0.2)
-
-
-def starts(raw: bytes, topic: str) -> bool:
-    return raw.startswith(topic.encode())
-
-
-def unpack_prefixed_msgpack(raw: bytes, topic: str) -> dict:
-    return msgpack.unpackb(raw[len(topic):], raw=False)
 
 
 def parse_packed_fields(raw: bytes, topic: str) -> dict[str, np.ndarray]:
@@ -1028,14 +993,9 @@ def main() -> int:
             "PATH requires CasADi/IPOPT arm ownership; "
             "--no-arm-nonlinear-ik-enabled is not supported."
         )
-    if args.qp_reference_disabled:
-        raise RuntimeError(
-            "PATH requires the CasADi/IPOPT arm reference stream; "
-            "--qp-reference-disabled is not supported."
-        )
     ctx = zmq.Context.instance()
 
-    def make_pico_sub(
+    def make_xr_sub(
         topic: str,
         *,
         conflate: bool,
@@ -1054,23 +1014,9 @@ def main() -> int:
 
     # Keep independent queues so pose traffic cannot delay the calibrated arm
     # target stream or controller inputs.
-    pico_vr_body = make_pico_sub(
-        "vr_pose_debug", conflate=True, endpoint=args.pico_vr_endpoint
+    xr_hand_stream = make_xr_sub(
+        "vr_pose_debug", conflate=True, endpoint=args.xr_hand_endpoint
     )
-
-    button_sub = ctx.socket(zmq.SUB)
-    button_sub.setsockopt(zmq.SUBSCRIBE, args.button_topic.encode())
-    button_sub.setsockopt(zmq.RCVHWM, 64)
-    button_sub.setsockopt(zmq.RCVTIMEO, 1)
-    button_sub.connect(args.button_endpoint)
-
-    controller_sub = ctx.socket(zmq.SUB)
-    controller_sub.setsockopt(
-        zmq.SUBSCRIBE, args.controller_state_topic.encode()
-    )
-    controller_sub.setsockopt(zmq.CONFLATE, 1)
-    controller_sub.setsockopt(zmq.RCVTIMEO, 1)
-    controller_sub.connect(args.button_endpoint)
 
     static_target_sub = ctx.socket(zmq.SUB)
     static_target_sub.setsockopt(zmq.SUBSCRIBE, args.static_target_topic.encode())
@@ -1106,14 +1052,11 @@ def main() -> int:
     shared_hand_pub.bind(args.shared_hand_selection_bind)
 
     log(
-        f"XR wrist target SUB {args.pico_vr_endpoint}/vr_pose_debug "
-        "(shared PICO-compatible wire format)"
+        f"XR wrist target SUB {args.xr_hand_endpoint}/vr_pose_debug "
+        "(legacy-compatible pose packet; hand landmarks are enabled)"
     )
-    log(
-        f"XR controller SUB (PICO-compatible buttons) {args.button_endpoint}/"
-        f"{args.button_topic},{args.controller_state_topic}"
-    )
-    log("XR/PICO-compatible wrist targets use manager-calibrated waist-frame SE(3)")
+    log("XR hands are tracked continuously; terminal r/s/q control the session")
+    log("Galaxy XR wrist targets use manager-calibrated waist-frame SE(3)")
     log(f"static EE target SUB {args.static_target_bind}/{args.static_target_topic}")
     log(f"state command SUB {args.state_command_bind}/{args.state_command_topic}")
     log(
@@ -1179,7 +1122,7 @@ def main() -> int:
 
     current_state = "teleop" if args.state == "auto_planning" else args.state
     if args.state == "auto_planning":
-        log("initial auto_planning alias -> teleop (Y/B gates belief)")
+        log("initial auto_planning alias -> teleop (hand pinch may gate belief)")
     latest_static_target: dict | None = None
     latest_static_target_us = 0
     static_target_revision = 0
@@ -1203,18 +1146,13 @@ def main() -> int:
     latest_pico_body_receive_us = 0
     latest_pico_session_id = -1
     pico_tracking_armed = False
-    pico_arm_pending = bool(args.auto_arm_pico_tracking)
+    pico_arm_pending = bool(args.auto_arm_xr_tracking)
     last_forwarded_pose_frame = -1
-    last_button_sequence = 0
-    last_button_publish_us = 0
     latest_hand_us = 0
-    latest_hand_control_us = 0
     latest_hand_meta: dict[str, float] = {}
-    latest_controller_y = False
-    latest_controller_b = False
-    latest_controller_state_us = 0
-    latest_controller_sequence = 0
-    latest_controller_publish_us = 0
+    recording_active = False
+    record_control_sequence = 0
+    quit_deadline: float | None = None
     phase_mode = "none"
     phase_sync_error_rad = float("nan")
     last_arm_ik_solve_ms = float("nan")
@@ -1229,11 +1167,11 @@ def main() -> int:
     last_ipopt_q_ref: np.ndarray | None = None
     last_ipopt_tau_ff: np.ndarray | None = None
     last_plan_q: np.ndarray | None = None
-    qp_reference_enabled = not args.qp_reference_disabled
+    qp_reference_enabled = True
     last_tick = time.monotonic()
     last_log = 0.0
     period = 1.0 / max(args.fps, 1.0e-6)
-    keyboard = KeyboardController(enabled=not args.no_keyboard)
+    keyboard = TerminalKeyInput(enabled=not args.no_keyboard)
     shared_config = SharedControlConfig(
         stale_after_s=float(args.shared_stale_after_sec),
         d_max_m=float(args.shared_d_max_m),
@@ -1308,7 +1246,7 @@ def main() -> int:
     # confirmed grasp releases the shared position target without suppressing
     # an actively held B/Y-gated orientation constraint.
     orientation_belief_active = {side: False for side in ("left", "right")}
-    # Y/B is a dead-man switch for the left/right belief blend.
+    # Hand pinch is a dead-man switch for optional left/right belief blending.
     shared_selected_hand = "none"
     shared_hand_selection_revision = 0
     next_shared_hand_publish = 0.0
@@ -1316,16 +1254,16 @@ def main() -> int:
     command_history = {side: None for side in ("left", "right")}
     log(
             "XR absolute waist-frame wrist targets enabled: "
-        f"topic={args.pico_vr_endpoint}/vr_pose_debug "
-        "(shared PICO-compatible wire format), mode=head_position, "
+        f"topic={args.xr_hand_endpoint}/vr_pose_debug "
+        "(legacy-compatible pose packet), mode=head_position, "
         "anchor=none, gain=none"
         + (
             "; MuJoCo auto-arms on first fresh wrist frame"
-            if args.auto_arm_pico_tracking
-            else "; waiting for Q_READY/A+X"
+            if args.auto_arm_xr_tracking
+            else "; waiting for terminal r and Q_READY"
         )
     )
-    if args.auto_arm_pico_tracking:
+    if args.auto_arm_xr_tracking:
         log(
             "MuJoCo XR auto-arm enabled: live wrist targets arm on the first fresh "
             "Televuer frame; stale frames remain rejected"
@@ -1339,7 +1277,7 @@ def main() -> int:
     log(
         "shared contact target assist="
         + (
-            "enabled (held Y/B may select a fresh perception target)"
+            "enabled (hand pinch may select a fresh perception target)"
             if args.enable_shared_target_assist
             else "disabled (arm goals stay on Televuer)"
         )
@@ -1425,7 +1363,7 @@ def main() -> int:
     ) -> dict[str, dict]:
         """Encode the pelvis-frame wrist poses currently held by IPOPT.
 
-        The viewer must retain an explicit target even while PICO is waiting
+        The viewer must retain an explicit target while hand tracking is waiting
         for its first fresh body frame.  In those states the direct controller
         holds Q_READY or the last IPOPT solution, both of which still have a
         well-defined wrist FK pose.
@@ -1455,15 +1393,11 @@ def main() -> int:
         latest_hand_us = int(rx_us)
 
     def pico_grip_active(side: str, tick_us: int) -> bool:
-        """Return the latest valid binary close request from Pico controls."""
-        control_age_us = tick_us - latest_hand_control_us
+        """Return the latest valid binary pinch/grip request from hand tracking."""
         pose_age_us = tick_us - latest_hand_us
         timeout_us = max(0.0, args.pico_hand_timeout_sec) * 1.0e6
-        if latest_hand_control_us <= 0 or control_age_us > timeout_us:
-            # The pose stream remains a compatibility fallback only.  The
-            # normal route is pico_controller_state at 100 Hz.
-            if latest_hand_us <= 0 or pose_age_us > timeout_us:
-                return False
+        if latest_hand_us <= 0 or pose_age_us > timeout_us:
+            return False
         return bool(max(
             latest_hand_meta.get(f"{side}_trigger", 0.0),
             latest_hand_meta.get(f"{side}_grip", 0.0),
@@ -1497,7 +1431,7 @@ def main() -> int:
         if tick_us is None:
             tick_us = now_us()
         if requested == "auto_planning":
-            log(f"{source} auto_planning alias -> teleop (Y/B gates belief)")
+            log(f"{source} auto_planning alias -> teleop (hand pinch may gate belief)")
             requested = "teleop"
         if requested not in VALID_STATES:
             log(f"ignored invalid {source} state command: {requested}")
@@ -1517,13 +1451,13 @@ def main() -> int:
             phase_sync_error_rad = float("nan")
 
     def set_pico_tracking_armed(enabled: bool, source: str) -> None:
-        """Switch between live PICO tracking and fixed-FK(Q_READY) IPOPT."""
+        """Switch between live Galaxy XR hand tracking and fixed-FK(Q_READY) IPOPT."""
 
         nonlocal pico_tracking_armed
         nonlocal pico_arm_pending
         enabled = bool(enabled)
         if enabled:
-            if not args.auto_arm_pico_tracking:
+            if not args.auto_arm_xr_tracking:
                 ready_error_rad = (
                     float(
                         np.max(
@@ -1543,7 +1477,7 @@ def main() -> int:
                 if not robot_ready:
                     pico_arm_pending = True
                     log(
-                        f"{source}: A+X arm pending until Q_READY "
+                        f"{source}: arm pending until G1 reports Q_READY "
                         f"(max_arm_error={ready_error_rad:.3f}rad, threshold=0.100rad)"
                     )
                     return
@@ -1554,7 +1488,7 @@ def main() -> int:
             pico_arm_pending = False
         if enabled == pico_tracking_armed:
             log(
-                f"{source}: PICO tracking already "
+                f"{source}: XR hand tracking already "
                 f"{'armed' if enabled else 'disarmed'}"
             )
             return
@@ -1562,7 +1496,7 @@ def main() -> int:
         pico_arm_pending = False
         resync_shared_control_state("pico_tracking_armed" if enabled else "pico_tracking_disarmed")
         if enabled:
-            if args.auto_arm_pico_tracking:
+            if args.auto_arm_xr_tracking:
                 log(f"{source}: teleop_tracking armed from a fresh XR wrist frame")
             else:
                 log(
@@ -1593,14 +1527,14 @@ def main() -> int:
             or source_age_us < -future_tolerance_us
         ):
             return
-        if args.auto_arm_pico_tracking:
+        if args.auto_arm_xr_tracking:
             set_pico_tracking_armed(True, "MuJoCo XR auto-arm")
             return
         ready_error_rad = float(
             np.max(np.abs(np.asarray(latest_robot_q, dtype=np.float64)[15:29] - Q_READY[15:29]))
         )
         if ready_error_rad < 0.10:
-            set_pico_tracking_armed(True, "Pico A+X pending")
+            set_pico_tracking_armed(True, "terminal r pending")
 
     def set_qp_reference_enabled(enabled: bool, source: str) -> None:
         nonlocal qp_reference_enabled
@@ -1613,13 +1547,25 @@ def main() -> int:
         else:
             log(f"{source} CasADi/IPOPT arm reference: staying ON")
 
-    if keyboard.enabled:
-        log(
-            "keyboard hotkeys enabled: w=intention, "
-            "p=IPOPT arm disable rejected"
+    def publish_record_toggle() -> None:
+        nonlocal record_control_sequence
+        record_control_sequence += 1
+        stamp = int(now_us())
+        wrist_visual_lcm.publish(
+            args.wrist_record_control_channel,
+            pack_experiment_record_control(
+                {
+                    "event": "toggle",
+                    "sequence": record_control_sequence,
+                    "published_timestamp_us": stamp,
+                }
+            ),
         )
+
+    if keyboard.enabled:
+        log("terminal keys: r=start/resume hand tracking, s=record start/stop, q=stop")
     else:
-        log("keyboard hotkeys disabled; use tcp://*:5563/path_state_command")
+        log("terminal keys unavailable; run PATH-state in an interactive terminal")
     log(f"QP reference gate initial state: {'ON' if qp_reference_enabled else 'OFF'}")
     log("PATH publishes arm joints only; DreamWaQ owns base, legs, and waist")
 
@@ -1627,114 +1573,16 @@ def main() -> int:
     try:
         while True:
             now = time.monotonic()
+            if quit_deadline is not None and now >= quit_deadline:
+                break
             tick_us = now_us()
             dt = max(1.0e-4, now - last_tick)
             last_tick = now
 
-            # Controller state is conflated independently of discrete button
-            # events; Y/B is a dead-man selector for belief assistance.
+            # Galaxy XR hand-tracked wrist targets arrive independently of
+            # the PATH terminal key stream.
             try:
-                controller_raw = controller_sub.recv(zmq.NOBLOCK)
-                controller = unpack_prefixed_msgpack(
-                    controller_raw, args.controller_state_topic
-                )
-                controller_sequence = int(controller.get("sequence", 0))
-                controller_hand_meta: dict[str, float] = {}
-                for key in ("left_trigger", "right_trigger", "left_grip", "right_grip"):
-                    try:
-                        value = float(controller.get(key, float("nan")))
-                    except (TypeError, ValueError):
-                        continue
-                    if np.isfinite(value):
-                        controller_hand_meta[key] = value
-                if controller_hand_meta:
-                    latest_hand_meta.update(controller_hand_meta)
-                    latest_hand_control_us = tick_us
-                controller_publish_us = int(
-                    controller.get("publish_timestamp_us", 0)
-                )
-                controller_restarted = bool(
-                    controller_sequence <= latest_controller_sequence
-                    and controller_publish_us > latest_controller_publish_us
-                )
-                if controller_sequence > latest_controller_sequence or controller_restarted:
-                    if controller_restarted:
-                        log(
-                            "Pico controller publisher sequence restarted: "
-                            f"{latest_controller_sequence} -> {controller_sequence}"
-                        )
-                    latest_controller_y = bool(controller.get("y", False))
-                    latest_controller_b = bool(controller.get("b", False))
-                    latest_controller_state_us = tick_us
-                    latest_controller_sequence = controller_sequence
-                    latest_controller_publish_us = controller_publish_us
-            except zmq.Again:
-                pass
-
-            # ABXY has a dedicated 100Hz event queue so pose/FK/IK work cannot
-            # delay mode commands. Preserve the input timestamps for telemetry.
-            try:
-                while True:
-                    event_raw = button_sub.recv(zmq.NOBLOCK)
-                    if not starts(event_raw, args.button_topic):
-                        continue
-                    event = unpack_prefixed_msgpack(event_raw, args.button_topic)
-                    sequence = int(event.get("sequence", 0))
-                    event_publish_us = int(event.get("publish_timestamp_us", 0))
-                    event_restarted = bool(
-                        sequence <= last_button_sequence
-                        and event_publish_us > last_button_publish_us
-                    )
-                    if sequence <= last_button_sequence and not event_restarted:
-                        continue
-                    if event_restarted:
-                        log(
-                            "Pico button publisher sequence restarted: "
-                            f"{last_button_sequence} -> {sequence}"
-                        )
-                    last_button_sequence = sequence
-                    last_button_publish_us = event_publish_us
-                    event_name = str(event.get("event", ""))
-                    if event_name == "record_toggle":
-                        wrist_visual_lcm.publish(
-                            args.wrist_record_control_channel,
-                            pack_experiment_record_control(
-                                {
-                                    "event": "toggle",
-                                    "sequence": sequence,
-                                    "published_timestamp_us": int(now_us()),
-                                    "button_read_timestamp_us": int(
-                                        event.get("button_read_timestamp_us", 0)
-                                    ),
-                                }
-                            ),
-                        )
-                        log("Pico X: experiment recorder toggle relayed")
-                        continue
-                    if event_name not in {
-                        "start_combo", "ax", "by", "select_left", "select_right",
-                    }:
-                        continue
-                    if event_name == "start_combo":
-                        set_pico_tracking_armed(False, "Pico start/stop")
-                        if current_state != "teleop":
-                            current_state = "teleop"
-                            resync_shared_control_state("pico_stop")
-                    elif event_name == "ax":
-                        set_pico_tracking_armed(
-                            not (pico_tracking_armed or pico_arm_pending), "Pico A+X"
-                        )
-                    elif event_name == "select_left":
-                        log("Pico Y: hold to enable left shared-control")
-                    elif event_name == "select_right":
-                        log("Pico B: hold to enable right shared-control")
-            except zmq.Again:
-                pass
-
-            # Native PICO wrist tracking is published independently of the
-            # controller event stream.
-            try:
-                raw = pico_vr_body.recv(zmq.NOBLOCK)
+                raw = xr_hand_stream.recv(zmq.NOBLOCK)
                 remember_pico_hand_fields(raw, "vr_pose_debug", tick_us)
                 targets = wrist_targets_from_message(
                     raw,
@@ -1874,10 +1722,37 @@ def main() -> int:
                 pass
 
             keyboard_command = keyboard.poll_command()
-            if keyboard_command == KeyboardController.TOGGLE_QP:
-                set_qp_reference_enabled(not qp_reference_enabled, "keyboard")
-            elif keyboard_command is not None:
-                apply_state_request(keyboard_command, "keyboard", tick_us)
+            if keyboard_command == TerminalKeyInput.START:
+                if current_state != "teleop":
+                    apply_state_request("teleop", "terminal r", tick_us)
+                if pico_tracking_armed:
+                    log("terminal r: XR arm tracking is already active")
+                elif pico_arm_pending:
+                    log("terminal r: waiting for fresh hands and G1 Q_READY state")
+                else:
+                    set_pico_tracking_armed(True, "terminal r")
+            elif keyboard_command == TerminalKeyInput.RECORD:
+                if recording_active:
+                    publish_record_toggle()
+                    recording_active = False
+                    set_pico_tracking_armed(False, "terminal s: recording stopped")
+                    log("terminal s: save requested; arms are returning to Q_READY; press r to resume")
+                elif pico_tracking_armed or pico_arm_pending:
+                    publish_record_toggle()
+                    recording_active = True
+                    log("terminal s: PATH experiment recording started")
+                else:
+                    log("terminal s ignored: press r to start arm tracking first")
+            elif keyboard_command == TerminalKeyInput.QUIT:
+                if recording_active:
+                    publish_record_toggle()
+                    recording_active = False
+                    log("terminal q: closing the active recording")
+                if current_state != "teleop":
+                    apply_state_request("teleop", "terminal q", tick_us)
+                set_pico_tracking_armed(False, "terminal q")
+                quit_deadline = now + 1.5
+                log("terminal q: holding Q_READY briefly, then stopping PATH")
 
             pico_body_age_sec = (
                 (tick_us - latest_pico_body_receive_us) / 1.0e6
@@ -1916,32 +1791,30 @@ def main() -> int:
             grasp_state = {
                 side: grasp_detector[side].state for side in ("left", "right")
             }
-            controller_age_sec = (
-                (tick_us - latest_controller_state_us) / 1.0e6
-                if latest_controller_state_us > 0
-                else float("inf")
-            )
-            controller_fresh = (
-                latest_controller_state_us > 0
-                and controller_age_sec
-                <= float(args.controller_stale_timeout_sec)
-            )
-            # Y/B are a dead-man arm selector in teleop.  Never retain the
-            # selected arm after a release or controller-state timeout.
+            # Optional shared-target selection uses hand pinch state only.
+            # It is disabled by default and never gates ordinary hand tracking.
             requested_shared_hand = "none"
             if (
                 current_state == "teleop"
-                and controller_fresh
+                and hand_fresh
                 and args.enable_shared_target_assist
             ):
-                if latest_controller_y and not latest_controller_b:
+                left_pinch = max(
+                    latest_hand_meta.get("left_trigger", 0.0),
+                    latest_hand_meta.get("left_grip", 0.0),
+                ) >= 0.5
+                right_pinch = max(
+                    latest_hand_meta.get("right_trigger", 0.0),
+                    latest_hand_meta.get("right_grip", 0.0),
+                ) >= 0.5
+                if left_pinch and not right_pinch:
                     requested_shared_hand = "left"
-                elif latest_controller_b and not latest_controller_y:
+                elif right_pinch and not left_pinch:
                     requested_shared_hand = "right"
             if requested_shared_hand != shared_selected_hand:
                 shared_selected_hand = requested_shared_hand
                 shared_hand_selection_revision += 1
-                # Y/B only selects whether shared constraints are considered;
+                # Pinch only selects whether shared constraints are considered;
                 # unselected arms receive the current Televuer goals directly.
                 log(
                     "shared-control hold "
@@ -1968,7 +1841,7 @@ def main() -> int:
             control_visual_hands: dict[str, dict] = {}
             if current_state in {"teleop", "intention"}:
                 if current_state == "teleop" and not pico_tracking_armed:
-                    # A+X enters teleop_wait_ready.  It is deliberately a
+                    # Terminal r enters teleop_wait_ready. It is deliberately a
                     # Cartesian IPOPT task, not a direct q=0 command: FK of
                     # Q_READY provides both fixed wrist positions and fixed
                     # orientations every 50 Hz.
@@ -2208,7 +2081,7 @@ def main() -> int:
                         # IK. A shared orientation constraint may explicitly
                         # alter this target, but no reference dynamics follow it.
                         # The direct Televuer position is the default. Shared
-                        # target logic only changes it while a valid Y/B target
+                        # target logic only changes it while a valid pinch target
                         # is actively selected.
                         position_target = position_command
                         position_source = "operator"
@@ -2430,7 +2303,7 @@ def main() -> int:
                             pico_target_held=False,
                             pico_left_target_position=left_target_tf[:3, 3].tolist(),
                             pico_right_target_position=right_target_tf[:3, 3].tolist(),
-                            q_prior_source="ipopt_xr_controller_ee",
+                            q_prior_source="ipopt_xr_hand_ee",
                             belief_enabled=bool(shared_selection_armed),
                             shared_control=bool(shared_selection_armed),
                             teleop_qp_bimanual=True,
@@ -2633,9 +2506,9 @@ def main() -> int:
                             q_arm=q_direct[ARM_START:ARM_START + 14],
                             dq_arm=np.zeros(14, dtype=np.float64),
                             tau_arm=tau_direct[ARM_START:ARM_START + 14],
-                            # Trigger/grip values arrive independently at
-                            # 100 Hz through pico_controller_state.  They are
-                            # not coupled to the conflated VR pose frame.
+                            # Hand pinch values share the fresh XR pose packet;
+                            # the G1 arm bridge ignores grip flags, while the
+                            # separate Revo2 MPPI process owns finger targets.
                             left_grip=direct_left_grip,
                             right_grip=direct_right_grip,
                         ),
@@ -2776,7 +2649,7 @@ def main() -> int:
             )
 
             # PUB/SUB has no retained state.  A short heartbeat makes the
-            # Y/B selection available to a gateway that starts later too.
+            # Pinch selection available to a gateway that starts later too.
             if now >= next_shared_hand_publish:
                 shared_hand_pub.send(
                     pack_topic(
@@ -2847,7 +2720,7 @@ def main() -> int:
                     f"{latest_hand_meta.get('right_trigger', float('nan')):.2f}) "
                     f"grip=({latest_hand_meta.get('left_grip', float('nan')):.2f},"
                     f"{latest_hand_meta.get('right_grip', float('nan')):.2f}) "
-                    f"hand_ctrl_age={(tick_us - latest_hand_control_us) / 1000.0 if latest_hand_control_us else -1.0:.1f}ms "
+                    f"hand_age={(tick_us - latest_hand_us) / 1000.0 if latest_hand_us else -1.0:.1f}ms "
                     f"direct_grip=({int(direct_left_grip)},{int(direct_right_grip)}) "
                     f"qp_type={qp_payload.get('reference_type') if qp_payload else 'none'} "
                     f"source={qp_payload.get('source', 'none') if qp_payload else 'none'} "
@@ -2856,9 +2729,8 @@ def main() -> int:
                     f"{pico_position_log} "
                     f"xr_age={1000.0 * pico_body_age_sec if np.isfinite(pico_body_age_sec) else -1.0:.1f}ms "
                     f"xr_source_age={1000.0 * pico_source_age_sec if np.isfinite(pico_source_age_sec) else -1.0:.1f}ms "
-                    f"button_seq={last_button_sequence} "
-                    f"controller_seq={latest_controller_sequence} "
-                    f"controller_age={1000.0 * controller_age_sec if np.isfinite(controller_age_sec) else -1.0:.1f}ms "
+                    f"recording={'on' if recording_active else 'off'} "
+                    f"quit_pending={quit_deadline is not None} "
                     f"control={qp_payload.get('control_mode', 'none') if qp_payload else 'none'} "
                     f"plan={qp_payload.get('plan_id', 0) if qp_payload else 0} "
                     f"phase={float(qp_payload.get('phase', 0.0)) if qp_payload else 0.0:.2f} "
@@ -2883,9 +2755,7 @@ def main() -> int:
     except KeyboardInterrupt:
         return 0
     finally:
-        pico_vr_body.close()
-        button_sub.close()
-        controller_sub.close()
+        xr_hand_stream.close()
         state_sub.close()
         qp.close()
         shared_hand_pub.close()

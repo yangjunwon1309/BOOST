@@ -12,8 +12,8 @@ Example:
     --wifi-lcm-url 'udpm://239.255.77.67:7667?ttl=1' \
     --output records/trial_001.csv
 
-Use --x-toggle to start and stop successive numbered trials with an unchorded
-controller X press/release.  A+X remains reserved for PATH tracking.
+Use --event-toggle to start and stop successive numbered trials when PATH's
+terminal s key emits a recording edge.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ import json
 import math
 import os
 import re
+import signal
 import sys
 import time
 from dataclasses import dataclass
@@ -474,17 +475,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--flush-every", type=int, default=25)
     parser.add_argument(
-        "--x-toggle",
+        "--event-toggle",
         action="store_true",
         help=(
-            "Wait for unchorded controller-X relay events: first press starts a "
-            "new numbered CSV, next press closes it, then repeats."
+            "Wait for PATH terminal-s relay events: first edge starts a new "
+            "numbered CSV, next edge closes it, then repeats."
         ),
     )
     parser.add_argument(
         "--record-control-channel",
         default="PATH_V11_WRIST_EXPERIMENT_RECORD_CONTROL",
-        help="Wi-Fi LCM channel carrying state-machine-relayed controller-X edges.",
+        help="Wi-Fi LCM channel carrying state-machine-relayed terminal-s edges.",
     )
     return parser.parse_args()
 
@@ -508,11 +509,11 @@ def main() -> int:
             f"{error.name} is required in the recorder Python environment."
         ) from error
 
-    if args.x_toggle and args.overwrite:
-        raise SystemExit("--overwrite cannot be used with --x-toggle")
-    if args.x_toggle and float(args.duration_sec) > 0.0:
-        raise SystemExit("--duration-sec cannot be used with --x-toggle; press X again to stop")
-    if not args.x_toggle and args.output.exists() and not args.overwrite:
+    if args.event_toggle and args.overwrite:
+        raise SystemExit("--overwrite cannot be used with --event-toggle")
+    if args.event_toggle and float(args.duration_sec) > 0.0:
+        raise SystemExit("--duration-sec cannot be used with --event-toggle; press s again to stop")
+    if not args.event_toggle and args.output.exists() and not args.overwrite:
         raise SystemExit(
             f"refusing to overwrite existing trial CSV: {args.output} (pass --overwrite to replace it)"
         )
@@ -520,11 +521,16 @@ def main() -> int:
     if float(args.robot_state_max_age_ms) <= 0.0:
         raise SystemExit("--robot-state-max-age-ms must be positive")
 
+    def stop_on_sigterm(_signum, _frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, stop_on_sigterm)
+
     upper_body_torque = UpperBodyTorqueCache(
         max_age_sec=float(args.robot_state_max_age_ms) / 1000.0,
     )
     recorder: ExperimentRecorder | None = None
-    if not args.x_toggle:
+    if not args.event_toggle:
         recorder = ExperimentRecorder(
             args.output,
             sample_hz=float(args.sample_hz),
@@ -581,7 +587,7 @@ def main() -> int:
                 completed_trials += 1
                 print_summary({**summary, "summary_path": str(recorder.summary_path)})
                 recorder = None
-                print("[experiment-recorder] X toggle: stopped; waiting for next trial", flush=True)
+                print("[experiment-recorder] terminal s: stopped; waiting for next trial", flush=True)
                 return
             output = _next_indexed_output(args.output)
             recorder = ExperimentRecorder(
@@ -590,14 +596,14 @@ def main() -> int:
                 flush_every=int(args.flush_every),
                 upper_body_torque=upper_body_torque,
             )
-            print(f"[experiment-recorder] X toggle: started {output}", flush=True)
+            print(f"[experiment-recorder] terminal s: started {output}", flush=True)
         except Exception as error:
             print(f"[experiment-recorder] record-control packet rejected: {error}", file=sys.stderr)
 
     bus.subscribe(WRIST_BELIEF_TELEMETRY_CHANNEL, on_belief)
     bus.subscribe(WRIST_IPOPT_VISUAL_CHANNEL, on_ipopt)
     g1_bus.subscribe(args.robot_state_channel, on_robot_state)
-    if args.x_toggle:
+    if args.event_toggle:
         if args.record_control_channel != WRIST_EXPERIMENT_RECORD_CONTROL_CHANNEL:
             print(
                 "[experiment-recorder] warning: non-default record-control channel; "
@@ -606,7 +612,7 @@ def main() -> int:
             )
         bus.subscribe(args.record_control_channel, on_record_control)
         print(
-            "[experiment-recorder] waiting for unchorded controller X; "
+            "[experiment-recorder] waiting for PATH terminal s; "
             f"next output={_next_indexed_output(args.output)}",
             flush=True,
         )

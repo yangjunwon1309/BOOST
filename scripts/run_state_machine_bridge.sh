@@ -13,9 +13,7 @@ state_machine_command=(
   --pico-body-gap-hold-ms "${PATH_PICO_BODY_GAP_HOLD_MS:-200}" \
   --xr-future-tolerance-ms "${PATH_XR_FUTURE_TOLERANCE_MS:-100}" \
   --arm-reference-mode head_position \
-  --pico-vr-endpoint "${PATH_PICO_VR_ENDPOINT:-tcp://127.0.0.1:5566}" \
-  --button-endpoint "${PATH_PICO_BUTTON_ENDPOINT:-tcp://127.0.0.1:5565}" \
-  --button-topic "${PATH_PICO_BUTTON_TOPIC:-pico_button_event}" \
+  --xr-hand-endpoint "${PATH_XR_HAND_ENDPOINT:-tcp://127.0.0.1:5566}" \
   --static-target-bind "tcp://*:${PATH_STATIC_TARGET_PORT:-5564}" \
   --static-target-topic "${PATH_STATIC_TARGET_TOPIC:-path_static_ee_target}" \
   --static-target-timeout-sec "${PATH_STATIC_TARGET_TIMEOUT_SEC:-0.35}" \
@@ -64,8 +62,8 @@ state_machine_command=(
   "$@"
 )
 
-if [[ "${PATH_AUTO_ARM_PICO_TRACKING:-0}" == "1" ]]; then
-  state_machine_command+=(--auto-arm-pico-tracking)
+if [[ "${PATH_AUTO_ARM_XR_TRACKING:-0}" == "1" ]]; then
+  state_machine_command+=(--auto-arm-xr-tracking)
 fi
 
 if [[ "${PATH_ENABLE_SHARED_TARGET_ASSIST:-0}" == "1" ]]; then

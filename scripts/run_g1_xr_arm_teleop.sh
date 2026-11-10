@@ -81,7 +81,7 @@ fi
 
 args=(
   --arm G1_29
-  --input-mode "${BOOST_G1_XR_INPUT_MODE:-controller}"
+  --input-mode hand
   --display-mode "${BOOST_G1_XR_DISPLAY_MODE:-pass-through}"
   --motion --record --headless --camera-clock-sync
   --network-interface "$network_interface"
@@ -95,7 +95,7 @@ args=(
 
 echo "Starting arm-only Galaxy XR teleop on $network_interface."
 echo "DreamWaQ must already own rt/lowcmd on the G1 host; this process publishes rt/arm_sdk."
-echo "Record: [r] tracking, [s] start/save, [1..9]/[0] labels, hold [q] 3s to stop."
+echo "Hand tracking: [r] start/resume, [s] recording toggle, hold [q] 3s to stop (legacy direct route)."
 echo "XR URL: https://$xr_host:8012/"
 echo "Data root: $data_root/$task_name"
 exec "$teleop_python" "$BOOST_ROOT/external/g1_arm_teleop/teleop/teleop_arm_only.py" "${args[@]}" "$@"

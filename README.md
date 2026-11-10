@@ -50,22 +50,26 @@ python scripts/boost_git.py --help.
   deployment references, verification, dataset guidance, and pinned external
   dependencies.
 
-## Existing PATH teleop entry points
+## Galaxy XR hand teleoperation
 
-The current PATH-derived servers can be started from the repository root:
+On Thor, start the combined hand-tracking/PATH/session recorder in an
+interactive terminal, then run Revo2 MPPI in a second terminal:
 
 ~~~bash
-bash scripts/run_pico_manager.sh
-bash scripts/run_state_machine_bridge.sh
+pixi run -e thor-teleop path-teleop
 ~~~
 
-Use bash scripts/run_galaxy_xr_manager.sh for the Galaxy XR input route.
-These entry points retain PATH's arm packet and IK behavior. On hardware, the
-PATH G1 adapter feeds rt/arm_sdk and target DreamWaQ owns rt/lowcmd. See
+~~~bash
+BRAINCO_DDS_INTERFACE=eth0 pixi run -e thor hand-mppi-publish
+~~~
+
+After Galaxy XR hand tracking is connected, use `r` to start/resume, `s` to
+start or stop a wrist experiment recording, and `q` to stop. The G1 PATH
+adapter feeds `rt/arm_sdk`; target DreamWaQ owns `rt/lowcmd`. See
+[docs/g1_installation.md](docs/g1_installation.md) and
 [docs/dreamwaq_integration.md](docs/dreamwaq_integration.md).
-Revo2 targets use the separate hand MPPI publisher and BrainCo serial service.
-The physical deployment split and ordered bring-up are in
-[docs/g1_installation.md](docs/g1_installation.md).
+Use `bash scripts/diagnose_g1_teleop_links.sh <peer-ip>` on Thor and G1 to
+inspect the configured addresses, listeners, and G1 LCM state packets.
 The alternative direct arm-only Galaxy XR route runs the Pixi task
 `g1-arm-teleop` on Thor and `scripts/run_g1_dreamwaq_body_controller.sh` on
 G1; it publishes arm targets directly to `rt/arm_sdk` and does not control fingers.
@@ -87,8 +91,8 @@ lock instead of re-solving the separate Thor NumPy 2 environment.
 
 Start the desktop simulation without a headset with
 pixi run -e sim mujoco-no-xr; use pixi run -e sim mujoco when Galaxy XR
-certificates are configured. To stream Televuer's 25 hand landmarks over PATH's
-ZMQ pose message, set PATH_TELEVUER_HAND_TRACKING=1 when starting mujoco.
+certificates are configured. The Televuer manager always uses hand tracking;
+press `r` in the PATH terminal to start following fresh XR wrist poses.
 Use pixi run -e sim mujoco-hand-test to run the simulated G1 under DreamWaQ
 while hand MPPI reads an editable JSON pose; it starts no XR, Televuer, or PATH
 bridge. Use pixi run -e sim mujoco-hand-motion-test for a generated repeating

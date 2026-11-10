@@ -1,8 +1,4 @@
-pico_controls:
-  bind: "tcp://*:5565"
-  connect: "tcp://127.0.0.1:5565"
-  topics: ["pico_button_event", "pico_controller_state"]
-pico_wrist_targets:
+galaxy_xr_hand_wrist_targets:
   bind: "tcp://*:5566"
   connect: "tcp://127.0.0.1:5566"
   topic: "vr_pose_debug"

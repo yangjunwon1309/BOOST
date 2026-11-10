@@ -382,7 +382,7 @@ def unpack_ipopt_visual(data: bytes) -> dict[str, Any]:
 
 
 def pack_experiment_record_control(payload: dict[str, Any]) -> bytes:
-    """Encode one controller-originated start/stop edge for the recorder."""
+    """Encode one PATH terminal start/stop edge for the recorder."""
     sequence = payload.get("sequence")
     if not isinstance(sequence, int) or sequence < 0:
         raise ValueError("record-control sequence must be a non-negative integer")

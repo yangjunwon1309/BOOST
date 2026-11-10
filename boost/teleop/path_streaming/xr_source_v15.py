@@ -259,7 +259,7 @@ def world_arm_to_waist_head_position(arm_world: np.ndarray, head_world: np.ndarr
     return transform
 
 
-def controller_waist_targets_se3(
+def xr_waist_targets_se3(
     left_xr: np.ndarray,
     right_xr: np.ndarray,
     head_xr: np.ndarray,
@@ -281,6 +281,11 @@ def controller_waist_targets_se3(
         world_arm_to_waist_head_position(right_robot, head_robot),
         bool(head_ok and left_ok and right_ok),
     )
+
+
+# Keep the old name for the PICO comparison utility; Galaxy XR uses the
+# source-neutral hand-tracking name above.
+controller_waist_targets_se3 = xr_waist_targets_se3
 
 
 def _unit_interval(value: Any) -> float:
@@ -540,10 +545,10 @@ class TeleVuerSource(_LatestSampleSource):
             right_trigger = 1.0 if right_pinch else 0.0
             left_grip = _unit_interval(getattr(raw, "left_hand_squeezeValue", 0.0)) if ready else 0.0
             right_grip = _unit_interval(getattr(raw, "right_hand_squeezeValue", 0.0)) if ready else 0.0
+            # Kept only on the internal compatibility sample for the XR-source
+            # comparison utility. The live Galaxy XR manager never publishes
+            # these button fields or consumes them for teleop state changes.
             buttons = {
-                # PATH's current gates are left=Y and right=B.  TeleVuer's
-                # hand event already reports a discrete, tracker-qualified
-                # pinch; no assumed landmark ordering is introduced here.
                 "A": False,
                 "B": right_pinch,
                 "X": False,

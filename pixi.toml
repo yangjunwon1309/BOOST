@@ -185,6 +185,7 @@ CYCLONEDDS_HOME = "$CONDA_PREFIX"
 path-state = { cmd = "bash scripts/run_state_machine_bridge.sh", description = "Run PATH arm IK and Televuer pose bridge on Thor" }
 galaxy-xr = { cmd = "bash scripts/run_galaxy_xr_manager.sh", description = "Run the Galaxy XR/Televuer service on Thor" }
 path-teleop = { cmd = "bash scripts/run_galaxy_path_teleop.sh", description = "Run Galaxy XR hand tracking, PATH, terminal r/s/q, and wrist experiment recording" }
+inspect-xr-stream = { cmd = "python scripts/inspect_galaxy_xr_stream.py", description = "Inspect Galaxy XR wrist and hand frames arriving at Thor ZMQ port 5566" }
 g1-arm-teleop = { cmd = "bash scripts/run_g1_xr_arm_teleop.sh", description = "Run verified arm-only Galaxy XR teleop on the XR host; DreamWaQ runs on G1" }
 verify-thor-teleop = { cmd = "python scripts/verify_thor_teleop_environment.py", description = "Check Thor PATH, Televuer, LCM and Unitree SDK imports" }
 

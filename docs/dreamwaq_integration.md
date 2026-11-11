@@ -17,14 +17,16 @@ publish `rt/arm_sdk`. Revo2 MPPI is a separate optional hand route in the PATH
 flow; the direct arm-only runner does not start it or publish finger commands.
 
 The selected deployment source is `url_g1_deploy` commit
-`3d37aa43f88964fc4255857c840dd33dd08e6eda`. The selected model/export pair is
-`new3_4_backpack_440000`: its export manifest records a 12-action lower-body
-policy and a backpack payload domain of 2–5 kg. The MuJoCo model adds the
+`3d37aa43f88964fc4255857c840dd33dd08e6eda`. The default model/export pair is
+`new2_3_backpack_lower8cm_299999`: its manifest records a 12-action lower-body
+policy, 99-dimensional observation, and no explicit standing/walking mode
+input. Its backpack training domain is 2–5 kg. The MuJoCo model adds the
 nominal 3.5 kg box at the manifest center `[-0.12464276, 0, 0.1]` m with
-`[0.11, 0.18, 0.34]` m dimensions. The export and payload metadata remain
-together in `external/dreamwaq_g1_29dof/checkpoints/new3_4_backpack_440000/exported/`.
-The manifest and policy files are hash-recorded in that directory's
-`SOURCE.md`. The original training checkpoint is not needed to run inference.
+`[0.11, 0.18, 0.34]` m dimensions. The runtime export and payload receipt are
+in `external/dreamwaq_g1_29dof/checkpoints/new2_3_backpack_lower8cm_299999/exported/`;
+the earlier `new3_4_backpack_440000` export remains available as an alternate.
+The manifest and policy files are hash-recorded in `external/dreamwaq_g1_29dof/SOURCE.md`.
+The original training checkpoint is not needed to run inference.
 
 The deployment config and action compiler retain the target joint order,
 waist behavior, gains, torque limits, command timing, deadline handling, and
@@ -56,13 +58,13 @@ G1_NETWORK_INTERFACE=eth0 \
 bash scripts/run_g1_dreamwaq_controller.sh
 ```
 
-The hardware launcher starts the PATH adapter with arm output enabled and
-`--hand-backend none`, then invokes the target `deploy/run_dreamwaq.py` with
-the selected export, standing mode, 15 ms action deadline, and three-timeout
-diagnostic window. It intentionally requires the explicit
+The hardware launcher starts the PATH arm/state adapter, then invokes the
+target `deploy/run_dreamwaq.py` with the selected export, 15 ms action deadline,
+and three-timeout diagnostic window. It intentionally requires the explicit
 `BOOST_ALLOW_HARDWARE_CONTROL=1` environment setting. The target runtime still
-requires its START then A enable procedure; X switches standing/walking. Do
-not start a second body controller or `g1_ws/g1_lowlevel_bridge` alongside it.
+requires its START then A enable procedure. The default NEW2-3 export has no
+explicit standing/walking mode input, so the X mode toggle is inactive. Do not
+start a second body controller or `g1_ws/g1_lowlevel_bridge` alongside it.
 The `g1_ws` bridge publishes `rt/lowcmd` even in its null-action smoke mode.
 
 The target runner's default CPU partition reserves camera cores 0–2, DDS I/O
@@ -142,7 +144,9 @@ MuJoCo state every target 20 ms control period and applies the target 29-joint
 PD gains and the MuJoCo actuator limits. Arm targets come from PATH on
 `rt/arm_sdk`; the Revo2 command route remains unchanged. The sim bridge does
 not create an `rt/lowcmd` subscriber or hardware writer. Viewer keys W/S,
-A/D, and Q/R request velocity; X toggles DreamWaQ standing/walking.
+A/D, and Q/R request velocity. With the default NEW2-3 export, X does not
+change the policy input; the toggle is available with exports that include an
+explicit locomotion-mode contract.
 
 The selected config and export are set in
 `configs/sim/mujoco_revo2.yaml`. `BOOST_DREAMWAQ_EXPORT` can override the

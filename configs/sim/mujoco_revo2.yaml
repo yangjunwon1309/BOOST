@@ -4,7 +4,7 @@
 scene: boost/sim/mujoco/scene_29dof_with_revo2_table_room.xml
 controller: dreamwaq
 body_config: configs/sim/dreamwaq_g1_mujoco.yaml
-dreamwaq_export: external/dreamwaq_g1_29dof/checkpoints/new3_4_backpack_440000/exported
+dreamwaq_export: external/dreamwaq_g1_29dof/checkpoints/new2_3_backpack_lower8cm_299999/exported
 hand_config: configs/hands/brainco_revo2.yaml
 interface: lo
 domain_id: 0

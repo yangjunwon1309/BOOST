@@ -1,0 +1,75 @@
+{
+  "parent_sha256": "c18b1431e478b2fd67f77c642b7327d0537fbb2bd3281908daa7941ee22e1e71",
+  "reward_sha256": "b69be707236b71f9794c95d743247eff167e7459d29930a336ab0ade196ca7bc",
+  "original_profile": "new2_3_from_new1_final",
+  "backpack_enabled": true,
+  "allowed_delta": [
+    [
+      "/backpack_payload",
+      {
+        "size_xyz_m": [
+          0.11,
+          0.18,
+          0.34
+        ],
+        "center_torso_xyz_m": [
+          -0.12464276,
+          0.0,
+          0.1
+        ],
+        "mass_range_kg": [
+          2.0,
+          5.0
+        ],
+        "com_offset_half_range_xyz_m": [
+          0.025,
+          0.04,
+          0.08
+        ],
+        "sampling": "uniform_per_environment_per_episode",
+        "compound_body": "torso_link",
+        "preserve_existing_torso_mass_dr": true,
+        "additional_joint_count": 0
+      },
+      null
+    ],
+    [
+      "/domain_rand/events/new23_backpack",
+      {
+        "func": "legged_lab.modules.g1_lower_body.backpack_payload:randomize_backpack",
+        "params": {
+          "asset_cfg": {
+            "name": "robot",
+            "joint_names": null,
+            "joint_ids": "slice(None, None, None)",
+            "fixed_tendon_names": null,
+            "fixed_tendon_ids": "slice(None, None, None)",
+            "body_names": [
+              "torso_link"
+            ],
+            "body_ids": "slice(None, None, None)",
+            "object_collection_names": null,
+            "object_collection_ids": "slice(None, None, None)",
+            "preserve_order": true
+          }
+        },
+        "mode": "reset",
+        "interval_range_s": null,
+        "is_global_time": false,
+        "min_step_count_between_reset": 0
+      },
+      null
+    ],
+    [
+      "/scene/robot/spawn/usd_dir",
+      "/home/pcm/DREAMWAQ_runs/ls69_robustness_0915/legged_lab/assets/g1/usd/new23_backpack_w18_h34_lower8cm",
+      "/home/pcm/DREAMWAQ_runs/ls69_robustness_0915/legged_lab/assets/g1/usd/generated"
+    ],
+    [
+      "/scene/robot/spawn/usd_file_name",
+      "g1_29dof_new23_backpack.usda",
+      "g1_29dof_flashsac_reference.usd"
+    ]
+  ],
+  "non_backpack_change_count": 0
+}

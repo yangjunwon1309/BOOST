@@ -7,7 +7,7 @@ BOOST separates teleoperation, robot I/O, perception, and controller runtimes.
 - `boost/control/hand_mppi/`: Revo2 iCEM/MPOPI retargeting and BrainCo DDS mapping.
 - `boost/io/g1_bridge/`: G1 arm-only adapter and GST1 state relay.
 - `boost/sim/mujoco/`: G1/Revo2 scene, in-process DreamWaQ policy, DDS bridge, and surface queries.
-- `external/dreamwaq_g1_29dof/`: selected DreamWaQ runtime and `new3_4_backpack_440000` export.
+- `external/dreamwaq_g1_29dof/`: selected DreamWaQ runtime and `new2_3_backpack_lower8cm_299999` default export.
 - `external/g1_ws/`: target command, state, and camera schema references.
 - `external/teleimager/`: G1 camera server, selected preset, and TIM2 protocol.
 - `services/pose_service/`: Thor wrist relay, RGB/RGB-D perception, SAM3, and surface geometry.

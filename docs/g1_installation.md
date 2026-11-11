@@ -54,7 +54,7 @@ Unitree SDK2 C++ checkout already used on the robot.
 
 The selected body runtime and backpack-trained export live under
 external/dreamwaq_g1_29dof/; the active export is
-new3_4_backpack_440000/exported. The target deployment retains upstream
+new2_3_backpack_lower8cm_299999/exported. The target deployment retains upstream
 filenames such as g1_homie.yaml and run_homie.py; these belong to the
 DreamWaQ deployment package and do not indicate the retired BOOST HOMIE
 controller.
@@ -89,9 +89,10 @@ G1_NETWORK_INTERFACE=eth0 \
 bash scripts/run_g1_dreamwaq_controller.sh
 ~~~
 
-DreamWaQ starts in standing mode and follows the target deployment START then
-A enable procedure; X toggles standing/walking. This launcher starts the PATH
-adapter on rt/arm_sdk and DreamWaQ as the sole rt/lowcmd owner. It does not
+DreamWaQ follows the target deployment START then A enable procedure. The
+default NEW2-3 export has no explicit standing/walking input, so X does not
+toggle its policy mode. This launcher starts the PATH adapter on rt/arm_sdk
+and DreamWaQ as the sole rt/lowcmd owner. It does not
 start the physical Dex1 or Revo2 service.
 
 For the direct arm-only route, start the alternative body-only launcher on G1:

@@ -350,6 +350,7 @@ def main() -> int:
     dreamwaq_next_time = 0.0
     dreamwaq_policy_ms = 0.0
     dreamwaq_mode = 0
+    dreamwaq_mode_name = "stand"
     dreamwaq_imu_quat_adr = None
     dreamwaq_imu_gyro_adr = None
     dreamwaq_torque_limit = None
@@ -386,7 +387,7 @@ def main() -> int:
         if dreamwaq_policy.contract.action_dim != 12:
             dreamwaq_policy.close()
             raise ValueError(
-                "BOOST sim expects the backpack NEW3-4 12-action export; "
+                "BOOST sim expects a reviewed backpack 12-action lower-body export; "
                 f"got action_dim={dreamwaq_policy.contract.action_dim}"
             )
         dreamwaq_torque_limit = np.asarray(
@@ -518,10 +519,18 @@ def main() -> int:
             flush=True,
         )
     if viewer is not None:
+        mode_help = (
+            "X toggles DreamWaQ standing/walking."
+            if dreamwaq_policy is not None
+            and dreamwaq_policy.contract.explicit_locomotion_mode
+            else "X mode toggle inactive for this DreamWaQ export."
+            if dreamwaq_policy is not None
+            else ""
+        )
         print(
             "[MuJoCo keyboard] W/S forward/back, A/D left/right, "
             "Q/R yaw left/right; O/P change linear and angular speed "
-            "(20-100%); Space stops; X toggles DreamWaQ standing/walking. "
+            f"(20-100%); Space stops; {mode_help} "
             "Direction keys latch until reversed or stopped.",
             flush=True,
         )
@@ -570,7 +579,7 @@ def main() -> int:
                     gyro = data.sensordata[
                         dreamwaq_imu_gyro_adr:dreamwaq_imu_gyro_adr + 3
                     ].astype(np.float32, copy=True)
-                    dreamwaq_target_q15, _mode_name, inference_ns = dreamwaq_policy.update(
+                    dreamwaq_target_q15, dreamwaq_mode_name, inference_ns = dreamwaq_policy.update(
                         q29, dq29, quat, gyro
                     )
                     dreamwaq_policy_ms = float(inference_ns) / 1.0e6
@@ -666,10 +675,13 @@ def main() -> int:
                     (
                         mujoco.mjtFontScale.mjFONTSCALE_150,
                         mujoco.mjtGridPos.mjGRID_TOPLEFT,
-                        "W/S forward/back  A/D left/right  Q/R yaw  O/P speed  Space stop  X stand/walk",
+                        "W/S forward/back  A/D left/right  Q/R yaw  O/P speed  Space stop  "
+                        + ("X stand/walk" if dreamwaq_policy is not None
+                           and dreamwaq_policy.contract.explicit_locomotion_mode
+                           else "X inactive" if dreamwaq_policy is not None else ""),
                         f"cmd_vel=[{cmd[0]:+.2f}, {cmd[1]:+.2f}, {cmd[2]:+.2f}]  "
                         f"speed={speed_scale:.1f}x  "
-                        f"mode={'walking' if keyboard.dreamwaq_mode() else 'standing'}",
+                        f"mode={dreamwaq_mode_name}",
                     )
                 )
             if tick % 200 == 0:
@@ -686,7 +698,7 @@ def main() -> int:
                 )
                 if dreamwaq_policy is not None:
                     controller_status += (
-                        f"dreamwaq_mode={'walking' if dreamwaq_mode else 'standing'} "
+                        f"dreamwaq_mode={dreamwaq_mode_name} "
                         f"policy_ms={dreamwaq_policy_ms:.2f} "
                     )
                 print(

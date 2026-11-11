@@ -42,6 +42,14 @@ if manifest.get("num_actions") != 12:
     )
 if manifest.get("action_contract_version") != "g1_lower_body_action_v3_canonical_waist_effort":
     raise SystemExit("selected DreamWaQ export does not match the reviewed waist-effort contract")
+mode_layout = manifest.get("flashsac_observation_layout")
+if mode_layout == "g1_lower_body_reference_mode_v2":
+    print("DreamWaQ export has an explicit standing/walking mode; X mode toggle is active.")
+else:
+    print(
+        "DreamWaQ export has no explicit standing/walking mode; "
+        "X mode toggle is inactive and velocity commands drive locomotion."
+    )
 PY
 if [[ "${G1_BRIDGE_LIVE:-1}" != "1" ]]; then
   echo "G1_BRIDGE_LIVE must be 1 so PATH arm targets reach rt/arm_sdk." >&2
@@ -76,7 +84,7 @@ if ! kill -0 "${pids[0]}" 2>/dev/null; then
 fi
 
 echo "Starting the target DreamWaQ hardware runtime as the sole rt/lowcmd owner."
-echo "Initial mode is standing. Use the target deployment's START then A procedure to enable control."
+echo "Use the target deployment's START then A procedure to enable control."
 "$BOOST_DREAMWAQ_PYTHON" "$BOOST_DREAMWAQ_ROOT/deploy/run_dreamwaq.py" \
   --net "$network_interface" \
   --config "$BOOST_DREAMWAQ_CONFIG" \

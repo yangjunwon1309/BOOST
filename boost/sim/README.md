@@ -8,7 +8,7 @@ scene currently has nq=76, nv=73, and nu=41.
 configs/sim/mujoco_revo2.yaml selects the table-room scene with the articulated
 box and can assets. configs/sim/mujoco_revo2_vacant.yaml selects the vacant
 scene. Both use the backpack payload represented by the
-new3_4_backpack_440000 DreamWaQ export metadata.
+new2_3_backpack_lower8cm_299999 DreamWaQ export metadata.
 
 ## Start the integrated scene
 
@@ -42,7 +42,9 @@ With the viewer focused, W/S set forward/backward velocity, A/D set left/right,
 and Q/R set left/right yaw. O/P adjust a shared speed scale from 20% to 100% in
 10% steps. Direction inputs stay active until the opposite direction or Space
 is pressed. The initial scale is 50%; the viewer overlay and periodic sim log
-show the current cmd_vel. X switches DreamWaQ between standing and walking.
+show the current cmd_vel. The default NEW2-3 export has no explicit
+standing/walking observation, so X does not change its policy input. Exports
+with an explicit locomotion-mode contract enable the X toggle.
 
 ## Revo2 hand motion test
 

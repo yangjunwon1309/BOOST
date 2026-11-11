@@ -20,8 +20,9 @@ targets on `rt/arm_sdk` and relays robot state to Thor. DreamWaQ reads the arm
 targets and `rt/lowstate`, merges body and arm commands, and owns the sole
 hardware `rt/lowcmd` publisher. The external BrainCo hand service owns Revo2
 serial I/O; Thor's hand-MPPI process publishes the separate hand DDS targets.
-Teleimager runs as a single camera service on G1 and sends TIM2/ZMQ frames to
-the Thor relay.
+The G1 Teleimager serves the wrist cameras and sends their TIM2/ZMQ frames to
+Thor. A separate Thor Teleimager serves the stereo head camera; the PATH
+experiment recorder subscribes to both hosts directly.
 
 For a direct, finger-free XR arm route, `g1-arm-teleop` on Thor publishes
 `rt/arm_sdk` from Televuer/G1_29 IK and DreamWaQ runs through

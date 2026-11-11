@@ -1,5 +1,7 @@
-# Thor-side receiver settings for the G1 Teleimager TIM2 streams.
-# Wrist ports and image dimensions are read from the selected server preset.
+# Thor-side receiver settings for G1 wrist and local stereo head TIM2 streams.
+# Wrist ports come from G1; the independently launched head server runs on Thor.
 g1_host: 192.168.123.164
+head_host: 127.0.0.1
 wifi_lcm_url: udpm://239.255.77.67:7667?ttl=1
 teleimager_config: external/teleimager/config/hbvcam_4m2214hd_g1.yaml
+head_teleimager_config: external/teleimager/config/dex1_cam_nature_head_stereo.yaml

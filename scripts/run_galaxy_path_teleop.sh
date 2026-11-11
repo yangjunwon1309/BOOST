@@ -50,7 +50,7 @@ xr_pid=$!
 recorder_pid=$!
 
 echo "Galaxy XR hand teleop stack is starting. In this terminal: r=start/resume, s=record start/stop, q=stop and exit."
-echo "Wrist experiment trials: $data_root/path_wrist_experiment_NNN/"
+echo "Teleop experiment trials: $data_root/path_wrist_experiment_NNN/"
 echo "The Revo2 hand publisher is a separate thor environment: BRAINCO_DDS_INTERFACE=eth0 pixi run -e thor hand-mppi-publish"
 
 bash scripts/run_state_machine_bridge.sh "$@"

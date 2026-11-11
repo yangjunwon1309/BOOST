@@ -38,11 +38,12 @@ is not compatible with PDU1 and does not replace PATH arm commands. The target
 G1_CAMERA_FRAME CRAM packet is a separate camera stream.
 
 Teleimager's recording stream uses TIM2 with a 44-byte <code>&lt;4sHHQQQIII&gt;</code> header:
-magic/version/flags, capture sequence, G1 wall and monotonic capture times,
-width, height, and JPEG length. The G1 preset uses head port 55558 and wrist
-ports 55559/55560. Thor validates TIM2 and publishes wrist-image message v2
-with JPEG, sequence, G1 capture timestamps, and Thor receive timestamp; its
-receiver also accepts v1 frames during transition.
+magic/version/flags, capture sequence, source-host wall and monotonic capture times,
+width, height, and JPEG length. The experiment recorder receives the Thor
+stereo head server on port 55558 and the G1 wrist servers on ports 55559/55560.
+The wrist relay validates TIM2 and publishes wrist-image message v2 with JPEG,
+sequence, G1 capture timestamps, and Thor receive timestamp; its receiver also
+accepts v1 frames during transition.
 
 G1 and Thor monotonic timestamps belong to different clock domains and must
 not be compared directly. Thor's receive timestamp is the freshness clock.

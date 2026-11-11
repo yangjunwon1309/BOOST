@@ -11,7 +11,7 @@ their separate BrainCo command and state path.
 | G1 arms, motors 15-28 | PATH nonlinear IK | PDU1/LCM -> G1 adapter -> `rt/arm_sdk` -> DreamWaQ merge |
 | G1 state | Unitree DDS | `rt/lowstate` -> DreamWaQ; adapter relays GST1 over LCM |
 | BrainCo Revo2 hands | Thor hand MPPI | BrainCo DDS -> external hand serial service |
-| G1 cameras | Teleimager | TIM2/ZMQ -> Thor relay -> wrist RGB consumer |
+| Cameras | Thor head Teleimager and G1 wrist Teleimager | TIM2/ZMQ -> PATH experiment recorder; G1 wrist TIM2 also reaches the Thor relay -> wrist RGB consumer |
 | Simulated Revo2 hands | BOOST binary grip adapter or hand MPPI, one at a time | Loopback BrainCo DDS channels |
 
 DreamWaQ is the only hardware publisher to `rt/lowcmd`. The PATH G1 adapter

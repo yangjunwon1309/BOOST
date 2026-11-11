@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Record PATH wrist, Revo2 hand and G1 camera experiment data.
+"""Record PATH wrist, Revo2 hand, local head and G1 wrist camera data.
 
 The recorder runs on Thor, receives PATH/G1 LCM and BrainCo DDS telemetry, and
 stores each trial as a directory containing a 50 Hz CSV plus lossless TIM2 JPEGs.
+The head camera may use a separate local Teleimager server from the G1 wrists.
 
 Example:
   python services/pose_service/tools/record_wrist_experiment_v11.py \
@@ -405,6 +406,7 @@ class ExperimentRecorder:
         self._hand_lock = threading.Lock()
         self.image_writer: CameraImageWriter | None = None
         self.image_client: Any | None = None
+        self.image_endpoints: dict[str, tuple[str, int]] = {}
         self.image_warning_deadline = time.monotonic() + 3.0
         self.image_warning_printed = False
         if not no_images:
@@ -418,11 +420,38 @@ class ExperimentRecorder:
 
             relay_path = relay_path if relay_path.is_absolute() else _BOOST_ROOT / relay_path
             relay = yaml.safe_load(relay_path.read_text(encoding="utf-8"))
-            host = str(relay["g1_host"])
-            camera_path = Path(relay["teleimager_config"])
+            g1_host = str(os.environ.get("G1_TELEIMAGER_HOST", relay["g1_host"]))
+            camera_path = Path(os.environ.get(
+                "BOOST_TELEIMAGER_G1_CONFIG", relay["teleimager_config"]
+            ))
             if not camera_path.is_absolute():
                 camera_path = _BOOST_ROOT / camera_path
             camera_config = yaml.safe_load(camera_path.read_text(encoding="utf-8"))
+            camera_hosts = {name: g1_host for name in CAMERAS}
+
+            head_config_value = os.environ.get(
+                "BOOST_HEAD_TELEIMAGER_CONFIG",
+                relay.get("head_teleimager_config"),
+            )
+            head_config_path = None
+            if head_config_value:
+                head_config_path = Path(head_config_value)
+                if not head_config_path.is_absolute():
+                    head_config_path = _BOOST_ROOT / head_config_path
+                head_server_config = yaml.safe_load(
+                    head_config_path.read_text(encoding="utf-8")
+                )
+                head_camera = head_server_config.get("head_camera")
+                if not isinstance(head_camera, dict):
+                    raise ValueError(
+                        f"head Teleimager config has no head_camera section: {head_config_path}"
+                    )
+                camera_config["head_camera"] = head_camera
+                camera_hosts["head_camera"] = str(
+                    os.environ.get("BOOST_HEAD_TELEIMAGER_HOST")
+                    or relay.get("head_host", g1_host)
+                )
+
             enabled = tuple(
                 name for name, value in camera_config.items()
                 if name in CAMERAS and isinstance(value, dict) and value.get("enable_recording_zmq", False)
@@ -433,8 +462,12 @@ class ExperimentRecorder:
                     f"[experiment-recorder] warning: no TIM2 stream configured for {', '.join(missing)}",
                     flush=True,
                 )
+            self.image_endpoints = {
+                name: (camera_hosts[name], int(camera_config[name]["recording_zmq_port"]))
+                for name in enabled
+            }
             self.image_client = RecordingImageClient(
-                host,
+                camera_hosts,
                 camera_config,
                 decode_cameras=(),
                 cameras=enabled,
@@ -442,8 +475,13 @@ class ExperimentRecorder:
                 subscriber_hwm=256,
             )
             print(
-                f"[experiment-recorder] TIM2 JPEG capture subscribed to G1 {host}: "
-                + ", ".join(enabled),
+                "[experiment-recorder] TIM2 JPEG capture subscriptions: "
+                + ", ".join(
+                    f"{name}={host}:{port}"
+                    for name, (host, port) in self.image_endpoints.items()
+                )
+                + f"; G1 config={camera_path}"
+                + (f"; head config={head_config_path}" if head_config_path else ""),
                 flush=True,
             )
         except Exception as error:
@@ -513,10 +551,26 @@ class ExperimentRecorder:
         metrics = self.image_writer.metrics()
         missing = [name for name, stats in metrics.items() if stats["received_frames"] == 0]
         if missing:
+            health = self.image_client.health() if self.image_client is not None else {}
+            details = []
+            for name in missing:
+                config_name = {
+                    "head": "head_camera",
+                    "left_wrist": "left_wrist_camera",
+                    "right_wrist": "right_wrist_camera",
+                }[name]
+                endpoint = self.image_endpoints.get(config_name)
+                endpoint_text = f"{endpoint[0]}:{endpoint[1]}" if endpoint else "not configured"
+                stream_health = health.get(config_name, {})
+                error = stream_health.get("error") or stream_health.get("last_packet_error")
+                details.append(
+                    f"{name}@{endpoint_text}"
+                    + (f" ({error})" if error else " (waiting for frames)")
+                )
             print(
                 "[experiment-recorder] warning: no TIM2 frames received for "
-                + ", ".join(missing)
-                + "; continuing CSV recording",
+                + ", ".join(details)
+                + "; continuing to wait while CSV recording continues",
                 flush=True,
             )
         self.image_warning_printed = True

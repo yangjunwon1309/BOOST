@@ -97,23 +97,43 @@ The schema reference is in [`../external/g1_ws/SOURCE.md`](../external/g1_ws/SOU
 Do not launch the source `g1_lowlevel_bridge` beside DreamWaQ: its smoke path
 also initializes a `rt/lowcmd` publisher.
 
-## Teleimager and wrist relay
+## Teleimager image recording
 
-The selected preset is
-`external/teleimager/config/hbvcam_4m2214hd_g1.yaml`. It exposes head TIM2 on
-55558, left wrist TIM2 on 55559, and right wrist TIM2 on 55560. The wrist
-streams are 640×480. `scripts/run_g1_teleimager.sh` starts this one server and
-does not start VideoHub or a second OpenCV camera process.
+The experiment recorder receives cameras from two Teleimager servers. The G1
+preset `external/teleimager/config/hbvcam_4m2214hd_g1.yaml` supplies left and
+right wrist TIM2 on ports 55559 and 55560. The independently started Thor head
+server uses `external/teleimager/config/dex1_cam_nature_head_stereo.yaml` and
+supplies head TIM2 on local port 55558. The head stream is a 1280×480
+side-by-side stereo JPEG; each wrist stream is 640×480. These assignments are
+in `configs/teleop/teleimager_relay.yaml`: `head_host` defaults to
+`127.0.0.1`, while wrist subscriptions use `g1_host`. Set
+`BOOST_HEAD_TELEIMAGER_HOST` if the head server is on a different host.
 
-On Thor, source `configs/teleop/local.env` and launch
-`services/pose_service/tools/run_thor_g1_teleimager_wrist_relay_v11.sh`. The
-relay reads the configured Teleimager preset, subscribes to the TIM2 recording
-ports, validates the 44-byte `<4sHHQQQIII>` header and image dimensions, then
-publishes JPEG plus metadata as wrist RGB message version 2. The payload
-includes camera sequence, G1 capture wall/monotonic timestamps, and Thor
-receive timestamp. The worker still accepts version 1 messages during
-transition and uses Thor receive time for freshness. It does not compare G1
-and Thor monotonic clocks. Sequence gaps are counted and logged.
+On Thor, start the standalone head server in its Teleimager environment:
+
+```bash
+cd ~/00_workspace/onlineRL
+source submodules/scripts/workspace-env.sh
+conda activate teleimager
+python -m teleimager.image_server --no-affinity \
+  --config "$TELEIMAGER_DIR/config/dex1_cam_nature_head_stereo.yaml" \
+  --rotation 180
+```
+
+The G1 server remains a separate process, started with
+`scripts/run_g1_teleimager.sh`. When `path-teleop` records an `s` trial,
+`record_wrist_experiment_v11.py` subscribes directly to the local head server
+and the two G1 wrist endpoints, preserving the original JPEG bytes and TIM2
+timestamps in `images/head`, `images/left_wrist`, `images/right_wrist`, and
+`images_index.csv`. Its startup log prints each resolved host and port; after
+three seconds, it identifies any stream that has not supplied a frame while
+continuing CSV recording.
+
+For perception, the separate G1 wrist relay still subscribes to G1 TIM2,
+validates the 44-byte `<4sHHQQQIII>` header and image dimensions, then publishes
+JPEG plus metadata as wrist RGB message version 2. It does not relay the local
+Thor head stream. The worker uses Thor receive time for freshness and does not
+compare G1 and Thor monotonic clocks. Sequence gaps are counted and logged.
 
 The existing D405 RGB-D gateway, depth synchronization, and 3D estimation
 remain separate. The JPEG-only Teleimager wrist stream does not replace them.

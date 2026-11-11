@@ -8,12 +8,13 @@ with `G1_ROBOT_STATE`, runs surface/belief processing, and publishes selected
 ## G1 Teleimager TIM2 wrist RGB path (image-only)
 
 The selected G1 preset is
-`external/teleimager/config/hbvcam_4m2214hd_g1.yaml`. It publishes TIM2 on
-head port 55558 and wrist ports 55559 (left) and 55560 (right); wrist images
-are 640 x 480. The relay reads these values from the selected Teleimager preset,
-validates the TIM2 header, and publishes a version 2 wrist RGB message with the
-original JPEG, camera sequence, G1 capture wall/monotonic time, and Thor
-receive timestamp:
+`external/teleimager/config/hbvcam_4m2214hd_g1.yaml`. It publishes wrist TIM2
+on ports 55559 (left) and 55560 (right); wrist images are 640 x 480. The PATH
+experiment recorder gets the stereo head image from its separate Thor-local
+Teleimager server on port 55558. This wrist relay reads the G1 wrist ports from
+the selected preset, validates the TIM2 header, and publishes a version 2 wrist
+RGB message with the original JPEG, camera sequence, G1 capture
+wall/monotonic time, and Thor receive timestamp:
 
 ```bash
 cd BOOST/services/pose_service

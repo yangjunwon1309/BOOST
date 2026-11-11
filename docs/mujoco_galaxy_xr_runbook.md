@@ -52,10 +52,12 @@ service. Port 5566 carries Galaxy XR hand pose and landmark messages to PATH.
 Wait until the headset reports live hand tracking, then press `r` in the PATH
 terminal to start or resume arm following. PATH first confirms the G1 is in its
 Q_READY pose. `[PATH-state]` should then report `teleop_tracking` and
-`xr_wrist_fresh=True`. Press `s` to start a wrist experiment CSV and again to
-stop and save it; press `q` to stop and exit. Revo2 finger targets are handled
-by hand MPPI in parallel. Stale XR frames are rejected so an old target is not
-replayed after tracking drops.
+`xr_wrist_fresh=True`. Press `s` to start a wrist experiment and again to stop
+and save it; press `q` to stop and exit. Revo2 finger targets are handled by
+hand MPPI in parallel. Wrist goals pass through XR outlier rejection, a weak
+SE(3) low-pass, and bounded startup/engagement/return references before IK.
+Trial folders contain the control CSV and summary; on Thor they also contain
+the lossless TIM2 head and wrist camera streams and Revo2 hand telemetry.
 
 With the MuJoCo viewer focused, locomotion keys are W/S (forward/back), A/D
 (left/right), Q/R (yaw), O/P (speed), and Space (stop). Direction keys latch

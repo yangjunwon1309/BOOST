@@ -36,10 +36,15 @@ then drives local actuators with the selected target gains and torque limits.
 It uses isolated loopback DDS and never subscribes to or publishes a hardware
 `rt/lowcmd` command.
 
-Fresh PATH goals pass to IK without added reference smoothing or target
-projection. Existing age, finite-value, and joint-limit checks remain active.
-The hand retargeter publishes fresh bounded Revo2 targets directly; stale hand
-input stops publication and leaves command-loss handling to the receiver.
+XR wrist goals pass through source-timestamp velocity rejection and a 5 Hz SE(3)
+low-pass before PATH's 50 Hz IK loop. Startup, XR engagement, return to
+Q_READY, and outlier resynchronization use a second-order reference bounded to
+6 cm/s and 0.6 rad/s. Direct tracking resumes after at least one second when
+both wrist position errors are below 10 cm; the remaining pose offset is then
+removed at those same speed limits. Existing age, finite-value, and joint-limit
+checks remain active. The hand retargeter publishes fresh bounded Revo2 targets
+directly; stale hand input stops publication and leaves command-loss handling
+to the receiver.
 
 See [`dreamwaq_integration.md`](dreamwaq_integration.md) for export provenance,
 runtime setup, protocols, and launch commands.

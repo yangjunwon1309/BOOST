@@ -1,6 +1,6 @@
 # HOMIE G1 29DoF hardware/deploy config (mirrors TWIST2 deploy_real/robot_control/configs/g1.yaml)
 # Owns everything about the *robot*: control rate, joint mapping, 29-dim PD gains,
-# and the full 29-dim default pose (policy joints + arm rest pose).
+# and the full 29-dim default pose (policy joints + zero-angle arm rest pose).
 #
 # The 15 policy joints (0..14) use the HOMIE gains from config/g1_homie_v2.yaml.
 # The 14 arm joints (15..28) are NOT policy-controlled; conservative arm gains are
@@ -43,8 +43,8 @@ kds: [2.55789, 6.30880, 2.55789, 6.30880, 1.81445, 1.81445,
 default_angles: [-0.2, 0.0, 0.0, 0.42, -0.23, 0.0,  # left leg
                  -0.2, 0.0, 0.0, 0.42, -0.23, 0.0,  # right leg
                   0.0, 0.0, 0.0,                      # waist
-                  0.0, 0.4, 0.0, 1.2, 0.0, 0.0, 0.0,  # left arm
-                  0.0, -0.4, 0.0, 1.2, 0.0, 0.0, 0.0] # right arm
+                  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,  # left arm
+                  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] # right arm
 
 # Wireless-controller cmd_vel limits [vx, vy, wz] (m/s, m/s, rad/s).
 max_cmd: [0.6, 0.4, 0.5]       # clipped to the DreamWaQ training envelope

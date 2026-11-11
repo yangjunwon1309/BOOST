@@ -7,9 +7,9 @@ client speaks the timestamped TIM2 protocol instead.
 
 Two properties matter for recording quality:
 
-Latency -- every socket is CONFLATE + RCVHWM 1, so ZMQ keeps only the newest
-message. A control loop that falls behind therefore skips stale frames instead
-of draining a queue that grows further behind real time with every cycle.
+Latency -- viewer sockets use CONFLATE + RCVHWM 1, so ZMQ keeps only the newest
+message. Recording callbacks instead use a bounded HWM and drain every received
+frame into the recorder's own bounded disk-writer queue.
 
 CPU -- the original JPEG bytes are carried through untouched. Only cameras
 asked to `decode` pay for `cv2.imdecode`, and that happens on the subscriber
@@ -24,14 +24,17 @@ import time
 import math
 from typing import Optional
 
-import cv2
 import numpy as np
 import zmq
 
 from teleimager.recording_protocol import decode_recording_frame
 
-import logging_mp
-logger_mp = logging_mp.getLogger(__name__)
+try:
+    import logging_mp
+    logger_mp = logging_mp.getLogger(__name__)
+except ModuleNotFoundError:  # The Thor recorder only needs JPEG passthrough.
+    import logging
+    logger_mp = logging.getLogger(__name__)
 
 
 class RecordingFrame:
@@ -62,6 +65,7 @@ class RecordingFrame:
     def bgr(self) -> Optional[np.ndarray]:
         """Decoded image. Decoded on first access if the stream was not decoding."""
         if not self._decoded:
+            import cv2
             self._bgr = cv2.imdecode(np.frombuffer(self.jpg, np.uint8), cv2.IMREAD_COLOR)
             self._decoded = True
         return self._bgr
@@ -72,7 +76,8 @@ class RecordingFrame:
 
 
 class _StreamThread(threading.Thread):
-    def __init__(self, host, port, name, decode, context, clock_calibration=None):
+    def __init__(self, host, port, name, decode, context, clock_calibration=None,
+                 frame_callback=None, subscriber_hwm=1):
         super().__init__(daemon=True)
         self._host = host
         self._port = port
@@ -80,6 +85,8 @@ class _StreamThread(threading.Thread):
         self._decode = decode
         self._context = context
         self._clock_calibration = clock_calibration
+        self._frame_callback = frame_callback
+        self._subscriber_hwm = max(1, int(subscriber_hwm))
         self._socket = None
         self._running = True
         self._lock = threading.Lock()
@@ -91,14 +98,17 @@ class _StreamThread(threading.Thread):
         self._last_packet_monotonic_ns = None
         self._last_packet_error = None
         self._error = None
+        self._callback_errors = 0
 
     def run(self):
         try:
             self._socket = self._context.socket(zmq.SUB)
             self._socket.setsockopt_string(zmq.SUBSCRIBE, "")
-            # Keep only the newest frame: a slow consumer must skip, never queue.
-            self._socket.setsockopt(zmq.RCVHWM, 1)
-            self._socket.setsockopt(zmq.CONFLATE, 1)
+            # Recording callbacks drain frames into their own bounded writer
+            # queue; viewer clients keep the original latest-frame behavior.
+            self._socket.setsockopt(zmq.RCVHWM, self._subscriber_hwm)
+            if self._frame_callback is None:
+                self._socket.setsockopt(zmq.CONFLATE, 1)
             self._socket.setsockopt(zmq.RCVTIMEO, 200)
             self._socket.connect(f"tcp://{self._host}:{self._port}")
 
@@ -113,6 +123,7 @@ class _StreamThread(threading.Thread):
                     decoded = decode_recording_frame(packet)
                     bgr = None
                     if self._decode:
+                        import cv2
                         # Decoding stays off the control loop and outside its lock.
                         bgr = cv2.imdecode(np.frombuffer(decoded.jpeg, np.uint8), cv2.IMREAD_COLOR)
                         if bgr is None:
@@ -144,6 +155,13 @@ class _StreamThread(threading.Thread):
                     self._last_packet_error = None
                     self._latest = frame
                     self._received += 1
+                if self._frame_callback is not None:
+                    try:
+                        self._frame_callback(self._name, frame)
+                    except Exception as error:
+                        with self._lock:
+                            self._callback_errors += 1
+                        logger_mp.warning(f"[RecordingImageClient] {self._name}: frame callback failed ({error})")
         except Exception as error:
             with self._lock:
                 self._error = str(error) or type(error).__name__
@@ -167,6 +185,7 @@ class _StreamThread(threading.Thread):
                 "malformed": self._malformed,
                 "sequence_gaps": self._sequence_gaps,
                 "last_sequence": self._last_sequence,
+                "callback_errors": self._callback_errors,
             }
 
     def health(self, now_ns=None, max_age_ms=None):
@@ -199,7 +218,8 @@ class RecordingImageClient:
     DECODED_CAMERAS = ("head_camera",)
 
     def __init__(self, host, cam_config, decode_cameras=None, cameras=None,
-                 clock_sync=False, request_port=60000):
+                 clock_sync=False, request_port=60000, frame_callback=None,
+                 subscriber_hwm=256):
         """`cameras` limits the subscription; None subscribes to every TIM2 stream.
 
         `host` is either one address for every camera or a mapping from camera
@@ -250,7 +270,16 @@ class RecordingImageClient:
         try:
             for name, camera_host, port, decode in streams:
                 clock_args = ({"clock_calibration": self.clock_calibrations[camera_host]} if clock_sync else {})
-                thread = _StreamThread(camera_host, port, name, decode, self._context, **clock_args)
+                thread = _StreamThread(
+                    camera_host,
+                    port,
+                    name,
+                    decode,
+                    self._context,
+                    frame_callback=frame_callback,
+                    subscriber_hwm=(subscriber_hwm if frame_callback is not None else 1),
+                    **clock_args,
+                )
                 self._threads[name] = thread
                 thread.start()
                 logger_mp.info(f"[RecordingImageClient] {name}: tcp://{camera_host}:{port}"

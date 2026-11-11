@@ -43,11 +43,14 @@ xr_pid=$!
   --wifi-lcm-url "$WIFI_LCM_URL" \
   --g1-lcm-url "$PATH_LCM_URL" \
   --output "$data_root/path_wrist_experiment.csv" \
+  --brainco-dds-interface "$BRAINCO_DDS_INTERFACE" \
+  --hand-config "$BOOST_ROOT/configs/hands/brainco_revo2.yaml" \
+  --teleimager-relay-config "$BOOST_TELEIMAGER_RELAY_CONFIG" \
   --event-toggle &
 recorder_pid=$!
 
 echo "Galaxy XR hand teleop stack is starting. In this terminal: r=start/resume, s=record start/stop, q=stop and exit."
-echo "Wrist experiment CSVs: $data_root/path_wrist_experiment_NNN.csv"
+echo "Wrist experiment trials: $data_root/path_wrist_experiment_NNN/"
 echo "The Revo2 hand publisher is a separate thor environment: BRAINCO_DDS_INTERFACE=eth0 pixi run -e thor hand-mppi-publish"
 
 bash scripts/run_state_machine_bridge.sh "$@"

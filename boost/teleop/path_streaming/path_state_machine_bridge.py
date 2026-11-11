@@ -31,6 +31,7 @@ from pathlib import Path
 import lcm
 import numpy as np
 import zmq
+import yaml
 
 from boost.io.path_transport.zmq_wire import unpack_pose_message
 
@@ -65,6 +66,8 @@ from boost.io.path_transport.path_schema import (
 )
 from boost.io.path_transport.zmq_bus import pack_topic, unpack_topic
 from boost.control.arm.path_planning.unitree_arm_nonlinear_ik import UnitreeG1ArmNonlinearIK
+from boost.teleop.path_core.references.damped_se3 import DampedSE3Reference, so3_log
+from boost.teleop.path_core.references.xr_target_continuity import XRTargetContinuity
 from services.pose_service.seg_web_node.robot_geometry import (
     HAND_AXIS_LOCAL,
     angular_velocity_from_rotations,
@@ -130,6 +133,22 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state", choices=sorted(VALID_STATES), default="teleop")
     parser.add_argument("--fps", type=float, default=50.0)
+    parser.add_argument(
+        "--reference-config",
+        type=Path,
+        default=Path(__file__).resolve().parents[3] / "configs" / "teleop" / "path_reference.yaml",
+        help="YAML defaults for bounded wrist references and XR continuity.",
+    )
+    parser.add_argument("--damped-zeta", type=float, default=None)
+    parser.add_argument("--damped-omega-n-rad-s", type=float, default=None)
+    parser.add_argument("--damped-linear-speed-limit-m-s", type=float, default=None)
+    parser.add_argument("--damped-angular-speed-limit-rad-s", type=float, default=None)
+    parser.add_argument("--damped-minimum-duration-s", type=float, default=None)
+    parser.add_argument("--damped-direct-position-error-m", type=float, default=None)
+    parser.add_argument("--xr-outlier-max-linear-speed-m-s", type=float, default=None)
+    parser.add_argument("--xr-outlier-max-angular-speed-rad-s", type=float, default=None)
+    parser.add_argument("--xr-resync-after-s", type=float, default=None)
+    parser.add_argument("--xr-lowpass-cutoff-hz", type=float, default=None)
     parser.add_argument("--pico-hand-timeout-sec", type=float, default=0.20)
     parser.add_argument("--pico-body-gap-hold-ms", type=float, default=200.0)
     parser.add_argument("--xr-future-tolerance-ms", type=float, default=100.0)
@@ -403,7 +422,29 @@ def parse_args() -> argparse.Namespace:
         help="Disable terminal hotkeys r/s/q.",
     )
     parser.add_argument("--verbose", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    try:
+        config = yaml.safe_load(args.reference_config.read_text(encoding="utf-8"))
+        damped = config["damped_se3"]
+        continuity = config["xr_continuity"]
+    except (OSError, KeyError, TypeError, yaml.YAMLError) as error:
+        parser.error(f"cannot load reference config {args.reference_config}: {error}")
+    defaults = {
+        "damped_zeta": damped["zeta"],
+        "damped_omega_n_rad_s": damped["omega_n_rad_s"],
+        "damped_linear_speed_limit_m_s": damped["linear_speed_limit_m_s"],
+        "damped_angular_speed_limit_rad_s": damped["angular_speed_limit_rad_s"],
+        "damped_minimum_duration_s": damped["minimum_duration_s"],
+        "damped_direct_position_error_m": damped["direct_position_error_m"],
+        "xr_outlier_max_linear_speed_m_s": continuity["max_linear_speed_m_s"],
+        "xr_outlier_max_angular_speed_rad_s": continuity["max_angular_speed_rad_s"],
+        "xr_resync_after_s": continuity["resync_after_s"],
+        "xr_lowpass_cutoff_hz": continuity["lowpass_cutoff_hz"],
+    }
+    for name, default in defaults.items():
+        if getattr(args, name) is None:
+            setattr(args, name, float(default))
+    return args
 
 
 def log(message: str) -> None:
@@ -1112,6 +1153,32 @@ def main() -> int:
         f"L={q_ready_left_wrist_tf[:3, 3].round(4).tolist()} "
         f"R={q_ready_right_wrist_tf[:3, 3].round(4).tolist()}"
     )
+    damped_reference = {
+        side: DampedSE3Reference(
+            zeta=args.damped_zeta,
+            omega_n=args.damped_omega_n_rad_s,
+            v_max=args.damped_linear_speed_limit_m_s,
+            omega_max=args.damped_angular_speed_limit_rad_s,
+        )
+        for side in ("left", "right")
+    }
+    xr_continuity = XRTargetContinuity(
+        max_linear_speed_mps=args.xr_outlier_max_linear_speed_m_s,
+        max_angular_speed_rps=args.xr_outlier_max_angular_speed_rad_s,
+        resync_after_sec=args.xr_resync_after_s,
+        cutoff_hz=args.xr_lowpass_cutoff_hz,
+    )
+    log(
+        "bounded SE(3) wrist reference enabled: "
+        f"zeta={args.damped_zeta:.2f} omega_n={args.damped_omega_n_rad_s:.2f}rad/s "
+        f"v_max={args.damped_linear_speed_limit_m_s:.3f}m/s "
+        f"omega_max={args.damped_angular_speed_limit_rad_s:.3f}rad/s "
+        f"direct_after={args.damped_minimum_duration_s:.2f}s/"
+        f"{args.damped_direct_position_error_m:.3f}m; XR outlier="
+        f"{args.xr_outlier_max_linear_speed_m_s:.1f}m/s/"
+        f"{args.xr_outlier_max_angular_speed_rad_s:.1f}rad/s "
+        f"resync={args.xr_resync_after_s:.2f}s LPF={args.xr_lowpass_cutoff_hz:.1f}Hz"
+    )
     gravity_estimator = PelvisGravityEstimator(args)
     log(
         "50Hz arm-only RNEA enabled (waist feedforward zero): "
@@ -1143,6 +1210,15 @@ def main() -> int:
     )
     latest_robot_state_us = 0
     latest_wrist_targets: WaistWristTargets | None = None
+    filtered_xr_targets: dict[str, np.ndarray | None] = {"left": None, "right": None}
+    xr_reference_initialized = False
+    damped_active = {"left": True, "right": True}
+    resync_damping_started: dict[str, float | None] = {"left": None, "right": None}
+    tracking_damping_started: float | None = None
+    last_commanded_wrist_tf: dict[str, np.ndarray | None] = {
+        "left": None,
+        "right": None,
+    }
     latest_pico_body_receive_us = 0
     latest_pico_session_id = -1
     pico_tracking_armed = False
@@ -1355,6 +1431,74 @@ def main() -> int:
         hold[:15] = 0.0
         return hold
 
+    def apply_teleop_wrist_reference(
+        targets: dict[str, np.ndarray], dt: float, now_s: float
+    ) -> dict[str, np.ndarray]:
+        """Apply startup/engagement/return damping and residual handoff."""
+        nonlocal tracking_damping_started
+        if not xr_reference_initialized:
+            return {side: np.asarray(targets[side], dtype=np.float64).copy() for side in ("left", "right")}
+
+        if not pico_tracking_armed:
+            fixed_targets = {"left": q_ready_left_wrist_tf, "right": q_ready_right_wrist_tf}
+            output = {
+                side: damped_reference[side].advance(fixed_targets[side], dt)
+                for side in ("left", "right")
+            }
+            for side in ("left", "right"):
+                last_commanded_wrist_tf[side] = output[side].copy()
+            return output
+
+        errors = {
+            side: float(
+                np.linalg.norm(
+                    np.asarray(targets[side], dtype=np.float64)[:3, 3]
+                    - damped_reference[side].position
+                )
+            )
+            for side in ("left", "right")
+        }
+        if (
+            tracking_damping_started is not None
+            and now_s - tracking_damping_started >= args.damped_minimum_duration_s
+            and all(error < args.damped_direct_position_error_m for error in errors.values())
+        ):
+            for side in ("left", "right"):
+                damped_reference[side].release_to_direct(targets[side])
+                damped_active[side] = False
+                resync_damping_started[side] = None
+            log(
+                "XR engagement damping released to direct tracking: "
+                f"position errors L/R={errors['left'] * 100.0:.1f}/"
+                f"{errors['right'] * 100.0:.1f}cm after "
+                f"{now_s - tracking_damping_started:.2f}s; residual offsets decay at speed limits"
+            )
+            tracking_damping_started = None
+
+        for side in ("left", "right"):
+            started = resync_damping_started[side]
+            if (
+                started is not None
+                and now_s - started >= args.damped_minimum_duration_s
+                and errors[side] < args.damped_direct_position_error_m
+            ):
+                damped_reference[side].release_to_direct(targets[side])
+                damped_active[side] = False
+                resync_damping_started[side] = None
+                log(
+                    f"XR {side} outlier resync damping released: "
+                    f"position error={errors[side] * 100.0:.1f}cm; residual offset decays"
+                )
+
+        output = {}
+        for side in ("left", "right"):
+            if damped_active[side]:
+                output[side] = damped_reference[side].advance(targets[side], dt)
+            else:
+                output[side] = damped_reference[side].direct_target(targets[side], dt)
+            last_commanded_wrist_tf[side] = output[side].copy()
+        return output
+
     def ipopt_visual_hands_from_transforms(
         left_wrist_tf: np.ndarray,
         right_wrist_tf: np.ndarray,
@@ -1450,13 +1594,36 @@ def main() -> int:
             phase_mode = "none"
             phase_sync_error_rad = float("nan")
 
+    def xr_targets_are_fresh(tick_us: int) -> bool:
+        if latest_wrist_targets is None or latest_pico_body_receive_us <= 0:
+            return False
+        receive_age_us = int(tick_us) - latest_pico_body_receive_us
+        source_age_us = int(tick_us) - latest_wrist_targets.source_timestamp_us
+        max_age_us = max(1_000, int(args.pico_body_gap_hold_ms * 1_000.0))
+        future_tolerance_us = max(0, int(args.xr_future_tolerance_ms * 1_000.0))
+        return (
+            receive_age_us <= max_age_us
+            and -future_tolerance_us <= source_age_us <= max_age_us
+        )
+
     def set_pico_tracking_armed(enabled: bool, source: str) -> None:
         """Switch between live Galaxy XR hand tracking and fixed-FK(Q_READY) IPOPT."""
 
         nonlocal pico_tracking_armed
         nonlocal pico_arm_pending
+        nonlocal tracking_damping_started
         enabled = bool(enabled)
         if enabled:
+            tick_us = now_us()
+            robot_state_fresh = (
+                latest_robot_q is not None
+                and latest_robot_state_us > 0
+                and tick_us - latest_robot_state_us <= 200_000
+            )
+            if not robot_state_fresh:
+                pico_arm_pending = True
+                log(f"{source}: arm pending until a fresh G1 robot state arrives")
+                return
             if not args.auto_arm_xr_tracking:
                 ready_error_rad = (
                     float(
@@ -1481,9 +1648,9 @@ def main() -> int:
                         f"(max_arm_error={ready_error_rad:.3f}rad, threshold=0.100rad)"
                     )
                     return
-            if latest_wrist_targets is None:
+            if not xr_targets_are_fresh(tick_us):
                 pico_arm_pending = True
-                log(f"{source}: arm tracking pending until a valid XR wrist frame arrives")
+                log(f"{source}: arm tracking pending until a fresh valid XR wrist frame arrives")
                 return
             pico_arm_pending = False
         if enabled == pico_tracking_armed:
@@ -1492,10 +1659,22 @@ def main() -> int:
                 f"{'armed' if enabled else 'disarmed'}"
             )
             return
+        was_armed = pico_tracking_armed
         pico_tracking_armed = enabled
         pico_arm_pending = False
         resync_shared_control_state("pico_tracking_armed" if enabled else "pico_tracking_disarmed")
         if enabled:
+            tracking_damping_started = time.monotonic()
+            xr_continuity.reset_filter_to_accepted()
+            for side in ("left", "right"):
+                resync_damping_started[side] = None
+                if not damped_active[side] and last_commanded_wrist_tf[side] is not None:
+                    damped_reference[side].reset(last_commanded_wrist_tf[side])
+                    damped_active[side] = True
+            log(
+                "XR engagement entered damped reference; starting from the last "
+                "IPOPT wrist target and resetting XR LPF to the accepted pose"
+            )
             if args.auto_arm_xr_tracking:
                 log(f"{source}: teleop_tracking armed from a fresh XR wrist frame")
             else:
@@ -1504,6 +1683,21 @@ def main() -> int:
                     "XR wrist targets re-enabled"
                 )
         else:
+            tracking_damping_started = None
+            if was_armed and xr_reference_initialized:
+                for side in ("left", "right"):
+                    previous_target = last_commanded_wrist_tf[side]
+                    if previous_target is not None:
+                        # Direct -> damped transitions restart at the exact pose
+                        # sent on the preceding tick and zero their velocity.
+                        damped_reference[side].reset(previous_target)
+                    damped_active[side] = True
+                    resync_damping_started[side] = None
+                xr_continuity.reset_filter_to_accepted()
+                log(
+                    "XR disengagement entered damped Q_READY return from the "
+                    "last IPOPT wrist targets"
+                )
             # Keep IPOPT's previous solution as the warm start while both arms
             # transition to the fixed ready target.
             log(
@@ -1514,17 +1708,11 @@ def main() -> int:
     def try_complete_pico_arm_request(tick_us: int) -> None:
         if not pico_arm_pending or pico_tracking_armed:
             return
-        if latest_robot_q is None or latest_wrist_targets is None:
-            return
-        target_age_us = tick_us - latest_pico_body_receive_us
-        source_age_us = tick_us - latest_wrist_targets.source_timestamp_us
-        max_target_age_us = max(1_000, int(args.pico_body_gap_hold_ms * 1_000.0))
-        future_tolerance_us = max(0, int(args.xr_future_tolerance_ms * 1_000.0))
         if (
-            latest_pico_body_receive_us <= 0
-            or target_age_us > max_target_age_us
-            or source_age_us > max_target_age_us
-            or source_age_us < -future_tolerance_us
+            latest_robot_q is None
+            or latest_robot_state_us <= 0
+            or tick_us - latest_robot_state_us > 200_000
+            or not xr_targets_are_fresh(tick_us)
         ):
             return
         if args.auto_arm_xr_tracking:
@@ -1596,14 +1784,60 @@ def main() -> int:
                         latest_pico_session_id = targets.session_id
                         last_ipopt_q_ref = None
                         last_ipopt_tau_ff = None
+                        xr_continuity.reset_session()
                         log(
                             "XR absolute-target session="
-                            f"{latest_pico_session_id}; reset IPOPT warm start"
+                            f"{latest_pico_session_id}; reset XR continuity and IPOPT warm start"
                         )
-                    latest_wrist_targets = targets
-                    latest_pico_body_receive_us = tick_us
+                    for side, transform in (
+                        ("left", targets.left_waist),
+                        ("right", targets.right_waist),
+                    ):
+                        result = xr_continuity.accept(
+                            side,
+                            transform,
+                            targets.source_timestamp_us,
+                            now,
+                        )
+                        if result == "resync":
+                            xr_continuity.reset_filter_to_accepted(side)
+                            if (
+                                pico_tracking_armed
+                                and xr_reference_initialized
+                                and tracking_damping_started is None
+                            ):
+                                previous_target = last_commanded_wrist_tf[side]
+                                if previous_target is None and latest_robot_q is not None:
+                                    fk_left, fk_right = arm_nonlinear_ik.wrist_transforms_from_q29(
+                                        latest_robot_q
+                                    )
+                                    previous_target = fk_left if side == "left" else fk_right
+                                if previous_target is not None:
+                                    damped_reference[side].reset(previous_target)
+                                    damped_active[side] = True
+                                    resync_damping_started[side] = now
+                                    log(
+                                        f"XR {side} outlier resync#{xr_continuity.resync_count[side]} "
+                                        "accepted after timeout; entering bounded damping"
+                                    )
+                        elif result == "rejected":
+                            pass
+                    accepted_left = xr_continuity.accepted["left"]
+                    accepted_right = xr_continuity.accepted["right"]
+                    if accepted_left is not None and accepted_right is not None:
+                        latest_wrist_targets = WaistWristTargets(
+                            left_waist=accepted_left.copy(),
+                            right_waist=accepted_right.copy(),
+                            session_id=targets.session_id,
+                            frame_index=targets.frame_index,
+                            source_timestamp_us=targets.source_timestamp_us,
+                            valid=True,
+                        )
+                        latest_pico_body_receive_us = tick_us
             except zmq.Again:
                 pass
+
+            filtered_xr_targets = xr_continuity.tick(dt)
 
             try:
                 while True:
@@ -1697,6 +1931,28 @@ def main() -> int:
                     latest_robot_base_accel = lcm_state.base_accel.copy()
                     latest_robot_base_gyro = lcm_state.base_gyro.copy()
                     latest_robot_state_us = int(lcm_state_received_us)
+
+            if latest_robot_q is not None and not xr_reference_initialized:
+                initial_left_tf, initial_right_tf = (
+                    arm_nonlinear_ik.wrist_transforms_from_q29(latest_robot_q)
+                )
+                for side, transform in (
+                    ("left", initial_left_tf),
+                    ("right", initial_right_tf),
+                ):
+                    damped_reference[side].reset(transform)
+                    last_commanded_wrist_tf[side] = transform.copy()
+                    damped_active[side] = True
+                xr_reference_initialized = True
+                log(
+                    "damped wrist references initialized from FK of the first "
+                    "fresh G1 state; arm commands remain inhibited until this state"
+                )
+                log(
+                    "initial teleop_wait_ready damping toward FK(Q_READY) started; "
+                    f"v_max={args.damped_linear_speed_limit_m_s:.3f}m/s "
+                    f"omega_max={args.damped_angular_speed_limit_rad_s:.3f}rad/s"
+                )
 
             latest_gravity_direction = gravity_estimator.update(
                 latest_robot_base_quat,
@@ -1839,15 +2095,18 @@ def main() -> int:
             # not retain an old command: a stale visual marker looks like a
             # tracking error to the operator.
             control_visual_hands: dict[str, dict] = {}
-            if current_state in {"teleop", "intention"}:
+            if latest_robot_q is not None and current_state in {"teleop", "intention"}:
                 if current_state == "teleop" and not pico_tracking_armed:
-                    # Terminal r enters teleop_wait_ready. It is deliberately a
-                    # Cartesian IPOPT task, not a direct q=0 command: FK of
-                    # Q_READY provides both fixed wrist positions and fixed
-                    # orientations every 50 Hz.
+                    # Ease to FK(Q_READY); never send an arm command before the
+                    # first fresh G1 state has initialized the SE(3) references.
+                    ready_targets = apply_teleop_wrist_reference(
+                        {"left": q_ready_left_wrist_tf, "right": q_ready_right_wrist_tf},
+                        dt,
+                        now,
+                    )
                     ready_result = solve_authoritative_ipopt_transforms(
-                        q_ready_left_wrist_tf,
-                        q_ready_right_wrist_tf,
+                        ready_targets["left"],
+                        ready_targets["right"],
                     )
                     q_arm_reference = (
                         ready_result.q_ref.copy()
@@ -1856,9 +2115,9 @@ def main() -> int:
                     )
                     if ready_result.success:
                         control_visual_hands = ipopt_visual_hands_from_transforms(
-                            q_ready_left_wrist_tf,
-                            q_ready_right_wrist_tf,
-                            target_source="teleop_wait_ready_q_ready",
+                            ready_targets["left"],
+                            ready_targets["right"],
+                            target_source="teleop_wait_ready_damped_q_ready",
                         )
                     else:
                         hold_left_tf, hold_right_tf = (
@@ -1889,9 +2148,9 @@ def main() -> int:
                         bridge_timestamp_us=tick_us,
                         pico_target_reason="fixed_fk_q_ready",
                         pico_target_held=True,
-                        pico_left_target_position=q_ready_left_wrist_tf[:3, 3].tolist(),
-                        pico_right_target_position=q_ready_right_wrist_tf[:3, 3].tolist(),
-                        q_prior_source="ipopt_fixed_q_ready_fk",
+                        pico_left_target_position=ready_targets["left"][:3, 3].tolist(),
+                        pico_right_target_position=ready_targets["right"][:3, 3].tolist(),
+                        q_prior_source="ipopt_damped_q_ready_fk",
                         belief_enabled=False,
                         shared_control=False,
                         teleop_qp_bimanual=True,
@@ -1928,8 +2187,16 @@ def main() -> int:
                     )
                     shared_orientation_source = "xr_operator"
                     if pico_body_fresh and latest_wrist_targets is not None:
-                        left_target_tf = latest_wrist_targets.left_waist.copy()
-                        right_target_tf = latest_wrist_targets.right_waist.copy()
+                        left_target_tf = (
+                            filtered_xr_targets["left"].copy()
+                            if filtered_xr_targets["left"] is not None
+                            else latest_wrist_targets.left_waist.copy()
+                        )
+                        right_target_tf = (
+                            filtered_xr_targets["right"].copy()
+                            if filtered_xr_targets["right"] is not None
+                            else latest_wrist_targets.right_waist.copy()
+                        )
                         human_source_timestamp_us = int(
                             latest_wrist_targets.source_timestamp_us
                         )
@@ -2156,8 +2423,8 @@ def main() -> int:
                         reference_diagnostics[side] = {
                             "armed": bool(belief_target is not None), "position_source": position_source,
                             "orientation_source": orientation_source,
-                            # Compatibility telemetry: no Cartesian reference
-                            # remains between Televuer and IK in direct mode.
+                            # Filled with the raw-to-IPOPT residual after the
+                            # configured damped or residual-offset reference.
                             "position_error_m": 0.0,
                             "orientation_error_rad": 0.0,
                             "reference_speed_mps": (
@@ -2209,6 +2476,28 @@ def main() -> int:
                             },
                             "grasp_state_source": "v17_physical_state_machine",
                         }
+                    if current_state == "teleop":
+                        raw_goal = {side: human_tf[side].copy() for side in ("left", "right")}
+                        human_tf = apply_teleop_wrist_reference(raw_goal, dt, now)
+                        for side in ("left", "right"):
+                            reference_diagnostics[side]["position_error_m"] = float(
+                                np.linalg.norm(
+                                    raw_goal[side][:3, 3] - human_tf[side][:3, 3]
+                                )
+                            )
+                            reference_diagnostics[side]["orientation_error_rad"] = float(
+                                np.linalg.norm(
+                                    so3_log(
+                                        human_tf[side][:3, :3].T
+                                        @ raw_goal[side][:3, :3]
+                                    )
+                                )
+                            )
+                            reference_diagnostics[side]["goal_mode"] = (
+                                "damped_se3"
+                                if damped_active[side]
+                                else "direct_with_residual_offset"
+                            )
                     control_visual_hands = {
                         side: {
                             # Exact wrist-yaw Cartesian goal handed to IPOPT.
@@ -2729,6 +3018,8 @@ def main() -> int:
                     f"{pico_position_log} "
                     f"xr_age={1000.0 * pico_body_age_sec if np.isfinite(pico_body_age_sec) else -1.0:.1f}ms "
                     f"xr_source_age={1000.0 * pico_source_age_sec if np.isfinite(pico_source_age_sec) else -1.0:.1f}ms "
+                    f"xr_outliers=L{xr_continuity.reject_count['left']}/R{xr_continuity.reject_count['right']} "
+                    f"xr_resyncs=L{xr_continuity.resync_count['left']}/R{xr_continuity.resync_count['right']} "
                     f"recording={'on' if recording_active else 'off'} "
                     f"quit_pending={quit_deadline is not None} "
                     f"control={qp_payload.get('control_mode', 'none') if qp_payload else 'none'} "

@@ -38,6 +38,20 @@ control:
   stale_command_timeout_sec: 0.35
   stale_command_pose: open
 
+contact_detection:
+  command_error_on: 0.08
+  command_error_off: 0.04
+  minimum_duration_sec: 0.10
+  stale_after_sec: 0.25
+  # Initial mapping assumes thumb proximal is flexion; confirm it on Revo2
+  # hardware before interpreting thumb contact labels as physical contact.
+  finger_channels:
+    thumb: thumb_aux
+    index: index
+    middle: middle
+    ring: ring
+    pinky: pinky
+
 # MJCF equality semantics: q_proximal = multiplier * q_distal. The adapter
 # solves those constraints for q_distal; dynamic MuJoCo simulation enforces
 # the same relation.

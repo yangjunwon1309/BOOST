@@ -5,6 +5,10 @@ completed hardware validation. MuJoCo commands in
 [../boost/sim/README.md](../boost/sim/README.md) run locally and do not
 connect to a physical robot.
 
+For the short live bring-up sequence from multicast routing through USB cleanup
+and Galaxy XR/Revo2 startup, see
+[g1_thor_galaxy_xr_revo2_runbook.md](g1_thor_galaxy_xr_revo2_runbook.md).
+
 ## Mutually exclusive arm command routes
 
 DreamWaQ is the sole G1 hardware writer to `rt/lowcmd`. Choose one source for
@@ -122,10 +126,14 @@ pixi run -e thor-teleop path-teleop
 
 Open the printed secure Televuer URL on Galaxy XR and wait until the PATH log
 shows fresh XR wrist frames. Press `r` in that same terminal to start/resume
-arm following, `s` to start a wrist experiment CSV, `s` again to stop and save,
-or `q` to stop and exit. The CSV and summary JSON are written under
-`$HOME/data/boost/path_wrist_experiments` by default; override that directory
-with `BOOST_PATH_EXPERIMENT_DATA_ROOT`.
+arm following, `s` to start a wrist experiment, `s` again to stop and save, or
+`q` to stop and exit. Each trial directory under
+`$HOME/data/boost/path_wrist_experiments` contains `data.csv`, `summary.json`,
+and the lossless head and wrist camera JPEGs plus `images_index.csv`. The CSV
+records wrist targets/tracking, fresh BrainCo command/state error and debounced
+per-finger contact, and upper-body torque estimates. Override the data root
+with `BOOST_PATH_EXPERIMENT_DATA_ROOT`; use recorder `--no-images` only when
+camera capture is not wanted.
 
 In a second Thor terminal, start Revo2 hand MPPI:
 
@@ -142,8 +150,9 @@ The hand runner accepts Televuer frames only when their schema, finite 25 x 3
 landmarks, timestamp, and 0.20 s freshness bound are valid. It publishes
 bounded fresh targets directly; stale input stops publication and leaves
 command-loss handling to the BrainCo service. PATH applies its timestamp and
-receive-age checks before publishing arm targets. Fresh wrist goals go to IK
-without added output smoothing or retiming.
+receive-age checks before publishing arm targets. XR wrist goals also pass
+through source-time outlier rejection, a 5 Hz SE(3) low-pass and bounded
+startup/engagement/return references before IK.
 
 PATH publishes 14 arm targets on LCM channel G1_PATH_UPPER_COMMAND; the G1
 adapter republishes them on rt/arm_sdk. Thor and G1 must permit the configured

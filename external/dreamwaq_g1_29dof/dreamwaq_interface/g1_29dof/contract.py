@@ -181,7 +181,7 @@ WAIST50_TORQUE_LIMIT_SDK[13:15] = 50.0
 #
 # Arm order is SDK indices 15..28: left seven, then right seven.
 HOMIE_ARM_DEFAULT_Q_SDK = np.asarray(
-    [0.0, 0.4, 0.0, 1.2, 0.0, 0.0, 0.0, 0.0, -0.4, 0.0, 1.2, 0.0, 0.0, 0.0],
+    [0.0] * 14,
     dtype=np.float32,
 )
 HOMIE_ARM_DEFAULT_KP_SDK = np.asarray(

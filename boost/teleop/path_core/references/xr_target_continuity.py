@@ -36,12 +36,14 @@ class XRTargetContinuity:
         max_angular_speed_rps: float = 10.0,
         resync_after_sec: float = 0.3,
         cutoff_hz: float = 5.0,
+        reacquire_gap_sec: float = 0.15,
     ) -> None:
         values = (
             max_linear_speed_mps,
             max_angular_speed_rps,
             resync_after_sec,
             cutoff_hz,
+            reacquire_gap_sec,
         )
         if not all(math.isfinite(float(value)) and float(value) > 0.0 for value in values):
             raise ValueError("XR continuity parameters must be finite and positive")
@@ -49,12 +51,16 @@ class XRTargetContinuity:
         self.max_angular_speed_rps = float(max_angular_speed_rps)
         self.resync_after_sec = float(resync_after_sec)
         self.cutoff_hz = float(cutoff_hz)
+        self.reacquire_gap_sec = float(reacquire_gap_sec)
         self.accepted: dict[str, np.ndarray | None] = {side: None for side in SIDES}
         self.accepted_timestamp_us: dict[str, int | None] = {side: None for side in SIDES}
         self.filtered: dict[str, np.ndarray | None] = {side: None for side in SIDES}
         self.reject_started: dict[str, float | None] = {side: None for side in SIDES}
         self.reject_count = {side: 0 for side in SIDES}
         self.resync_count = {side: 0 for side in SIDES}
+        self.recovery_count = {side: 0 for side in SIDES}
+        self.tracking_lost = {side: False for side in SIDES}
+        self.last_input_timestamp_us: dict[str, int | None] = {side: None for side in SIDES}
 
     def reset_session(self) -> None:
         for side in SIDES:
@@ -62,6 +68,13 @@ class XRTargetContinuity:
             self.accepted_timestamp_us[side] = None
             self.filtered[side] = None
             self.reject_started[side] = None
+            self.tracking_lost[side] = False
+            self.last_input_timestamp_us[side] = None
+
+    def mark_lost(self) -> None:
+        """Remember an invalid tracking frame without changing the held poses."""
+        for side in SIDES:
+            self.tracking_lost[side] = True
 
     def reset_filter_to_accepted(self, side: str | None = None) -> None:
         selected = SIDES if side is None else (side,)
@@ -70,16 +83,33 @@ class XRTargetContinuity:
             self.filtered[hand] = None if accepted is None else accepted.copy()
 
     def accept(self, side: str, transform, source_timestamp_us: int, now_s: float) -> str:
-        """Return ``accepted``, ``rejected``, or ``resync`` for one XR frame."""
+        """Return accepted/rejected/resync/recovered for one new source frame."""
         if side not in SIDES:
             raise ValueError(f"unknown wrist side {side!r}")
         candidate = _valid_transform(transform)
         stamp = int(source_timestamp_us)
+        previous_input_stamp = self.last_input_timestamp_us[side]
+        if previous_input_stamp is not None and stamp <= previous_input_stamp:
+            return "rejected"
+        self.last_input_timestamp_us[side] = stamp
         accepted = self.accepted[side]
         previous_stamp = self.accepted_timestamp_us[side]
         if accepted is None or previous_stamp is None:
+            self.tracking_lost[side] = False
             self._store(side, candidate, stamp)
             return "accepted"
+
+        if self.tracking_lost[side] or (
+            previous_input_stamp is not None
+            and (stamp - previous_input_stamp) / 1.0e6 > self.reacquire_gap_sec
+        ):
+            # A long gap makes a relocalization jump look like low velocity.
+            # Always ask the bridge for a bounded handoff after tracking loss.
+            self.tracking_lost[side] = False
+            self.reject_started[side] = None
+            self.recovery_count[side] += 1
+            self._store(side, candidate, stamp)
+            return "recovered"
 
         delta_s = (stamp - previous_stamp) / 1.0e6
         if delta_s <= 0.0:

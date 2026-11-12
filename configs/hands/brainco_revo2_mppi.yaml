@@ -74,3 +74,10 @@ control:
   command_speed: 1.0
   state_timeout_sec: 0.25
   log_hz: 2.0
+  tracking_continuity:
+    hold_sec: 1.0
+    reacquire_gap_sec: 0.15
+    recovery_tau_sec: 0.10
+    recovery_speed: 2.0 # normalized command units/s, only during reacquisition
+    tracking_speed: 5.0 # clips abrupt valid-frame jumps; no continuous LPF
+    minimum_recovery_sec: 0.25

@@ -8,6 +8,7 @@ from services.pose_service.tools.record_wrist_experiment_v11 import (
     CSV_FIELDS,
     SCHEMA_VERSION,
     CameraImageWriter,
+    ExperimentRecorder,
 )
 from teleimager.recording_protocol import RecordingFrame, decode_recording_frame, encode_recording_frame
 
@@ -16,6 +17,16 @@ def test_schema_v3_keeps_pose_and_hand_data_without_legacy_belief_columns() -> N
     assert SCHEMA_VERSION == 3
     assert "left_hand_json" in CSV_FIELDS and "right_hand_json" in CSV_FIELDS
     assert not any("belief" in field or "objects_json" in field for field in CSV_FIELDS)
+
+
+def test_pose_record_keeps_tracking_loss_and_recovery_labels() -> None:
+    for state in ("hold", "stale_release", "recovering", "tracking"):
+        record = ExperimentRecorder._ipopt_record({
+            "ipopt_wrist_target_m": [0.1, 0.2, 0.3],
+            "ipopt_wrist_rotation": [1, 0, 0, 0, 1, 0, 0, 0, 1],
+            "xr_tracking_state": state,
+        })
+        assert record["xr_tracking_state"] == state
 
 
 def test_fake_tim2_frame_is_saved_as_original_jpeg_and_indexed(tmp_path: Path) -> None:

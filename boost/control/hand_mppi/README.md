@@ -18,12 +18,20 @@ The runner checks schema, coordinate frame, age, validity, shape, and finite val
 
 `runner.py` uses Mimic's sampling-based iCEM retargeter with the local Revo2
 model. Its six radian targets are clamped to official BrainCo limits, converted
-through `BrainCoRevo2Adapter` to `[0, 1]`, and published directly. Live
+through `BrainCoRevo2Adapter` to `[0, 1]`, and passed through the command
+continuity guard. Live
 publishing waits for fresh Revo2 state on each side and seeds the optimizer from
-the measured pose. When Televuer input becomes stale, the runner stops
-publishing; the BrainCo service owns its command-loss watchdog. There is no
-post-retarget EMA, interpolation, or rate limiter. DreamWaQ remains the sole writer
-to `rt/lowcmd`.
+the measured pose. Invalid tracking freezes the last output for at most one
+second; after that publishing stops and the BrainCo command-loss watchdog
+applies. Reacquisition uses a 100 ms low-pass and a 2 normalized-units/s limit,
+starting from the held output or a fresh measurement after release. Normal
+tracking has no low-pass and only clips jumps above 5 normalized-units/s.
+Duplicate source timestamps do not refresh tracking. Settings are under
+`control.tracking_continuity` in `configs/hands/brainco_revo2_mppi.yaml`.
+DreamWaQ remains the sole writer to `rt/lowcmd`.
+
+See [XR tracking continuity and recorded contact criteria](../../../docs/xr_tracking_continuity.md)
+for recovery behavior and the dataset quality labels.
 
 The runner is read-only unless `--publish` is supplied:
 
@@ -50,7 +58,8 @@ wrist-to-tip and thumb-to-tip target vectors before sampling; surface lookup
 does not run per candidate. The thresholds are `d_on=1 cm`, `d_off=1.5 cm`,
 with a `3 mm` inward target offset. A missing or invalid surface sample sets
 that fingertip's contact blend to zero, leaving its upstream SBR target
-unchanged. There is no hand-target smoothing in this path.
+unchanged. Surface guidance and the output continuity guard are separate:
+the guard bounds commands after retargeting, independently of surface queries.
 
 MuJoCo queries use `mj_geomDistance` against configured collision geoms. A
 real deployment path is also wired as an opt-in point-cloud SDF approximation:

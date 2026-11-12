@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from boost.teleop.path_core.references.damped_se3 import so3_exp
+from boost.teleop.path_core.references.damped_se3 import DampedSE3Reference, so3_exp
 from boost.teleop.path_core.references.xr_target_continuity import XRTargetContinuity
 
 
@@ -33,8 +33,51 @@ def test_continuous_outlier_resynchronizes_after_timeout() -> None:
     continuity.accept("left", initial, 1_000_000, 1.0)
     assert continuity.accept("left", jumped, 1_050_000, 1.05) == "rejected"
     assert continuity.accept("left", jumped, 1_150_000, 1.15) == "rejected"
+    assert continuity.accept("left", jumped, 1_250_000, 1.25) == "rejected"
     assert continuity.accept("left", jumped, 1_350_000, 1.35) == "resync"
     assert continuity.resync_count["left"] == 1
+
+
+def test_tracking_gap_recovers_even_when_the_jump_has_plausible_average_speed() -> None:
+    continuity = XRTargetContinuity()
+    initial = np.eye(4)
+    continuity.accept("left", initial, 1_000_000, 1.0)
+    jumped = initial.copy()
+    jumped[0, 3] = 0.30
+    assert continuity.accept("left", jumped, 2_000_000, 2.0) == "recovered"
+    assert continuity.recovery_count["left"] == 1
+    # Acceptance does not reset the filtered reference onto the new raw pose.
+    continuity.filtered["left"] = initial.copy()
+    filtered = continuity.tick(0.02)["left"]
+    assert 0.0 < filtered[0, 3] < jumped[0, 3]
+
+
+def test_explicit_loss_requires_handoff_and_duplicate_packets_cannot_clear_it() -> None:
+    continuity = XRTargetContinuity()
+    for side in ("left", "right"):
+        continuity.accept(side, np.eye(4), 1_000_000, 1.0)
+    continuity.mark_lost()
+    assert continuity.accept("left", np.eye(4), 1_000_000, 1.01) == "rejected"
+    assert continuity.tracking_lost["left"]
+    assert continuity.accept("left", np.eye(4), 1_020_000, 1.02) == "recovered"
+    assert not continuity.tracking_lost["left"]
+    assert continuity.tracking_lost["right"]
+
+
+def test_recovered_wrist_uses_existing_bounded_damping_from_held_pose() -> None:
+    continuity = XRTargetContinuity()
+    held = np.eye(4)
+    continuity.accept("left", held, 1_000_000, 1.0)
+    recovered = held.copy()
+    recovered[0, 3] = 0.4
+    recovered[:3, :3] = so3_exp([0.0, 0.0, 2.0])
+    assert continuity.accept("left", recovered, 2_000_000, 2.0) == "recovered"
+    continuity.reset_filter_to_accepted("left")
+    reference = DampedSE3Reference(v_max=0.06, omega_max=0.6)
+    reference.reset(held)
+    output = reference.advance(continuity.tick(0.02)["left"], 0.02)
+    assert np.linalg.norm(output[:3, 3] - held[:3, 3]) <= 0.06 * 0.02 + 1e-12
+    assert not np.allclose(output, recovered)
 
 
 def test_five_hz_lpf_has_the_expected_se3_step_response() -> None:

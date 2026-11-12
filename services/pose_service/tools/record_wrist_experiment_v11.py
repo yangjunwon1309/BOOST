@@ -539,6 +539,7 @@ class ExperimentRecorder:
         return {
             "position_m": _vector(hand.get("ipopt_wrist_target_m"), 3),
             "orientation": _vector(hand.get("ipopt_wrist_rotation"), 9),
+            "xr_tracking_state": hand.get("xr_tracking_state"),
         }
 
     def _warn_if_camera_streams_missing(self, now: float) -> None:

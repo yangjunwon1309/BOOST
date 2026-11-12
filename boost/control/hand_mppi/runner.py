@@ -20,6 +20,7 @@ import zmq
 
 from boost.control.hand_mppi.brainco_dds import BrainCoDDS
 from boost.control.hand_mppi.brainco_revo2_model import BrainCoRevo2HandModel
+from boost.control.hand_mppi.command_continuity import HandCommandContinuity
 from boost.control.hand_mppi.revo2 import BrainCoRevo2Adapter
 from boost.io.path_transport.zmq_wire import unpack_pose_message
 
@@ -164,6 +165,7 @@ class SideRuntime:
     jax_numpy: Any
     q_min: np.ndarray
     q_max: np.ndarray
+    continuity: HandCommandContinuity
     last_sequence: int | None = None
     last_valid_timestamp: float | None = None
     desired_rad: np.ndarray | None = None
@@ -437,6 +439,10 @@ def main() -> int:
             jax_numpy=jax_numpy,
             q_min=q_min,
             q_max=q_max,
+            continuity=HandCommandContinuity(
+                stale_sec=stale_timeout,
+                **config["control"].get("tracking_continuity", {}),
+            ),
         )
         print(
             f"[hand-mppi] {side} retargeter ready in "
@@ -559,7 +565,13 @@ def main() -> int:
                     last_input_error = ""
                     for side, runtime in runtimes.items():
                         points = frame.hands[side]
-                        if points is None or frame.sequence == runtime.last_sequence:
+                        if points is None:
+                            runtime.continuity.mark_lost()
+                            continue
+                        if (frame.sequence == runtime.last_sequence or (
+                            runtime.last_valid_timestamp is not None
+                            and frame.timestamp_monotonic <= runtime.last_valid_timestamp
+                        )):
                             continue
 
                         set_sequence = getattr(runtime.retargeter, "set_input_sequence", None)
@@ -570,18 +582,28 @@ def main() -> int:
                                 hand_timestamp_monotonic=frame.timestamp_monotonic,
                             )
 
-                        if args.publish and not runtime.state_seeded:
+                        measured_normalized = None
+                        if args.publish and (
+                            not runtime.state_seeded
+                            or runtime.continuity.needs_recovery(frame.timestamp_monotonic)
+                        ):
                             state = dds.state(
                                 side,
                                 timeout_sec=float(config["control"]["state_timeout_sec"]),
                             )
                             if state is None:
+                                runtime.continuity.mark_lost(released=True)
                                 continue
-                            measured_rad = adapter.normalized_to_actuated(state.q).astype(
+                            measured_normalized = state.q
+                            seed = runtime.continuity.recovery_seed(
+                                state.q, frame.timestamp_monotonic
+                            )
+                            measured_rad = adapter.normalized_to_actuated(seed).astype(
                                 np.float32
                             )
                             # Mimic's public reset() returns to neutral. Seed its
-                            # optimizer warm start from the fresh measured pose.
+                            # optimizer warm start from the held command, or a
+                            # fresh measurement after command ownership expired.
                             runtime.retargeter._qpos_prev = (
                                 runtime.jax_numpy.asarray(measured_rad, dtype=np.float32)
                             )
@@ -609,6 +631,12 @@ def main() -> int:
                         runtime.desired_rad = np.clip(
                             target_rad, runtime.q_min, runtime.q_max
                         )
+                        runtime.continuity.submit(
+                            adapter.actuated_to_normalized(runtime.desired_rad),
+                            frame.timestamp_monotonic,
+                            time.monotonic(),
+                            measured=measured_normalized,
+                        )
                         runtime.last_valid_timestamp = frame.timestamp_monotonic
                         runtime.last_sequence = frame.sequence
                 except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -633,21 +661,9 @@ def main() -> int:
                     continue
 
                 age = max(0.0, now - runtime.last_valid_timestamp)
-                if age > stale_timeout:
-                    # Stop issuing commands when operator input is no longer
-                    # fresh. The BrainCo service owns its configured stale
-                    # command watchdog; do not synthesize a new hand target here.
-                    status_parts.append(f"{side}:stale-stop age={age:.2f}s")
-                    continue
                 if runtime.desired_rad is None:
                     status_parts.append(f"{side}:waiting-target")
                     continue
-                # Publish the latest valid retarget result directly. There is
-                # no output EMA, interpolation, or rate limiter; model limits
-                # are enforced before normalization.
-                command_rad = np.clip(runtime.desired_rad, runtime.q_min, runtime.q_max)
-                normalized = adapter.actuated_to_normalized(command_rad)
-
                 state = None
                 if dds is not None:
                     state = dds.state(
@@ -655,8 +671,14 @@ def main() -> int:
                         timeout_sec=float(config["control"]["state_timeout_sec"]),
                     )
                     if state is None:
+                        runtime.continuity.mark_lost(released=True)
                         status_parts.append(f"{side}:waiting-fresh-DDS-state")
                         continue
+                normalized, tracking_mode = runtime.continuity.command(now)
+                if normalized is None:
+                    status_parts.append(f"{side}:{tracking_mode} age={age:.2f}s")
+                    continue
+                if dds is not None:
                     dds.publish(side, normalized.tolist(), speed=command_speed)
                     publish_counts[side] += 1
 
@@ -677,12 +699,12 @@ def main() -> int:
                         contact_text = f" contact-alpha=[{alpha_text}] surf-mm=[{distance_text}]"
                 if state is None:
                     status_parts.append(
-                        f"{side}:age={age:.2f}s q=[{target_text}] read-only{contact_text}"
+                        f"{side}:{tracking_mode} age={age:.2f}s q=[{target_text}] read-only{contact_text}"
                     )
                 else:
                     measured_text = ",".join(f"{value:.2f}" for value in state.q)
                     status_parts.append(
-                        f"{side}:age={age:.2f}s target=[{target_text}] "
+                        f"{side}:{tracking_mode} age={age:.2f}s target=[{target_text}] "
                         f"state=[{measured_text}]{contact_text}"
                     )
 

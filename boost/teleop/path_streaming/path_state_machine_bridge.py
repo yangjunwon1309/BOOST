@@ -149,6 +149,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--xr-outlier-max-angular-speed-rad-s", type=float, default=None)
     parser.add_argument("--xr-resync-after-s", type=float, default=None)
     parser.add_argument("--xr-lowpass-cutoff-hz", type=float, default=None)
+    parser.add_argument("--xr-reacquire-gap-s", type=float, default=None)
+    parser.add_argument("--xr-tracking-hold-s", type=float, default=None)
     parser.add_argument("--pico-hand-timeout-sec", type=float, default=0.20)
     parser.add_argument("--pico-body-gap-hold-ms", type=float, default=200.0)
     parser.add_argument("--xr-future-tolerance-ms", type=float, default=100.0)
@@ -440,10 +442,17 @@ def parse_args() -> argparse.Namespace:
         "xr_outlier_max_angular_speed_rad_s": continuity["max_angular_speed_rad_s"],
         "xr_resync_after_s": continuity["resync_after_s"],
         "xr_lowpass_cutoff_hz": continuity["lowpass_cutoff_hz"],
+        "xr_reacquire_gap_s": continuity.get("reacquire_gap_s", 0.15),
+        "xr_tracking_hold_s": continuity.get("tracking_hold_s", 1.0),
     }
     for name, default in defaults.items():
         if getattr(args, name) is None:
             setattr(args, name, float(default))
+    if not (
+        np.isfinite([args.xr_reacquire_gap_s, args.xr_tracking_hold_s]).all()
+        and 0.0 < args.xr_reacquire_gap_s < args.xr_tracking_hold_s
+    ):
+        parser.error("XR reacquire gap must be positive and less than tracking hold")
     return args
 
 
@@ -1166,6 +1175,7 @@ def main() -> int:
         max_linear_speed_mps=args.xr_outlier_max_linear_speed_m_s,
         max_angular_speed_rps=args.xr_outlier_max_angular_speed_rad_s,
         resync_after_sec=args.xr_resync_after_s,
+        reacquire_gap_sec=args.xr_reacquire_gap_s,
         cutoff_hz=args.xr_lowpass_cutoff_hz,
     )
     log(
@@ -1177,7 +1187,8 @@ def main() -> int:
         f"{args.damped_direct_position_error_m:.3f}m; XR outlier="
         f"{args.xr_outlier_max_linear_speed_m_s:.1f}m/s/"
         f"{args.xr_outlier_max_angular_speed_rad_s:.1f}rad/s "
-        f"resync={args.xr_resync_after_s:.2f}s LPF={args.xr_lowpass_cutoff_hz:.1f}Hz"
+        f"resync={args.xr_resync_after_s:.2f}s LPF={args.xr_lowpass_cutoff_hz:.1f}Hz "
+        f"reacquire_gap={args.xr_reacquire_gap_s:.2f}s hold={args.xr_tracking_hold_s:.2f}s"
     )
     gravity_estimator = PelvisGravityEstimator(args)
     log(
@@ -1345,7 +1356,8 @@ def main() -> int:
             "Televuer frame; stale frames remain rejected"
         )
     log(
-        "teleop Cartesian goal mode=direct Televuer wrist pose; no pose reference/filter "
+        "teleop Cartesian goal=Televuer wrist pose with weak SE(3) LPF; "
+        "bounded damping on engagement/reacquisition; "
         f"hand_model={args.end_effector_model} "
         f"axis={np.round(hand_axis_local, 4).tolist()} "
         f"grasp_local={np.round(grasp_center_local, 4).tolist()}"
@@ -1602,7 +1614,8 @@ def main() -> int:
         max_age_us = max(1_000, int(args.pico_body_gap_hold_ms * 1_000.0))
         future_tolerance_us = max(0, int(args.xr_future_tolerance_ms * 1_000.0))
         return (
-            receive_age_us <= max_age_us
+            not any(xr_continuity.tracking_lost.values())
+            and receive_age_us <= max_age_us
             and -future_tolerance_us <= source_age_us <= max_age_us
         )
 
@@ -1780,7 +1793,12 @@ def main() -> int:
                     future_tolerance_us=int(args.xr_future_tolerance_ms * 1_000.0),
                 )
                 if targets is not None:
-                    if targets.session_id != latest_pico_session_id:
+                    previous_source_age_s = (
+                        float("inf") if latest_wrist_targets is None
+                        else (tick_us - latest_wrist_targets.source_timestamp_us) / 1.0e6
+                    )
+                    session_changed = targets.session_id != latest_pico_session_id
+                    if session_changed:
                         latest_pico_session_id = targets.session_id
                         last_ipopt_q_ref = None
                         last_ipopt_tau_ff = None
@@ -1799,17 +1817,23 @@ def main() -> int:
                             targets.source_timestamp_us,
                             now,
                         )
-                        if result == "resync":
+                        if result in {"resync", "recovered"} or (session_changed and pico_tracking_armed):
                             xr_continuity.reset_filter_to_accepted(side)
                             if (
                                 pico_tracking_armed
                                 and xr_reference_initialized
-                                and tracking_damping_started is None
                             ):
+                                if tracking_damping_started is not None:
+                                    tracking_damping_started = now
                                 previous_target = last_commanded_wrist_tf[side]
-                                if previous_target is None and latest_robot_q is not None:
+                                recovery_q = last_ipopt_q_ref
+                                if previous_source_age_s > args.xr_tracking_hold_s or recovery_q is None:
+                                    recovery_q = latest_robot_q
+                                    last_ipopt_q_ref = None
+                                    last_ipopt_tau_ff = None
+                                if recovery_q is not None:
                                     fk_left, fk_right = arm_nonlinear_ik.wrist_transforms_from_q29(
-                                        latest_robot_q
+                                        recovery_q
                                     )
                                     previous_target = fk_left if side == "left" else fk_right
                                 if previous_target is not None:
@@ -1817,8 +1841,8 @@ def main() -> int:
                                     damped_active[side] = True
                                     resync_damping_started[side] = now
                                     log(
-                                        f"XR {side} outlier resync#{xr_continuity.resync_count[side]} "
-                                        "accepted after timeout; entering bounded damping"
+                                        f"XR {side} {result}: entering bounded recovery "
+                                        f"after {previous_source_age_s:.3f}s source gap"
                                     )
                         elif result == "rejected":
                             pass
@@ -1830,13 +1854,22 @@ def main() -> int:
                             right_waist=accepted_right.copy(),
                             session_id=targets.session_id,
                             frame_index=targets.frame_index,
-                            source_timestamp_us=targets.source_timestamp_us,
+                            source_timestamp_us=min(
+                                xr_continuity.accepted_timestamp_us.values()
+                            ),
                             valid=True,
                         )
                         latest_pico_body_receive_us = tick_us
+                else:
+                    xr_continuity.mark_lost()
             except zmq.Again:
                 pass
 
+            source_stamps = list(xr_continuity.last_input_timestamp_us.values())
+            if all(stamp is not None for stamp in source_stamps) and (
+                tick_us - min(source_stamps) > args.xr_reacquire_gap_s * 1.0e6
+            ):
+                xr_continuity.mark_lost()
             filtered_xr_targets = xr_continuity.tick(dt)
 
             try:
@@ -2022,6 +2055,7 @@ def main() -> int:
             )
             pico_body_fresh = (
                 pico_tracking_armed
+                and not any(xr_continuity.tracking_lost.values())
                 and latest_wrist_targets is not None
                 and pico_body_age_sec
                 <= max(0.001, float(args.pico_body_gap_hold_ms) / 1000.0)
@@ -2714,10 +2748,29 @@ def main() -> int:
                         hold_right_tf,
                         target_source="stale_xr_display_hold",
                     )
-                    # Keep the last wrist marker visible for diagnostics, but
-                    # release arm-SDK ownership when the live XR target ages
-                    # out. A display hold is not a new robot command.
-                    qp_payload = qp_none_reference(
+                    short_tracking_hold = (
+                        current_state == "teleop"
+                        and hold_tracking_target
+                        and latest_wrist_targets is not None
+                        and 0.0 <= pico_source_age_sec <= args.xr_tracking_hold_s
+                        and latest_robot_state_us > 0
+                        and tick_us - latest_robot_state_us <= 200_000
+                        and last_ipopt_q_ref is not None
+                    )
+                    # Brief FOV loss holds the exact last arm command. A long
+                    # loss still releases ownership; recovery then starts at FK
+                    # of the fresh measured pose rather than an old reference.
+                    qp_payload = ipopt_arm_sample_reference(
+                        hold_q,
+                        state=current_state,
+                        source="xr_tracking_hold",
+                        control_mode="tracking_hold",
+                        feasible=True,
+                        timestamp_us=tick_us,
+                        tau_ff_ref=np.zeros(29, dtype=np.float64),
+                        pico_target_held=True,
+                        pico_source_timestamp_us=missing_pico_source_us,
+                    ) if short_tracking_hold else qp_none_reference(
                         state=current_state,
                         source="xr_wrist_target_stale",
                         control_mode="stale_wait",
@@ -2734,6 +2787,8 @@ def main() -> int:
                         pico_target_held=False,
                         arm_target_valid=False,
                     )
+                    for hand in control_visual_hands.values():
+                        hand["xr_tracking_state"] = "hold" if short_tracking_hold else "stale_release"
             # IK owns q, while arm gravity compensation is evaluated independently
             # at the 50 Hz bridge rate. This keeps arm-load feedforward
             # synchronized with the latest pelvis gravity even when a static IK
@@ -2924,6 +2979,17 @@ def main() -> int:
             # This direct Wi-Fi diagnostic path deliberately bypasses the
             # Thor-local belief ZMQ subscriber. Perception/belief may be late,
             # but the laptop must always see the current IPOPT wrist target.
+            for side, hand in control_visual_hands.items():
+                recovering = (
+                    damped_active[side]
+                    or np.linalg.norm(damped_reference[side].position_offset) > 1e-4
+                    or np.linalg.norm(damped_reference[side].rotation_offset) > 1e-4
+                )
+                hand.setdefault(
+                    "xr_tracking_state",
+                    ("recovering" if recovering else "tracking")
+                    if pico_body_fresh else "waiting",
+                )
             wrist_visual_lcm.publish(
                 args.wrist_visual_channel,
                 pack_ipopt_visual(
@@ -3020,6 +3086,7 @@ def main() -> int:
                     f"xr_source_age={1000.0 * pico_source_age_sec if np.isfinite(pico_source_age_sec) else -1.0:.1f}ms "
                     f"xr_outliers=L{xr_continuity.reject_count['left']}/R{xr_continuity.reject_count['right']} "
                     f"xr_resyncs=L{xr_continuity.resync_count['left']}/R{xr_continuity.resync_count['right']} "
+                    f"xr_recoveries=L{xr_continuity.recovery_count['left']}/R{xr_continuity.recovery_count['right']} "
                     f"recording={'on' if recording_active else 'off'} "
                     f"quit_pending={quit_deadline is not None} "
                     f"control={qp_payload.get('control_mode', 'none') if qp_payload else 'none'} "

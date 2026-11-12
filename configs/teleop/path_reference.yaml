@@ -12,3 +12,5 @@ xr_continuity:
   max_angular_speed_rad_s: 10.0
   resync_after_s: 0.3
   lowpass_cutoff_hz: 5.0
+  reacquire_gap_s: 0.15
+  tracking_hold_s: 1.0
